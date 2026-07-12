@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "crates/queqlite",
     "crates/queqlite-archive",
     "crates/queqlite-core",
     "crates/queqlite-log",
+    "crates/queqlite-node",
     "crates/queqlite-obj-store",
     "crates/queqlite-quepaxa",
     "crates/queqlite-sqlite",
@@ -16,12 +18,14 @@ license = "MIT"
 repository = "https://github.com/mrchypark/queqlite"
 
 [workspace.dependencies]
+axum = "0.8"
 bytes = "1"
 futures = "0.3"
 object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1.52.3", features = ["fs", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
