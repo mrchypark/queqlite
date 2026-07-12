@@ -490,6 +490,7 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
         )
         .unwrap();
     assert!(engine.inspect_decision_proof_at(1).unwrap().is_none());
+    assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     drop(engine);
 
     let reopened = consensus(root.path(), "n3").with_priority_source(Arc::new(FixedPriority));
@@ -1391,7 +1392,7 @@ fn record_broadcast_returns_typed_rejection_when_quorum_is_impossible() {
 }
 
 #[test]
-fn early_record_quorum_threads_are_joined_on_consensus_drop() {
+fn consensus_drop_does_not_wait_for_a_blocked_minority_rpc() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1444,18 +1445,14 @@ fn early_record_quorum_threads_are_joined_on_consensus_drop() {
         dropped_sender.send(()).unwrap();
     });
     drop_started_receiver.recv().unwrap();
-    let drop_waited_for_record = dropped_receiver
+    dropped_receiver
         .recv_timeout(Duration::from_millis(100))
-        .is_err();
+        .unwrap();
 
     let (release_lock, release_condition) = &*release;
     *release_lock.lock().unwrap() = true;
     release_condition.notify_all();
 
-    assert!(drop_waited_for_record);
-    dropped_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
     drop_thread.join().unwrap();
 }
 

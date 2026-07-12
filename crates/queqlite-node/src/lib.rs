@@ -28,8 +28,7 @@ use queqlite_log::{
 use queqlite_obj_store::{ObjStore, ObjStoreConfig};
 use queqlite_quepaxa::{
     CertifiedDecisionInspection, Consensus, DecisionInspection, DecisionProof, Membership,
-    RecordRequest, RecordSummary, RecorderFileStore, RecorderReply, RecorderRequest, RecorderRpc,
-    RejectReason, ThreeNodeConsensus,
+    RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc, RejectReason, ThreeNodeConsensus,
 };
 use queqlite_sqlite::{
     encode_sql_command, restore_snapshot_file, RecoverySnapshot, RequestConflict, RequestOutcome,
@@ -466,13 +465,6 @@ impl HttpRecorderClient {
 }
 
 impl RecorderRpc for HttpRecorderClient {
-    fn call(&self, _request: RecorderRequest) -> queqlite_quepaxa::Result<RecorderReply> {
-        Err(queqlite_quepaxa::Error::MigrationRequired {
-            format: "recorder HTTP transport",
-            version: 1,
-        })
-    }
-
     fn recorder_id(&self) -> queqlite_quepaxa::Result<String> {
         self.post_v2(RECORDER_IDENTITY_PATH, ())
     }
@@ -2064,7 +2056,6 @@ fn recorder_error_status(error: &queqlite_quepaxa::Error) -> StatusCode {
     match error {
         queqlite_quepaxa::Error::NoQuorum
         | queqlite_quepaxa::Error::CommandUnavailable
-        | queqlite_quepaxa::Error::ContentionExhausted { .. }
         | queqlite_quepaxa::Error::Io(_)
         | queqlite_quepaxa::Error::RecorderRootLocked(_) => StatusCode::SERVICE_UNAVAILABLE,
         queqlite_quepaxa::Error::Rejected(_) => StatusCode::CONFLICT,
@@ -4113,9 +4104,6 @@ impl NodeRuntime {
             | queqlite_quepaxa::Error::CommandUnavailable
             | queqlite_quepaxa::Error::Cancelled
             | queqlite_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
-            queqlite_quepaxa::Error::ContentionExhausted { .. } => {
-                NodeError::Contention(error.to_string())
-            }
             queqlite_quepaxa::Error::ConflictingCertificates
             | queqlite_quepaxa::Error::ChainConflict { .. } => {
                 self.latch(NodeError::Reconciliation(error.to_string()))
@@ -4632,7 +4620,6 @@ fn startup_consensus_error(error: queqlite_quepaxa::Error) -> NodeError {
     match error {
         queqlite_quepaxa::Error::NoQuorum
         | queqlite_quepaxa::Error::CommandUnavailable
-        | queqlite_quepaxa::Error::ContentionExhausted { .. }
         | queqlite_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
         other => NodeError::Reconciliation(other.to_string()),
     }

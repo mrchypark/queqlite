@@ -4,9 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+description = "Transport-independent QuePaxa consensus engine used by Queqlite"
+readme = "README.md"
+keywords = ["consensus", "quepaxa", "distributed-systems"]
+categories = ["algorithms", "database"]
 
 [dependencies]
-queqlite-core = { path = "../queqlite-core" }
+getrandom.workspace = true
+queqlite-core = { version = "0.1.0", path = "../queqlite-core" }
 serde.workspace = true
 
 [dev-dependencies]

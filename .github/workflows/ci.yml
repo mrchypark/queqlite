@@ -18,3 +18,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
+      - run: scripts/check-quepaxa-package.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check -p queqlite-core -p queqlite-quepaxa --lib --locked

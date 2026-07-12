@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use sha2::{Digest, Sha256};
 
 pub type LogIndex = u64;

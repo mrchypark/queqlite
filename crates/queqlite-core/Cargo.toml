@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+description = "Shared value types and deterministic log model for Queqlite"
+readme = "README.md"
+keywords = ["sqlite", "consensus", "database"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 serde.workspace = true
