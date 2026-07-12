@@ -1614,6 +1614,12 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
     assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 0);
 }
 
+thread_local! {
+    static PIGGYBACK_PROPERTY_ROOT: tempfile::TempDir = tempfile::tempdir().unwrap();
+}
+
+static PIGGYBACK_PROPERTY_CASE: AtomicUsize = AtomicUsize::new(0);
+
 proptest! {
     #[test]
     fn mismatched_piggyback_never_persists_or_advances(
@@ -1621,10 +1627,12 @@ proptest! {
         other in prop::collection::vec(any::<u8>(), 1..64),
     ) {
         prop_assume!(offered != other);
-        let root = tempfile::tempdir().unwrap();
+        let case = PIGGYBACK_PROPERTY_CASE.fetch_add(1, Ordering::Relaxed);
+        let root = PIGGYBACK_PROPERTY_ROOT.with(|root| root.path().join(case.to_string()));
+        std::fs::create_dir(&root).unwrap();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
         let store = RecorderFileStore::new_with_membership(
-            root.path(), "n1", "cluster", 1, 1, membership.clone(),
+            root, "n1", "cluster", 1, 1, membership.clone(),
         ).unwrap();
         let expected = StoredCommand::new(EntryType::Command, offered);
         let mismatched = StoredCommand::new(EntryType::Command, other);
