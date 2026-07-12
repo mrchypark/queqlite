@@ -1459,7 +1459,7 @@ fn early_record_quorum_threads_are_joined_on_consensus_drop() {
     });
     drop_started_receiver.recv().unwrap();
     let drop_waited_for_record = dropped_receiver
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(Duration::from_secs(1))
         .is_err();
 
     let (release_lock, release_condition) = &*release;
