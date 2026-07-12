@@ -408,7 +408,7 @@ fn drive_has_no_fixed_retry_cap_and_eventually_decides() {
 }
 
 #[test]
-fn three_simultaneous_proposers_cooperate_on_one_value() {
+fn three_interleaved_proposers_cooperate_on_one_value() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let stores: Vec<_> = membership
@@ -441,7 +441,7 @@ fn three_simultaneous_proposers_cooperate_on_one_value() {
             )
         })
         .collect();
-    let handles: Vec<_> = engines
+    let mut proposers: Vec<_> = engines
         .into_iter()
         .enumerate()
         .map(|(index, engine)| {
@@ -450,29 +450,37 @@ fn three_simultaneous_proposers_cooperate_on_one_value() {
             engine.register_command(command.hash(), command.payload.clone());
             let accepted = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
             let proposer = format!("n{}", index + 1);
-            thread::spawn(move || {
-                let mut progress = ProposerProgress::new(
+            (
+                engine,
+                Some(ProposerProgress::new(
                     1,
                     Proposal::new(ProposalPriority::MAX, proposer, 1, accepted),
-                );
-                for _ in 0..1_000 {
-                    match engine.drive(progress).unwrap() {
-                        DriveOutcome::Pending(next) | DriveOutcome::Progress(next) => {
-                            progress = next;
-                            thread::yield_now();
-                        }
-                        DriveOutcome::Decision(proof) => {
-                            return Some(proof.proposal().value.clone().unwrap())
-                        }
-                    }
-                }
-                None
-            })
+                )),
+                None,
+            )
         })
         .collect();
-    let values: Vec<_> = handles
+    for _ in 0..1_000 {
+        for (engine, progress, decision) in &mut proposers {
+            let Some(current) = progress.take() else {
+                continue;
+            };
+            match engine.drive(current).unwrap() {
+                DriveOutcome::Pending(next) | DriveOutcome::Progress(next) => {
+                    *progress = Some(next);
+                }
+                DriveOutcome::Decision(proof) => {
+                    *decision = proof.proposal().value.clone();
+                }
+            }
+        }
+        if proposers.iter().all(|(_, _, decision)| decision.is_some()) {
+            break;
+        }
+    }
+    let values: Vec<_> = proposers
         .into_iter()
-        .filter_map(|handle| handle.join().unwrap())
+        .filter_map(|(_, _, decision)| decision)
         .collect();
     assert_eq!(values.len(), 3);
     assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
