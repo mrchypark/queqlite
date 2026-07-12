@@ -705,7 +705,9 @@ impl SuccessorDescriptor {
 
 pub fn canonical_membership_digest(members: &[NodeId]) -> Result<LogHash, ConfigChangeDecodeError> {
     if !(3..=7).contains(&members.len())
-        || members.iter().any(String::is_empty)
+        || members
+            .iter()
+            .any(|member| member.is_empty() || member.len() > usize::from(u16::MAX))
         || !members.windows(2).all(|pair| pair[0] < pair[1])
     {
         return Err(ConfigChangeDecodeError);
@@ -981,6 +983,9 @@ fn decode_successor(
     let members = (0..count)
         .map(|_| read_config_string(bytes, cursor))
         .collect::<Result<Vec<_>, _>>()?;
+    if !members.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ConfigChangeDecodeError);
+    }
     let descriptor = SuccessorDescriptor::new(
         cluster_id,
         predecessor_config_id,

@@ -410,6 +410,25 @@ fn bound_stop_round_trip_binds_cluster_predecessor_and_exact_successor() {
 }
 
 #[test]
+fn bound_stop_binary_rejects_noncanonical_member_order() {
+    let stop = ConfigChange::bound_stop(
+        "cluster-a",
+        4,
+        LogHash::ZERO,
+        5,
+        vec!["r1".into(), "r2".into(), "r3".into()],
+    )
+    .unwrap();
+    let mut command = stop.to_stored_command();
+    let member_start = 7 + 2 + "cluster-a".len() + 8 + 32 + 8 + 32 + 1;
+    let (_, members) = command.payload.split_at_mut(member_start);
+    let (first, rest) = members.split_at_mut(4);
+    first.swap_with_slice(&mut rest[..4]);
+
+    assert!(ConfigChange::recognize(&command).is_err());
+}
+
+#[test]
 fn bound_stop_rejects_skipped_successor_and_duplicate_members() {
     assert!(ConfigChange::bound_stop(
         "cluster-a",
@@ -461,6 +480,12 @@ fn bound_stop_accepts_max_wire_strings_and_rejects_one_byte_more() {
         vec!["r1".into(), "r2".into(), too_long],
     )
     .is_err());
+}
+
+#[test]
+fn membership_digest_rejects_members_larger_than_config_wire_limit() {
+    let oversized = "z".repeat(u16::MAX as usize + 1);
+    assert!(canonical_membership_digest(&["r1".into(), "r2".into(), oversized]).is_err());
 }
 
 #[test]
