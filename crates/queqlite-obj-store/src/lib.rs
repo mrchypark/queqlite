@@ -1,0 +1,499 @@
+use std::{fmt, fs, path::PathBuf, sync::Arc};
+
+use bytes::Bytes;
+use futures::{lock::Mutex, TryStreamExt};
+use object_store::{
+    aws::{AmazonS3Builder, S3ConditionalPut},
+    azure::MicrosoftAzureBuilder,
+    gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem,
+    path::Path as ObjPath,
+    ObjectStore, ObjectStoreExt, PutMode,
+};
+use serde::{Deserialize, Serialize};
+
+pub use object_store::UpdateVersion;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    AlreadyExists { key: String },
+    Precondition { key: String },
+    NotFound { key: String },
+    MissingVersion { key: String },
+    Configuration(String),
+    Transport { key: String, message: String },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists { key } => write!(f, "object already exists: {key}"),
+            Self::Precondition { key } => write!(f, "object precondition failed: {key}"),
+            Self::NotFound { key } => write!(f, "object not found: {key}"),
+            Self::MissingVersion { key } => {
+                write!(f, "object has no safe version identity: {key}")
+            }
+            Self::Configuration(message) => {
+                write!(f, "object store configuration failed: {message}")
+            }
+            Self::Transport { key, message } => {
+                write!(f, "object store operation failed for {key}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum ObjStoreConfig {
+    Local {
+        root: PathBuf,
+    },
+    S3 {
+        endpoint: String,
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+        region: String,
+        allow_http: bool,
+    },
+    Gcs {
+        bucket: String,
+        service_account_path: Option<String>,
+        service_account_key: Option<String>,
+    },
+    AzureBlob {
+        account: String,
+        container: String,
+        access_key: Option<String>,
+    },
+}
+
+impl fmt::Debug for ObjStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { root } => formatter.debug_struct("Local").field("root", root).finish(),
+            Self::S3 {
+                endpoint,
+                bucket,
+                region,
+                allow_http,
+                ..
+            } => formatter
+                .debug_struct("S3")
+                .field("endpoint", endpoint)
+                .field("bucket", bucket)
+                .field("access_key", &"[redacted]")
+                .field("secret_key", &"[redacted]")
+                .field("region", region)
+                .field("allow_http", allow_http)
+                .finish(),
+            Self::Gcs {
+                bucket,
+                service_account_path,
+                ..
+            } => formatter
+                .debug_struct("Gcs")
+                .field("bucket", bucket)
+                .field("service_account_path", service_account_path)
+                .field("service_account_key", &"[redacted]")
+                .finish(),
+            Self::AzureBlob {
+                account, container, ..
+            } => formatter
+                .debug_struct("AzureBlob")
+                .field("account", account)
+                .field("container", container)
+                .field("access_key", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ObjStore {
+    inner: Arc<dyn ObjectStore>,
+    local_update_lock: Option<Arc<Mutex<()>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedObject {
+    bytes: Vec<u8>,
+    version: UpdateVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectVersion {
+    e_tag: Option<String>,
+    version: Option<String>,
+}
+
+impl ObjectVersion {
+    pub const fn e_tag(&self) -> Option<&String> {
+        self.e_tag.as_ref()
+    }
+
+    pub const fn version(&self) -> Option<&String> {
+        self.version.as_ref()
+    }
+}
+
+impl From<UpdateVersion> for ObjectVersion {
+    fn from(value: UpdateVersion) -> Self {
+        Self {
+            e_tag: value.e_tag,
+            version: value.version,
+        }
+    }
+}
+
+impl From<ObjectVersion> for UpdateVersion {
+    fn from(value: ObjectVersion) -> Self {
+        Self {
+            e_tag: value.e_tag,
+            version: value.version,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectMetadata {
+    key: String,
+    size_bytes: u64,
+    last_modified_ms: u64,
+    version: ObjectVersion,
+}
+
+impl ObjectMetadata {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub const fn last_modified_ms(&self) -> u64 {
+        self.last_modified_ms
+    }
+
+    pub const fn version(&self) -> &ObjectVersion {
+        &self.version
+    }
+}
+
+impl VersionedObject {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub const fn version(&self) -> &UpdateVersion {
+        &self.version
+    }
+}
+
+impl ObjStore {
+    pub fn new(config: ObjStoreConfig) -> Result<Self> {
+        let (inner, local_update_lock): (Arc<dyn ObjectStore>, _) = match config {
+            ObjStoreConfig::Local { root } => {
+                fs::create_dir_all(&root).map_err(|err| Error::Configuration(err.to_string()))?;
+                let store = LocalFileSystem::new_with_prefix(root)
+                    .map_err(|err| Error::Configuration(err.to_string()))?;
+                (Arc::new(store), Some(Arc::new(Mutex::new(()))))
+            }
+            ObjStoreConfig::S3 {
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                region,
+                allow_http,
+            } => {
+                validate_required("S3 endpoint", &endpoint)?;
+                validate_required("S3 bucket", &bucket)?;
+                validate_required("S3 access key", &access_key)?;
+                validate_required("S3 secret key", &secret_key)?;
+                validate_required("S3 region", &region)?;
+                let store = AmazonS3Builder::new()
+                    .with_endpoint(endpoint)
+                    .with_bucket_name(bucket)
+                    .with_access_key_id(access_key)
+                    .with_secret_access_key(secret_key)
+                    .with_region(region)
+                    .with_allow_http(allow_http)
+                    .with_virtual_hosted_style_request(false)
+                    .with_conditional_put(S3ConditionalPut::ETagMatch)
+                    .build()
+                    .map_err(|err| Error::Configuration(err.to_string()))?;
+                (Arc::new(store), None)
+            }
+            ObjStoreConfig::Gcs {
+                bucket,
+                service_account_path,
+                service_account_key,
+            } => {
+                validate_required("GCS bucket", &bucket)?;
+                validate_optional("GCS service account path", service_account_path.as_deref())?;
+                validate_optional("GCS service account key", service_account_key.as_deref())?;
+                if service_account_path.is_some() && service_account_key.is_some() {
+                    return Err(Error::Configuration(
+                        "GCS service account path and key are mutually exclusive".to_string(),
+                    ));
+                }
+
+                let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+                if let Some(path) = service_account_path {
+                    builder = builder.with_service_account_path(path);
+                }
+                if let Some(key) = service_account_key {
+                    builder = builder.with_service_account_key(key);
+                }
+                let store = builder
+                    .build()
+                    .map_err(|err| Error::Configuration(err.to_string()))?;
+                (Arc::new(store), None)
+            }
+            ObjStoreConfig::AzureBlob {
+                account,
+                container,
+                access_key,
+            } => {
+                validate_required("Azure storage account", &account)?;
+                validate_required("Azure Blob container", &container)?;
+                validate_optional("Azure storage access key", access_key.as_deref())?;
+
+                let mut builder = MicrosoftAzureBuilder::new()
+                    .with_account(account)
+                    .with_container_name(container);
+                if let Some(key) = access_key {
+                    builder = builder.with_access_key(key);
+                }
+                let store = builder
+                    .build()
+                    .map_err(|err| Error::Configuration(err.to_string()))?;
+                (Arc::new(store), None)
+            }
+        };
+
+        Ok(Self {
+            inner,
+            local_update_lock,
+        })
+    }
+
+    pub fn supports_strong_cross_process_cas(&self) -> bool {
+        self.local_update_lock.is_none()
+    }
+
+    pub async fn put(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<()> {
+        self.put_with_mode(key, bytes.as_ref(), PutMode::Overwrite)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<UpdateVersion> {
+        let bytes = bytes.as_ref();
+        match self.put_with_mode(key, bytes, PutMode::Create).await {
+            Ok(version) => Ok(version),
+            Err(error @ Error::AlreadyExists { .. }) => match self.get_with_version(key).await {
+                Ok(existing) if existing.bytes() == bytes => Ok(existing.version().clone()),
+                Ok(_) | Err(Error::NotFound { .. }) => Err(error),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn update(
+        &self,
+        key: &str,
+        bytes: impl AsRef<[u8]>,
+        version: UpdateVersion,
+    ) -> Result<UpdateVersion> {
+        self.put_with_mode(key, bytes.as_ref(), PutMode::Update(version))
+            .await
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        Ok(self.get_with_version(key).await?.bytes)
+    }
+
+    pub async fn get_with_version(&self, key: &str) -> Result<VersionedObject> {
+        let result = self
+            .inner
+            .get(&ObjPath::from(key))
+            .await
+            .map_err(|err| map_store_error(key, err))?;
+        let version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|err| map_store_error(key, err))?;
+        Ok(VersionedObject {
+            bytes: bytes.to_vec(),
+            version,
+        })
+    }
+
+    pub async fn get_versioned(&self, key: &str) -> Result<VersionedObject> {
+        self.get_with_version(key).await
+    }
+
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_metadata(prefix)
+            .await?
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect())
+    }
+
+    pub async fn list_metadata(&self, prefix: &str) -> Result<Vec<ObjectMetadata>> {
+        let objects = self
+            .inner
+            .list(Some(&ObjPath::from(prefix)))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|err| map_store_error(prefix, err))?;
+        let mut metadata = objects
+            .into_iter()
+            .map(|meta| ObjectMetadata {
+                key: meta.location.to_string(),
+                size_bytes: meta.size,
+                last_modified_ms: u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0),
+                version: ObjectVersion {
+                    e_tag: meta.e_tag,
+                    version: meta.version,
+                },
+            })
+            .collect::<Vec<_>>();
+        if let Some(object) = metadata
+            .iter()
+            .find(|object| object.version.e_tag.is_none() && object.version.version.is_none())
+        {
+            return Err(Error::MissingVersion {
+                key: object.key.clone(),
+            });
+        }
+        metadata.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(metadata)
+    }
+
+    /// Deletes only the listed immutable object version. Callers must fence writers because
+    /// object_store does not expose provider-native conditional DELETE across all backends.
+    pub async fn delete_exact(&self, key: &str, expected: &ObjectVersion) -> Result<bool> {
+        let _guard = match &self.local_update_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let path = ObjPath::from(key);
+        let actual = match self.inner.head(&path).await {
+            Ok(meta) => ObjectVersion {
+                e_tag: meta.e_tag,
+                version: meta.version,
+            },
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(map_store_error(key, error)),
+        };
+        if &actual != expected {
+            return Err(Error::Precondition {
+                key: key.to_string(),
+            });
+        }
+        match self.inner.delete(&path).await {
+            Ok(()) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_store_error(key, error)),
+        }
+    }
+
+    async fn put_with_mode(&self, key: &str, bytes: &[u8], mode: PutMode) -> Result<UpdateVersion> {
+        let path = ObjPath::from(key);
+        let payload: object_store::PutPayload = Bytes::copy_from_slice(bytes).into();
+
+        if let (PutMode::Update(expected), Some(lock)) = (&mode, &self.local_update_lock) {
+            let _guard = lock.lock().await;
+            let native = self
+                .inner
+                .put_opts(&path, payload.clone(), mode.clone().into())
+                .await;
+            let result = match native {
+                Err(object_store::Error::NotImplemented { .. }) => {
+                    let meta = match self.inner.head(&path).await {
+                        Ok(meta) => meta,
+                        Err(object_store::Error::NotFound { .. }) => {
+                            return Err(Error::Precondition {
+                                key: key.to_string(),
+                            });
+                        }
+                        Err(err) => return Err(map_store_error(key, err)),
+                    };
+                    let actual = UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    };
+                    if &actual != expected {
+                        return Err(Error::Precondition {
+                            key: key.to_string(),
+                        });
+                    }
+                    self.inner
+                        .put_opts(&path, payload, PutMode::Overwrite.into())
+                        .await
+                }
+                result => result,
+            };
+            return result
+                .map(UpdateVersion::from)
+                .map_err(|err| map_store_error(key, err));
+        }
+
+        self.inner
+            .put_opts(&path, payload, mode.into())
+            .await
+            .map(UpdateVersion::from)
+            .map_err(|err| map_store_error(key, err))
+    }
+}
+
+fn validate_required(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::Configuration(format!("{name} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_optional(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        validate_required(name, value)?;
+    }
+    Ok(())
+}
+
+fn map_store_error(key: &str, error: object_store::Error) -> Error {
+    match error {
+        object_store::Error::AlreadyExists { .. } => Error::AlreadyExists {
+            key: key.to_string(),
+        },
+        object_store::Error::Precondition { .. } | object_store::Error::NotModified { .. } => {
+            Error::Precondition {
+                key: key.to_string(),
+            }
+        }
+        object_store::Error::NotFound { .. } => Error::NotFound {
+            key: key.to_string(),
+        },
+        error => Error::Transport {
+            key: key.to_string(),
+            message: error.to_string(),
+        },
+    }
+}
