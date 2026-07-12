@@ -710,7 +710,8 @@ pub fn canonical_membership_digest(members: &[NodeId]) -> Result<LogHash, Config
     {
         return Err(ConfigChangeDecodeError);
     }
-    let mut encoded = Vec::new();
+    let encoded_len = 14 + members.len() * 8 + members.iter().map(String::len).sum::<usize>();
+    let mut encoded = Vec::with_capacity(encoded_len);
     encoded.extend_from_slice(b"QMEM\0\x01");
     encoded.extend_from_slice(&(members.len() as u64).to_be_bytes());
     for member in members {
@@ -936,6 +937,14 @@ impl ConfigChange {
 
 fn encode_successor(out: &mut Vec<u8>, successor: &SuccessorDescriptor) {
     let cluster = successor.cluster_id.as_bytes();
+    let encoded_len = 83
+        + cluster.len()
+        + successor
+            .members
+            .iter()
+            .map(|member| 2 + member.len())
+            .sum::<usize>();
+    out.reserve(encoded_len);
     let cluster_length =
         u16::try_from(cluster.len()).expect("validated successor cluster length fits u16");
     out.extend_from_slice(&cluster_length.to_be_bytes());
