@@ -1244,6 +1244,7 @@ fn non_preferred_path_piggybacks_command_without_a_separate_store_round() {
             Command::new(CommandKind::Deterministic, b"slow-path".to_vec()),
         )
         .unwrap();
+    drop(consensus);
 
     assert_eq!(counts.legacy_stores.load(Ordering::SeqCst), 0);
     assert_eq!(counts.fetches.load(Ordering::SeqCst), 0);
@@ -1607,6 +1608,7 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
             Command::new(CommandKind::Deterministic, b"fast".to_vec()),
         )
         .unwrap();
+    drop(consensus);
 
     assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
     assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 0);
