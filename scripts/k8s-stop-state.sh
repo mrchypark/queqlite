@@ -20,9 +20,12 @@ case "${1-}" in
     [ "$old_id" -gt 0 ] && [ "$new_id" -gt 0 ] || die "configuration ids must be positive integers"
     [ -n "$candidate" ] || die "candidate Stop operation id must not be empty"
     jq -e --argjson new "$new_id" '
+      (keys | sort) == ["config_id", "digest", "members"] and
       .config_id == $new and
-      (.members | type == "array" and length >= 3) and
-      (.digest | type == "array" and length == 32)
+      (.members | type == "array" and length >= 3 and
+        all(type == "string" and length > 0)) and
+      (.digest | type == "array" and length == 32 and
+        all(type == "number" and floor == . and . >= 0 and . <= 255))
     ' <<< "$successor" >/dev/null || die "invalid successor descriptor"
 
     if [ -e "$state_file" ]; then

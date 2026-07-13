@@ -85,6 +85,25 @@ admin() {
     scripts/k8s-admin-job.sh "$@"
 }
 
+if ! "$durable_resume"; then
+  expected_old_members="$(jq -ec '[.members[].node_id] | sort' "$old_bundle")"
+  for ((ordinal=0; ordinal<old_replicas; ordinal++)); do
+    if ! admin "$old_name" "${old_name}-${ordinal}" GET "$status_path" \
+      > "$status_json"; then
+      echo "cannot verify live membership for ${old_name}-${ordinal}" >&2
+      exit 65
+    fi
+    jq -e --argjson id "$old_id" --argjson members "$expected_old_members" '
+      .node.active_config_id == $id and
+      .node.configuration_state.config_id == $id and
+      .members == $members and (.members | length) == ($members | length)
+    ' "$status_json" >/dev/null || {
+      echo "live membership does not match the old configuration bundle: ${old_name}-${ordinal}" >&2
+      exit 65
+    }
+  done
+fi
+
 be64() {
   printf '%b' "$(printf '%016x' "$1" | sed 's/../\\x&/g')"
 }

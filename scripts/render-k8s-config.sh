@@ -23,13 +23,18 @@ require sed
 require yq
 
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
+  ((keys | sort) == ["config_id", "members", "version"] or
+   (keys | sort) == ["config_id", "members", "predecessor", "version"]) and
   .version == 1 and .config_id == $id and
   (.members | length) == $replicas and
+  all(.members[];
+    (keys | sort) == ["log_url", "node_id", "token", "url"]) and
+  ((has("predecessor") | not) or .predecessor == null or
+    (.predecessor | type == "object" and
+      (keys | sort) == ["members", "stop_entry", "stop_proof", "version"])) and
   ([.members[].node_id] | sort) ==
     [range(1; $replicas + 1) | "node-\(.)"] and
-  ([.members[].token] | all(
-    type == "string" and test("[^[:space:]]") and
-    (test("[[:cntrl:]]") | not))) and
+  ([.members[].token] | all(type == "string" and test("^[!-~]+$"))) and
   ([.members[].token] | unique | length) == $replicas and
   ([.members | sort_by(.node_id)[] | {node_id, url, log_url}] ==
     [range(0; $replicas) as $n | {

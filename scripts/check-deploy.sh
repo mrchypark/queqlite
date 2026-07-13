@@ -62,6 +62,33 @@ if scripts/render-k8s-config.sh 3 3 \
   echo "render accepted duplicate peer tokens" >&2
   exit 1
 fi
+jq '.members[0].token = "peer secret"' "$tmp/config-3.json" \
+  > "$tmp/config-3-spaced-token.json"
+if scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3-spaced-token.json" "$tmp/invalid-spaced-token.yaml"; then
+  echo "render accepted a peer token containing whitespace" >&2
+  exit 1
+fi
+jq '.members[0].token = "peer-sécret"' "$tmp/config-3.json" \
+  > "$tmp/config-3-nonascii-token.json"
+if scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3-nonascii-token.json" "$tmp/invalid-nonascii-token.yaml"; then
+  echo "render accepted a non-ASCII peer token" >&2
+  exit 1
+fi
+jq '.unknown = true' "$tmp/config-3.json" > "$tmp/config-3-unknown-field.json"
+if scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3-unknown-field.json" "$tmp/invalid-unknown-field.yaml"; then
+  echo "render accepted an unknown bundle field" >&2
+  exit 1
+fi
+jq '.members[0].unknown = true' "$tmp/config-3.json" \
+  > "$tmp/config-3-unknown-member-field.json"
+if scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3-unknown-member-field.json" "$tmp/invalid-unknown-member-field.yaml"; then
+  echo "render accepted an unknown member field" >&2
+  exit 1
+fi
 
 jq '.config_id = 4 |
   .members |= to_entries | .members |= map(
@@ -74,6 +101,12 @@ jq '.members[0].token = " "' "$tmp/config-4.json" \
   > "$tmp/config-4-invalid-token.json"
 jq '.members[0].url = "not-a-url"' "$tmp/config-4.json" \
   > "$tmp/config-4-invalid-url.json"
+jq '.members[0].token = "peer secret"' "$tmp/config-4.json" \
+  > "$tmp/config-4-spaced-token.json"
+jq '.members[0].token = "peer-sécret"' "$tmp/config-4.json" \
+  > "$tmp/config-4-nonascii-token.json"
+jq '.members[0].unknown = true' "$tmp/config-4.json" \
+  > "$tmp/config-4-unknown-member-field.json"
 stub_bin="$tmp/stub-bin"
 mkdir "$stub_bin"
 # shellcheck disable=SC2016
@@ -98,9 +131,51 @@ assert_replace_rejects_before_kubectl() {
 assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-node.json" invalid-node
 assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-token.json" invalid-token
 assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-url.json" invalid-url
+assert_replace_rejects_before_kubectl "$tmp/config-4-spaced-token.json" spaced-token
+assert_replace_rejects_before_kubectl "$tmp/config-4-nonascii-token.json" nonascii-token
+assert_replace_rejects_before_kubectl \
+  "$tmp/config-4-unknown-member-field.json" unknown-member-field
+
+# Permit read-only discovery, but record any kubectl mutation attempted afterward.
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" get statefulset "*) exit 0 ;;' \
+  '  *" get secret "*) exit 1 ;;' \
+  '  *) : > "$KUBECTL_MARKER"; exit 99 ;;' \
+  'esac' > "$stub_bin/kubectl"
+wrong_live_status="$tmp/wrong-live-members.json"
+jq -n '{
+  node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
+  members:["node-1","node-2","other-node"],
+  recovery_generation:1,
+  qlog_root:{index:0,hash:[range(32) | 0]},
+  checkpoint_root:null,
+  stopped_transition:null
+}' > "$wrong_live_status"
+wrong_members_dir="$tmp/wrong-members-transition"
+wrong_members_marker="$tmp/wrong-members.kubectl-mutation"
+set +e
+PATH="$stub_bin:$PATH" KUBECTL_MARKER="$wrong_members_marker" \
+  QUEQLITE_RECONFIG_WORK_DIR="$wrong_members_dir" \
+  QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$wrong_live_status" \
+  scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+  >/dev/null 2>&1
+wrong_members_rc=$?
+set -e
+[ "$wrong_members_rc" = 65 ]
+[ ! -e "$wrong_members_dir/stop-c3.state.json" ]
+[ ! -e "$wrong_members_marker" ]
 
 stop_successor="$(jq -cn '{config_id:4,members:["node-1","node-2","node-3"],
   digest:[range(32) | 0]}')"
+set +e
+scripts/k8s-stop-state.sh prepare "$tmp/invalid-successor.state.json" 3 4 \
+  "$(jq -c '.unknown = true' <<< "$stop_successor")" stop-invalid-successor
+unknown_successor_rc=$?
+set -e
+[ "$unknown_successor_rc" = 65 ]
+[ ! -e "$tmp/invalid-successor.state.json" ]
 stop_state="$tmp/stop-c3.state.json"
 first_stop_operation="$(scripts/k8s-stop-state.sh prepare \
   "$stop_state" 3 4 "$stop_successor" stop-first)"
@@ -127,7 +202,7 @@ legacy_stop_operation="$(jq -er '.operation_id' "$tmp/recovered-stop.json")"
   "$stop_successor" "$legacy_stop_operation")" = "$legacy_stop_operation" ]
 scripts/k8s-stop-state.sh validate "$legacy_stop_state" "$tmp/recovered-stop.json"
 successor_draft="$tmp/successor-draft.json"
-jq '.config_id = 4 | del(.predecessor)' "$tmp/config-3.json" > "$successor_draft"
+jq 'del(.predecessor)' "$tmp/config-4.json" > "$successor_draft"
 partial_successor_bundle="$tmp/partial-successor-bundle.json"
 printf '{"version":' > "$partial_successor_bundle"
 scripts/k8s-stop-state.sh write-bundle \
@@ -137,6 +212,13 @@ jq -e '
   .version == 1 and .config_id == 4 and .predecessor.version == 2 and
   .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
 ' "$partial_successor_bundle" >/dev/null
+jq '.predecessor.unknown = true' "$partial_successor_bundle" \
+  > "$tmp/unknown-predecessor-field.json"
+if scripts/render-k8s-config.sh 4 3 \
+  "$tmp/unknown-predecessor-field.json" "$tmp/invalid-predecessor-field.yaml" successor; then
+  echo "render accepted an unknown predecessor field" >&2
+  exit 1
+fi
 for bundle_attempt in "$partial_successor_bundle".attempt.*; do
   [ ! -e "$bundle_attempt" ]
 done
