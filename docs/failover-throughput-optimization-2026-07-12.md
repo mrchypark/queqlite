@@ -6,7 +6,9 @@ Evidence status: the figures below are historical observations from unversioned
 local runs. Their `target/queqlite-bench/...` directories are not included in
 this repository, so a checkout cannot independently audit them. Re-run the
 benchmark to produce versioned evidence before using the figures for a release
-or performance claim.
+or performance claim. New vind artifacts support such claims only when
+`artifacts.json.provenance.publishable` is `true`, which requires clean Git
+source and an immutable Docker content identity.
 
 ## Scope
 

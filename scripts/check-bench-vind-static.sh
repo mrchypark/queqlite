@@ -22,11 +22,12 @@ if validate_resource_sample_schema "$tmp/empty-resources.jsonl"; then
   exit 1
 fi
 resource_sample() {
-  jq -cn --arg app "$1" --argjson epoch "$2" \
+  jq -cn --arg app "$1" --argjson epoch "$2" --argjson cpu "${3:-$2}" \
+    --argjson memory "${4:-2}" \
     '{timestamp:"2026-07-13T00:00:00Z",timestamp_epoch_seconds:$epoch,
       source:"containerd_cri_stats",app:$app,pod:($app + "-0"),pod_uid:($app + "-uid"),
       container:$app,container_id:($app + "-container"),restart_count:0,
-      cpu_usage_usec:$epoch,memory_bytes:2}'
+      cpu_usage_usec:$cpu,memory_bytes:$memory}'
 }
 resource_sample queqlite 100 > "$tmp/resources.jsonl"
 if validate_resource_sample_schema "$tmp/resources.jsonl"; then
@@ -56,9 +57,22 @@ if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2; then
   echo "resource evidence that starts after measurement was accepted" >&2
   exit 1
 fi
-resource_sample queqlite 199 >> "$tmp/resources.jsonl"
-resource_sample simulator 199 >> "$tmp/resources.jsonl"
+resource_sample queqlite 201 >> "$tmp/resources.jsonl"
+resource_sample simulator 201 >> "$tmp/resources.jsonl"
 validate_resource_samples "$tmp/resources.jsonl" 120 200 2
+
+for epoch in 0 100 150 200 999; do
+  if [ "$epoch" = 0 ] || [ "$epoch" = 999 ]; then cpu=999999; memory=999999
+  else cpu="$epoch"; memory=2
+  fi
+  resource_sample queqlite "$epoch" "$cpu" "$memory"
+  resource_sample simulator "$epoch" "$cpu" "$memory"
+done > "$tmp/window-resources.jsonl"
+summarize_resource_samples "$tmp/window-resources.jsonl" 120 190 > "$tmp/resource-summary.json"
+jq -e '.samples == 6 and
+  (all(.apps[]; .peak_memory_bytes == 2 and .average_memory_bytes == 2)) and
+  (all(.container_cpu_usage_usec_deltas[]; .delta_usec == 100))' \
+  "$tmp/resource-summary.json" >/dev/null
 
 : > "$tmp/empty-access.jsonl"
 printf '%s\n' '{"metering":{"enabled":true,"status":"failed","requests":0},"retained":{"status":"ok","object_count":0,"retained_bytes":0}}' > "$tmp/invalid-meter.json"
@@ -94,8 +108,27 @@ jq -e '(.requested | not) and (.cleaned_up | not) and .namespace == "retained"' 
   <<< "$(render_cleanup_json skipped retained retained)" >/dev/null
 jq -e '.started_at_epoch_seconds == 120 and .finished_at_epoch_seconds == 200' \
   <<< "$(render_measurement_window_json 120 200)" >/dev/null
-printf '%s\n' '{"configured":{"warmup_seconds":0.5}}' > "$tmp/benchmark-report.json"
-[ "$(measurement_start_from_report 100 "$tmp/benchmark-report.json")" = 101 ]
+printf '%s\n' '{"measurement":{"measurement_window":{"started_at_epoch_seconds":120.25,"finished_at_epoch_seconds":200.75}}}' > "$tmp/benchmark-report.json"
+jq -e '.started_at_epoch_seconds == 120.25 and .finished_at_epoch_seconds == 200.75' \
+  <<< "$(measurement_window_from_report "$tmp/benchmark-report.json")" >/dev/null
+
+image_id="sha256:$(printf 'a%.0s' {1..64})"
+repo_digest="example/queqlite@sha256:$(printf 'b%.0s' {1..64})"
+source_commit="$(printf 'c%.0s' {1..40})"
+inspect="$(jq -cn --arg id "$image_id" --arg digest "$repo_digest" '[{Id:$id,RepoDigests:[$digest]}]')"
+for mode in built skip-build; do
+  provenance="$(render_provenance_json "$source_commit" false "$mode" queqlite:dev "$inspect")"
+  jq -e --arg mode "$mode" --arg id "$image_id" --arg digest "$repo_digest" '
+    .publishable == true and .source.dirty == false and .image.build_mode == $mode and
+    .image.content_id == $id and .image.repo_digests == [$digest] and .reasons == []
+  ' <<< "$provenance" >/dev/null
+done
+dirty_provenance="$(render_provenance_json "$source_commit" true built queqlite:dev "$inspect")"
+jq -e '.publishable == false and (.reasons | index("dirty_source") != null)' \
+  <<< "$dirty_provenance" >/dev/null
+missing_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev '[{"Id":"","RepoDigests":[]}]')"
+jq -e '.publishable == false and (.reasons | index("missing_immutable_image_identity") != null)' \
+  <<< "$missing_provenance" >/dev/null
 
 build_line="$(grep -n 'cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench' scripts/bench-vind.sh | cut -d: -f1)"
 # shellcheck disable=SC2016 # Literal source-order check.

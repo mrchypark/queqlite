@@ -114,6 +114,12 @@ suffixes. `artifacts.json` records the selected mode and the applicable
 `max_lag` or `interval` under `configuration.durability`; the rendered cluster
 manifest records the same environment configuration.
 
+`artifacts.json.provenance` binds the run to the Git commit and dirty state plus
+the Docker image content ID and available repository digests. A dirty source
+tree or missing immutable image ID leaves an ordinary local run usable but sets
+`publishable: false` with a reason. Only clean, immutable artifacts marked
+`publishable: true` support release or published performance evidence.
+
 It applies fixed default resources to make comparisons controlled on the
 8-core/24-GiB host: each Queqlite and RustFS container requests `250m` CPU and
 `512Mi` memory, with `1000m` and `1Gi` limits. RustFS is only the local S3
@@ -121,8 +127,10 @@ simulator and its resources are reported separately from Queqlite. Override them
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_CPU_{REQUEST,LIMIT}` and
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_MEMORY_{REQUEST,LIMIT}`. Resource JSONL
 samples use containerd CRI stats and cover both services; `resource-summary.json`
-reports restart-safe CPU deltas plus average/peak memory. Disable resource sampling
-with `QUEQLITE_BENCH_RESOURCE_SAMPLING=0`. A default-on nginx sidecar meters S3 method,
+reports restart-safe CPU deltas plus average/peak memory using only the samples
+inside, or immediately bracketing, the Rust-reported measurement window; warmup
+and later cleanup samples are excluded. Disable resource sampling with
+`QUEQLITE_BENCH_RESOURCE_SAMPLING=0`. A default-on nginx sidecar meters S3 method,
 status, and byte counts, while an AWS CLI inventory records logical object count
 and retained bytes in `object-usage.json`. Disable it with
 `QUEQLITE_BENCH_OBJECT_USAGE_METERING=0`. The runner asserts that the deployment

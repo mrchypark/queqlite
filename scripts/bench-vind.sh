@@ -54,6 +54,10 @@ object_evidence_status=disabled
 object_meter_reset_status=disabled
 measurement_started_at_epoch_seconds=""
 measurement_finished_at_epoch_seconds=""
+source_git_commit=""
+source_dirty=true
+image_build_mode="unknown"
+image_inspect_json='[]'
 [ "$resource_sampling" = 0 ] || resource_evidence_status=pending
 [ "$object_metering" = 0 ] || {
   object_evidence_status=pending
@@ -116,10 +120,49 @@ validate_resource_samples() {
       [$samples[] | select(.app == $app)] as $app_samples |
       ($app_samples | length) >= 2 and
       ([$app_samples[].timestamp_epoch_seconds] | min) <= $start and
-      ([$app_samples[].timestamp_epoch_seconds] | max) >= ($end - $interval - 1) and
+      ([$app_samples[].timestamp_epoch_seconds] | max) >= $end and
       ([$app_samples[].timestamp_epoch_seconds] | max) >
         ([$app_samples[].timestamp_epoch_seconds] | min))
   ' "$1" >/dev/null 2>&1
+}
+
+resource_samples_cover_end() {
+  jq -s -e --argjson end "$2" '
+    . as $samples |
+    all(["queqlite","simulator"][];
+      . as $app | any($samples[]; .app == $app and .timestamp_epoch_seconds >= $end))
+  ' "$1" >/dev/null 2>&1
+}
+
+summarize_resource_samples() {
+  jq -s --argjson start "$2" --argjson end "$3" '
+    . as $samples |
+    ([$samples[].timestamp_epoch_seconds | select(. <= $start)] | max) as $before |
+    ([$samples[].timestamp_epoch_seconds | select(. >= $end)] | min) as $after |
+    [$samples[] | select(
+      .timestamp_epoch_seconds == $before or
+      (.timestamp_epoch_seconds >= $start and .timestamp_epoch_seconds <= $end) or
+      .timestamp_epoch_seconds == $after)] as $window |
+    def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) |
+      map(sort_by(.timestamp_epoch_seconds) as $g |
+        {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
+         container_id:$g[0].container_id,first:$g[0].cpu_usage_usec,last:$g[-1].cpu_usage_usec,
+         delta_usec:([0,($g[-1].cpu_usage_usec - $g[0].cpu_usage_usec)] | max)});
+    def memory_by_app: group_by([.timestamp_epoch_seconds,.app]) |
+      map({timestamp:.[0].timestamp,timestamp_epoch_seconds:.[0].timestamp_epoch_seconds,
+        app:.[0].app,memory_bytes:(map(.memory_bytes) | add)});
+    ($window | cpu_deltas) as $cpu | ($window | memory_by_app) as $memory |
+    {status:"ok",measurement_window:{started_at_epoch_seconds:$start,
+      finished_at_epoch_seconds:$end},samples:($window | length),
+     container_cpu_usage_usec_deltas:$cpu,
+     apps:(["queqlite","simulator"] | map(. as $app |
+       ($memory | map(select(.app == $app))) as $app_memory |
+       {app:$app,cpu_usage_usec:($cpu | map(select(.app == $app) | .delta_usec) | add // 0),
+        memory_samples:($app_memory | length),
+        average_memory_bytes:(if ($app_memory | length) == 0 then null else
+          (($app_memory | map(.memory_bytes) | add) / ($app_memory | length) | floor) end),
+        peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))}
+  ' "$1"
 }
 
 validate_object_evidence() {
@@ -183,8 +226,30 @@ render_measurement_window_json() {
       finished_at_epoch_seconds:(if $finished == "" then null else ($finished | tonumber) end)}'
 }
 
-measurement_start_from_report() {
-  jq -er --argjson started "$1" '$started + (.configured.warmup_seconds | ceil)' "$2"
+measurement_window_from_report() {
+  jq -ce '
+    .measurement.measurement_window as $window |
+    $window |
+    select(($window.started_at_epoch_seconds | type == "number" and . >= 0) and
+      ($window.finished_at_epoch_seconds | type == "number" and . >= 0) and
+      ($window.finished_at_epoch_seconds >= $window.started_at_epoch_seconds))
+  ' "$1"
+}
+
+render_provenance_json() {
+  jq -n --arg commit "$1" --argjson dirty "$2" --arg build_mode "$3" \
+    --arg image_reference "$4" --argjson inspect "$5" '
+    ($inspect[0].Id // "") as $content_id |
+    (($inspect[0].RepoDigests // []) | map(select(type == "string"))) as $repo_digests |
+    ([if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
+      if $dirty then "dirty_source" else empty end,
+      if ($content_id | test("^sha256:[0-9a-f]{64}$") | not)
+        then "missing_immutable_image_identity" else empty end]) as $reasons |
+    {publishable:($reasons | length == 0),reasons:$reasons,
+     source:{git_commit:(if $commit == "" then null else $commit end),dirty:$dirty,clean:($dirty | not)},
+     image:{reference:$image_reference,build_mode:$build_mode,
+       content_id:(if $content_id == "" then null else $content_id end),repo_digests:$repo_digests}}
+  '
 }
 
 # Allow the static check to exercise process-failure handling without starting a cluster.
@@ -299,6 +364,15 @@ sample_resources() {
        memory_bytes:(.memory.workingSetBytes.value // .memory.usageBytes.value // "0" | tonumber)}
     ' <<< "$summary" >> "$resources_jsonl"
     sleep "$sample_interval"
+  done
+}
+
+wait_for_resource_coverage() {
+  local deadline=$((SECONDS + sample_interval + 2))
+  while ! resource_samples_cover_end "$resources_jsonl" "$measurement_finished_at_epoch_seconds"; do
+    kill -0 "$sampler_pid" 2>/dev/null || return 1
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
   done
 }
 
@@ -422,7 +496,7 @@ wait_for_checkpoint_drain() {
 }
 
 emit_artifacts() {
-  local resource_enabled=false object_enabled=false evidence cleanup measurement_window
+  local resource_enabled=false object_enabled=false evidence cleanup measurement_window provenance
   [ "$resource_sampling" = 0 ] || resource_enabled=true
   [ "$object_metering" = 0 ] || object_enabled=true
   evidence="$(render_evidence_json "$resource_evidence_status" "$object_evidence_status" \
@@ -431,6 +505,8 @@ emit_artifacts() {
     "$namespace_cleanup_status" "$vcluster_cleanup_status")"
   measurement_window="$(render_measurement_window_json \
     "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds")"
+  provenance="$(render_provenance_json "$source_git_commit" "$source_dirty" \
+    "$image_build_mode" "$image" "$image_inspect_json")"
   jq -n \
     --arg run_id "$run_id" \
     --arg cluster "$cluster" \
@@ -451,9 +527,10 @@ emit_artifacts() {
     --argjson evidence "$evidence" \
     --argjson cleanup "$cleanup" \
     --argjson measurement_window "$measurement_window" \
+    --argjson provenance "$provenance" \
     --argjson cleaned_up "$cleaned_up" \
     '{run_id:$run_id,cluster:$cluster,namespace:$namespace,benchmark_exit_status:$benchmark_exit,
-      exit_status:$run_exit,evidence:$evidence,cleanup:$cleanup,
+      exit_status:$run_exit,evidence:$evidence,cleanup:$cleanup,provenance:$provenance,
       measurement_window:$measurement_window,
       configuration:{durability:{mode:$durability_mode,
         max_lag:(if $durability_max_lag == "" then null else $durability_max_lag end),
@@ -491,22 +568,9 @@ cleanup_run() {
       > "$resource_summary"
   elif [ "$resource_evidence_status" != failed ] &&
     validate_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
-      "$measurement_finished_at_epoch_seconds" "$sample_interval" && jq -s '
-      def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) | map(sort_by(.timestamp) as $g |
-        {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
-         container_id:$g[0].container_id,first:$g[0].cpu_usage_usec,last:$g[-1].cpu_usage_usec,
-         delta_usec:([0,($g[-1].cpu_usage_usec - $g[0].cpu_usage_usec)] | max)});
-      def memory_by_app: group_by([.timestamp,.app]) | map({timestamp:.[0].timestamp,app:.[0].app,
-        memory_bytes:(map(.memory_bytes) | add)});
-      . as $samples | ($samples | cpu_deltas) as $cpu | ($samples | memory_by_app) as $memory |
-      {status:"ok",samples:($samples | length),container_cpu_usage_usec_deltas:$cpu,
-       apps:(["queqlite","simulator"] | map(. as $app |
-         ($memory | map(select(.app == $app))) as $app_memory |
-         {app:$app,cpu_usage_usec:($cpu | map(select(.app == $app) | .delta_usec) | add // 0),
-          memory_samples:($app_memory | length),
-          average_memory_bytes:(if ($app_memory | length) == 0 then null else (($app_memory | map(.memory_bytes) | add) / ($app_memory | length) | floor) end),
-          peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))}' \
-      "$resources_jsonl" > "$resource_summary"; then
+      "$measurement_finished_at_epoch_seconds" "$sample_interval" &&
+    summarize_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
+      "$measurement_finished_at_epoch_seconds" > "$resource_summary"; then
     resource_evidence_status=ok
   else
     resource_evidence_status=failed
@@ -569,15 +633,24 @@ on_exit() {
 trap on_exit EXIT
 
 cd "$repo_root"
+source_git_commit="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+source_status=""
+if source_status="$(git status --porcelain --untracked-files=normal 2>/dev/null)" &&
+  [ -z "$source_status" ]; then
+  source_dirty=false
+fi
 mkdir -p "$target"
 chmod 700 "$target"
 previous_context="$(kubectl config current-context 2>/dev/null || true)"
 
 if [ "${QUEQLITE_VIND_SKIP_BUILD:-0}" = 1 ]; then
   docker image inspect "$image" >/dev/null 2>&1 || die "missing local image: $image"
+  image_build_mode=skip-build
 else
   docker build -t "$image" .
+  image_build_mode=built
 fi
+image_inspect_json="$(docker image inspect "$image" 2>/dev/null || printf '[]')"
 vcluster use driver docker >/dev/null
 if vcluster list --driver docker --output json | grep -Fq "\"${cluster}\""; then
   [ "${QUEQLITE_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
@@ -756,15 +829,17 @@ case "$fault" in
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
-benchmark_started_at_epoch_seconds="$(date -u +%s)"
 if QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
   benchmark_status=0
 else
   benchmark_status=$?
 fi
-measurement_finished_at_epoch_seconds="$(date -u +%s)"
 [ "$benchmark_status" -eq 0 ] || exit "$benchmark_status"
-measurement_started_at_epoch_seconds="$(measurement_start_from_report \
-  "$benchmark_started_at_epoch_seconds" "$benchmark_json")" ||
-  die "benchmark report has no valid warmup duration"
+measurement_window="$(measurement_window_from_report "$benchmark_json")" ||
+  die "benchmark report has no valid measurement window"
+measurement_started_at_epoch_seconds="$(jq -r .started_at_epoch_seconds <<< "$measurement_window")"
+measurement_finished_at_epoch_seconds="$(jq -r .finished_at_epoch_seconds <<< "$measurement_window")"
+if [ "$resource_sampling" = 1 ]; then
+  wait_for_resource_coverage || die "resource sampler did not cover the measurement end"
+fi
 wait_for_checkpoint_drain || die "checkpoint did not drain to the committed qlog tip"
