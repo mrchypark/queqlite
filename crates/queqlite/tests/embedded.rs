@@ -124,6 +124,9 @@ async fn reopen_preserves_sql_and_idempotent_returning_results() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
+    const OUTER_HANG_GUARD: Duration = Duration::from_secs(10);
+    const BEHAVIOR_DEADLINE: Duration = Duration::from_secs(1);
+
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
     let archive = initialized_checkpoint(&archive_root).await;
@@ -140,17 +143,29 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
     std::fs::remove_dir_all(&archive_root).unwrap();
     std::fs::write(&archive_root, b"archive unavailable").unwrap();
 
+    let previous_attempts = coordinator.checkpoint_publication_attempts();
     let write = tokio::spawn(async move { handle.put("request", "key", "value").await });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(OUTER_HANG_GUARD, async {
+        while coordinator.checkpoint_publication_attempts() == previous_attempts {
+            assert!(
+                !write.is_finished(),
+                "the sync write finished before attempting checkpoint publication"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint publication attempt must not hang the test");
+    tokio::time::timeout(BEHAVIOR_DEADLINE, async {
         while coordinator.health() != DurabilityHealth::Unavailable {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap();
+    .expect("checkpoint storage failure must make durability unavailable");
     assert!(!status_handle.status().await.unwrap().ready);
 
-    let shutdown = tokio::time::timeout(Duration::from_secs(1), queqlite.shutdown())
+    let shutdown = tokio::time::timeout(BEHAVIOR_DEADLINE, queqlite.shutdown())
         .await
         .expect("shutdown must not wait forever for the blocked write");
     assert!(shutdown.is_err());
