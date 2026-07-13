@@ -269,6 +269,73 @@ grep -Fq 'port-forward exited with status' <<< "$failure"
 grep -Fq 'http://127.0.0.1:18080' <<< "$failure"
 grep -Fq 'fixture port-forward failure' <<< "$failure"
 
+printf '%s\n' 'fixture non-target failure' > "$tmp/port-forward-1.log"
+if failure="$(
+  target="$tmp"
+  endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
+  sleep 30 & live_pid=$!
+  trap 'kill "$live_pid" 2>/dev/null || true' EXIT
+  false & dead_pid=$!
+  port_forward_pids=("$live_pid" "$dead_pid")
+  while kill -0 "$dead_pid" 2>/dev/null; do :; done
+  assert_all_port_forwards_alive 2>&1
+)"; then
+  echo "dead non-target port-forward was accepted" >&2
+  exit 1
+fi
+grep -Fq 'http://127.0.0.1:18081' <<< "$failure"
+grep -Fq 'fixture non-target failure' <<< "$failure"
+
+rebind_fixture="$tmp/rebind"
+mkdir "$rebind_fixture"
+(
+  target="$rebind_fixture"
+  endpoint_urls=(http://127.0.0.1:18081)
+  printf '0\n' > "$rebind_fixture/starts"
+  k() {
+    local invocation
+    invocation=$(( $(cat "$rebind_fixture/starts") + 1 ))
+    printf '%s\n' "$invocation" > "$rebind_fixture/starts"
+    : > "$rebind_fixture/started-$invocation"
+    trap ': > "$rebind_fixture/stopped-$invocation"; exit 0' TERM INT
+    while true; do sleep 1; done
+  }
+  curl() { [ -e "$rebind_fixture/allow-ready" ]; }
+  wait_for_fixture() {
+    for _ in $(seq 1 500); do [ -e "$1" ] && return; sleep 0.01; done
+    return 1
+  }
+  supervise_rebinding_port_forward 0 queqlite-c1-1 18081 & supervisor_pid=$!
+  trap 'kill "$supervisor_pid" 2>/dev/null || true; wait "$supervisor_pid" 2>/dev/null || true' EXIT
+  wait_for_fixture "$rebind_fixture/started-1"
+  : > "$rebind_fixture/port-forward-0.rebind-request"
+  wait_for_fixture "$rebind_fixture/stopped-1"
+  [ ! -e "$rebind_fixture/started-2" ]
+  : > "$rebind_fixture/port-forward-0.replacement-ready"
+  wait_for_fixture "$rebind_fixture/started-2"
+  : > "$rebind_fixture/allow-ready"
+  wait_for_fixture "$rebind_fixture/port-forward-0.rebound"
+  kill -0 "$supervisor_pid"
+)
+
+supervisor_line="$(grep -n 'supervise_rebinding_port_forward' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
+request_line="$(grep -n 'port-forward-.*\.rebind-request' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+delete_line="$(grep -n 'delete pod .*fault_pod' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+rebound_line="$(grep -n 'port-forward-.*\.rebound' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+ready_line="$(grep -n 'wait --for=condition=Ready pod/' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+replacement_ready_line="$(grep -n 'touch .*port-forward-.*\.replacement-ready' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+local_ready_line="$(grep -n 'curl -fsS .*readyz' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016 # Literal source check.
+rebound_ack_line="$(grep -n ': > "\$rebound"' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
+benchmark_line="$(grep -n 'QUEQLITE_CLIENT_TOKEN=.*bench_binary' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+final_forward_check_line="$(grep -n 'assert_all_port_forwards_ready' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
+[ -n "$supervisor_line" ]
+[ -n "$request_line" ] && [ "$request_line" -lt "$delete_line" ]
+[ -n "$replacement_ready_line" ] && [ "$ready_line" -lt "$replacement_ready_line" ]
+[ -n "$rebound_line" ] && [ "$replacement_ready_line" -le "$rebound_line" ]
+[ -n "$local_ready_line" ] && [ "$local_ready_line" -lt "$rebound_ack_line" ]
+[ -n "$final_forward_check_line" ] && [ "$benchmark_line" -lt "$final_forward_check_line" ]
+
 jq -n '{version:1,config_id:1,members:[range(3) as $n | {
   node_id:"node-\($n + 1)",
   url:"http://queqlite-c1-\($n).queqlite-c1:8081",

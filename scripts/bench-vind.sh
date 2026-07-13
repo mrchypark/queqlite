@@ -102,6 +102,68 @@ assert_port_forward_alive() {
   exit 1
 }
 
+assert_all_port_forwards_alive() {
+  local index
+  for index in "${!endpoint_urls[@]}"; do assert_port_forward_alive "$index"; done
+}
+
+assert_all_port_forwards_ready() {
+  local endpoint_url
+  assert_all_port_forwards_alive
+  for endpoint_url in "${endpoint_urls[@]}"; do
+    curl -fsS "$endpoint_url/readyz" >/dev/null ||
+      die "port-forward did not remain ready: $endpoint_url"
+  done
+}
+
+supervise_rebinding_port_forward() {
+  local index="$1" pod="$2" port="$3" child="" status=0
+  local request="$target/port-forward-$index.rebind-request"
+  local replacement_ready="$target/port-forward-$index.replacement-ready"
+  local rebound="$target/port-forward-$index.rebound"
+  local log="$target/port-forward-$index.log"
+  trap 'exit 0' TERM INT
+  trap 'status=$?; trap - EXIT; if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; exit "$status"' EXIT
+
+  : > "$log"
+  k port-forward "pod/$pod" "${port}:8080" >> "$log" 2>&1 &
+  child=$!
+  while true; do
+    while kill -0 "$child" 2>/dev/null && [ ! -e "$request" ]; do sleep 1; done
+    if [ ! -e "$request" ]; then
+      if wait "$child"; then status=0; else status=$?; fi
+      child=""
+      return "$status"
+    fi
+
+    kill "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    child=""
+    while [ ! -e "$replacement_ready" ]; do sleep 1; done
+    while [ -e "$request" ]; do
+      k port-forward "pod/$pod" "${port}:8080" >> "$log" 2>&1 &
+      child=$!
+      for _ in $(seq 1 60); do
+        if kill -0 "$child" 2>/dev/null &&
+          curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then
+          rm -f "$request"
+          rm -f "$replacement_ready"
+          : > "$rebound"
+          break
+        fi
+        kill -0 "$child" 2>/dev/null || break
+        sleep 1
+      done
+      if [ -e "$request" ]; then
+        kill "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+        child=""
+        sleep 1
+      fi
+    done
+  done
+}
+
 validate_resource_sample_schema() {
   jq -s -e '
     any(.[]; .app == "queqlite") and any(.[]; .app == "simulator") and all(.[];
@@ -842,11 +904,17 @@ k set env statefulset/queqlite-c1 QUEQLITE_STARTUP_MODE=rejoin >/dev/null
 local_port="${QUEQLITE_BENCH_PORT:-18080}"
 endpoint_urls=()
 endpoint_count=1
+fault_endpoint_index=""
 [ "$multi_endpoint" = 0 ] || endpoint_count=3
 for ordinal in $(seq 0 $((endpoint_count - 1))); do
   port=$((local_port + ordinal))
-  k port-forward "pod/queqlite-c1-$ordinal" "${port}:8080" \
-    > "$target/port-forward-$ordinal.log" 2>&1 &
+  if [ "$fault" = pod-delete ] && [ "$fault_pod" = "queqlite-c1-$ordinal" ]; then
+    fault_endpoint_index="$ordinal"
+    supervise_rebinding_port_forward "$ordinal" "$fault_pod" "$port" &
+  else
+    k port-forward "pod/queqlite-c1-$ordinal" "${port}:8080" \
+      > "$target/port-forward-$ordinal.log" 2>&1 &
+  fi
   port_forward_pids+=("$!")
   endpoint_urls+=("http://127.0.0.1:${port}")
 done
@@ -915,7 +983,14 @@ for endpoint_url in "${endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint
 [ -z "$target_rate" ] || bench_args+=(--target-rate "$target_rate")
 case "$fault" in
   pod-delete)
-    fault_command="kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") delete pod $(shell_quote "$fault_pod") --wait=true >/dev/null; for attempt in \$(seq 1 240); do kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") get pod $(shell_quote "$fault_pod") >/dev/null 2>&1 && break; sleep 1; done; kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") wait --for=condition=Ready pod/$(shell_quote "$fault_pod") --timeout=240s >/dev/null"
+    fault_rebind_before=""
+    if [ -n "$fault_endpoint_index" ]; then
+      fault_rebind_before="rm -f $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") $(shell_quote "$target/port-forward-$fault_endpoint_index.replacement-ready"); touch $(shell_quote "$target/port-forward-$fault_endpoint_index.rebind-request"); "
+    fi
+    fault_command="${fault_rebind_before}kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") delete pod $(shell_quote "$fault_pod") --wait=true >/dev/null; for attempt in \$(seq 1 240); do kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") get pod $(shell_quote "$fault_pod") >/dev/null 2>&1 && break; sleep 1; done; kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") wait --for=condition=Ready pod/$(shell_quote "$fault_pod") --timeout=240s >/dev/null"
+    if [ -n "$fault_endpoint_index" ]; then
+      fault_command+="; touch $(shell_quote "$target/port-forward-$fault_endpoint_index.replacement-ready"); for attempt in \$(seq 1 30); do [ -e $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") ] && break; sleep 1; done; [ -e $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") ]"
+    fi
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
@@ -924,6 +999,7 @@ if QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$
 else
   benchmark_status=$?
 fi
+assert_all_port_forwards_ready
 [ "$benchmark_status" -eq 0 ] || exit "$benchmark_status"
 measurement_window="$(measurement_window_from_report "$benchmark_json")" ||
   die "benchmark report has no valid measurement window"
@@ -933,3 +1009,4 @@ if [ "$resource_sampling" = 1 ]; then
   wait_for_resource_coverage || die "resource sampler did not cover the measurement end"
 fi
 wait_for_checkpoint_drain || die "checkpoint did not drain to the committed qlog tip"
+assert_all_port_forwards_ready
