@@ -119,6 +119,7 @@ k create secret generic queqlite-c1-bundle --from-file=config.json="$target/conf
 export QUEQLITE_IMAGE="$image" QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace"
 export QUEQLITE_CLUSTER_ID=queqlite-vind QUEQLITE_RECOVERY_GENERATION=1
 export QUEQLITE_CHECKPOINT_LEASE_MS=5000
+export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials
 
 echo "== initialize object checkpoint and bootstrap config 1 =="
 scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null

@@ -20,6 +20,7 @@ case "$replicas" in 3|4|5|6|7) ;; *) usage;; esac
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
 require jq
 require sed
+require yq
 
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
   .version == 1 and .config_id == $id and
@@ -39,12 +40,14 @@ durability_max_lag="${QUEQLITE_DURABILITY_MAX_LAG-}"
 durability_interval="${QUEQLITE_DURABILITY_INTERVAL-}"
 durability_max_lag_set="${QUEQLITE_DURABILITY_MAX_LAG+x}"
 durability_interval_set="${QUEQLITE_DURABILITY_INTERVAL+x}"
-s3_endpoint="${QUEQLITE_S3_ENDPOINT:-http://rustfs:9000}"
+s3_endpoint="${QUEQLITE_S3_ENDPOINT-}"
+s3_endpoint_set="${QUEQLITE_S3_ENDPOINT+x}"
 s3_bucket="${QUEQLITE_S3_BUCKET:-queqlite}"
 s3_region="${QUEQLITE_S3_REGION:-us-east-1}"
 s3_http="${QUEQLITE_S3_ALLOW_HTTP:-true}"
 auth_secret="${QUEQLITE_AUTH_SECRET:-queqlite-auth}"
-object_secret="${QUEQLITE_OBJECT_SECRET:-rustfs-credentials}"
+object_secret="${QUEQLITE_OBJECT_SECRET-}"
+object_secret_set="${QUEQLITE_OBJECT_SECRET+x}"
 checkpoint_lease_ms="${QUEQLITE_CHECKPOINT_LEASE_MS:-300000}"
 bundle_secret="${name}-bundle"
 
@@ -52,6 +55,10 @@ die() { echo "$*" >&2; exit 65; }
 case "$checkpoint_lease_ms" in
   ''|*[!0-9]*|0) die "QUEQLITE_CHECKPOINT_LEASE_MS must be a positive integer" ;;
 esac
+[ -z "$s3_endpoint_set" ] || [ -n "$s3_endpoint" ] ||
+  die "QUEQLITE_S3_ENDPOINT must not be empty when set"
+[ -z "$object_secret_set" ] || [ -n "$object_secret" ] ||
+  die "QUEQLITE_OBJECT_SECRET must not be empty when set"
 validate_duration() {
   local name="$1" value="$2" amount
   case "$value" in
@@ -94,6 +101,7 @@ case "$successor" in
 esac
 
 escape() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
+object_secret_placeholder="${object_secret:-unused-object-credentials}"
 sed \
   -e "s|__CONFIG_NAME__|$(escape "$name")|g" \
   -e "s|__CONFIG_ID__|${config_id}|g" \
@@ -107,15 +115,32 @@ sed \
   -e "s|__CHECKPOINT_LEASE_MS__|${checkpoint_lease_ms}|g" \
   -e "s|            # __DURABILITY_MAX_LAG_ENV__|$(escape "$durability_max_lag_env")|g" \
   -e "s|            # __DURABILITY_INTERVAL_ENV__|$(escape "$durability_interval_env")|g" \
-  -e "s|__S3_ENDPOINT__|$(escape "$s3_endpoint")|g" \
   -e "s|__S3_BUCKET__|$(escape "$s3_bucket")|g" \
   -e "s|__S3_REGION__|$(escape "$s3_region")|g" \
   -e "s|__S3_ALLOW_HTTP__|$(escape "$s3_http")|g" \
   -e "s|__AUTH_SECRET__|$(escape "$auth_secret")|g" \
-  -e "s|__OBJECT_SECRET__|$(escape "$object_secret")|g" \
+  -e "s|__OBJECT_SECRET__|$(escape "$object_secret_placeholder")|g" \
   -e "s|__BUNDLE_SECRET__|$(escape "$bundle_secret")|g" \
   -e "s|__SUCCESSOR__|${successor_flag}|g" \
   deploy/k8s/queqlite-cluster.yaml > "$output"
+export S3_ENDPOINT="$s3_endpoint" S3_ENDPOINT_SET="$s3_endpoint_set"
+export OBJECT_SECRET="$object_secret" OBJECT_SECRET_SET="$object_secret_set"
+yq eval --inplace '
+  (select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[] | select(.name == "queqlite") | .env) |= (
+      map(select(.name != "QUEQLITE_S3_ENDPOINT" and
+        .name != "QUEQLITE_S3_ACCESS_KEY" and
+        .name != "QUEQLITE_S3_SECRET_KEY")) +
+      ([{"name":"QUEQLITE_S3_ENDPOINT", "value":strenv(S3_ENDPOINT)}] |
+        map(select(strenv(S3_ENDPOINT_SET) == "x"))) +
+      ([
+        {"name":"QUEQLITE_S3_ACCESS_KEY", "valueFrom":{"secretKeyRef":{
+          "name":strenv(OBJECT_SECRET), "key":"access-key", "optional":true}}},
+        {"name":"QUEQLITE_S3_SECRET_KEY", "valueFrom":{"secretKeyRef":{
+          "name":strenv(OBJECT_SECRET), "key":"secret-key", "optional":true}}}
+      ] | map(select(strenv(OBJECT_SECRET_SET) == "x")))
+    )
+' "$output"
 if grep -Eq '__[A-Z0-9_]+__' "$output"; then
   echo "unrendered placeholder" >&2
   exit 65

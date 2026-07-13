@@ -43,7 +43,39 @@ for replicas in 3 7; do
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${id}.yaml")" = OnDelete ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | has("emptyDir")' "$tmp/config-${id}.yaml")" = true ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec | has("initContainers")' "$tmp/config-${id}.yaml")" = false ]
+  if yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].env[].name' "$tmp/config-${id}.yaml" |
+    grep -Eq '^QUEQLITE_S3_(ENDPOINT|ACCESS_KEY|SECRET_KEY)$'; then
+    echo "provider-chain render retained optional S3 endpoint or credentials" >&2
+    exit 1
+  fi
 done
+
+QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
+QUEQLITE_OBJECT_SECRET=rustfs-credentials \
+  scripts/render-k8s-config.sh 3 3 \
+    "$tmp/config-3.json" "$tmp/config-3-rustfs.yaml" successor
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "QUEQLITE_S3_ENDPOINT") | .value' \
+  "$tmp/config-3-rustfs.yaml")" = http://rustfs:9000 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "QUEQLITE_S3_ACCESS_KEY" or
+    .name == "QUEQLITE_S3_SECRET_KEY") |
+  .valueFrom.secretKeyRef |
+  .name + ":" + (.optional | tostring)' "$tmp/config-3-rustfs.yaml" |
+  grep -c '^rustfs-credentials:true$')" = 2 ]
+if QUEQLITE_S3_ENDPOINT='' scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3.json" "$tmp/invalid-empty-endpoint.yaml"; then
+  echo "render accepted an explicitly empty S3 endpoint" >&2
+  exit 1
+fi
+if QUEQLITE_OBJECT_SECRET='' scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3.json" "$tmp/invalid-empty-object-secret.yaml"; then
+  echo "render accepted an explicitly empty object credential secret" >&2
+  exit 1
+fi
 
 grep -Fq "successor:{config_id:\$successor_id,members:\$members,digest:\$digest}" \
   scripts/replace-k8s-config.sh
@@ -55,6 +87,8 @@ start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=disaster' scripts/replace-k8s-confi
 [ "$fork_line" -lt "$start_line" ]
 grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
+grep -Fq 'export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials' \
+  scripts/e2e-vind-rustfs.sh
 # Assert literal runtime variables in the helper call.
 # shellcheck disable=SC2016
 grep -Fq 'scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"' \
@@ -73,8 +107,35 @@ QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/object-job.yaml" \
 yq eval '.' "$tmp/object-job.yaml" >/dev/null
 [ "$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/object-job.yaml")" = init-checkpoint ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].args[1]' "$tmp/object-job.yaml")" = $'multiline\nargument' ]
+[ "$(yq eval '[.spec.template.spec.containers[0].env[] |
+  select(.name == "QUEQLITE_S3_ENDPOINT" or
+    .name == "QUEQLITE_S3_ACCESS_KEY" or
+    .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$tmp/object-job.yaml")" = 0 ]
 if grep -Eq '__[A-Z0-9_]+__' "$tmp/object-job.yaml"; then
   echo "object Job contains an unrendered placeholder" >&2
+  exit 1
+fi
+QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
+QUEQLITE_OBJECT_SECRET=rustfs-credentials \
+QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/object-job-rustfs.yaml" \
+  scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
+  select(.name == "QUEQLITE_S3_ENDPOINT") | .value' \
+  "$tmp/object-job-rustfs.yaml")" = http://rustfs:9000 ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
+  select(.name == "QUEQLITE_S3_ACCESS_KEY" or
+    .name == "QUEQLITE_S3_SECRET_KEY") |
+  .valueFrom.secretKeyRef |
+  .name + ":" + (.optional | tostring)' "$tmp/object-job-rustfs.yaml" |
+  grep -c '^rustfs-credentials:true$')" = 2 ]
+if QUEQLITE_S3_ENDPOINT='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+  scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
+  echo "object Job accepted an explicitly empty S3 endpoint" >&2
+  exit 1
+fi
+if QUEQLITE_OBJECT_SECRET='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+  scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
+  echo "object Job accepted an explicitly empty object credential secret" >&2
   exit 1
 fi
 
