@@ -157,8 +157,11 @@ set -e
 for invalid_env in \
   'QUEQLITE_EPOCH=abc' \
   'QUEQLITE_EPOCH=0' \
+  'QUEQLITE_EPOCH=18446744073709551616' \
   'QUEQLITE_RECOVERY_GENERATION=abc' \
   'QUEQLITE_RECOVERY_GENERATION=0' \
+  'QUEQLITE_RECOVERY_GENERATION=18446744073709551616' \
+  'QUEQLITE_CHECKPOINT_LEASE_MS=18446744073709551616' \
   'QUEQLITE_S3_ALLOW_HTTP=maybe'; do
   invalid_env_marker="$tmp/${invalid_env//=/_}.kubectl-called"
   invalid_env_dir="$tmp/${invalid_env//=/_}-transition"
@@ -172,6 +175,43 @@ for invalid_env in \
   [ "$invalid_env_rc" = 65 ]
   [ ! -e "$invalid_env_marker" ]
   [ ! -e "$invalid_env_dir/stop-c3.state.json" ]
+done
+
+for oversized_duration in \
+  18446744073709551616ms \
+  18446744073709552s \
+  307445734561826m \
+  5124095576031h; do
+  invalid_env_marker="$tmp/${oversized_duration}.kubectl-called"
+  invalid_env_dir="$tmp/${oversized_duration}-transition"
+  set +e
+  env QUEQLITE_DURABILITY_MODE=bounded \
+    "QUEQLITE_DURABILITY_MAX_LAG=$oversized_duration" \
+    PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_env_marker" \
+    QUEQLITE_RECONFIG_WORK_DIR="$invalid_env_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  invalid_env_rc=$?
+  set -e
+  [ "$invalid_env_rc" = 65 ]
+  [ ! -e "$invalid_env_marker" ]
+  [ ! -e "$invalid_env_dir/stop-c3.state.json" ]
+done
+
+QUEQLITE_EPOCH=18446744073709551615 \
+QUEQLITE_RECOVERY_GENERATION=18446744073709551615 \
+QUEQLITE_CHECKPOINT_LEASE_MS=18446744073709551615 \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" \
+    "$tmp/max-u64.yaml" successor
+for maximum_duration in \
+  18446744073709551615ms \
+  18446744073709551s \
+  307445734561825m \
+  5124095576030h; do
+  QUEQLITE_DURABILITY_MODE=bounded \
+  QUEQLITE_DURABILITY_MAX_LAG="$maximum_duration" \
+    scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" \
+      "$tmp/max-duration.yaml" successor
 done
 
 wrong_live_status="$tmp/wrong-live-members.json"

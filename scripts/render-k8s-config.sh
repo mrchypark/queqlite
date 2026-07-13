@@ -72,32 +72,48 @@ checkpoint_lease_ms="${QUEQLITE_CHECKPOINT_LEASE_MS:-300000}"
 bundle_secret="${name}-bundle"
 
 die() { echo "$*" >&2; exit 65; }
-case "$epoch" in
-  ''|*[!0-9]*|0) die "QUEQLITE_EPOCH must be a positive integer" ;;
-esac
-case "$generation" in
-  ''|*[!0-9]*|0) die "QUEQLITE_RECOVERY_GENERATION must be a positive integer" ;;
-esac
+u64_max=18446744073709551615
+decimal_at_most() {
+  local value="$1" maximum="$2" LC_ALL=C
+  while [ "${value#0}" != "$value" ]; do value="${value#0}"; done
+  [ -n "$value" ] || return 1
+  if [ "${#value}" -ne "${#maximum}" ]; then
+    [ "${#value}" -lt "${#maximum}" ]
+    return
+  fi
+  [[ "$value" < "$maximum" || "$value" = "$maximum" ]]
+}
+validate_positive_u64() {
+  local name="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*) die "$name must be a positive integer" ;;
+  esac
+  decimal_at_most "$value" "$u64_max" || die "$name must be a positive integer"
+}
+validate_positive_u64 QUEQLITE_EPOCH "$epoch"
+validate_positive_u64 QUEQLITE_RECOVERY_GENERATION "$generation"
 case "$s3_http" in
   true|false|1|0) ;;
   *) die "QUEQLITE_S3_ALLOW_HTTP must be true|false|1|0" ;;
 esac
-case "$checkpoint_lease_ms" in
-  ''|*[!0-9]*|0) die "QUEQLITE_CHECKPOINT_LEASE_MS must be a positive integer" ;;
-esac
+validate_positive_u64 QUEQLITE_CHECKPOINT_LEASE_MS "$checkpoint_lease_ms"
 [ -z "$s3_endpoint_set" ] || [ -n "$s3_endpoint" ] ||
   die "QUEQLITE_S3_ENDPOINT must not be empty when set"
 [ -z "$object_secret_set" ] || [ -n "$object_secret" ] ||
   die "QUEQLITE_OBJECT_SECRET must not be empty when set"
 validate_duration() {
-  local name="$1" value="$2" amount
+  local name="$1" value="$2" amount maximum
   case "$value" in
-    *ms) amount="${value%ms}" ;;
-    *s|*m|*h) amount="${value%?}" ;;
+    *ms) amount="${value%ms}"; maximum=18446744073709551615 ;;
+    *s) amount="${value%s}"; maximum=18446744073709551 ;;
+    *m) amount="${value%m}"; maximum=307445734561825 ;;
+    *h) amount="${value%h}"; maximum=5124095576030 ;;
     *) die "$name must be a positive duration with ms/s/m/h suffix" ;;
   esac
   case "$amount" in ''|*[!0-9]*) die "$name must be a positive duration with ms/s/m/h suffix" ;; esac
-  [ -n "${amount//0/}" ] || die "$name must be a positive duration with ms/s/m/h suffix"
+  decimal_at_most "$amount" "$u64_max" ||
+    die "$name must be a positive duration with ms/s/m/h suffix"
+  decimal_at_most "$amount" "$maximum" || die "$name duration is too large"
 }
 
 durability_max_lag_env=""
