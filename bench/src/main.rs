@@ -3,7 +3,7 @@ use std::{
     process::{self, Command, Stdio},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
-        Arc, Barrier, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -223,16 +223,36 @@ fn run_phase(
     duration: Duration,
     fault_config: Option<FaultConfig>,
 ) -> Result<PhaseResult, String> {
+    run_phase_with_startup_delay(
+        client,
+        config,
+        run_id,
+        phase,
+        duration,
+        fault_config,
+        Duration::ZERO,
+    )
+}
+
+fn run_phase_with_startup_delay(
+    client: &Client,
+    config: &Config,
+    run_id: &str,
+    phase: &str,
+    duration: Duration,
+    fault_config: Option<FaultConfig>,
+    worker_startup_delay: Duration,
+) -> Result<PhaseResult, String> {
     if duration.is_zero() {
         return Ok(PhaseResult::default());
     }
-    let started_at_epoch_seconds = epoch_seconds(SystemTime::now(), &format!("{phase} start"))?;
-    let phase_start = Instant::now();
-    let phase_deadline = phase_start
-        .checked_add(duration)
-        .ok_or_else(|| format!("{phase} duration exceeds the platform clock range"))?;
-    let start = Arc::new(Mutex::new(None));
-    let barrier = Arc::new(Barrier::new(config.concurrency + 1));
+    validate_instant_duration(phase, duration)?;
+    let has_fault = fault_config.is_some();
+    let participants = config
+        .concurrency
+        .checked_add(usize::from(has_fault))
+        .ok_or_else(|| "phase participant count overflow".to_string())?;
+    let phase_gate = Arc::new(PhaseGate::default());
     let ticket = Arc::new(AtomicU64::new(0));
     let fault_stage = Arc::new(AtomicU8::new(if fault_config.is_some() {
         BEFORE
@@ -246,13 +266,16 @@ fn run_phase(
         let config = config.clone();
         let run_id = run_id.to_owned();
         let phase = phase.to_owned();
-        let start = Arc::clone(&start);
-        let barrier = Arc::clone(&barrier);
+        let phase_gate = Arc::clone(&phase_gate);
         let ticket = Arc::clone(&ticket);
         let fault_stage = Arc::clone(&fault_stage);
         workers.push(thread::spawn(move || {
-            barrier.wait();
-            let start = start.lock().unwrap().expect("phase start must be set");
+            if worker_id == 0 {
+                thread::sleep(worker_startup_delay);
+            }
+            let Some(timing) = phase_gate.wait_for_start() else {
+                return WorkerStats::default();
+            };
             run_worker(
                 worker_id,
                 WorkerContext {
@@ -260,8 +283,8 @@ fn run_phase(
                     config: &config,
                     run_id: &run_id,
                     phase: &phase,
-                    start,
-                    deadline: phase_deadline,
+                    start: timing.start,
+                    deadline: timing.deadline,
                     ticket: &ticket,
                     fault_stage: &fault_stage,
                 },
@@ -269,19 +292,17 @@ fn run_phase(
         }));
     }
 
-    *start.lock().unwrap() = Some(phase_start);
     let fault_handle = fault_config.map(|fault| {
         let identity = (fault.tag.clone(), fault.offset);
-        let handle = spawn_fault_hook(
+        let handle = spawn_phase_fault_hook(
             fault,
-            phase_start,
-            phase_deadline,
+            Arc::clone(&phase_gate),
             config.fault_timeout,
             Arc::clone(&fault_stage),
         );
         (identity, handle)
     });
-    barrier.wait();
+    let timing_result = phase_gate.release(participants, phase, duration);
 
     let mut result = PhaseResult::default();
     for worker in workers {
@@ -296,17 +317,101 @@ fn run_phase(
             }
         }
     }
-    result.wall_elapsed = phase_start.elapsed();
-    let finished_at_epoch_seconds = epoch_seconds(SystemTime::now(), &format!("{phase} end"));
+    let finished_at_epoch_seconds = timing_result.as_ref().ok().map(|timing| {
+        result.wall_elapsed = timing.start.elapsed();
+        epoch_seconds(SystemTime::now(), &format!("{phase} end"))
+    });
     result.fault = fault_handle.map(|((tag, offset), handle)| match handle.join() {
         Ok(output) => output,
         Err(_) => FaultOutput::thread_panicked(tag, offset),
     });
+    let phase_timing = timing_result?;
+    let finished_at_epoch_seconds = finished_at_epoch_seconds
+        .ok_or_else(|| "phase end wall clock was not captured".to_string())??;
     result.measurement_window = Some(measurement_window(
-        started_at_epoch_seconds,
-        finished_at_epoch_seconds?,
+        phase_timing.started_at_epoch_seconds,
+        finished_at_epoch_seconds,
     )?);
     Ok(result)
+}
+
+#[derive(Clone, Copy)]
+struct PhaseTiming {
+    start: Instant,
+    deadline: Instant,
+    started_at_epoch_seconds: f64,
+}
+
+#[derive(Default)]
+struct PhaseGate {
+    state: Mutex<PhaseGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct PhaseGateState {
+    ready: usize,
+    released: bool,
+    timing: Option<PhaseTiming>,
+}
+
+impl PhaseGate {
+    fn wait_for_start(&self) -> Option<PhaseTiming> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.ready = state.ready.saturating_add(1);
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.timing
+    }
+
+    fn release(
+        &self,
+        participants: usize,
+        phase: &str,
+        duration: Duration,
+    ) -> Result<PhaseTiming, String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.ready < participants {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        let phase_start_wall = SystemTime::now();
+        let phase_start = Instant::now();
+        let timing = epoch_seconds(phase_start_wall, &format!("{phase} start")).and_then(
+            |started_at_epoch_seconds| {
+                phase_start
+                    .checked_add(duration)
+                    .map(|deadline| PhaseTiming {
+                        start: phase_start,
+                        deadline,
+                        started_at_epoch_seconds,
+                    })
+                    .ok_or_else(|| format!("{phase} duration exceeds the platform clock range"))
+            },
+        );
+        state.timing = timing.as_ref().ok().copied();
+        state.released = true;
+        self.changed.notify_all();
+        timing
+    }
+
+    #[cfg(test)]
+    fn wait_until_ready(&self, participants: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.ready < participants {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
 }
 
 struct WorkerContext<'a> {
@@ -563,6 +668,7 @@ fn http_error(status: StatusCode) -> String {
     format!("http_{}", status.as_u16())
 }
 
+#[cfg(test)]
 fn spawn_fault_hook(
     fault: FaultConfig,
     start: Instant,
@@ -570,46 +676,114 @@ fn spawn_fault_hook(
     fault_timeout: Duration,
     stage: Arc<AtomicU8>,
 ) -> thread::JoinHandle<FaultOutput> {
+    thread::spawn(move || run_fault_hook(fault, start, measurement_deadline, fault_timeout, stage))
+}
+
+fn spawn_phase_fault_hook(
+    fault: FaultConfig,
+    phase_gate: Arc<PhaseGate>,
+    fault_timeout: Duration,
+    stage: Arc<AtomicU8>,
+) -> thread::JoinHandle<FaultOutput> {
     thread::spawn(move || {
-        let Some(scheduled_start) = start.checked_add(fault.offset) else {
+        let Some(timing) = phase_gate.wait_for_start() else {
             return FaultOutput::not_started(fault.tag, fault.offset);
         };
-        if let Some(wait) = scheduled_start.checked_duration_since(Instant::now()) {
-            thread::sleep(wait);
-        }
-        if Instant::now() >= measurement_deadline {
-            return FaultOutput::not_started(fault.tag, fault.offset);
-        }
-        stage.store(DURING, Ordering::Release);
-        let command_start = Instant::now();
-        let command_start_offset = command_start.saturating_duration_since(start);
-        let Some(command_deadline) = command_start.checked_add(fault_timeout) else {
+        run_fault_hook(fault, timing.start, timing.deadline, fault_timeout, stage)
+    })
+}
+
+fn run_fault_hook(
+    fault: FaultConfig,
+    start: Instant,
+    measurement_deadline: Instant,
+    fault_timeout: Duration,
+    stage: Arc<AtomicU8>,
+) -> FaultOutput {
+    let Some(scheduled_start) = start.checked_add(fault.offset) else {
+        return FaultOutput::not_started(fault.tag, fault.offset);
+    };
+    if let Some(wait) = scheduled_start.checked_duration_since(Instant::now()) {
+        thread::sleep(wait);
+    }
+    if Instant::now() >= measurement_deadline {
+        return FaultOutput::not_started(fault.tag, fault.offset);
+    }
+    stage.store(DURING, Ordering::Release);
+    let command_start = Instant::now();
+    let command_start_offset = command_start.saturating_duration_since(start);
+    let Some(command_deadline) = command_start.checked_add(fault_timeout) else {
+        stage.store(AFTER, Ordering::Release);
+        return FaultOutput::failed_to_start(
+            fault.tag,
+            fault.offset,
+            command_start_offset,
+            command_start.elapsed(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fault timeout exceeds the platform clock range",
+            ),
+        );
+    };
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&fault.command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let result = command.spawn();
+    let mut child = match result {
+        Ok(child) => child,
+        Err(error) => {
             stage.store(AFTER, Ordering::Release);
             return FaultOutput::failed_to_start(
                 fault.tag,
                 fault.offset,
                 command_start_offset,
                 command_start.elapsed(),
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "fault timeout exceeds the platform clock range",
-                ),
+                error,
             );
-        };
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(&fault.command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        command.process_group(0);
-        let result = command.spawn();
-        let mut child = match result {
-            Ok(child) => child,
-            Err(error) => {
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = terminate_fault_command(&mut child);
                 stage.store(AFTER, Ordering::Release);
-                return FaultOutput::failed_to_start(
+                return FaultOutput::finished(
+                    fault.tag,
+                    fault.offset,
+                    command_start_offset,
+                    command_start.elapsed(),
+                    status,
+                );
+            }
+            Ok(None) if Instant::now() >= command_deadline => {
+                let kill_error = terminate_fault_command(&mut child);
+                let status = child.wait().ok().and_then(|status| status.code());
+                stage.store(AFTER, Ordering::Release);
+                return FaultOutput::unfinished(
+                    fault.tag,
+                    fault.offset,
+                    command_start_offset,
+                    command_start.elapsed(),
+                    status,
+                    kill_error,
+                );
+            }
+            Ok(None) => {
+                let wait = command_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10));
+                thread::sleep(wait);
+            }
+            Err(error) => {
+                let _ = terminate_fault_command(&mut child);
+                let _ = child.wait();
+                stage.store(AFTER, Ordering::Release);
+                return FaultOutput::observation_failed(
                     fault.tag,
                     fault.offset,
                     command_start_offset,
@@ -617,54 +791,8 @@ fn spawn_fault_hook(
                     error,
                 );
             }
-        };
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let _ = terminate_fault_command(&mut child);
-                    stage.store(AFTER, Ordering::Release);
-                    return FaultOutput::finished(
-                        fault.tag,
-                        fault.offset,
-                        command_start_offset,
-                        command_start.elapsed(),
-                        status,
-                    );
-                }
-                Ok(None) if Instant::now() >= command_deadline => {
-                    let kill_error = terminate_fault_command(&mut child);
-                    let status = child.wait().ok().and_then(|status| status.code());
-                    stage.store(AFTER, Ordering::Release);
-                    return FaultOutput::unfinished(
-                        fault.tag,
-                        fault.offset,
-                        command_start_offset,
-                        command_start.elapsed(),
-                        status,
-                        kill_error,
-                    );
-                }
-                Ok(None) => {
-                    let wait = command_deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(10));
-                    thread::sleep(wait);
-                }
-                Err(error) => {
-                    let _ = terminate_fault_command(&mut child);
-                    let _ = child.wait();
-                    stage.store(AFTER, Ordering::Release);
-                    return FaultOutput::observation_failed(
-                        fault.tag,
-                        fault.offset,
-                        command_start_offset,
-                        command_start.elapsed(),
-                        error,
-                    );
-                }
-            }
         }
-    })
+    }
 }
 
 fn terminate_fault_command(child: &mut process::Child) -> Option<std::io::Error> {
@@ -1044,8 +1172,9 @@ mod tests {
     use reqwest::blocking::Client;
 
     use super::{
-        benchmark_failure, endpoint_candidates, run, run_phase, setup_table, spawn_fault_hook,
-        wait_for_rate, write_request_id, FaultWindows, PhaseResult, BEFORE,
+        benchmark_failure, endpoint_candidates, epoch_seconds, run, run_phase,
+        run_phase_with_startup_delay, setup_table, spawn_fault_hook, spawn_phase_fault_hook,
+        wait_for_rate, write_request_id, FaultWindows, PhaseGate, PhaseResult, BEFORE,
         WORKER_PANIC_DIAGNOSTIC,
     };
 
@@ -1160,9 +1289,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
+            for (index, stream) in listener.incoming().take(2).enumerate() {
                 let mut stream = stream.unwrap();
                 let _ = read_request_body(&mut stream);
+                if index == 1 {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 respond(
                     &mut stream,
                     "200 OK",
@@ -1185,18 +1317,24 @@ mod tests {
             None,
         )
         .unwrap();
+        let marker = std::env::temp_dir().join(format!(
+            "queqlite-bench-offset-zero-start-{}",
+            process::id()
+        ));
+        let _ = fs::remove_file(&marker);
         let call_started = Instant::now();
-        let measurement = run_phase(
+        let measurement = run_phase_with_startup_delay(
             &client,
             &config,
             "run",
             "measurement",
-            Duration::from_millis(10),
+            Duration::from_millis(50),
             Some(FaultConfig {
                 offset: Duration::ZERO,
                 tag: "slow-join".into(),
-                command: "sleep 0.2".into(),
+                command: format!("printf started > '{}'; sleep 0.2", marker.display()),
             }),
+            Duration::from_millis(100),
         )
         .unwrap();
         server.join().unwrap();
@@ -1209,7 +1347,41 @@ mod tests {
             measurement_window.started_at_epoch_seconds >= warmup_window.finished_at_epoch_seconds
         );
         assert!((reported_span - measurement.wall_elapsed.as_secs_f64()).abs() < 0.05);
-        assert!(call_started.elapsed().as_secs_f64() > reported_span + 0.1);
+        assert!(reported_span < 0.05);
+        assert!(call_started.elapsed().as_secs_f64() > reported_span + 0.25);
+        let marker_epoch =
+            epoch_seconds(fs::metadata(&marker).unwrap().modified().unwrap(), "marker").unwrap();
+        assert!(marker_epoch >= measurement_window.started_at_epoch_seconds);
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn offset_zero_fault_waits_for_phase_release() {
+        let marker =
+            std::env::temp_dir().join(format!("queqlite-bench-offset-zero-gate-{}", process::id()));
+        let _ = fs::remove_file(&marker);
+        let phase_gate = Arc::new(PhaseGate::default());
+        let handle = spawn_phase_fault_hook(
+            FaultConfig {
+                offset: Duration::ZERO,
+                tag: "offset-zero".into(),
+                command: format!("printf started > '{}'", marker.display()),
+            },
+            Arc::clone(&phase_gate),
+            Duration::from_secs(1),
+            Arc::new(AtomicU8::new(BEFORE)),
+        );
+
+        phase_gate.wait_until_ready(1);
+        assert!(!marker.exists());
+        let timing = phase_gate
+            .release(1, "measurement", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(handle.join().unwrap().status, "succeeded");
+        let marker_epoch =
+            epoch_seconds(fs::metadata(&marker).unwrap().modified().unwrap(), "marker").unwrap();
+        assert!(marker_epoch >= timing.started_at_epoch_seconds);
+        let _ = fs::remove_file(marker);
     }
 
     #[test]
