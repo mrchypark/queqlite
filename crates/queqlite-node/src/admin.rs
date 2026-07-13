@@ -557,18 +557,18 @@ where
     let detached_fingerprint = fingerprint.clone();
     let (completed, mut completion) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _permit = permit;
         let result = operation.await;
         let mut operations = detached_state.operations.lock().await;
-        let Some(records) = operations.as_mut() else {
-            completed.send_replace(true);
-            return;
-        };
-        let _ = store_result(records, detached_operation_id, detached_fingerprint, result);
-        if let Err(error) = persist_operations(&detached_state.ledger_path, records) {
-            eprintln!("admin operation ledger persistence failed: {error}");
-            *operations = None;
+        if let Some(records) = operations.as_mut() {
+            let _ = store_result(records, detached_operation_id, detached_fingerprint, result);
+            if let Err(error) = persist_operations(&detached_state.ledger_path, records) {
+                eprintln!("admin operation ledger persistence failed: {error}");
+                *operations = None;
+            }
         }
+        drop(operations);
+        drop(detached_state);
+        drop(permit);
         completed.send_replace(true);
     });
     let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
