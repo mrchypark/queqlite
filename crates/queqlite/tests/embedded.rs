@@ -143,19 +143,22 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
     std::fs::remove_dir_all(&archive_root).unwrap();
     std::fs::write(&archive_root, b"archive unavailable").unwrap();
 
-    let previous_attempts = coordinator.checkpoint_publication_attempts();
+    let retry_cap_attempt = coordinator
+        .checkpoint_publication_attempts()
+        .checked_add(7)
+        .unwrap();
     let write = tokio::spawn(async move { handle.put("request", "key", "value").await });
     tokio::time::timeout(OUTER_HANG_GUARD, async {
-        while coordinator.checkpoint_publication_attempts() == previous_attempts {
+        while coordinator.checkpoint_publication_attempts() < retry_cap_attempt {
             assert!(
                 !write.is_finished(),
-                "the sync write finished before attempting checkpoint publication"
+                "the sync write finished before reaching the capped retry backoff"
             );
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("checkpoint publication attempt must not hang the test");
+    .expect("checkpoint publication retries must not hang the test");
     tokio::time::timeout(BEHAVIOR_DEADLINE, async {
         while coordinator.health() != DurabilityHealth::Unavailable {
             tokio::task::yield_now().await;
