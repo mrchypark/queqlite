@@ -2,6 +2,8 @@ use std::{env, process, time::SystemTime};
 
 use queqlite_obj_store::{Error, ObjStore, ObjStoreConfig, UpdateVersion};
 
+const ISOLATED_TEST_CHILD: &str = "QUEQLITE_ISOLATED_TEST_CHILD";
+
 #[tokio::test]
 async fn local_store_put_get_and_list_round_trips_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -76,16 +78,88 @@ fn local_store_reports_process_local_compare_and_swap() {
 #[test]
 fn s3_store_reports_strong_cross_process_compare_and_swap() {
     let store = ObjStore::new(ObjStoreConfig::S3 {
-        endpoint: "http://127.0.0.1:1".to_string(),
+        endpoint: Some("http://127.0.0.1:1".to_string()),
         bucket: "test".to_string(),
-        access_key: "test".to_string(),
-        secret_key: "test".to_string(),
+        access_key: Some("test".to_string()),
+        secret_key: Some("test".to_string()),
         region: "us-east-1".to_string(),
         allow_http: true,
     })
     .unwrap();
 
     assert!(store.supports_strong_cross_process_cas());
+}
+
+#[test]
+fn s3_store_constructs_without_static_credentials_for_default_credential_chain() {
+    if env::var_os(ISOLATED_TEST_CHILD).is_none() {
+        run_isolated_test(
+            "s3_store_constructs_without_static_credentials_for_default_credential_chain",
+            &[],
+        );
+        return;
+    }
+
+    let store = ObjStore::new(ObjStoreConfig::S3 {
+        endpoint: None,
+        bucket: "test".to_string(),
+        access_key: None,
+        secret_key: None,
+        region: "us-east-1".to_string(),
+        allow_http: true,
+    })
+    .unwrap();
+
+    assert!(store.supports_strong_cross_process_cas());
+}
+
+#[test]
+fn s3_store_constructs_without_endpoint_for_static_credentials() {
+    let store = ObjStore::new(ObjStoreConfig::S3 {
+        endpoint: None,
+        bucket: "test".to_string(),
+        access_key: Some("test".to_string()),
+        secret_key: Some("test".to_string()),
+        region: "us-east-1".to_string(),
+        allow_http: false,
+    })
+    .unwrap();
+
+    assert!(store.supports_strong_cross_process_cas());
+}
+
+#[tokio::test]
+async fn explicit_s3_endpoint_overrides_ambient_service_endpoint() {
+    if env::var_os(ISOLATED_TEST_CHILD).is_none() {
+        run_isolated_test(
+            "explicit_s3_endpoint_overrides_ambient_service_endpoint",
+            &[
+                ("AWS_ACCESS_KEY_ID", "test"),
+                ("AWS_SECRET_ACCESS_KEY", "test"),
+                ("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:2"),
+            ],
+        );
+        return;
+    }
+
+    let store = ObjStore::new(ObjStoreConfig::S3 {
+        endpoint: Some("http://127.0.0.1:1".to_string()),
+        bucket: "test".to_string(),
+        access_key: None,
+        secret_key: None,
+        region: "us-east-1".to_string(),
+        allow_http: true,
+    })
+    .unwrap();
+
+    let result = store.get("endpoint-probe").await;
+    assert!(
+        matches!(
+            &result,
+            Err(Error::Transport { message, .. }) if message.contains("127.0.0.1:1")
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -115,10 +189,10 @@ fn azure_blob_store_constructs_without_live_credentials_and_reports_strong_cas()
 #[test]
 fn object_store_config_debug_redacts_credentials() {
     let config = ObjStoreConfig::S3 {
-        endpoint: "https://objects.example".to_string(),
+        endpoint: Some("https://objects.example".to_string()),
         bucket: "bucket".to_string(),
-        access_key: "visible-access-key".to_string(),
-        secret_key: "visible-secret-key".to_string(),
+        access_key: Some("visible-access-key".to_string()),
+        secret_key: Some("visible-secret-key".to_string()),
         region: "us-east-1".to_string(),
         allow_http: false,
     };
@@ -133,10 +207,42 @@ fn object_store_config_debug_redacts_credentials() {
 fn cloud_store_configuration_rejects_missing_or_conflicting_values() {
     let cases = [
         ObjStoreConfig::S3 {
-            endpoint: "".to_string(),
+            endpoint: Some("".to_string()),
             bucket: "test".to_string(),
-            access_key: "test".to_string(),
-            secret_key: "test".to_string(),
+            access_key: Some("test".to_string()),
+            secret_key: Some("test".to_string()),
+            region: "us-east-1".to_string(),
+            allow_http: true,
+        },
+        ObjStoreConfig::S3 {
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            bucket: "test".to_string(),
+            access_key: Some("test".to_string()),
+            secret_key: None,
+            region: "us-east-1".to_string(),
+            allow_http: true,
+        },
+        ObjStoreConfig::S3 {
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            bucket: "test".to_string(),
+            access_key: None,
+            secret_key: Some("test".to_string()),
+            region: "us-east-1".to_string(),
+            allow_http: true,
+        },
+        ObjStoreConfig::S3 {
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            bucket: "test".to_string(),
+            access_key: Some("".to_string()),
+            secret_key: Some("test".to_string()),
+            region: "us-east-1".to_string(),
+            allow_http: true,
+        },
+        ObjStoreConfig::S3 {
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            bucket: "test".to_string(),
+            access_key: Some("test".to_string()),
+            secret_key: Some(" ".to_string()),
             region: "us-east-1".to_string(),
             allow_http: true,
         },
@@ -178,6 +284,20 @@ async fn create_returns_existing_version_when_immutable_bytes_are_identical() {
     assert_eq!(retried, created);
     assert_eq!(observed.bytes(), b"immutable");
     assert_eq!(observed.version(), &created);
+}
+
+#[tokio::test]
+async fn versioned_get_returns_bytes_while_get_remains_vec_compatible() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = local_store(&dir);
+    store.put("segment.qlog", b"immutable").await.unwrap();
+
+    let versioned = store.get_with_version("segment.qlog").await.unwrap();
+    let versioned_bytes: &[u8] = versioned.bytes();
+    let compatible_bytes: Vec<u8> = store.get("segment.qlog").await.unwrap();
+
+    assert_eq!(versioned_bytes, b"immutable");
+    assert_eq!(compatible_bytes, b"immutable");
 }
 
 #[tokio::test]
@@ -235,19 +355,25 @@ async fn missing_object_is_typed_as_not_found() {
 #[tokio::test]
 async fn unreachable_s3_endpoint_is_typed_as_transport() {
     let store = ObjStore::new(ObjStoreConfig::S3 {
-        endpoint: "http://127.0.0.1:1".to_string(),
+        endpoint: Some("http://127.0.0.1:1".to_string()),
         bucket: "test".to_string(),
-        access_key: "test".to_string(),
-        secret_key: "test".to_string(),
+        access_key: Some("test".to_string()),
+        secret_key: Some("test".to_string()),
         region: "us-east-1".to_string(),
         allow_http: true,
     })
     .unwrap();
 
-    assert!(matches!(
-        store.get("transport-probe").await,
-        Err(Error::Transport { key, .. }) if key == "transport-probe"
-    ));
+    let result = store.get("transport-probe").await;
+    assert!(
+        matches!(
+            &result,
+            Err(Error::Transport { key, message })
+                if key == "transport-probe"
+                    && message.contains("http://127.0.0.1:1/test/transport-probe")
+        ),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
@@ -293,6 +419,17 @@ fn local_store(dir: &tempfile::TempDir) -> ObjStore {
     .unwrap()
 }
 
+fn run_isolated_test(name: &str, environment: &[(&str, &str)]) {
+    let status = process::Command::new(env::current_exe().unwrap())
+        .args(["--exact", name])
+        .env_clear()
+        .env(ISOLATED_TEST_CHILD, "1")
+        .envs(environment.iter().copied())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 fn one_create_winner<'a>(
     first: (&'a [u8], queqlite_obj_store::Result<UpdateVersion>),
     second: (&'a [u8], queqlite_obj_store::Result<UpdateVersion>),
@@ -317,10 +454,10 @@ fn one_update_winner<'a>(
 
 fn s3_config_from_env() -> ObjStoreConfig {
     ObjStoreConfig::S3 {
-        endpoint: required_env("QUEQLITE_S3_ENDPOINT"),
+        endpoint: env::var("QUEQLITE_S3_ENDPOINT").ok(),
         bucket: required_env("QUEQLITE_S3_BUCKET"),
-        access_key: required_env("QUEQLITE_S3_ACCESS_KEY"),
-        secret_key: required_env("QUEQLITE_S3_SECRET_KEY"),
+        access_key: env::var("QUEQLITE_S3_ACCESS_KEY").ok(),
+        secret_key: env::var("QUEQLITE_S3_SECRET_KEY").ok(),
         region: env::var("QUEQLITE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         allow_http: env::var("QUEQLITE_S3_ALLOW_HTTP")
             .map(|value| value == "true" || value == "1")

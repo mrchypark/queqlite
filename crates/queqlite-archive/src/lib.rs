@@ -932,6 +932,36 @@ struct PendingPublisherFlush {
     result: tokio::sync::oneshot::Sender<Result<LoadedCheckpointManifest>>,
 }
 
+fn coalesce_pending_entries(
+    pending: &[PendingPublisherFlush],
+    published_index: LogIndex,
+) -> Result<Vec<LogEntry>> {
+    let mut entries = pending
+        .iter()
+        .flat_map(|flush| flush.entries.iter())
+        .filter(|entry| entry.index > published_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.index);
+
+    let mut coalesced = Vec::<LogEntry>::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(previous) = coalesced.last() {
+            if previous.index == entry.index {
+                if previous != &entry {
+                    return Err(Error::InvalidCheckpoint(format!(
+                        "conflicting concurrent publications at index {}",
+                        entry.index
+                    )));
+                }
+                continue;
+            }
+        }
+        coalesced.push(entry);
+    }
+    Ok(coalesced)
+}
+
 struct CheckpointPublisherState {
     loaded: LoadedCheckpointManifest,
     pending: Vec<PendingPublisherFlush>,
@@ -1050,21 +1080,21 @@ impl CheckpointPublisher {
             }
             (std::mem::take(&mut state.pending), state.loaded.clone())
         };
-        let entries = pending
-            .iter()
-            .max_by_key(|flush| flush.entries.last().map(|entry| entry.index).unwrap_or(0))
-            .expect("non-empty pending publisher flushes")
-            .entries
-            .clone();
-        let published = self
-            .store
-            .publish_committed_from_loaded_unleased(
-                &entries,
-                &self.lease_id,
-                self.options.lease_duration_ms,
-                loaded,
-            )
-            .await;
+        let published_index = loaded.manifest().tip().index();
+        let published = match coalesce_pending_entries(&pending, published_index) {
+            Ok(entries) if entries.is_empty() => Ok(loaded),
+            Ok(entries) => {
+                self.store
+                    .publish_committed_from_loaded_unleased(
+                        &entries,
+                        &self.lease_id,
+                        self.options.lease_duration_ms,
+                        loaded,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
 
         if let Ok(loaded) = &published {
             self.state.lock().await.loaded = loaded.clone();

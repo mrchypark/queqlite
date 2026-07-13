@@ -175,6 +175,76 @@ async fn publisher_session_groups_concurrent_flushes_to_the_highest_requested_in
 }
 
 #[tokio::test]
+async fn publisher_session_coalesces_adjacent_concurrent_suffixes() {
+    let (_dir, _store, archive) = local_checkpoint(checkpoint_identity());
+    let publisher = std::sync::Arc::new(
+        archive
+            .open_checkpoint_publisher("publisher-a", CheckpointPublisherOptions::default())
+            .await
+            .unwrap(),
+    );
+    let committed = entries(1, 4, LogHash::ZERO);
+    let first = publisher.clone();
+    let second = publisher.clone();
+
+    let (prefix, suffix) = tokio::join!(
+        first.publish_committed(&committed[..2]),
+        second.publish_committed(&committed[2..]),
+    );
+
+    assert_eq!(prefix.unwrap().manifest().tip().index(), 4);
+    assert_eq!(suffix.unwrap().manifest().tip().index(), 4);
+    assert_eq!(archive.restore_checkpoint().await.unwrap(), committed);
+}
+
+#[tokio::test]
+async fn publisher_session_rejects_conflicting_concurrent_entries() {
+    let (_dir, _store, archive) = local_checkpoint(checkpoint_identity());
+    let publisher = std::sync::Arc::new(
+        archive
+            .open_checkpoint_publisher("publisher-a", CheckpointPublisherOptions::default())
+            .await
+            .unwrap(),
+    );
+    let first = entries(1, 1, LogHash::ZERO);
+    let mut conflicting = first.clone();
+    conflicting[0].payload = b"conflict".to_vec();
+    conflicting[0].hash = LogEntry::calculate_hash(
+        &conflicting[0].cluster_id,
+        conflicting[0].index,
+        conflicting[0].epoch,
+        conflicting[0].config_id,
+        conflicting[0].entry_type,
+        conflicting[0].prev_hash,
+        &conflicting[0].payload,
+    );
+    let left = publisher.clone();
+    let right = publisher.clone();
+
+    let (first_result, conflicting_result) = tokio::join!(
+        left.publish_committed(&first),
+        right.publish_committed(&conflicting),
+    );
+
+    assert!(matches!(first_result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(
+        conflicting_result,
+        Err(Error::InvalidCheckpoint(_))
+    ));
+    assert_eq!(
+        archive
+            .load_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .tip()
+            .index(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn publisher_session_reloads_a_stale_manifest_cache_after_cas_conflict() {
     let (_dir, _store, archive) = local_checkpoint(checkpoint_identity());
     let first = archive
