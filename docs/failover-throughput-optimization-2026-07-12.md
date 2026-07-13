@@ -2,6 +2,12 @@
 
 Date: 2026-07-12
 
+Evidence status: the figures below are historical observations from unversioned
+local runs. Their `target/queqlite-bench/...` directories are not included in
+this repository, so a checkout cannot independently audit them. Re-run the
+benchmark to produce versioned evidence before using the figures for a release
+or performance claim.
+
 ## Scope
 
 This change implements four related improvements without making Queqlite depend
@@ -74,11 +80,11 @@ Raft-equivalent performance. The paper-conformance and benchmark-comparability
 boundaries are documented in
 [`quepaxa-paper-conformance-2026-07-12.md`](quepaxa-paper-conformance-2026-07-12.md).
 
-Checkpoint drain required no wait: qlog and checkpoint both ended at index 5193
-with the exact same hash. This establishes agreement for this run, not a general
-recovery-time or performance claim.
+The local run notes report no checkpoint-drain wait: qlog and checkpoint both
+ended at index 5193 with the exact same hash. This is an unversioned observation,
+not independently auditable evidence or a general recovery-time claim.
 
-Artifacts:
+Original local run directories (not distributed with this repository):
 
 - Final preferred-first deletion run: `target/queqlite-bench/20260712-113825-51624`
 - Normal: `target/queqlite-bench/20260712-034534-80063`
@@ -87,14 +93,14 @@ Artifacts:
 
 ## OSS usage and cost
 
-The final preferred-first deletion run used 5,259 metered OSS requests and
-retained 29,855,178 bytes in 286 objects.
+The local notes for the final preferred-first deletion run report 5,259 metered
+OSS requests and 29,855,178 retained bytes in 286 objects.
 
 For historical context, the earlier optimized normal run used 3,997 metered OSS
 calls for 10,053 warmup and measured writes and retained 29.50 MB in 292 objects.
-Its checked-in request-rate estimate was $1.01 per million writes before retained
+Its reported request-rate estimate was $1.01 per million writes before retained
 storage and network egress, versus the previous $4.53 estimate. Those cost
-figures were not recomputed from the final artifact.
+figures were not recomputed from a repository-retained artifact.
 
 The final access log included transient PUT 412 responses from expected CAS
 races and PUT 502 responses that were retried successfully. These were

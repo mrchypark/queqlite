@@ -40,7 +40,7 @@ keep=false
 context=""
 previous_context=""
 created_cluster=false
-port_forward_pids=""
+port_forward_pids=()
 sampler_pid=""
 benchmark_status=255
 
@@ -68,6 +68,18 @@ usage() {
 
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || die "missing required command: $1"; }
+
+assert_port_forward_alive() {
+  local index="$1" pid="${port_forward_pids[$1]}" status=0
+  kill -0 "$pid" 2>/dev/null && return
+  if wait "$pid"; then status=0; else status=$?; fi
+  echo "port-forward exited with status $status: ${endpoint_urls[$index]}" >&2
+  sed 's/^/  /' "$target/port-forward-$index.log" >&2
+  exit 1
+}
+
+# Allow the static check to exercise process-failure handling without starting a cluster.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 validate_duration() {
   local name="$1" value="$2" amount
@@ -302,8 +314,8 @@ cleanup_run() {
   touch "$stop_sampler" 2>/dev/null || true
   [ -z "$sampler_pid" ] || kill "$sampler_pid" 2>/dev/null || true
   [ -z "$sampler_pid" ] || wait "$sampler_pid" 2>/dev/null || true
-  for pid in $port_forward_pids; do kill "$pid" 2>/dev/null || true; done
-  for pid in $port_forward_pids; do wait "$pid" 2>/dev/null || true; done
+  for pid in "${port_forward_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${port_forward_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   collect_object_usage || true
   if [ -s "$resources_jsonl" ]; then
     jq -s '
@@ -384,7 +396,7 @@ vcluster node load-image "$node" --image "$image" >/dev/null
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
-peer_token="$(openssl rand -hex 24)"
+peer_tokens="$(for _ in 1 2 3; do openssl rand -hex 24; done | jq -Rsc 'split("\n")[:-1]')"
 k create secret generic queqlite-auth --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" >/dev/null
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
@@ -429,11 +441,11 @@ k rollout status deployment/rustfs --timeout=240s >/dev/null
 k wait --for=condition=complete job/rustfs-create-bucket --timeout=240s >/dev/null
 
 bundle="$target/config-c1.json"
-jq -n --arg token "$peer_token" '
+jq -n --argjson tokens "$peer_tokens" '
   {version:1,config_id:1,members:[range(3) as $n | {
     node_id:("node-" + ($n + 1 | tostring)),
     url:("http://queqlite-c1-" + ($n|tostring) + ".queqlite-c1:8081"),
-    log_url:("http://queqlite-c1-" + ($n|tostring) + ".queqlite-c1:8080"), token:$token
+    log_url:("http://queqlite-c1-" + ($n|tostring) + ".queqlite-c1:8080"), token:$tokens[$n]
   }]}
 ' > "$bundle"
 chmod 600 "$bundle"
@@ -442,6 +454,8 @@ k create secret generic queqlite-c1-bundle --from-file=config.json="$bundle" --d
 
 export QUEQLITE_IMAGE="$image" QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace"
 export QUEQLITE_CLUSTER_ID=queqlite-vind QUEQLITE_RECOVERY_GENERATION=1
+export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials
+export QUEQLITE_S3_ALLOW_HTTP=true
 scripts/k8s-object-job.sh 1 "$bundle" init-checkpoint >/dev/null
 QUEQLITE_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
 export QUEQLITE_CPU_REQUEST="$queqlite_cpu_request" QUEQLITE_CPU_LIMIT="$queqlite_cpu_limit"
@@ -462,15 +476,21 @@ for ordinal in $(seq 0 $((endpoint_count - 1))); do
   port=$((local_port + ordinal))
   k port-forward "pod/queqlite-c1-$ordinal" "${port}:8080" \
     > "$target/port-forward-$ordinal.log" 2>&1 &
-  port_forward_pids="$port_forward_pids $!"
+  port_forward_pids+=("$!")
   endpoint_urls+=("http://127.0.0.1:${port}")
 done
-for endpoint_url in "${endpoint_urls[@]}"; do
+
+for index in "${!endpoint_urls[@]}"; do
+  endpoint_url="${endpoint_urls[$index]}"
   for _ in $(seq 1 60); do
     curl -fsS "$endpoint_url/readyz" >/dev/null 2>&1 && break
+    assert_port_forward_alive "$index"
     sleep 1
   done
-  curl -fsS "$endpoint_url/readyz" >/dev/null || die "port-forward did not become ready: $endpoint_url"
+  if ! curl -fsS "$endpoint_url/readyz" >/dev/null; then
+    assert_port_forward_alive "$index"
+    die "port-forward did not become ready: $endpoint_url"
+  fi
 done
 
 setup_body="$(jq -n --arg request_id "$run_id-setup" '

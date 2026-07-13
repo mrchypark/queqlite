@@ -4,9 +4,13 @@
 
 이 문서는 2026-07-12 시점의 `Queqlite`, `Hiqlite`, `HaQLite`를 비교한 간단한 엔지니어링 메모다.
 
-- `측정됨`: 로컬 아티팩트나 공개 벤치 수치가 확인된 항목
+- `측정됨`: 작성 당시 로컬 실행이나 공개 벤치에서 관측된 항목
 - `미측정`: 아직 재현하지 못했거나, 컴파일 실패/실험 미실시로 수치가 없는 항목
 - 서로 다른 프로젝트의 내구성 모델, 배포 토폴로지, 벤치 조건이 같지 않으므로 절대 성능 순위로 읽으면 안 된다
+
+중요: `target/queqlite-bench/...`로 표시한 실행 디렉터리는 저장소에 포함되지 않은
+unversioned 로컬 관측이다. 현재 checkout만으로 수치를 독립 감사할 수 없으며, 릴리스나
+성능 주장의 근거로 쓰려면 벤치를 다시 실행해 아티팩트를 별도로 보존해야 한다.
 
 ## 한줄 결론
 
@@ -44,7 +48,7 @@
 
 `측정됨`
 
-- 아티팩트: `target/queqlite-bench/20260711-170514-5240`
+- 당시 로컬 실행 디렉터리(미포함): `target/queqlite-bench/20260711-170514-5240`
 - 워크로드: `c4`, `20s`, write, `INSERT ... RETURNING`
 - 결과:
   - 성공 `1282`, 오류 `0`
@@ -56,7 +60,7 @@
 
 `측정됨`
 
-- 아티팩트: `target/queqlite-bench/20260711-171848-31702`
+- 당시 로컬 실행 디렉터리(미포함): `target/queqlite-bench/20260711-171848-31702`
 - 워크로드: `c4`, `60s`, write, 노드 교체 포함
 - 구간별 결과:
   - 장애 전 `10s`: `85.7 tx/s`, 오류 `0`
@@ -71,7 +75,7 @@
 
 복구 command 재구성 결함 수정 후 재실험:
 
-- 아티팩트: `target/queqlite-bench/20260711-180230-71577`
+- 당시 로컬 실행 디렉터리(미포함): `target/queqlite-bench/20260711-180230-71577`
 - 조건: `c4`, `70s`, write, 10초 시점 follower Pod 삭제
 - 장애 전: `81.2 tx/s`, 오류 `0`, `p95 102.4ms`, `p99 204.8ms`
 - replacement Ready: `47.927s`
@@ -131,7 +135,7 @@
 
 이 표의 공통 단위는 성공한 단일 행 INSERT다. Queqlite 내부 JSON 필드가 `committed_transactions_per_second`인 이유는 한 요청이 여러 statement의 원자적 transaction일 수도 있기 때문이다. 이번 workload는 요청마다 `INSERT ... RETURNING` 한 문장뿐이므로 `tx/s`와 `single-row writes/s`가 수치상 같다.
 
-아티팩트:
+당시 로컬 실행 디렉터리(Queqlite 항목은 저장소에 미포함):
 
 - Queqlite sync: `target/queqlite-bench/20260712-022156-66465`
 - Queqlite bounded: `target/queqlite-bench/20260712-022432-68236`
@@ -197,13 +201,15 @@ RustFS는 이번 실험에서 `Queqlite` 내장 스토리지가 아니라 로컬
 - `서비스 성능`: `Queqlite` HTTP SQL 벤치 결과
 - `객체 저장소 사용량`: RustFS에 실제로 생성된 object 수, 저장 바이트, 요청 수
 
-RustFS 문서는 모든 작업에 대한 상세 로그와 audit trail 지원을 설명한다. 즉, 최종 비용 계산은 벤치 결과가 아니라 RustFS 로그/인벤토리에서 나와야 한다.
+RustFS는 작업 로그와 audit trail 기능을 제공하지만, 이 문서가 참조한 로그와
+인벤토리는 저장소에 포함되지 않았다. 최종 비용 계산을 검증하려면 벤치 결과와 함께
+RustFS 로그/인벤토리를 별도 보존해야 한다.
 
 ### 5.2 clean metering 사용량
 
 `측정됨`
 
-- 아티팩트: `target/queqlite-bench/20260711-175103-52098`
+- 당시 로컬 실행 디렉터리(미포함): `target/queqlite-bench/20260711-175103-52098`
 - 조건: `10s`, concurrency `1`, warmup `0`, `389` successful writes
 - setup의 DDL/seed 2건까지 합쳐 qlog publication은 `391`건이다
 - S3 calls: `8210`, 즉 qlog transaction당 사실상 `21 calls`
@@ -290,7 +296,7 @@ meter는 setup transaction 이후 비워졌고, 종료 시 qlog와 checkpoint의
 
 ### 5.7 재현 명령
 
-벤치 아티팩트 확인:
+당시 로컬 실행 디렉터리가 남아 있는 환경에서만 확인:
 
 ```sh
 for id in 20260712-022156-66465 20260712-022432-68236 20260712-023024-83282; do

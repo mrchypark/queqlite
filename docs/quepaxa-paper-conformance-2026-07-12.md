@@ -2,6 +2,11 @@
 
 Date: 2026-07-12
 
+Evidence status: benchmark figures in this document are historical observations
+from unversioned local runs. The referenced `target/queqlite-bench/...`
+directories are not included in the repository and cannot be audited from a
+checkout.
+
 Primary source: Tennage et al., [*QuePaxa: Escaping the Tyranny of Timeouts in
 Consensus*](https://discovery.ucl.ac.uk/id/eprint/10181480/1/quepaxa.pdf), SOSP
 2023.
@@ -36,24 +41,24 @@ support comparisons between the recorded Queqlite runs only. They do not prove
 the paper's throughput, parity with its prototype, or Raft-equivalent
 performance.
 
-## Current Queqlite evidence
+## Reported local Queqlite observation
 
-The final-image artifact
-`target/queqlite-bench/20260712-113825-51624` records a 30-second,
-concurrency-4, periodic-1-second run with one SQL `INSERT` per request and
-preferred-first multi-endpoint routing. It completed all 9,143 attempts with
-zero errors at 304.77 transactions/s (p50 12.8 ms, p95 51.2 ms, p99 102.4 ms).
+The local notes for `target/queqlite-bench/20260712-113825-51624` report a
+30-second, concurrency-4, periodic-1-second run with one SQL `INSERT` per
+request and preferred-first multi-endpoint routing. They report all 9,143
+attempts completed with zero errors at 304.77 transactions/s (p50 12.8 ms,
+p95 51.2 ms, p99 102.4 ms).
 
-Before preferred-pod deletion it measured 317.4 transactions/s. During the
-20.009-second deletion/restore window it measured 298.316 transactions/s with
-zero errors, about a 6.0% reduction. The fault command succeeded in 34.846
-seconds. Checkpoint drain waited zero seconds and found qlog and checkpoint at
-index 5193 with the exact same hash. The run used 5,259 OSS requests and retained
-29,855,178 bytes in 286 objects.
+The same notes report 317.4 transactions/s before preferred-pod deletion and
+298.316 transactions/s with zero errors during the 20.009-second
+deletion/restore window, about a 6.0% reduction. They report that the fault
+command succeeded in 34.846 seconds, checkpoint drain waited zero seconds, qlog
+and checkpoint ended at index 5193 with the same hash, and the run used 5,259
+OSS requests while retaining 29,855,178 bytes in 286 objects.
 
-This is evidence for the stated Queqlite workload and topology only. It remains
-neither a reproduction of the paper workload nor evidence of Raft-equivalent
-performance.
+This unversioned observation is scoped to the stated Queqlite workload and
+topology only. It is neither a reproduction of the paper workload nor evidence
+of Raft-equivalent performance.
 
 ## Missing performance evidence and work
 

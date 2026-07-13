@@ -18,3 +18,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace --all-targets
+      - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path bench/Cargo.toml --locked --all-targets
+      - run: bash -n scripts/bench-vind.sh
