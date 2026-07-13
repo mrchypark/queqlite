@@ -70,10 +70,14 @@ pub fn calculate(
         .iter()
         .find(|provider| provider.id == provider_id)
         .ok_or_else(|| format!("unknown provider {provider_id:?}"))?;
+    validate_provider(provider)?;
     let storage_rate = match input.rustfs_storage_usd_per_gb_month {
         Some(rate) if provider.id == "rustfs-local" => rate,
         Some(_) => {
             return Err("--rustfs-storage-usd-per-gb-month only applies to rustfs-local".into())
+        }
+        None if provider.id == "rustfs-local" => {
+            return Err("--rustfs-storage-usd-per-gb-month is required for rustfs-local".into())
         }
         None => provider.storage_usd_per_unit_month,
     };
@@ -151,6 +155,27 @@ fn validate_input(input: CostInput) -> Result<(), String> {
     ] {
         if value < 0.0 || !value.is_finite() {
             return Err(format!("{name} must be a finite non-negative number"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider(provider: &ProviderRate) -> Result<(), String> {
+    for (name, value) in [
+        (
+            "storage input multiplier",
+            provider.storage_input_gb_month_multiplier,
+        ),
+        ("storage rate", provider.storage_usd_per_unit_month),
+        ("PUT/LIST rate", provider.put_list_usd_per_1000),
+        ("GET rate", provider.get_usd_per_1000),
+        ("DELETE rate", provider.delete_usd_per_1000),
+        ("default egress rate", provider.default_egress_usd_per_gb),
+    ] {
+        if value < 0.0 || !value.is_finite() {
+            return Err(format!(
+                "provider {name} must be a finite non-negative number"
+            ));
         }
     }
     Ok(())
@@ -261,5 +286,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.total_monthly_usd, 1.0);
+    }
+
+    #[test]
+    fn rustfs_requires_an_explicit_local_storage_rate() {
+        let rates = parse_rates(RATES).unwrap();
+        let error = calculate(
+            &rates,
+            "rustfs-local",
+            CostInput {
+                retained_gb_month: 100.0,
+                ..CostInput::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("--rustfs-storage-usd-per-gb-month"));
+    }
+
+    #[test]
+    fn provider_rates_must_be_finite_and_non_negative() {
+        for field in 0..6 {
+            let mut rates = parse_rates(RATES).unwrap();
+            let provider = &mut rates.providers[0];
+            match field {
+                0 => provider.storage_input_gb_month_multiplier = -1.0,
+                1 => provider.storage_usd_per_unit_month = -1.0,
+                2 => provider.put_list_usd_per_1000 = -1.0,
+                3 => provider.get_usd_per_1000 = -1.0,
+                4 => provider.delete_usd_per_1000 = -1.0,
+                5 => provider.default_egress_usd_per_gb = f64::NAN,
+                _ => unreachable!(),
+            }
+            let provider_id = provider.id.clone();
+
+            assert!(calculate(&rates, &provider_id, CostInput::default()).is_err());
+        }
     }
 }

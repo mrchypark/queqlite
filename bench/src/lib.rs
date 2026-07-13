@@ -233,6 +233,8 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
         (number, 1.0)
     } else if let Some(number) = value.strip_suffix('m') {
         (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600.0)
     } else {
         (value, 1.0)
     };
@@ -243,7 +245,7 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(format!("invalid duration: {value}"));
     }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| format!("invalid duration: {value}"))
 }
 
 fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
@@ -549,6 +551,12 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("before --duration"));
+    }
+
+    #[test]
+    fn durations_accept_hours_and_reject_unrepresentable_finite_values() {
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7_200));
+        assert!(parse_duration("1e300s").is_err());
     }
 
     #[test]

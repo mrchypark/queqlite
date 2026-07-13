@@ -25,6 +25,7 @@ const BEFORE: u8 = 0;
 const DURING: u8 = 1;
 const AFTER: u8 = 2;
 const UNFAULTED: u8 = 3;
+const WORKER_PANIC_DIAGNOSTIC: &str = "benchmark worker panicked; recorded as worker_panic";
 
 fn main() {
     let config = match parse_config(env::args().skip(1), |key| env::var(key).ok()) {
@@ -136,7 +137,7 @@ fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), Str
         "request_id": format!("{run_id}-setup-seed"),
         "statements": [{
             "sql": format!(
-                "INSERT INTO {} (request_id, value) VALUES (?, ?) RETURNING request_id, value",
+                "INSERT INTO {} (request_id, value) VALUES (?, ?) ON CONFLICT(request_id) DO UPDATE SET value = excluded.value RETURNING request_id, value",
                 config.table
             ),
             "parameters": [
@@ -228,9 +229,12 @@ fn run_phase(
     for worker in workers {
         match worker.join() {
             Ok(worker_stats) => result.merge(worker_stats),
-            Err(_) => result
-                .stats
-                .record(Duration::ZERO, false, false, Some("worker_panic")),
+            Err(_) => {
+                eprintln!("{WORKER_PANIC_DIAGNOSTIC}");
+                result
+                    .stats
+                    .record(Duration::ZERO, false, false, Some("worker_panic"));
+            }
         }
     }
     result.wall_elapsed = phase_start.elapsed();
@@ -319,8 +323,21 @@ fn wait_for_rate(
         };
     };
     let sequence = ticket.fetch_add(1, Ordering::Relaxed);
-    let scheduled = start + Duration::from_secs_f64(sequence as f64 / rate);
-    let interval = Duration::from_secs_f64(1.0 / rate);
+    let duration = deadline.saturating_duration_since(start);
+    let scheduled_seconds = sequence as f64 / rate;
+    if scheduled_seconds >= duration.as_secs_f64() {
+        return RateDecision::Stop;
+    }
+    let Ok(scheduled_offset) = Duration::try_from_secs_f64(scheduled_seconds) else {
+        return RateDecision::Stop;
+    };
+    let Some(scheduled) = start.checked_add(scheduled_offset) else {
+        return RateDecision::Stop;
+    };
+    if scheduled >= deadline {
+        return RateDecision::Stop;
+    }
+    let interval = Duration::try_from_secs_f64(1.0 / rate).unwrap_or(duration);
     if let Some(wait) = scheduled.checked_duration_since(Instant::now()) {
         thread::sleep(wait);
     }
@@ -328,7 +345,7 @@ fn wait_for_rate(
         Instant::now().saturating_duration_since(start),
         scheduled.saturating_duration_since(start),
         interval,
-        deadline.saturating_duration_since(start),
+        duration,
     )
 }
 
@@ -868,13 +885,68 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{atomic::AtomicU8, Arc},
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{
+            atomic::{AtomicU64, AtomicU8},
+            Arc,
+        },
+        thread,
         time::{Duration, Instant},
     };
 
-    use queqlite_bench::FaultConfig;
+    use queqlite_bench::{Config, FaultConfig, RateDecision, Workload};
+    use reqwest::blocking::Client;
 
-    use super::{endpoint_candidates, spawn_fault_hook, write_request_id, BEFORE};
+    use super::{
+        endpoint_candidates, setup_table, spawn_fault_hook, wait_for_rate, write_request_id,
+        BEFORE, WORKER_PANIC_DIAGNOSTIC,
+    };
+
+    fn config(endpoint: String) -> Config {
+        Config {
+            endpoints: vec![endpoint],
+            token: "secret".into(),
+            duration: Duration::from_secs(1),
+            warmup: Duration::ZERO,
+            concurrency: 1,
+            target_rate: None,
+            workload: Workload::Read,
+            write_percent: 0,
+            table: "queqlite_bench".into(),
+            request_timeout: Duration::from_secs(1),
+            fault_timeout: Duration::from_secs(1),
+            skip_setup: false,
+            fault: None,
+        }
+    }
+
+    fn read_request_body(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
 
     #[test]
     fn write_request_ids_differ_between_warmup_and_measurement() {
@@ -901,6 +973,59 @@ mod tests {
                 "http://n3/v1/sql/execute",
             ]
         );
+    }
+
+    #[test]
+    fn setup_seed_is_idempotent_for_an_existing_table() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut seed_seen = false;
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let body = read_request_body(&mut stream);
+                let is_seed = body.contains("RETURNING request_id, value");
+                if is_seed && seed_seen && !body.contains("ON CONFLICT") {
+                    respond(&mut stream, "409 Conflict", "{}");
+                    continue;
+                }
+                seed_seen |= is_seed;
+                let response = if is_seed {
+                    r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"queqlite-bench-seed"}]]}}]}"#
+                } else {
+                    r#"{"applied_index":1,"results":[{}]}"#
+                };
+                respond(&mut stream, "200 OK", response);
+            }
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let config = config(endpoint);
+
+        setup_table(&client, &config, "first").unwrap();
+        setup_table(&client, &config, "second").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn open_loop_workers_stop_before_sleeping_past_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(10);
+        let ticket = AtomicU64::new(64);
+
+        assert_eq!(
+            wait_for_rate(Some(0.001), &ticket, start, deadline),
+            RateDecision::Stop
+        );
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn worker_panic_diagnostic_is_bounded_to_one_line() {
+        assert!(WORKER_PANIC_DIAGNOSTIC.len() <= 128);
+        assert!(!WORKER_PANIC_DIAGNOSTIC.contains(['\n', '\r']));
     }
 
     #[test]

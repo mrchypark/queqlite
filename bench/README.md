@@ -17,7 +17,7 @@ cargo run --release --manifest-path bench/Cargo.toml -- \
   --write-percent 50 > benchmark.json
 ```
 
-`QUEQLITE_BENCH_ENDPOINT` (a comma-separated endpoint list) or `QUEQLITE_ENDPOINT`, plus `QUEQLITE_CLIENT_TOKEN` or `QUEQLITE_BENCH_TOKEN`, can replace the endpoint and token flags. `--endpoint` may be repeated to distribute requests deterministically across nodes.
+`QUEQLITE_BENCH_ENDPOINT` (a comma-separated endpoint list) or `QUEQLITE_ENDPOINT`, plus `QUEQLITE_CLIENT_TOKEN` or `QUEQLITE_BENCH_TOKEN`, can replace the endpoint and token flags. `--endpoint` may be repeated to define deterministic preferred-first failover order; every request starts at the first endpoint and tries later endpoints only for retryable failures.
 
 Use either concurrency-driven load (omit `--target-rate`) or an aggregate open-loop start rate:
 
@@ -28,7 +28,7 @@ cargo run --release --manifest-path bench/Cargo.toml -- \
   --workload write
 ```
 
-Durations accept `ms`, `s`, and `m` suffixes; a bare value means seconds. The default duration is `30s`, warmup is `5s`, concurrency is `1`, request timeout is `10s`, and fault-command timeout is `5m` (`--fault-timeout`).
+Durations accept `ms`, `s`, `m`, and `h` suffixes; a bare value means seconds. The default duration is `30s`, warmup is `5s`, concurrency is `1`, request timeout is `10s`, and fault-command timeout is `5m` (`--fault-timeout`).
 
 ## Workloads
 
