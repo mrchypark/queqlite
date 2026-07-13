@@ -55,6 +55,14 @@ start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=disaster' scripts/replace-k8s-confi
 [ "$fork_line" -lt "$start_line" ]
 grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
+# Assert literal runtime variables in the helper call.
+# shellcheck disable=SC2016
+grep -Fq 'scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"' \
+  scripts/replace-k8s-config.sh
+if grep -Fq "wait --for=jsonpath='{.status.phase}'=Running" scripts/replace-k8s-config.sh; then
+  echo "configuration replacement must wait for Ready pods, not merely Running pods" >&2
+  exit 1
+fi
 if grep -Eq 'vcluster-docker_|for candidate in' scripts/e2e-vind-rustfs.sh; then
   echo "vind E2E must use the actual selected context" >&2
   exit 1
@@ -100,9 +108,31 @@ QUEQLITE_AUTH_SECRET=rendered-auth QUEQLITE_ADMIN_JOB_RENDER_ONLY="$tmp/admin-po
   scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 POST /v1/admin/membership/stop "$post_body"
 yq eval '.' "$tmp/admin-post-job.yaml" >/dev/null
 post_command="$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/admin-post-job.yaml")"
+# Match variables expanded inside the Job container.
+# shellcheck disable=SC2016
 case "$post_command" in
-  *"--data '$post_body'"*) ;;
-  *) echo "admin POST body changed during rendering" >&2; exit 1;;
+  *'--data "$QUEQLITE_ADMIN_BODY"'*'${QUEQLITE_ADMIN_PATH}'*) ;;
+  *) echo "admin Job must pass request data through quoted environment variables" >&2; exit 1;;
+esac
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_BODY") | .value' "$tmp/admin-post-job.yaml")" = "$post_body" ]
+tricky_path="/v1/admin/o'connor"
+printf -v tricky_body '%s\n' \
+  '{' \
+  '  "operation_id": "op'\''s-safe",' \
+  '  "note": "line one\nline two"' \
+  '}'
+tricky_body="${tricky_body%$'\n'}"
+QUEQLITE_AUTH_SECRET=rendered-auth QUEQLITE_ADMIN_JOB_RENDER_ONLY="$tmp/admin-tricky-job.yaml" \
+  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 POST "$tricky_path" "$tricky_body"
+yq eval '.' "$tmp/admin-tricky-job.yaml" >/dev/null
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_PATH") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_path" ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_BODY") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_body" ]
+tricky_command="$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/admin-tricky-job.yaml")"
+case "$tricky_command" in
+  *"$tricky_path"*|*"op's-safe"*)
+    echo "admin request data was interpolated into the shell command" >&2
+    exit 1
+    ;;
 esac
 server_secret="$(yq eval -r '
   select(.kind == "StatefulSet") |
@@ -138,5 +168,26 @@ printf '%s' "$init_message" > "$tmp/object-response.txt"
 init_stdout="$(QUEQLITE_OBJECT_JOB_RESPONSE_FILE="$tmp/object-response.txt" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" init-checkpoint)"
 [ "$init_stdout" = "$init_message" ]
+
+mkdir "$tmp/transient-bin"
+cp scripts/test-fixtures/kubectl-transient.sh "$tmp/transient-bin/kubectl"
+chmod +x "$tmp/transient-bin/kubectl"
+transient_admin='{"status":"retried"}'
+admin_retry_stdout="$(
+  PATH="$tmp/transient-bin:$PATH" \
+  QUEQLITE_KUBECTL_FIXTURE_STATE="$tmp/admin-kubectl-state" \
+  QUEQLITE_KUBECTL_FIXTURE_RESPONSE="$transient_admin" \
+  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 GET /v1/admin/membership/status
+)"
+[ "$admin_retry_stdout" = "$transient_admin" ]
+[ "$(cat "$tmp/admin-kubectl-state")" = 3 ]
+object_retry_stdout="$(
+  PATH="$tmp/transient-bin:$PATH" \
+  QUEQLITE_KUBECTL_FIXTURE_STATE="$tmp/object-kubectl-state" \
+  QUEQLITE_KUBECTL_FIXTURE_RESPONSE=checkpoint-retried \
+  scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect
+)"
+[ "$object_retry_stdout" = checkpoint-retried ]
+[ "$(cat "$tmp/object-kubectl-state")" = 3 ]
 
 echo "deployment static checks passed"

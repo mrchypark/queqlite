@@ -65,7 +65,7 @@ k+=(-n "$namespace")
 deadline=$((SECONDS + 310))
 while :; do
   complete="$("${k[@]}" get "job/$job" \
-    -o 'jsonpath={.status.conditions[?(@.type=="Complete")].status}')"
+    -o 'jsonpath={.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
   if [ "$complete" = True ]; then
     if ! "${k[@]}" logs "job/$job" > "$response"; then
       cat "$response" >&2
@@ -75,7 +75,7 @@ while :; do
     exit 0
   fi
   failed="$("${k[@]}" get "job/$job" \
-    -o 'jsonpath={.status.conditions[?(@.type=="Failed")].status}')"
+    -o 'jsonpath={.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
   if [ "$failed" = True ]; then
     "${k[@]}" logs "job/$job" >&2 || true
     exit 1

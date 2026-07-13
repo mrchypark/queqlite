@@ -192,10 +192,7 @@ QUEQLITE_STARTUP_MODE=disaster scripts/render-k8s-config.sh \
   "$new_id" "$new_replicas" "$successor_bundle" "$successor_yaml" successor
 "${k[@]}" apply --dry-run=client --validate=false -f "$successor_yaml" >/dev/null
 "${k[@]}" apply -f "$successor_yaml" >/dev/null
-for ((ordinal=0; ordinal<new_replicas; ordinal++)); do
-  "${k[@]}" wait --for=jsonpath='{.status.phase}'=Running \
-    "pod/${new_name}-${ordinal}" --timeout=420s >/dev/null
-done
+scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"
 
 successor_already_active=false
 for ((attempt=1; attempt<=60; attempt++)); do
