@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use queqlite_bench::{
     fault_window_durations, operation_is_write, parse_config, rate_decision, Config, FaultConfig,
     RateDecision, Stats, StatsOutput,
@@ -48,6 +51,9 @@ fn main() {
 }
 
 fn run(config: Config) -> Result<(), String> {
+    validate_instant_duration("warmup", config.warmup)?;
+    validate_instant_duration("measurement", config.duration)?;
+    validate_instant_duration("fault timeout", config.fault_timeout)?;
     let client = Client::builder()
         .timeout(config.request_timeout)
         .build()
@@ -64,7 +70,7 @@ fn run(config: Config) -> Result<(), String> {
         setup_table(&client, &config, &run_id)?;
     }
 
-    let warmup = run_phase(&client, &config, &run_id, "warmup", config.warmup, None);
+    let warmup = run_phase(&client, &config, &run_id, "warmup", config.warmup, None)?;
     let measurement = run_phase(
         &client,
         &config,
@@ -72,7 +78,7 @@ fn run(config: Config) -> Result<(), String> {
         "measurement",
         config.duration,
         config.fault.clone(),
-    );
+    )?;
     let fault_failure = measurement.fault.as_ref().and_then(FaultOutput::failure);
     let report = BenchmarkReport {
         schema_version: 1,
@@ -112,6 +118,13 @@ fn run(config: Config) -> Result<(), String> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn validate_instant_duration(name: &str, duration: Duration) -> Result<(), String> {
+    Instant::now()
+        .checked_add(duration)
+        .map(|_| ())
+        .ok_or_else(|| format!("{name} duration exceeds the platform clock range"))
 }
 
 fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), String> {
@@ -168,10 +181,14 @@ fn run_phase(
     phase: &str,
     duration: Duration,
     fault_config: Option<FaultConfig>,
-) -> PhaseResult {
+) -> Result<PhaseResult, String> {
     if duration.is_zero() {
-        return PhaseResult::default();
+        return Ok(PhaseResult::default());
     }
+    let phase_start = Instant::now();
+    let phase_deadline = phase_start
+        .checked_add(duration)
+        .ok_or_else(|| format!("{phase} duration exceeds the platform clock range"))?;
     let start = Arc::new(Mutex::new(None));
     let barrier = Arc::new(Barrier::new(config.concurrency + 1));
     let ticket = Arc::new(AtomicU64::new(0));
@@ -202,7 +219,7 @@ fn run_phase(
                     run_id: &run_id,
                     phase: &phase,
                     start,
-                    duration,
+                    deadline: phase_deadline,
                     ticket: &ticket,
                     fault_stage: &fault_stage,
                 },
@@ -210,14 +227,13 @@ fn run_phase(
         }));
     }
 
-    let phase_start = Instant::now();
     *start.lock().unwrap() = Some(phase_start);
     let fault_handle = fault_config.map(|fault| {
         let identity = (fault.tag.clone(), fault.offset);
         let handle = spawn_fault_hook(
             fault,
             phase_start,
-            phase_start + duration,
+            phase_deadline,
             config.fault_timeout,
             Arc::clone(&fault_stage),
         );
@@ -242,7 +258,7 @@ fn run_phase(
         Ok(output) => output,
         Err(_) => FaultOutput::thread_panicked(tag, offset),
     });
-    result
+    Ok(result)
 }
 
 struct WorkerContext<'a> {
@@ -251,13 +267,13 @@ struct WorkerContext<'a> {
     run_id: &'a str,
     phase: &'a str,
     start: Instant,
-    duration: Duration,
+    deadline: Instant,
     ticket: &'a AtomicU64,
     fault_stage: &'a AtomicU8,
 }
 
 fn run_worker(worker_id: usize, context: WorkerContext<'_>) -> WorkerStats {
-    let deadline = context.start + context.duration;
+    let deadline = context.deadline;
     let mut sequence = 0_u64;
     let mut last_id = BENCH_SEED_ID.to_owned();
     let mut result = WorkerStats::default();
@@ -503,7 +519,10 @@ fn spawn_fault_hook(
     stage: Arc<AtomicU8>,
 ) -> thread::JoinHandle<FaultOutput> {
     thread::spawn(move || {
-        if let Some(wait) = (start + fault.offset).checked_duration_since(Instant::now()) {
+        let Some(scheduled_start) = start.checked_add(fault.offset) else {
+            return FaultOutput::not_started(fault.tag, fault.offset);
+        };
+        if let Some(wait) = scheduled_start.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
         if Instant::now() >= measurement_deadline {
@@ -511,13 +530,29 @@ fn spawn_fault_hook(
         }
         stage.store(DURING, Ordering::Release);
         let command_start = Instant::now();
-        let command_deadline = command_start + fault_timeout;
-        let result = Command::new("sh")
+        let command_start_offset = command_start.saturating_duration_since(start);
+        let Some(command_deadline) = command_start.checked_add(fault_timeout) else {
+            stage.store(AFTER, Ordering::Release);
+            return FaultOutput::failed_to_start(
+                fault.tag,
+                fault.offset,
+                command_start_offset,
+                command_start.elapsed(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "fault timeout exceeds the platform clock range",
+                ),
+            );
+        };
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&fault.command)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let result = command.spawn();
         let mut child = match result {
             Ok(child) => child,
             Err(error) => {
@@ -525,6 +560,7 @@ fn spawn_fault_hook(
                 return FaultOutput::failed_to_start(
                     fault.tag,
                     fault.offset,
+                    command_start_offset,
                     command_start.elapsed(),
                     error,
                 );
@@ -533,21 +569,26 @@ fn spawn_fault_hook(
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    if !status.success() {
+                        let _ = terminate_fault_command(&mut child);
+                    }
                     stage.store(AFTER, Ordering::Release);
                     return FaultOutput::finished(
                         fault.tag,
                         fault.offset,
+                        command_start_offset,
                         command_start.elapsed(),
                         status,
                     );
                 }
                 Ok(None) if Instant::now() >= command_deadline => {
-                    let kill_error = child.kill().err();
+                    let kill_error = terminate_fault_command(&mut child);
                     let status = child.wait().ok().and_then(|status| status.code());
                     stage.store(AFTER, Ordering::Release);
                     return FaultOutput::unfinished(
                         fault.tag,
                         fault.offset,
+                        command_start_offset,
                         command_start.elapsed(),
                         status,
                         kill_error,
@@ -560,12 +601,13 @@ fn spawn_fault_hook(
                     thread::sleep(wait);
                 }
                 Err(error) => {
-                    let _ = child.kill();
+                    let _ = terminate_fault_command(&mut child);
                     let _ = child.wait();
                     stage.store(AFTER, Ordering::Release);
                     return FaultOutput::observation_failed(
                         fault.tag,
                         fault.offset,
+                        command_start_offset,
                         command_start.elapsed(),
                         error,
                     );
@@ -573,6 +615,33 @@ fn spawn_fault_hook(
             }
         }
     })
+}
+
+fn terminate_fault_command(child: &mut process::Child) -> Option<std::io::Error> {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let group_error = match Command::new("/bin/kill")
+            .args(["-s", "KILL", &group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => return None,
+            Ok(status) => std::io::Error::other(format!("kill process group exited with {status}")),
+            Err(error) => error,
+        };
+        match child.kill() {
+            Ok(()) => Some(group_error),
+            Err(shell_error) => Some(std::io::Error::other(format!(
+                "{group_error}; kill shell failed: {shell_error}"
+            ))),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.kill().err()
+    }
 }
 
 struct Outcome {
@@ -643,7 +712,11 @@ impl FaultWindows {
         let durations = fault.map_or((elapsed, Duration::ZERO, Duration::ZERO), |fault| {
             let durations = fault_window_durations(
                 elapsed,
-                Duration::from_secs_f64(fault.offset_seconds),
+                Duration::from_secs_f64(
+                    fault
+                        .command_start_offset_seconds
+                        .unwrap_or(fault.offset_seconds),
+                ),
                 fault.command_elapsed_seconds.map(Duration::from_secs_f64),
                 fault.command_completed,
             );
@@ -731,6 +804,7 @@ struct FaultWindowsOutput {
 struct FaultOutput {
     tag: String,
     offset_seconds: f64,
+    command_start_offset_seconds: Option<f64>,
     window: String,
     status: String,
     command_status: Option<i32>,
@@ -744,6 +818,7 @@ impl FaultOutput {
     fn finished(
         tag: String,
         offset: Duration,
+        command_start_offset: Duration,
         elapsed: Duration,
         status: process::ExitStatus,
     ) -> Self {
@@ -751,6 +826,7 @@ impl FaultOutput {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: Some(command_start_offset.as_secs_f64()),
             window: "during".into(),
             status: if succeeded { "succeeded" } else { "failed" }.into(),
             command_status: status.code(),
@@ -765,6 +841,7 @@ impl FaultOutput {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: None,
             window: "before".into(),
             status: "unfinished".into(),
             command_status: None,
@@ -777,12 +854,14 @@ impl FaultOutput {
     fn failed_to_start(
         tag: String,
         offset: Duration,
+        command_start_offset: Duration,
         elapsed: Duration,
         error: std::io::Error,
     ) -> Self {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: Some(command_start_offset.as_secs_f64()),
             window: "during".into(),
             status: "failed".into(),
             command_status: None,
@@ -795,6 +874,7 @@ impl FaultOutput {
     fn unfinished(
         tag: String,
         offset: Duration,
+        command_start_offset: Duration,
         elapsed: Duration,
         command_status: Option<i32>,
         kill_error: Option<std::io::Error>,
@@ -806,6 +886,7 @@ impl FaultOutput {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: Some(command_start_offset.as_secs_f64()),
             window: "during".into(),
             status: "unfinished".into(),
             command_status,
@@ -818,12 +899,14 @@ impl FaultOutput {
     fn observation_failed(
         tag: String,
         offset: Duration,
+        command_start_offset: Duration,
         elapsed: Duration,
         error: std::io::Error,
     ) -> Self {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: Some(command_start_offset.as_secs_f64()),
             window: "during".into(),
             status: "failed".into(),
             command_status: None,
@@ -837,6 +920,7 @@ impl FaultOutput {
         Self {
             tag,
             offset_seconds: offset.as_secs_f64(),
+            command_start_offset_seconds: None,
             window: "during".into(),
             status: "failed".into(),
             command_status: None,
@@ -885,8 +969,10 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
+        process,
         sync::{
             atomic::{AtomicU64, AtomicU8},
             Arc,
@@ -899,8 +985,8 @@ mod tests {
     use reqwest::blocking::Client;
 
     use super::{
-        endpoint_candidates, setup_table, spawn_fault_hook, wait_for_rate, write_request_id,
-        BEFORE, WORKER_PANIC_DIAGNOSTIC,
+        endpoint_candidates, run, setup_table, spawn_fault_hook, wait_for_rate, write_request_id,
+        FaultWindows, BEFORE, WORKER_PANIC_DIAGNOSTIC,
     };
 
     fn config(endpoint: String) -> Config {
@@ -1029,6 +1115,15 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_rejects_phase_duration_outside_instant_range() {
+        let mut config = config("http://unused".into());
+        config.skip_setup = true;
+        config.duration = Duration::try_from_secs_f64(1.8e19).unwrap();
+
+        assert!(run(config).unwrap_err().contains("duration"));
+    }
+
+    #[test]
     fn fault_hook_nonzero_exit_is_joined_and_reported_as_failed() {
         let start = Instant::now();
         let output = spawn_fault_hook(
@@ -1079,5 +1174,58 @@ mod tests {
         let json = serde_json::to_value(output).unwrap();
         assert_eq!(json["command_completed"], false);
         assert_eq!(json["status"], "unfinished");
+    }
+
+    #[test]
+    fn timed_out_fault_kills_descendants_before_returning() {
+        let marker =
+            std::env::temp_dir().join(format!("queqlite-bench-fault-descendant-{}", process::id()));
+        let _ = fs::remove_file(&marker);
+        let start = Instant::now();
+        let output = spawn_fault_hook(
+            FaultConfig {
+                offset: Duration::ZERO,
+                tag: "descendant".into(),
+                command: format!(
+                    "(sleep 0.2; printf survived > '{}') & wait",
+                    marker.display()
+                ),
+            },
+            start,
+            start + Duration::from_secs(1),
+            Duration::from_millis(40),
+            Arc::new(AtomicU8::new(BEFORE)),
+        )
+        .join()
+        .unwrap();
+
+        assert_eq!(output.status, "unfinished");
+        thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn fault_windows_use_actual_delayed_command_start() {
+        let start = Instant::now()
+            .checked_sub(Duration::from_millis(100))
+            .unwrap();
+        let output = spawn_fault_hook(
+            FaultConfig {
+                offset: Duration::from_millis(20),
+                tag: "delayed".into(),
+                command: "true".into(),
+            },
+            start,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+            Arc::new(AtomicU8::new(BEFORE)),
+        )
+        .join()
+        .unwrap();
+        let windows = FaultWindows::default().output(Duration::from_millis(200), Some(&output));
+
+        assert_eq!(output.offset_seconds, 0.02);
+        assert!(output.command_start_offset_seconds.unwrap() >= 0.09);
+        assert!(windows.before_elapsed_seconds >= 0.09);
     }
 }

@@ -49,7 +49,7 @@ cargo run --release --manifest-path bench/Cargo.toml -- \
   --fault 20s leader-restart "kubectl rollout restart statefulset/queqlite"
 ```
 
-The JSON report records the supplied fault tag, completion flag, exit status, and `succeeded`, `failed`, or `unfinished` status. Requests are also aggregated into `before`, `during`, and `after` windows: `during` starts when the command is invoked and ends when it returns. Traffic stops at the measurement deadline; the command may finish afterward, bounded by `--fault-timeout`. An unfinished command is killed and reaped before the harness returns.
+The JSON report records the supplied fault tag, configured `offset_seconds`, actual `command_start_offset_seconds`, completion flag, exit status, and `succeeded`, `failed`, or `unfinished` status. Requests are also aggregated into `before`, `during`, and `after` windows: `during` starts when the command is invoked and ends when it returns. Traffic stops at the measurement deadline; the command may finish afterward, bounded by `--fault-timeout`. An unfinished command and its descendants are killed and reaped before the harness returns.
 
 ## JSON Output
 

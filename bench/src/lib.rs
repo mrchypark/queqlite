@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
@@ -48,6 +51,15 @@ impl Config {
         }
         if self.fault_timeout.is_zero() {
             return Err("--fault-timeout must be greater than zero".into());
+        }
+        for (flag, duration) in [
+            ("--duration", self.duration),
+            ("--warmup", self.warmup),
+            ("--fault-timeout", self.fault_timeout),
+        ] {
+            if Instant::now().checked_add(duration).is_none() {
+                return Err(format!("{flag} exceeds the platform clock range"));
+            }
         }
         if self.concurrency == 0 {
             return Err("--concurrency must be greater than zero".into());
@@ -557,6 +569,25 @@ mod tests {
     fn durations_accept_hours_and_reject_unrepresentable_finite_values() {
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7_200));
         assert!(parse_duration("1e300s").is_err());
+    }
+
+    #[test]
+    fn config_rejects_duration_outside_platform_clock_range() {
+        let result = parse_config(
+            [
+                "--endpoint",
+                "http://node",
+                "--token",
+                "secret",
+                "--duration",
+                "1.8e19s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("platform clock range"));
     }
 
     #[test]
