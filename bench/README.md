@@ -117,7 +117,9 @@ manifest records the same environment configuration.
 `artifacts.json.provenance` binds the run to the Git commit and dirty state plus
 the Docker image content ID and available repository digests. A dirty source
 tree or missing immutable image ID leaves an ordinary local run usable but sets
-`publishable: false` with a reason. Only clean, immutable artifacts marked
+`publishable: false` with a reason. Publication also requires a successful
+benchmark and runner exit, no failed evidence collection, and verified cleanup;
+`--keep` runs are therefore not publishable. Only artifacts marked
 `publishable: true` support release or published performance evidence. A
 skip-build run additionally requires the image's
 `org.opencontainers.image.revision` label to match the exact Git commit.

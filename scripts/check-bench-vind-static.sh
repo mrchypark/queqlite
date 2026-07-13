@@ -16,6 +16,25 @@ grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/bench-vind.sh
 # shellcheck disable=SC1091 # Repository-local source; callers run from repo root.
 source scripts/bench-vind.sh
 
+render_verified_provenance_json() {
+  render_provenance_json "$@" 0 0 ok ok
+}
+
+declare -F endpoint_ready >/dev/null
+(
+  stall_port_file="$tmp/stall-port"
+  python3 -c 'import socket,sys,time; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); open(sys.argv[1],"w").write(str(s.getsockname()[1])); c,_=s.accept(); time.sleep(10)' \
+    "$stall_port_file" & stall_server_pid=$!
+  trap 'kill "$stall_server_pid" 2>/dev/null || true; wait "$stall_server_pid" 2>/dev/null || true' EXIT
+  for _ in $(seq 1 500); do [ -s "$stall_port_file" ] && break; sleep 0.01; done
+  [ -s "$stall_port_file" ]
+  if endpoint_ready "http://127.0.0.1:$(cat "$stall_port_file")"; then
+    echo "stalled readiness probe was accepted" >&2
+    exit 1
+  fi
+  kill -0 "$stall_server_pid"
+)
+
 : > "$tmp/empty-resources.jsonl"
 if validate_resource_sample_schema "$tmp/empty-resources.jsonl"; then
   echo "empty resource evidence was accepted" >&2
@@ -152,7 +171,7 @@ printf '%s\n' "$observed_runtime" | jq -e --argjson expected "$runtime_images" '
   .queqlite == $expected.queqlite and .rustfs == $expected.rustfs and
   .object_meter == $expected.object_meter and .aws_cli_inventory == []
 ' >/dev/null
-built_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
+built_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
   "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
 printf '%s\n' "$built_provenance" | jq -e --arg id "$image_digest" --arg digest "$repo_digest" '
   .publishable == true and .source.dirty == false and .image.build_mode == "built" and
@@ -162,15 +181,28 @@ printf '%s\n' "$built_provenance" | jq -e --arg id "$image_digest" --arg digest 
   (.execution.toolchain.cargo_version | startswith("cargo ")) and
   all(.execution.runtime_images[]; .status == "verified" and (.image_digests | length) == 1)
 ' >/dev/null
+failed_run_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+  "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true \
+  9 9 failed failed)"
+printf '%s\n' "$failed_run_provenance" | jq -e '
+  .publishable == false and
+  (["benchmark_failed","run_failed","evidence_failed","cleanup_failed"] - .reasons == [])
+' >/dev/null
+kept_run_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+  "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true \
+  0 0 ok skipped)"
+printf '%s\n' "$kept_run_provenance" | jq -e '
+  .publishable == false and (.reasons | index("cleanup_not_verified") != null)
+' >/dev/null
 heterogeneous_runtime="$(printf '%s\n' "$runtime_images" | jq -c \
   --arg image "containerd://sha256:$(printf '5%.0s' {1..64})" '.queqlite[2] = $image')"
-heterogeneous_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+heterogeneous_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev \
   "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$heterogeneous_runtime" true)"
 printf '%s\n' "$heterogeneous_provenance" | jq -e '
   .publishable == false and (.reasons | index("heterogeneous_queqlite_runtime_images") != null)
 ' >/dev/null
 short_runtime="$(printf '%s\n' "$runtime_images" | jq -c '.queqlite = .queqlite[:2]')"
-short_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+short_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev \
   "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$short_runtime" true)"
 printf '%s\n' "$short_provenance" | jq -e '
   .publishable == false and (.reasons | index("unexpected_queqlite_runtime_image_count") != null)
@@ -178,12 +210,12 @@ printf '%s\n' "$short_provenance" | jq -e '
 mismatched_image="containerd://sha256:$(printf '6%.0s' {1..64})"
 mismatched_runtime="$(printf '%s\n' "$runtime_images" | jq -c --arg image "$mismatched_image" \
   '.queqlite = [$image,$image,$image]')"
-mismatched_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+mismatched_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev \
   "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$mismatched_runtime" true)"
 printf '%s\n' "$mismatched_provenance" | jq -e '
   .publishable == false and (.reasons | index("queqlite_runtime_image_mismatch") != null)
 ' >/dev/null
-matching_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev \
+matching_provenance="$(render_verified_provenance_json "$source_commit" false skip-build queqlite:dev \
   "$matching_inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
 printf '%s\n' "$matching_provenance" | jq -e --arg commit "$source_commit" '
   .publishable == true and .image.source_revision == $commit and .reasons == []
@@ -193,7 +225,7 @@ for revision in missing mismatch; do
   else candidate="$(jq -cn --arg id "$image_id" --arg revision deadbeef \
     '[{Id:$id,RepoDigests:[],Config:{Labels:{"org.opencontainers.image.revision":$revision}}}]')"
   fi
-  unverified="$(render_provenance_json "$source_commit" false skip-build queqlite:dev "$candidate" \
+  unverified="$(render_verified_provenance_json "$source_commit" false skip-build queqlite:dev "$candidate" \
     "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
   printf '%s\n' "$unverified" | jq -e \
     '.publishable == false and .reasons == ["unverified_image_source"]' >/dev/null
@@ -205,7 +237,7 @@ for identity in benchmark_client rustc cargo; do
     rustc) identity_rustc="" ;;
     cargo) identity_cargo="" ;;
   esac
-  missing_identity="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
+  missing_identity="$(render_verified_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
     "$identity_sha" "$identity_rustc" "$identity_cargo" "$runtime_images" true)"
   reason="missing_or_invalid_${identity}_$( [ "$identity" = benchmark_client ] && printf sha256 || printf version )"
   printf '%s\n' "$missing_identity" | jq -e --arg reason "$reason" \
@@ -216,7 +248,7 @@ for component in queqlite rustfs object_meter aws_cli_inventory; do
     if [ "$invalid" = missing ]; then value='[]'; else value='["latest"]'; fi
     invalid_runtime="$(printf '%s\n' "$runtime_images" | jq -c --arg component "$component" \
       --argjson value "$value" '.[$component] = $value')"
-    invalid_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+    invalid_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev \
       "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$invalid_runtime" true)"
     reason="missing_or_invalid_${component}_runtime_image"
     printf '%s\n' "$invalid_provenance" | jq -e --arg reason "$reason" \
@@ -225,17 +257,17 @@ for component in queqlite rustfs object_meter aws_cli_inventory; do
 done
 disabled_runtime="$(printf '%s\n' "$runtime_images" | jq -c \
   '.object_meter = ["latest"] | .aws_cli_inventory = []')"
-disabled_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
+disabled_provenance="$(render_verified_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
   "$client_sha256" "$rustc_vv" "$cargo_version" "$disabled_runtime" false)"
 printf '%s\n' "$disabled_provenance" | jq -e '
   .publishable == true and .execution.runtime_images.object_meter.status == "not_applicable" and
   .execution.runtime_images.aws_cli_inventory.status == "not_applicable"
 ' >/dev/null
-dirty_provenance="$(render_provenance_json "$source_commit" true built queqlite:dev "$inspect" \
+dirty_provenance="$(render_verified_provenance_json "$source_commit" true built queqlite:dev "$inspect" \
   "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
 printf '%s\n' "$dirty_provenance" | jq -e \
   '.publishable == false and (.reasons | index("dirty_source") != null)' >/dev/null
-missing_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev \
+missing_provenance="$(render_verified_provenance_json "$source_commit" false skip-build queqlite:dev \
   '[{"Id":"","RepoDigests":[]}]' "$client_sha256" "$rustc_vv" "$cargo_version" \
   "$runtime_images" true)"
 printf '%s\n' "$missing_provenance" | jq -e \
@@ -286,6 +318,51 @@ fi
 grep -Fq 'http://127.0.0.1:18081' <<< "$failure"
 grep -Fq 'fixture non-target failure' <<< "$failure"
 
+fake_bin="$tmp/fake-bin"
+mkdir "$fake_bin"
+# shellcheck disable=SC2016 # Written into the fake kubectl script verbatim.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >> "$KUBECTL_LOG"' \
+  'case " $* " in' \
+  '  *" get pod "*)' \
+  '    if [ -n "${KUBECTL_REPLACEMENT_UID:-}" ] && [ -e "$KUBECTL_OLD_UID_SEEN" ]; then printf "%s" "$KUBECTL_REPLACEMENT_UID"; else : > "$KUBECTL_OLD_UID_SEEN"; printf old-pod-uid; fi ;;' \
+  '  *" delete pod "*) [ "${KUBECTL_DELETE_FAIL:-1}" = 0 ] || exit 17 ;;' \
+  '  *" wait "*) exit 0 ;;' \
+  'esac' > "$fake_bin/kubectl"
+chmod +x "$fake_bin/kubectl"
+export KUBECTL_LOG="$tmp/kubectl.log"
+export KUBECTL_OLD_UID_SEEN="$tmp/old-uid-seen"
+failed_delete_command="$(build_pod_delete_fault_command fixture fixture queqlite-c1-1 '' '' '')"
+if PATH="$fake_bin:$PATH" sh -c "$failed_delete_command"; then
+  echo "failed pod deletion was accepted" >&2
+  exit 1
+fi
+grep -Fq 'delete pod queqlite-c1-1' "$KUBECTL_LOG"
+if grep -Fq ' wait ' "$KUBECTL_LOG"; then
+  echo "replacement wait ran after failed pod deletion" >&2
+  exit 1
+fi
+printf '%s\n' '#!/bin/sh' 'printf "1\n"' > "$fake_bin/seq"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/sleep"
+chmod +x "$fake_bin/seq" "$fake_bin/sleep"
+: > "$KUBECTL_LOG"
+if KUBECTL_DELETE_FAIL=0 PATH="$fake_bin:$PATH" sh -c "$failed_delete_command"; then
+  echo "same-identity replacement pod was accepted" >&2
+  exit 1
+fi
+if grep -Fq ' wait ' "$KUBECTL_LOG"; then
+  echo "replacement wait ran for the deleted pod identity" >&2
+  exit 1
+fi
+: > "$KUBECTL_LOG"
+rm -f "$KUBECTL_OLD_UID_SEEN"
+if ! KUBECTL_DELETE_FAIL=0 KUBECTL_REPLACEMENT_UID=new-pod-uid \
+  PATH="$fake_bin:$PATH" sh -c "$failed_delete_command"; then
+  echo "different ready replacement pod was rejected" >&2
+  exit 1
+fi
+grep -Fq 'wait --for=condition=Ready pod/queqlite-c1-1' "$KUBECTL_LOG"
+
 rebind_fixture="$tmp/rebind"
 mkdir "$rebind_fixture"
 (
@@ -318,22 +395,8 @@ mkdir "$rebind_fixture"
   kill -0 "$supervisor_pid"
 )
 
-supervisor_line="$(grep -n 'supervise_rebinding_port_forward' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
-request_line="$(grep -n 'port-forward-.*\.rebind-request' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-delete_line="$(grep -n 'delete pod .*fault_pod' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-rebound_line="$(grep -n 'port-forward-.*\.rebound' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-ready_line="$(grep -n 'wait --for=condition=Ready pod/' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-replacement_ready_line="$(grep -n 'touch .*port-forward-.*\.replacement-ready' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-local_ready_line="$(grep -n 'curl -fsS .*readyz' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
-# shellcheck disable=SC2016 # Literal source check.
-rebound_ack_line="$(grep -n ': > "\$rebound"' scripts/bench-vind.sh | head -n 1 | cut -d: -f1)"
 benchmark_line="$(grep -n 'QUEQLITE_CLIENT_TOKEN=.*bench_binary' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
 final_forward_check_line="$(grep -n 'assert_all_port_forwards_ready' scripts/bench-vind.sh | tail -n 1 | cut -d: -f1)"
-[ -n "$supervisor_line" ]
-[ -n "$request_line" ] && [ "$request_line" -lt "$delete_line" ]
-[ -n "$replacement_ready_line" ] && [ "$ready_line" -lt "$replacement_ready_line" ]
-[ -n "$rebound_line" ] && [ "$replacement_ready_line" -le "$rebound_line" ]
-[ -n "$local_ready_line" ] && [ "$local_ready_line" -lt "$rebound_ack_line" ]
 [ -n "$final_forward_check_line" ] && [ "$benchmark_line" -lt "$final_forward_check_line" ]
 
 jq -n '{version:1,config_id:1,members:[range(3) as $n | {

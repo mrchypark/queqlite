@@ -92,6 +92,11 @@ usage() {
 
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || die "missing required command: $1"; }
+shell_quote() { printf '%q' "$1"; }
+
+endpoint_ready() {
+  curl --connect-timeout 1 --max-time 3 -fsS "$1/readyz" >/dev/null 2>&1
+}
 
 assert_port_forward_alive() {
   local index="$1" pid="${port_forward_pids[$1]}" status=0
@@ -111,7 +116,7 @@ assert_all_port_forwards_ready() {
   local endpoint_url
   assert_all_port_forwards_alive
   for endpoint_url in "${endpoint_urls[@]}"; do
-    curl -fsS "$endpoint_url/readyz" >/dev/null ||
+    endpoint_ready "$endpoint_url" ||
       die "port-forward did not remain ready: $endpoint_url"
   done
 }
@@ -144,8 +149,7 @@ supervise_rebinding_port_forward() {
       k port-forward "pod/$pod" "${port}:8080" >> "$log" 2>&1 &
       child=$!
       for _ in $(seq 1 60); do
-        if kill -0 "$child" 2>/dev/null &&
-          curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then
+        if kill -0 "$child" 2>/dev/null && endpoint_ready "http://127.0.0.1:${port}"; then
           rm -f "$request"
           rm -f "$replacement_ready"
           : > "$rebound"
@@ -162,6 +166,26 @@ supervise_rebinding_port_forward() {
       fi
     done
   done
+}
+
+build_pod_delete_fault_command() {
+  local context="$1" namespace="$2" pod="$3"
+  local request="${4:-}" replacement_ready="${5:-}" rebound="${6:-}"
+  local kubectl_command pod_arg pod_resource command
+  kubectl_command="kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace")"
+  pod_arg="$(shell_quote "$pod")"
+  pod_resource="$(shell_quote "pod/$pod")"
+  command="old_pod_uid=\$($kubectl_command get pod $pod_arg -o jsonpath='{.metadata.uid}') && [ -n \"\$old_pod_uid\" ]"
+  if [ -n "$request" ]; then
+    command+=" && rm -f $(shell_quote "$rebound") $(shell_quote "$replacement_ready") && touch $(shell_quote "$request")"
+  fi
+  command+=" && $kubectl_command delete pod $pod_arg --wait=true >/dev/null"
+  command+=" && { replacement_pod_uid=; for attempt in \$(seq 1 240); do replacement_pod_uid=\$($kubectl_command get pod $pod_arg -o jsonpath='{.metadata.uid}' 2>/dev/null || true); [ -n \"\$replacement_pod_uid\" ] && [ \"\$replacement_pod_uid\" != \"\$old_pod_uid\" ] && break; sleep 1; done; [ -n \"\$replacement_pod_uid\" ] && [ \"\$replacement_pod_uid\" != \"\$old_pod_uid\" ]; }"
+  command+=" && $kubectl_command wait --for=condition=Ready $pod_resource --timeout=240s >/dev/null"
+  if [ -n "$request" ]; then
+    command+=" && touch $(shell_quote "$replacement_ready") && { for attempt in \$(seq 1 30); do [ -e $(shell_quote "$rebound") ] && break; sleep 1; done; [ -e $(shell_quote "$rebound") ]; }"
+  fi
+  printf '%s\n' "$command"
 }
 
 validate_resource_sample_schema() {
@@ -323,7 +347,9 @@ render_provenance_json() {
   jq -n --arg commit "$1" --argjson dirty "$2" --arg build_mode "$3" \
     --arg image_reference "$4" --argjson inspect "$5" --arg benchmark_sha256 "$6" \
     --arg rustc_vv "$7" --arg cargo_version "$8" --argjson runtime_image_ids "$9" \
-    --argjson object_enabled "${10}" '
+    --argjson object_enabled "${10}" --argjson benchmark_exit "${11}" \
+    --argjson run_exit "${12}" --arg evidence_status "${13}" \
+    --arg cleanup_status "${14}" '
     def immutable_digest:
       if type == "string" then
         if test("sha256:[0-9a-f]{64}$")
@@ -346,7 +372,12 @@ render_provenance_json() {
     runtime_component($runtime_image_ids.rustfs; true) as $rustfs_runtime |
     runtime_component($runtime_image_ids.object_meter; $object_enabled) as $meter_runtime |
     runtime_component($runtime_image_ids.aws_cli_inventory; $object_enabled) as $inventory_runtime |
-    ([if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
+    ([if $benchmark_exit != 0 then "benchmark_failed" else empty end,
+      if $run_exit != 0 then "run_failed" else empty end,
+      if $evidence_status == "failed" then "evidence_failed" else empty end,
+      if $cleanup_status == "failed" then "cleanup_failed"
+        elif $cleanup_status != "ok" then "cleanup_not_verified" else empty end,
+      if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
       if $dirty then "dirty_source" else empty end,
       if $content_id == null
         then "missing_immutable_image_identity" else empty end,
@@ -467,7 +498,6 @@ rendered_cluster="$target/queqlite-c1.yaml"
 stop_sampler="$target/.stop-sampler"
 
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
-shell_quote() { printf '%q' "$1"; }
 
 sample_resources() {
   printf 'resource sampler started: context=%s namespace=%s\n' "$context" "$namespace"
@@ -648,7 +678,10 @@ emit_artifacts() {
     "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds")"
   provenance="$(render_provenance_json "$source_git_commit" "$source_dirty" \
     "$image_build_mode" "$image" "$image_inspect_json" "$benchmark_binary_sha256" \
-    "$rustc_vv" "$cargo_version" "$runtime_image_ids_json" "$object_enabled")"
+    "$rustc_vv" "$cargo_version" "$runtime_image_ids_json" "$object_enabled" \
+    "$benchmark_status" "$cleanup_status" \
+    "$(evidence_overall_status "$resource_evidence_status" "$object_evidence_status")" \
+    "$cleanup_verification_status")"
   jq -n \
     --arg run_id "$run_id" \
     --arg cluster "$cluster" \
@@ -922,11 +955,11 @@ done
 for index in "${!endpoint_urls[@]}"; do
   endpoint_url="${endpoint_urls[$index]}"
   for _ in $(seq 1 60); do
-    curl -fsS "$endpoint_url/readyz" >/dev/null 2>&1 && break
+    endpoint_ready "$endpoint_url" && break
     assert_port_forward_alive "$index"
     sleep 1
   done
-  if ! curl -fsS "$endpoint_url/readyz" >/dev/null; then
+  if ! endpoint_ready "$endpoint_url"; then
     assert_port_forward_alive "$index"
     die "port-forward did not become ready: $endpoint_url"
   fi
@@ -983,14 +1016,16 @@ for endpoint_url in "${endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint
 [ -z "$target_rate" ] || bench_args+=(--target-rate "$target_rate")
 case "$fault" in
   pod-delete)
-    fault_rebind_before=""
+    fault_rebind_request=""
+    fault_replacement_ready=""
+    fault_rebound=""
     if [ -n "$fault_endpoint_index" ]; then
-      fault_rebind_before="rm -f $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") $(shell_quote "$target/port-forward-$fault_endpoint_index.replacement-ready"); touch $(shell_quote "$target/port-forward-$fault_endpoint_index.rebind-request"); "
+      fault_rebind_request="$target/port-forward-$fault_endpoint_index.rebind-request"
+      fault_replacement_ready="$target/port-forward-$fault_endpoint_index.replacement-ready"
+      fault_rebound="$target/port-forward-$fault_endpoint_index.rebound"
     fi
-    fault_command="${fault_rebind_before}kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") delete pod $(shell_quote "$fault_pod") --wait=true >/dev/null; for attempt in \$(seq 1 240); do kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") get pod $(shell_quote "$fault_pod") >/dev/null 2>&1 && break; sleep 1; done; kubectl --context $(shell_quote "$context") -n $(shell_quote "$namespace") wait --for=condition=Ready pod/$(shell_quote "$fault_pod") --timeout=240s >/dev/null"
-    if [ -n "$fault_endpoint_index" ]; then
-      fault_command+="; touch $(shell_quote "$target/port-forward-$fault_endpoint_index.replacement-ready"); for attempt in \$(seq 1 30); do [ -e $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") ] && break; sleep 1; done; [ -e $(shell_quote "$target/port-forward-$fault_endpoint_index.rebound") ]"
-    fi
+    fault_command="$(build_pod_delete_fault_command "$context" "$namespace" "$fault_pod" \
+      "$fault_rebind_request" "$fault_replacement_ready" "$fault_rebound")"
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
