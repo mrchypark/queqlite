@@ -4,10 +4,30 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
 
 case " $* " in
-  *" get statefulset queqlite-c3 "*) exit 0 ;;
-  *" get secret queqlite-c4-bundle -o json "*) exit 1 ;;
+  *" get statefulset queqlite-c"*) exit 0 ;;
+  *" get secret queqlite-c"*)
+    case "$*" in *"-bundle -o json") ;; *) exit 99 ;; esac
+    arguments=("$@")
+    requested=""
+    for ((index=0; index + 2 < ${#arguments[@]}; index++)); do
+      if [ "${arguments[index]}" = get ] && [ "${arguments[index + 1]}" = secret ]; then
+        requested="${arguments[index + 2]}"
+        break
+      fi
+    done
+    source_id="$(jq -r '.config_id' "$QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE")"
+    if [ "$requested" = "queqlite-c${source_id}-bundle" ]; then
+      jq -n --arg bundle "$(openssl base64 -A -in "$QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE")" \
+        '{data:{"config.json":$bundle}}'
+    else
+      exit 1
+    fi
+    ;;
   *" get secret queqlite-auth -o json "*) cat "$QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE" ;;
   *" get secret missing-object-credentials "*) exit 1 ;;
+  *" exec -i queqlite-c"*" -- queqlite validate-config-bundle --stdin "*)
+    "$QUEQLITE_KUBECTL_FIXTURE_QUEQLITE" validate-config-bundle --stdin
+    ;;
   *" create -f "*)
     manifest="${*: -1}"
     if [ "$(yq eval -r '.spec.template.spec.containers[0].name' "$manifest")" = curl ]; then
@@ -19,19 +39,33 @@ case " $* " in
       printf 'admin %s %s\n' "$method" "$path" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
     else
       args="$(yq eval -r '.spec.template.spec.containers[0].args | join(" ")' "$manifest")"
-      [ "$args" = "checkpoint inspect" ]
       printf '%s\n' "$args" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
-      case "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" in
-        provider)
-          [ "$(yq eval '[.spec.template.spec.containers[0].env[] |
-            select(.name == "QUEQLITE_S3_ENDPOINT" or
-              .name == "QUEQLITE_S3_ACCESS_KEY" or
-              .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$manifest")" = 0 ]
+      case "$args" in
+        validate-config-bundle)
+          if QUEQLITE_CONFIG_BUNDLE_FILE="$QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE" \
+            "$QUEQLITE_KUBECTL_FIXTURE_QUEQLITE" validate-config-bundle \
+            > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE" 2>/dev/null; then
+            printf success > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
+          else
+            printf failed > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
+          fi
           ;;
-        endpoint)
-          [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-            select(.name == "QUEQLITE_S3_ENDPOINT") | .value' "$manifest")" = \
-            http://127.0.0.1:1 ]
+        "checkpoint inspect")
+          case "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" in
+            endpoint)
+              [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
+                select(.name == "QUEQLITE_S3_ENDPOINT") | .value' "$manifest")" = \
+                http://127.0.0.1:1 ]
+              ;;
+            *)
+              [ "$(yq eval '[.spec.template.spec.containers[0].env[] |
+                select(.name == "QUEQLITE_S3_ENDPOINT" or
+                  .name == "QUEQLITE_S3_ACCESS_KEY" or
+                  .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$manifest")" = 0 ]
+              ;;
+          esac
+          printf failed > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
+          : > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE"
           ;;
         *) exit 99 ;;
       esac
@@ -40,8 +74,18 @@ case " $* " in
   *" get job/ql-admin-"*"Complete"*) printf 'True' ;;
   *" get job/ql-admin-"*"Failed"*) exit 0 ;;
   *" logs job/ql-admin-"*) cat "$QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE" ;;
-  *" get job/ql-object-"*"Complete"*) exit 0 ;;
-  *" get job/ql-object-"*"Failed"*) printf 'True' ;;
-  *" logs job/ql-object-"*) echo "fixture object-store preflight failed" >&2 ;;
+  *" get job/ql-object-"*"Complete"*)
+    [ "$(cat "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE")" = success ] && printf 'True'
+    ;;
+  *" get job/ql-object-"*"Failed"*)
+    [ "$(cat "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE")" = failed ] && printf 'True'
+    ;;
+  *" logs job/ql-object-"*)
+    if [ -s "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE" ]; then
+      cat "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE"
+    else
+      echo "fixture object-store preflight failed" >&2
+    fi
+    ;;
   *) exit 99 ;;
 esac

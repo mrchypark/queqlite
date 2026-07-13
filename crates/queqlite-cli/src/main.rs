@@ -1,5 +1,6 @@
 use std::{
     env, fmt, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -116,6 +117,16 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
             Err(error) => fail("checkpoint compact", error),
         },
+        Command::ValidateConfigBundle(config_id) => match config_id
+            .map(Ok)
+            .unwrap_or_else(validate_config_bundle_stdin)
+        {
+            Ok(config_id) => {
+                println!("{{\"config_id\":{config_id}}}");
+                0
+            }
+            Err(error) => fail("validate-config-bundle", error),
+        },
         Command::GcPlan(config) => match run_gc_plan(config).await {
             Ok(json) => {
                 println!("{json}");
@@ -221,6 +232,7 @@ enum Command {
     CheckpointInspect(CheckpointCommandConfig),
     CheckpointForkSuccessor(CheckpointForkSuccessorConfig),
     CheckpointCompact(Box<AdminCommandConfig>),
+    ValidateConfigBundle(Option<u64>),
     GcPlan(GcPlanConfig),
     GcInspect(GcInspectConfig),
     GcApply(GcInspectConfig),
@@ -677,6 +689,18 @@ where
         }
         "roll-checkpoint" => parse_roll_checkpoint(args).map(Command::RollCheckpoint),
         "checkpoint" => parse_checkpoint_command(args),
+        "validate-config-bundle" => {
+            let args = args.collect::<Vec<_>>();
+            if args == ["--stdin"] {
+                Ok(Command::ValidateConfigBundle(None))
+            } else {
+                reject_extra_args(args.into_iter())?;
+                parse_validate_config_bundle(
+                    |name| env::var(name).ok(),
+                    |path| fs::read_to_string(path),
+                )
+            }
+        }
         "gc" => parse_gc_command(args),
         "membership" => parse_membership_command(args),
         "write" => parse_write(args).map(Command::Write),
@@ -685,6 +709,22 @@ where
         "health" => parse_health(args).map(Command::Health),
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_validate_config_bundle(
+    lookup: impl FnMut(&str) -> Option<String>,
+    read_file: impl FnOnce(&str) -> std::io::Result<String>,
+) -> Result<Command, String> {
+    load_configuration_bundle(lookup, read_file)
+        .map(|bundle| Command::ValidateConfigBundle(Some(bundle.config_id)))
+}
+
+fn validate_config_bundle_stdin() -> Result<u64, String> {
+    let mut json = String::new();
+    io::stdin()
+        .read_to_string(&mut json)
+        .map_err(|error| format!("cannot read configuration bundle from stdin: {error}"))?;
+    parse_configuration_bundle(&json).map(|bundle| bundle.config_id)
 }
 
 fn parse_write(args: impl IntoIterator<Item = String>) -> Result<WriteArgs, String> {
@@ -3358,7 +3398,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate [--offline]\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite validate-config-bundle [--stdin]\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate [--offline]\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve, validate-config-bundle, and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -3869,31 +3909,36 @@ mod tests {
         assert!(bundle.require_predecessor().is_err());
     }
 
-    #[test]
-    fn configuration_bundle_accepts_exact_predecessor_stop_material() {
-        let predecessor = Membership::new(["n1", "n2", "n3"]).unwrap();
+    fn exact_predecessor_bundle() -> serde_json::Value {
+        predecessor_bundle_bound_to(["node-1", "node-2", "node-3"])
+    }
+
+    fn predecessor_bundle_bound_to<const N: usize>(
+        successor_members: [&str; N],
+    ) -> serde_json::Value {
+        let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
         let command = ConfigChange::bound_stop(
-            "cluster-a",
-            4,
+            "queqlite-vind",
+            3,
             predecessor.digest(),
-            5,
-            vec!["n1".into(), "n2".into(), "n4".into()],
+            4,
+            successor_members.into_iter().map(String::from).collect(),
         )
         .unwrap()
         .to_stored_command();
         let entry = LogEntry {
-            cluster_id: "cluster-a".into(),
+            cluster_id: "queqlite-vind".into(),
             epoch: 1,
-            config_id: 4,
+            config_id: 3,
             index: 10,
             entry_type: command.entry_type,
             payload: command.payload.clone(),
             prev_hash: LogHash::ZERO,
             hash: LogEntry::calculate_hash(
-                "cluster-a",
+                "queqlite-vind",
                 10,
                 1,
-                4,
+                3,
                 command.entry_type,
                 LogHash::ZERO,
                 &command.payload,
@@ -3903,17 +3948,17 @@ mod tests {
             queqlite_quepaxa::ProposalPriority::MAX,
             "n1",
             1,
-            AcceptedValue::from_command("cluster-a", 10, 1, 4, LogHash::ZERO, &command),
+            AcceptedValue::from_command("queqlite-vind", 10, 1, 3, LogHash::ZERO, &command),
         );
         let proof = DecisionProof::Phase2 {
-            cluster_id: "cluster-a".into(),
+            cluster_id: "queqlite-vind".into(),
             slot: 10,
             epoch: 1,
-            config_id: 4,
+            config_id: 3,
             config_digest: predecessor.digest(),
             step: 6,
             proposal: proposal.clone(),
-            summaries: ["n1", "n2"]
+            summaries: ["node-1", "node-2"]
                 .into_iter()
                 .map(|id| queqlite_quepaxa::RecorderSummary {
                     recorder_id: id.into(),
@@ -3924,29 +3969,121 @@ mod tests {
                 })
                 .collect(),
         };
-        let json = serde_json::json!({
+        serde_json::json!({
             "version": 1,
-            "config_id": 5,
+            "config_id": 4,
             "members": [
-                {"node_id": "n1", "url": "http://n1", "token": "t1"},
-                {"node_id": "n2", "url": "http://n2", "token": "t2"},
-                {"node_id": "n4", "url": "http://n4", "token": "t4"},
+                {"node_id": "node-1", "url": "http://queqlite-c4-0.queqlite-c4:8081", "log_url": "http://queqlite-c4-0.queqlite-c4:8080", "token": "peer-1-secret"},
+                {"node_id": "node-2", "url": "http://queqlite-c4-1.queqlite-c4:8081", "log_url": "http://queqlite-c4-1.queqlite-c4:8080", "token": "peer-2-secret"},
+                {"node_id": "node-3", "url": "http://queqlite-c4-2.queqlite-c4:8081", "log_url": "http://queqlite-c4-2.queqlite-c4:8080", "token": "peer-3-secret"},
             ],
             "predecessor": {
                 "version": 2,
-                "members": ["n1", "n2", "n3"],
+                "members": ["node-1", "node-2", "node-3"],
                 "stop_entry": entry,
                 "stop_proof": proof,
             },
-        });
+        })
+    }
+
+    #[test]
+    fn validate_config_bundle_uses_the_production_parser() {
+        let json = exact_predecessor_bundle().to_string();
+        let values = HashMap::from([("QUEQLITE_CONFIG_BUNDLE", json.as_str())]);
+
+        let command = parse_validate_config_bundle(
+            |name| values.get(name).map(ToString::to_string),
+            |_| unreachable!("inline bundle must not read a file"),
+        )
+        .unwrap();
+
+        assert!(matches!(command, Command::ValidateConfigBundle(Some(4))));
+        assert!(matches!(
+            parse_command(["validate-config-bundle", "--stdin"]).unwrap(),
+            Command::ValidateConfigBundle(None)
+        ));
+    }
+
+    #[test]
+    fn configuration_bundle_accepts_exact_predecessor_stop_material() {
+        let json = exact_predecessor_bundle();
 
         let bundle = parse_configuration_bundle(&json.to_string()).unwrap();
 
-        assert_eq!(bundle.config_id, 5);
-        assert_eq!(bundle.configuration_state.config_id(), 4);
-        assert_eq!(bundle.configuration_state.digest(), predecessor.digest());
+        assert_eq!(bundle.config_id, 4);
+        assert_eq!(bundle.configuration_state.config_id(), 3);
+        assert_eq!(
+            bundle.configuration_state.digest(),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest()
+        );
         assert_eq!(bundle.configuration_state.stop().unwrap().index(), 10);
         assert!(bundle.require_predecessor().is_ok());
+    }
+
+    #[test]
+    fn predecessor_fixture_is_generated_by_and_accepted_by_production_types() {
+        let fixture = include_str!("../../../scripts/test-fixtures/config-4-predecessor.json");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(fixture).unwrap(),
+            exact_predecessor_bundle()
+        );
+        assert!(parse_configuration_bundle(fixture).is_ok());
+        let wrong_successor =
+            include_str!("../../../scripts/test-fixtures/config-4-wrong-successor.json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(wrong_successor).unwrap(),
+            predecessor_bundle_bound_to(["node-1", "node-2", "node-4"])
+        );
+        assert!(parse_configuration_bundle(wrong_successor).is_err());
+    }
+
+    #[test]
+    fn configuration_bundle_rejects_semantically_invalid_predecessor_material() {
+        let valid = exact_predecessor_bundle();
+        let mut mutations = Vec::new();
+
+        let mut digest = valid.clone();
+        digest["predecessor"]["stop_proof"]["Phase2"]["config_digest"][0] = serde_json::json!(1);
+        mutations.push(digest);
+
+        let mut entry_hash = valid.clone();
+        entry_hash["predecessor"]["stop_entry"]["hash"][0] = serde_json::json!(1);
+        mutations.push(entry_hash);
+
+        let mut command_binding = valid.clone();
+        command_binding["predecessor"]["stop_proof"]["Phase2"]["proposal"]["value"]
+            ["command_hash"][0] = serde_json::json!(1);
+        mutations.push(command_binding);
+
+        mutations.push(predecessor_bundle_bound_to(["node-1", "node-2", "node-4"]));
+
+        let mut phase2_maximum = valid;
+        let low_priority = serde_json::json!([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1
+        ]);
+        let high_priority = serde_json::json!([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 2
+        ]);
+        phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["proposal"]["priority"] =
+            low_priority.clone();
+        for summary in phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["summaries"]
+            .as_array_mut()
+            .unwrap()
+        {
+            summary["aggregate_prior"]["priority"] = low_priority.clone();
+        }
+        phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["summaries"][0]["aggregate_prior"]
+            ["priority"] = high_priority;
+        mutations.push(phase2_maximum);
+
+        for mutation in mutations {
+            assert!(parse_configuration_bundle(&mutation.to_string()).is_err());
+        }
     }
 
     fn base_serve_env() -> HashMap<&'static str, &'static str> {

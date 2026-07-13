@@ -187,11 +187,74 @@ preflight_bin="$tmp/preflight-bin"
 mkdir "$preflight_bin"
 cp scripts/test-fixtures/kubectl-preflight-failure.sh "$preflight_bin/kubectl"
 chmod +x "$preflight_bin/kubectl"
+if [ -n "${QUEQLITE_TEST_QUEQLITE_BIN:-}" ]; then
+  queqlite_fixture_bin="$QUEQLITE_TEST_QUEQLITE_BIN"
+else
+  cargo build --locked -p queqlite-cli
+  queqlite_fixture_bin=target/debug/queqlite
+fi
+[ -x "$queqlite_fixture_bin" ]
+export QUEQLITE_KUBECTL_FIXTURE_QUEQLITE="$queqlite_fixture_bin"
+export QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE="$tmp/config-3.json"
+export QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE="$tmp/object-job.state"
+export QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE="$tmp/object-job.response"
 valid_auth_secret="$tmp/valid-auth-secret.json"
 jq -n \
   --arg client "$(printf '%s' successor-client | openssl base64 -A)" \
   --arg admin "$(printf '%s' successor-admin | openssl base64 -A)" \
   '{data:{"client-token":$client,"admin-token":$admin}}' > "$valid_auth_secret"
+
+jq 'del(.predecessor) | .config_id = 5 |
+  .members |= to_entries | .members |= map(
+    .value.url = "http://queqlite-c5-\(.key).queqlite-c5:8081" |
+    .value.log_url = "http://queqlite-c5-\(.key).queqlite-c5:8080" | .value
+  )' scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-5.json"
+jq '.predecessor.stop_proof.Phase2.config_digest[0] = 1' \
+  scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-4-bad-digest.json"
+jq '.predecessor.stop_entry.hash[0] = 1' \
+  scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-4-bad-entry-hash.json"
+jq '.predecessor.stop_proof.Phase2.proposal.value.command_hash[0] = 1' \
+  scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-4-bad-command-binding.json"
+jq '([range(31) | 0] + [1]) as $low |
+  ([range(31) | 0] + [2]) as $high |
+  .predecessor.stop_proof.Phase2.proposal.priority = $low |
+  (.predecessor.stop_proof.Phase2.summaries[].aggregate_prior.priority) = $low |
+  .predecessor.stop_proof.Phase2.summaries[0].aggregate_prior.priority = $high' \
+  scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-4-bad-phase2-maximum.json"
+
+assert_semantic_bundle_rejected() {
+  local bundle="$1" label="$2"
+  local transition_dir="$tmp/${label}-semantic-transition"
+  local command_log="$tmp/${label}-semantic.kubectl-log" rc
+  set +e
+  QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE="$bundle" \
+    PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE=semantic \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
+    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh "$bundle" "$tmp/config-5.json" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 65 ]
+  [ ! -e "$transition_dir/stop-c4.state.json" ]
+  grep -Fq 'validate-config-bundle --stdin' "$command_log"
+  if grep -Eq 'admin |checkpoint inspect|scale statefulset|apply |create secret|membership/stop' \
+    "$command_log"; then
+    echo "semantic bundle rejection allowed a transition action: $label" >&2
+    exit 1
+  fi
+}
+
+assert_semantic_bundle_rejected "$tmp/config-4-bad-digest.json" bad-digest
+assert_semantic_bundle_rejected "$tmp/config-4-bad-entry-hash.json" bad-entry-hash
+assert_semantic_bundle_rejected "$tmp/config-4-bad-command-binding.json" bad-command-binding
+assert_semantic_bundle_rejected \
+  scripts/test-fixtures/config-4-wrong-successor.json wrong-successor-binding
+assert_semantic_bundle_rejected "$tmp/config-4-bad-phase2-maximum.json" bad-phase2-maximum
+
 set +e
 PATH="$preflight_bin:$PATH" \
   QUEQLITE_KUBECTL_FIXTURE_PROFILE=wrong-members \
@@ -411,39 +474,9 @@ jq -e '
   .version == 1 and .config_id == 4 and .predecessor.version == 2 and
   .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
 ' "$partial_successor_bundle" >/dev/null
-valid_predecessor_bundle="$tmp/valid-predecessor-bundle.json"
-jq '
-  def bytes($value): [range(32) | $value];
-  {priority:bytes(255), proposer_id:"node-1", proposal_id:1,
-   value:{command_hash:bytes(2), prev_hash:bytes(0), entry_hash:bytes(1)}} as $proposal |
-  .predecessor = {
-    version:2,
-    members:["node-1","node-2","node-3"],
-    stop_entry:{
-      cluster_id:"queqlite-vind", epoch:1, config_id:3, index:9,
-      entry_type:"ConfigChange", payload:[1], prev_hash:bytes(0), hash:bytes(1)
-    },
-    stop_proof:{FastPath:{
-      cluster_id:"queqlite-vind", slot:9, epoch:1, config_id:3,
-      config_digest:bytes(3), proposal:$proposal,
-      summaries:["node-1","node-2"] | map({
-        recorder_id:., slot:9, step:4,
-        first_current:$proposal, aggregate_prior:null
-      })
-    }}
-  }
-' "$successor_draft" > "$valid_predecessor_bundle"
+valid_predecessor_bundle=scripts/test-fixtures/config-4-predecessor.json
 scripts/render-k8s-config.sh 4 3 \
   "$valid_predecessor_bundle" "$tmp/valid-predecessor.yaml" successor
-valid_phase2_bundle="$tmp/valid-phase2-predecessor-bundle.json"
-jq '
-  .predecessor.stop_proof.FastPath as $proof |
-  .predecessor.stop_proof = {Phase2:($proof + {step:6} |
-    .summaries |= map(.step = 6 | .first_current = null |
-      .aggregate_prior = $proof.proposal))}
-' "$valid_predecessor_bundle" > "$valid_phase2_bundle"
-scripts/render-k8s-config.sh 4 3 \
-  "$valid_phase2_bundle" "$tmp/valid-phase2-predecessor.yaml" successor
 
 assert_predecessor_rejected() {
   local filter="$1" label="$2"
@@ -456,9 +489,9 @@ assert_predecessor_rejected() {
   fi
 }
 assert_predecessor_rejected '.predecessor.version = 1' version
-assert_predecessor_rejected '.predecessor.members = ["node-1","node-1","node-3"]' members
-assert_predecessor_rejected 'del(.predecessor.stop_entry.hash)' stop-entry
-assert_predecessor_rejected '.predecessor.stop_proof = {}' stop-proof
+assert_predecessor_rejected '.predecessor.members = "not-an-array"' members
+assert_predecessor_rejected '.predecessor.stop_entry = null' stop-entry
+assert_predecessor_rejected '.predecessor.stop_proof = null' stop-proof
 assert_predecessor_rejected '.predecessor.unknown = true' unknown-field
 for bundle_attempt in "$partial_successor_bundle".attempt.*; do
   [ ! -e "$bundle_attempt" ]

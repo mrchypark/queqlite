@@ -23,79 +23,6 @@ require sed
 require yq
 
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
-  def uint: type == "number" and floor == . and . >= 0;
-  def byte: uint and . <= 255;
-  def hash: type == "array" and length == 32 and all(byte);
-  def accepted_value:
-    type == "object" and
-    (keys | sort) == ["command_hash", "entry_hash", "prev_hash"] and
-    (.command_hash | hash) and (.entry_hash | hash) and (.prev_hash | hash);
-  def proposal:
-    type == "object" and
-    (keys | sort) == ["priority", "proposal_id", "proposer_id", "value"] and
-    (.priority | hash) and
-    (.proposal_id | uint) and
-    (.proposer_id | type == "string" and length > 0) and
-    (.value | accepted_value);
-  def summary:
-    type == "object" and
-    (keys | sort) == ["aggregate_prior", "first_current", "recorder_id", "slot", "step"] and
-    (.recorder_id | type == "string" and length > 0) and
-    (.slot | uint) and (.step | uint) and
-    (.first_current == null or (.first_current | proposal)) and
-    (.aggregate_prior == null or (.aggregate_prior | proposal));
-  def stop_entry($successor_id):
-    type == "object" and
-    (keys | sort) == ["cluster_id", "config_id", "entry_type", "epoch", "hash", "index", "payload", "prev_hash"] and
-    (.cluster_id | type == "string" and length > 0) and
-    (.epoch | uint) and (.config_id | uint) and .config_id + 1 == $successor_id and
-    (.index | uint) and .entry_type == "ConfigChange" and
-    (.payload | type == "array" and length > 0 and all(byte)) and
-    (.prev_hash | hash) and (.hash | hash);
-  def proof_body($entry; $members; $phase2):
-    . as $body | $body.proposal as $proposal |
-    ($body | type == "object") and
-    ($body | keys | sort) ==
-      (if $phase2 then
-        ["cluster_id", "config_digest", "config_id", "epoch", "proposal", "slot", "step", "summaries"]
-       else
-        ["cluster_id", "config_digest", "config_id", "epoch", "proposal", "slot", "summaries"]
-       end) and
-    $body.cluster_id == $entry.cluster_id and
-    $body.slot == $entry.index and $body.epoch == $entry.epoch and
-    $body.config_id == $entry.config_id and
-    ($body.config_digest | hash) and ($proposal | proposal) and
-    ($proposal.value.prev_hash == $entry.prev_hash) and
-    ($proposal.value.entry_hash == $entry.hash) and
-    ($body.summaries | type == "array" and
-      length == (($members | length) / 2 | floor) + 1 and all(summary)) and
-    ([$body.summaries[].recorder_id] as $recorders |
-      $recorders == ($recorders | sort | unique) and
-      ($recorders - $members | length == 0)) and
-    (if $phase2 then
-      ($body.step as $step |
-        ($step | uint) and $step % 4 == 2 and
-        all($body.summaries[]; .slot == $entry.index and .step == $step) and
-        any($body.summaries[]; .aggregate_prior == $proposal))
-     else
-      ($proposal.priority | all(. == 255)) and
-      all($body.summaries[];
-        .slot == $entry.index and .step == 4 and .first_current == $proposal)
-     end);
-  def stop_proof($entry; $members):
-    type == "object" and
-    (((keys | sort) == ["FastPath"] and (.FastPath | proof_body($entry; $members; false))) or
-     ((keys | sort) == ["Phase2"] and (.Phase2 | proof_body($entry; $members; true))));
-  def predecessor($successor_id):
-    type == "object" and
-    (keys | sort) == ["members", "stop_entry", "stop_proof", "version"] and
-    .version == 2 and
-    (.members | type == "array" and length >= 3 and length <= 7 and
-      all(type == "string" and length > 0) and
-      length == (unique | length)) and
-    (.stop_entry | stop_entry($successor_id)) and
-    (.stop_entry as $entry | .members as $members |
-      .stop_proof | stop_proof($entry; $members));
   ((keys | sort) == ["config_id", "members", "version"] or
    (keys | sort) == ["config_id", "members", "predecessor", "version"]) and
   .version == 1 and .config_id == $id and
@@ -103,7 +30,13 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
   all(.members[];
     (keys | sort) == ["log_url", "node_id", "token", "url"]) and
   ((has("predecessor") | not) or .predecessor == null or
-    (.predecessor | predecessor($id))) and
+    (.predecessor |
+      type == "object" and
+      (keys | sort) == ["members", "stop_entry", "stop_proof", "version"] and
+      .version == 2 and
+      (.members | type == "array") and
+      (.stop_entry | type == "object") and
+      (.stop_proof | type == "object"))) and
   ([.members[].node_id] | sort) ==
     [range(1; $replicas + 1) | "node-\(.)"] and
   ([.members[].token] | all(type == "string" and test("^[!-~]+$"))) and

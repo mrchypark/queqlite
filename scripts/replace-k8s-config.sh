@@ -63,11 +63,27 @@ forked_json="$work_dir/fork-c${old_id}-to-c${new_id}.json"
 target_inspect_json="$work_dir/checkpoint-c${new_id}.json"
 status_json="$work_dir/status.json"
 object_preflight_json="$work_dir/checkpoint-c${old_id}.preflight.json"
+bundle_preflight_json="$work_dir/config-c${old_id}.preflight.json"
 
 k=(kubectl)
 [ -z "$context" ] || k+=(--context "$context")
 k+=(-n "$namespace")
 "${k[@]}" get statefulset "$old_name" >/dev/null
+
+validate_runtime_bundle() {
+  local bundle="$1" expected_id="$2" label="$3"
+  if ! "${k[@]}" exec -i "${old_name}-0" -- queqlite validate-config-bundle --stdin \
+    < "$bundle" > "$bundle_preflight_json"; then
+    echo "runtime rejected the $label configuration bundle" >&2
+    exit 65
+  fi
+  jq -e --argjson id "$expected_id" '.config_id == $id' \
+    "$bundle_preflight_json" >/dev/null || {
+    echo "runtime rejected the $label configuration bundle" >&2
+    exit 65
+  }
+}
+
 durable_resume=false
 if durable_secret_json="$("${k[@]}" get secret "${new_name}-bundle" -o json 2>/dev/null)"; then
   durable_secret_file="$work_dir/${new_name}-bundle.secret.json"
@@ -126,6 +142,17 @@ admin() {
 }
 
 if ! "$durable_resume"; then
+  if ! mounted_bundle_json="$("${k[@]}" get secret "${old_name}-bundle" -o json 2>/dev/null |
+    jq -er '.data["config.json"] | @base64d')"; then
+    echo "runtime configuration bundle Secret is unavailable or invalid: ${old_name}-bundle" >&2
+    exit 65
+  fi
+  jq -e --argjson mounted "$mounted_bundle_json" '. == $mounted' "$old_bundle" >/dev/null || {
+    echo "runtime configuration bundle differs from the old bundle input" >&2
+    exit 65
+  }
+  validate_runtime_bundle "$old_bundle" "$old_id" old
+  validate_runtime_bundle "$successor_draft" "$new_id" successor-draft
   expected_old_members="$(jq -ec '[.members[].node_id] | sort' "$old_bundle")"
   for ((ordinal=0; ordinal<old_replicas; ordinal++)); do
     if ! admin "$old_name" "${old_name}-${ordinal}" GET "$status_path" \
@@ -257,6 +284,7 @@ done
 scripts/k8s-stop-state.sh write-bundle \
   "$stop_json" "$old_bundle" "$successor_draft" "$successor_bundle"
 chmod 600 "$stop_json"
+validate_runtime_bundle "$successor_bundle" "$new_id" successor
 
 echo "publishing final checkpoint V2"
 admin "$old_name" "${old_name}-0" GET "$status_path" > "$status_json"
@@ -296,6 +324,16 @@ else
     | yq eval '.immutable = true' - \
     | "${k[@]}" create -f - >/dev/null
 fi
+
+if ! scripts/k8s-object-job.sh "$new_id" "$successor_bundle" validate-config-bundle \
+  > "$bundle_preflight_json"; then
+  echo "runtime rejected the successor configuration bundle" >&2
+  exit 65
+fi
+jq -e --argjson id "$new_id" '.config_id == $id' "$bundle_preflight_json" >/dev/null || {
+  echo "runtime rejected the successor configuration bundle" >&2
+  exit 65
+}
 
 echo "forking stopped checkpoint into configuration $new_id"
 QUEQLITE_RECOVERY_GENERATION="$generation" \
