@@ -55,6 +55,7 @@ impl Config {
         for (flag, duration) in [
             ("--duration", self.duration),
             ("--warmup", self.warmup),
+            ("--request-timeout", self.request_timeout),
             ("--fault-timeout", self.fault_timeout),
         ] {
             if Instant::now().checked_add(duration).is_none() {
@@ -303,9 +304,9 @@ pub fn rate_decision(
     interval: Duration,
     duration: Duration,
 ) -> RateDecision {
-    if scheduled >= duration {
+    if scheduled >= duration || elapsed >= duration {
         RateDecision::Stop
-    } else if elapsed >= duration || elapsed > scheduled.saturating_add(interval) {
+    } else if elapsed > scheduled.saturating_add(interval) {
         RateDecision::Dropped
     } else {
         RateDecision::Ready
@@ -591,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_request_timeout_outside_platform_clock_range() {
+        let result = parse_config(
+            [
+                "--endpoint",
+                "http://node",
+                "--token",
+                "secret",
+                "--request-timeout",
+                "1.8e19s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("--request-timeout"));
+    }
+
+    #[test]
     fn histogram_percentiles_and_transaction_rate_are_aggregated() {
         let mut stats = Stats::default();
         stats.record(Duration::from_micros(90), true, true, None);
@@ -658,6 +678,15 @@ mod tests {
                 Duration::from_secs(10),
             ),
             RateDecision::Ready
+        );
+        assert_eq!(
+            rate_decision(
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            ),
+            RateDecision::Stop
         );
     }
 }

@@ -53,6 +53,7 @@ fn main() {
 fn run(config: Config) -> Result<(), String> {
     validate_instant_duration("warmup", config.warmup)?;
     validate_instant_duration("measurement", config.duration)?;
+    validate_instant_duration("request timeout", config.request_timeout)?;
     validate_instant_duration("fault timeout", config.fault_timeout)?;
     let client = Client::builder()
         .timeout(config.request_timeout)
@@ -79,7 +80,7 @@ fn run(config: Config) -> Result<(), String> {
         config.duration,
         config.fault.clone(),
     )?;
-    let fault_failure = measurement.fault.as_ref().and_then(FaultOutput::failure);
+    let run_failure = benchmark_failure(&warmup, &measurement);
     let report = BenchmarkReport {
         schema_version: 1,
         run_id,
@@ -114,9 +115,17 @@ fn run(config: Config) -> Result<(), String> {
         serde_json::to_string_pretty(&report)
             .map_err(|error| format!("encode JSON report: {error}"))?
     );
-    match fault_failure {
+    match run_failure {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+fn benchmark_failure(warmup: &PhaseResult, measurement: &PhaseResult) -> Option<String> {
+    if warmup.worker_panicked || measurement.worker_panicked {
+        Some("one or more benchmark workers panicked".into())
+    } else {
+        measurement.fault.as_ref().and_then(FaultOutput::failure)
     }
 }
 
@@ -247,6 +256,7 @@ fn run_phase(
             Ok(worker_stats) => result.merge(worker_stats),
             Err(_) => {
                 eprintln!("{WORKER_PANIC_DIAGNOSTIC}");
+                result.worker_panicked = true;
                 result
                     .stats
                     .record(Duration::ZERO, false, false, Some("worker_panic"));
@@ -331,12 +341,11 @@ fn wait_for_rate(
     start: Instant,
     deadline: Instant,
 ) -> RateDecision {
+    if Instant::now() >= deadline {
+        return RateDecision::Stop;
+    }
     let Some(rate) = target_rate else {
-        return if Instant::now() >= deadline {
-            RateDecision::Stop
-        } else {
-            RateDecision::Ready
-        };
+        return RateDecision::Ready;
     };
     let sequence = match ticket.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)
@@ -574,9 +583,7 @@ fn spawn_fault_hook(
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    if !status.success() {
-                        let _ = terminate_fault_command(&mut child);
-                    }
+                    let _ = terminate_fault_command(&mut child);
                     stage.store(AFTER, Ordering::Release);
                     return FaultOutput::finished(
                         fault.tag,
@@ -746,6 +753,7 @@ struct PhaseResult {
     fault: Option<FaultOutput>,
     offered_iterations: u64,
     dropped_schedule_iterations: u64,
+    worker_panicked: bool,
 }
 
 impl PhaseResult {
@@ -990,8 +998,8 @@ mod tests {
     use reqwest::blocking::Client;
 
     use super::{
-        endpoint_candidates, run, setup_table, spawn_fault_hook, wait_for_rate, write_request_id,
-        FaultWindows, BEFORE, WORKER_PANIC_DIAGNOSTIC,
+        benchmark_failure, endpoint_candidates, run, setup_table, spawn_fault_hook, wait_for_rate,
+        write_request_id, FaultWindows, PhaseResult, BEFORE, WORKER_PANIC_DIAGNOSTIC,
     };
 
     fn config(endpoint: String) -> Config {
@@ -1131,6 +1139,17 @@ mod tests {
     }
 
     #[test]
+    fn very_high_open_loop_rate_stops_promptly_at_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(1);
+        let ticket = AtomicU64::new(0);
+
+        while wait_for_rate(Some(1.0e12), &ticket, start, deadline) != RateDecision::Stop {}
+
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
     fn worker_panic_diagnostic_is_bounded_to_one_line() {
         assert!(WORKER_PANIC_DIAGNOSTIC.len() <= 128);
         assert!(!WORKER_PANIC_DIAGNOSTIC.contains(['\n', '\r']));
@@ -1143,6 +1162,18 @@ mod tests {
         config.duration = Duration::try_from_secs_f64(1.8e19).unwrap();
 
         assert!(run(config).unwrap_err().contains("duration"));
+    }
+
+    #[test]
+    fn worker_panic_marks_the_reported_run_as_failed() {
+        let warmup = PhaseResult {
+            worker_panicked: true,
+            ..PhaseResult::default()
+        };
+
+        assert!(benchmark_failure(&warmup, &PhaseResult::default())
+            .unwrap()
+            .contains("worker"));
     }
 
     #[test]
@@ -1222,6 +1253,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.status, "unfinished");
+        thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn successful_fault_cleans_up_background_descendants() {
+        let marker = std::env::temp_dir().join(format!(
+            "queqlite-bench-fault-success-descendant-{}",
+            process::id()
+        ));
+        let _ = fs::remove_file(&marker);
+        let start = Instant::now();
+        let output = spawn_fault_hook(
+            FaultConfig {
+                offset: Duration::ZERO,
+                tag: "background".into(),
+                command: format!("(sleep 0.2; printf survived > '{}') &", marker.display()),
+            },
+            start,
+            start + Duration::from_secs(1),
+            Duration::from_secs(1),
+            Arc::new(AtomicU8::new(BEFORE)),
+        )
+        .join()
+        .unwrap();
+
+        assert_eq!(output.status, "succeeded");
         thread::sleep(Duration::from_millis(300));
         assert!(!marker.exists());
     }
