@@ -276,6 +276,11 @@ struct AdminClientConfig {
     token: String,
 }
 
+const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl fmt::Debug for AdminClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -519,13 +524,13 @@ impl ServeConfig {
         let data_dir = PathBuf::from(required_env(&mut lookup, "QUEQLITE_DATA_DIR")?);
         let epoch = positive_env(&mut lookup, "QUEQLITE_EPOCH")?;
         let client_token = required_env(&mut lookup, "QUEQLITE_CLIENT_TOKEN")?;
-        let admin_token = match lookup("QUEQLITE_ADMIN_TOKEN") {
-            Some(token) if token.trim().is_empty() => {
-                return Err("QUEQLITE_ADMIN_TOKEN must not be empty".into())
-            }
-            Some(token) => Some(token),
-            None => None,
-        };
+        let admin_token = lookup("QUEQLITE_ADMIN_TOKEN")
+            .map(|token| {
+                AdminConfig::new(token.clone())
+                    .map(|_| token)
+                    .map_err(|error| format!("invalid QUEQLITE_ADMIN_TOKEN: {error}"))
+            })
+            .transpose()?;
         let bundle = load_configuration_bundle(&mut lookup, |path| fs::read_to_string(path))?;
         let client_listen =
             lookup("QUEQLITE_CLIENT_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
@@ -931,9 +936,41 @@ fn client_token(
     flag: Option<String>,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String, String> {
-    flag.or_else(|| lookup("QUEQLITE_CLIENT_TOKEN"))
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| "missing client token: pass --token or set QUEQLITE_CLIENT_TOKEN".into())
+    let token = flag
+        .or_else(|| lookup("QUEQLITE_CLIENT_TOKEN"))
+        .ok_or_else(|| {
+            "missing client token: pass --token or set QUEQLITE_CLIENT_TOKEN".to_string()
+        })?;
+    validate_auth_token(&token, "client token")?;
+    Ok(token)
+}
+
+fn validate_auth_token(token: &str, name: &str) -> Result<(), String> {
+    if token.trim().is_empty()
+        || token.chars().any(char::is_whitespace)
+        || !header::HeaderValue::try_from(token).is_ok_and(|value| value.to_str().is_ok())
+    {
+        return Err(format!(
+            "{name} must be a nonempty whitespace-free HTTP header value"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_origin_url(url: String, name: &str) -> Result<String, String> {
+    let url = url.trim_end_matches('/').to_string();
+    let parsed = reqwest::Url::parse(&url).map_err(|_| format!("invalid {name}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!("invalid {name}"));
+    }
+    Ok(url)
 }
 
 fn reject_extra_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -1257,16 +1294,14 @@ fn parse_admin_command_config(
         .ok_or_else(|| {
             "missing admin URL: pass --admin-url or set QUEQLITE_ADMIN_URL".to_string()
         })?;
-    let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid admin URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("invalid admin URL".into());
-    }
+    let url = validate_origin_url(url, "admin URL")?;
     let token = token
         .or_else(|| lookup("QUEQLITE_ADMIN_TOKEN"))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             "missing admin token: pass --admin-token or set QUEQLITE_ADMIN_TOKEN".to_string()
         })?;
+    AdminConfig::new(token.clone()).map_err(|error| format!("invalid admin token: {error}"))?;
     let operation_id = operation_id
         .or_else(|| lookup("QUEQLITE_ADMIN_OPERATION_ID"))
         .filter(|value| !value.trim().is_empty());
@@ -1607,15 +1642,44 @@ fn peer_env(
 }
 
 async fn serve(config: ServeConfig) -> Result<(), String> {
+    serve_until(config, shutdown_signal()).await
+}
+
+async fn serve_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     if config.bundle.legacy {
         eprintln!(
             "warning: QUEQLITE_CONFIG_ID and QUEQLITE_PEER_1..3 are deprecated; use QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE"
         );
     }
     if config.remote.is_some() {
-        serve_remote(config).await
+        serve_remote_until(config, shutdown).await
     } else {
-        serve_legacy(config).await
+        serve_legacy_until(config, shutdown).await
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("cannot install SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -1627,7 +1691,10 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn serve_legacy(config: ServeConfig) -> Result<(), String> {
+async fn serve_legacy_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let node_config = config.node_config()?;
     let recorder = open_recorder(&config)?;
     let mut recorder_server = spawn_recorder_server(&config, recorder.clone()).await?;
@@ -1648,20 +1715,33 @@ async fn serve_legacy(config: ServeConfig) -> Result<(), String> {
     let _materializer = materializer_worker(runtime.clone());
 
     let app = match config.admin_config()? {
-        Some(admin) => node_router_with_admin(runtime, recorder, admin),
-        None => node_router(runtime, recorder),
+        Some(admin) => node_router_with_admin(runtime.clone(), recorder, admin)
+            .map_err(|error| error.to_string())?,
+        None => node_router(runtime.clone(), recorder),
     };
-    let client_server = async move { axum::serve(client_listener, app).await };
+    let shutdown_runtime = runtime.clone();
+    let client_server = async move {
+        axum::serve(client_listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                shutdown_runtime.cancel_operations();
+            })
+            .await
+    };
     tokio::pin!(client_server);
     let result = tokio::select! {
         result = &mut client_server =>
             result.map_err(|error| format!("client server stopped: {error}")),
         result = &mut recorder_server.0 => Err(recorder_task_error(result)),
     };
+    runtime.cancel_operations();
     result
 }
 
-async fn serve_remote(config: ServeConfig) -> Result<(), String> {
+async fn serve_remote_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let remote = config
         .remote
         .clone()
@@ -1755,13 +1835,26 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
             recorder,
             coordinator.clone(),
             admin,
-        ),
+        )
+        .map_err(|error| error.to_string())?,
         None => node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
     };
-    let client_server = async move { axum::serve(client_listener, app).await };
+    let shutdown_runtime = runtime.clone();
+    let client_server = async move {
+        axum::serve(client_listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                shutdown_runtime.cancel_operations();
+            })
+            .await
+    };
     tokio::pin!(client_server);
     let mut recorder_server = recorder_server.expect("remote recorder server started");
-    let mut worker = checkpoint_worker(remote.durability, runtime, coordinator);
+    let mut worker = checkpoint_worker(
+        remote.durability,
+        Arc::clone(&runtime),
+        Arc::clone(&coordinator),
+    );
     let result = if let Some(worker) = worker.as_mut() {
         tokio::select! {
             result = &mut client_server => result.map_err(|error| format!("client server stopped: {error}")),
@@ -1774,7 +1867,28 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
             result = &mut recorder_server.0 => Err(recorder_task_error(result)),
         }
     };
-    result
+    finish_remote_serve(result, runtime, coordinator).await
+}
+
+async fn finish_remote_serve(
+    result: Result<(), String>,
+    runtime: Arc<NodeRuntime>,
+    coordinator: Arc<CheckpointCoordinator>,
+) -> Result<(), String> {
+    runtime.cancel_operations();
+    let final_flush = match runtime.applied_index() {
+        Ok(applied_index) => coordinator
+            .flush_runtime(&runtime, applied_index)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("final checkpoint flush failed: {error}")),
+        Err(error) => Err(error.to_string()),
+    };
+    match (result, final_flush) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(()) | Err(_)) => Err(error),
+    }
 }
 
 fn install_successor_recorder_for_startup(config: &ServeConfig) -> Result<(), String> {
@@ -1811,7 +1925,11 @@ fn redact_object_store_error(config: &ObjStoreConfig, mut message: String) -> St
             access_key,
             secret_key,
             ..
-        } => vec![access_key, secret_key],
+        } => access_key
+            .iter()
+            .chain(secret_key.iter())
+            .map(String::as_str)
+            .collect(),
         ObjStoreConfig::Gcs {
             service_account_key,
             ..
@@ -2418,13 +2536,22 @@ async fn admin_get<T: DeserializeOwned>(
     config: &AdminClientConfig,
     path: &str,
 ) -> Result<T, String> {
-    let response = reqwest::Client::new()
+    let client = bounded_http_client(ADMIN_CONNECT_TIMEOUT, ADMIN_REQUEST_TIMEOUT)?;
+    admin_get_with_client(config, path, &client).await
+}
+
+async fn admin_get_with_client<T: DeserializeOwned>(
+    config: &AdminClientConfig,
+    path: &str,
+    client: &reqwest::Client,
+) -> Result<T, String> {
+    let response = client
         .get(admin_url(config, path))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth(&config.token)
         .send()
         .await
-        .map_err(|error| format!("admin request failed: {error}"))?;
+        .map_err(admin_request_error)?;
     decode_admin_response(response).await
 }
 
@@ -2433,19 +2560,34 @@ async fn admin_post<T: Serialize, R: DeserializeOwned>(
     path: &str,
     body: &T,
 ) -> Result<R, String> {
-    let response = reqwest::Client::new()
+    let response = bounded_http_client(ADMIN_CONNECT_TIMEOUT, ADMIN_REQUEST_TIMEOUT)?
         .post(admin_url(config, path))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth(&config.token)
         .json(body)
         .send()
         .await
-        .map_err(|error| format!("admin request failed: {error}"))?;
+        .map_err(admin_request_error)?;
     decode_admin_response(response).await
 }
 
 fn admin_url(config: &AdminClientConfig, path: &str) -> String {
     format!("{}{path}", config.url.trim_end_matches('/'))
+}
+
+fn admin_request_error(error: reqwest::Error) -> String {
+    format!("admin request failed: {}", error.without_url())
+}
+
+fn bounded_http_client(
+    connect_timeout: Duration,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        .build()
+        .map_err(|error| format!("cannot build HTTP client: {error}"))
 }
 
 async fn decode_admin_response<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -2887,8 +3029,16 @@ async fn client_attempt_response<T: DeserializeOwned>(
 }
 
 async fn request_health(args: &HealthArgs) -> Result<(), String> {
+    let client = bounded_http_client(HEALTH_CONNECT_TIMEOUT, HEALTH_REQUEST_TIMEOUT)?;
+    request_health_with_client(args, &client).await
+}
+
+async fn request_health_with_client(
+    args: &HealthArgs,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let path = if args.ready { READYZ_PATH } else { LIVEZ_PATH };
-    let response = protocol_request(&reqwest::Client::new(), Method::GET, &args.url, path)
+    let response = protocol_request(client, Method::GET, &args.url, path)
         .send()
         .await
         .map_err(request_error)?;
@@ -2996,14 +3146,24 @@ fn parse_object_store_with_lookup(
         });
     }
     match value {
-        "s3" => Ok(ObjStoreConfig::S3 {
-            endpoint: required_env(lookup, "QUEQLITE_S3_ENDPOINT")?,
-            bucket: required_env(lookup, "QUEQLITE_S3_BUCKET")?,
-            access_key: required_env(lookup, "QUEQLITE_S3_ACCESS_KEY")?,
-            secret_key: required_env(lookup, "QUEQLITE_S3_SECRET_KEY")?,
-            region: lookup("QUEQLITE_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
-            allow_http: parse_optional_bool(lookup, "QUEQLITE_S3_ALLOW_HTTP")?.unwrap_or(false),
-        }),
+        "s3" => {
+            let endpoint = optional_env(lookup, "QUEQLITE_S3_ENDPOINT")?;
+            let access_key = optional_env(lookup, "QUEQLITE_S3_ACCESS_KEY")?;
+            let secret_key = optional_env(lookup, "QUEQLITE_S3_SECRET_KEY")?;
+            if access_key.is_some() != secret_key.is_some() {
+                return Err(
+                    "QUEQLITE_S3_ACCESS_KEY and QUEQLITE_S3_SECRET_KEY must be set together".into(),
+                );
+            }
+            Ok(ObjStoreConfig::S3 {
+                endpoint,
+                bucket: required_env(lookup, "QUEQLITE_S3_BUCKET")?,
+                access_key,
+                secret_key,
+                region: lookup("QUEQLITE_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+                allow_http: parse_optional_bool(lookup, "QUEQLITE_S3_ALLOW_HTTP")?.unwrap_or(false),
+            })
+        }
         "gcs" => {
             let service_account_path = optional_env(lookup, "QUEQLITE_GCS_SERVICE_ACCOUNT_PATH")?;
             let service_account_key = optional_env(lookup, "QUEQLITE_GCS_SERVICE_ACCOUNT_KEY")?;
@@ -3672,6 +3832,68 @@ mod tests {
         assert!(parse_serve_env(&values).unwrap_err().contains("distinct"));
         values.insert("QUEQLITE_ADMIN_TOKEN", "peer-2-secret");
         assert!(parse_serve_env(&values).unwrap_err().contains("distinct"));
+        for invalid in [" admin ", "admin secret", "admin\tsecret", "café"] {
+            values.insert("QUEQLITE_ADMIN_TOKEN", invalid);
+            assert!(parse_serve_env(&values).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn client_and_admin_commands_reject_unsafe_auth_and_non_origin_admin_urls() {
+        for invalid in [" secret ", "a b", "a\tb", "café"] {
+            assert!(parse_write_with_lookup(
+                [
+                    "--url",
+                    "http://127.0.0.1:8080",
+                    "--token",
+                    invalid,
+                    "--request-id",
+                    "r1",
+                    "--key",
+                    "k",
+                    "--value",
+                    "v",
+                ]
+                .map(String::from),
+                |_| None,
+            )
+            .is_err());
+            assert!(parse_admin_command_config(
+                [
+                    "--admin-url",
+                    "http://127.0.0.1:8080",
+                    "--admin-token",
+                    invalid,
+                ]
+                .map(String::from)
+                .into_iter(),
+                false,
+                false,
+                |_| None,
+            )
+            .is_err());
+        }
+
+        for invalid in [
+            "http://user@127.0.0.1:8080",
+            "http://user:password@127.0.0.1:8080",
+            "http://127.0.0.1:8080/prefix",
+            "http://127.0.0.1:8080?query=1",
+            "http://127.0.0.1:8080#fragment",
+        ] {
+            assert!(
+                parse_admin_command_config(
+                    ["--admin-url", invalid, "--admin-token", "admin-secret"]
+                        .map(String::from)
+                        .into_iter(),
+                    false,
+                    false,
+                    |_| None,
+                )
+                .is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -3831,10 +4053,10 @@ mod tests {
     #[test]
     fn object_store_errors_redact_provider_credentials() {
         let config = ObjStoreConfig::S3 {
-            endpoint: "https://s3.example.test".into(),
+            endpoint: Some("https://s3.example.test".into()),
             bucket: "checkpoints".into(),
-            access_key: "access-secret".into(),
-            secret_key: "private-secret".into(),
+            access_key: Some("access-secret".into()),
+            secret_key: Some("private-secret".into()),
             region: "us-east-1".into(),
             allow_http: false,
         };
@@ -3843,6 +4065,67 @@ mod tests {
             "failed with access-secret and private-secret".into(),
         );
         assert_eq!(message, "failed with [redacted] and [redacted]");
+    }
+
+    #[test]
+    fn s3_configuration_supports_aws_discovery_and_rejects_partial_credentials() {
+        let base = HashMap::from([
+            ("QUEQLITE_S3_BUCKET", "checkpoints"),
+            ("QUEQLITE_S3_REGION", "ap-northeast-2"),
+        ]);
+        let discovered = parse_object_store_with_lookup("s3", false, &mut |name| {
+            base.get(name).map(ToString::to_string)
+        })
+        .unwrap();
+        assert!(matches!(
+            discovered,
+            ObjStoreConfig::S3 {
+                endpoint: None,
+                access_key: None,
+                secret_key: None,
+                ..
+            }
+        ));
+
+        let full = HashMap::from([
+            ("QUEQLITE_S3_ENDPOINT", "http://rustfs:9000"),
+            ("QUEQLITE_S3_BUCKET", "checkpoints"),
+            ("QUEQLITE_S3_ACCESS_KEY", "access"),
+            ("QUEQLITE_S3_SECRET_KEY", "secret"),
+        ]);
+        assert!(matches!(
+            parse_object_store_with_lookup("s3", false, &mut |name| {
+                full.get(name).map(ToString::to_string)
+            })
+            .unwrap(),
+            ObjStoreConfig::S3 {
+                endpoint: Some(_),
+                access_key: Some(_),
+                secret_key: Some(_),
+                ..
+            }
+        ));
+
+        for values in [
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_ACCESS_KEY", "access"),
+            ]),
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_SECRET_KEY", "secret"),
+            ]),
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_ACCESS_KEY", ""),
+                ("QUEQLITE_S3_SECRET_KEY", "secret"),
+            ]),
+        ] {
+            assert!(parse_object_store_with_lookup("s3", false, &mut |name| {
+                values.get(name).map(ToString::to_string)
+            })
+            .is_err());
+        }
     }
 
     #[test]
@@ -3982,6 +4265,82 @@ mod tests {
                 entry
             })
             .collect()
+    }
+
+    fn runtime_for_final_flush(root: &Path) -> Arc<NodeRuntime> {
+        Arc::new(
+            NodeRuntime::open(
+                NodeConfig::new(
+                    "cluster-a",
+                    "node-1",
+                    root.join("node"),
+                    1,
+                    1,
+                    [
+                        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+                        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+                        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+                    ],
+                    "client-token",
+                )
+                .unwrap(),
+                Arc::new(
+                    ThreeNodeConsensus::from_recovered_tip(
+                        "cluster-a",
+                        "node-1",
+                        1,
+                        1,
+                        [
+                            root.join("recorders/node-1"),
+                            root.join("recorders/node-2"),
+                            root.join("recorders/node-3"),
+                        ],
+                        1,
+                        LogHash::ZERO,
+                    )
+                    .unwrap(),
+                ),
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_flushes_the_applied_tip_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive.clone(),
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+
+        finish_remote_serve(Ok(()), Arc::clone(&runtime), Arc::clone(&coordinator))
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
+        assert_eq!(
+            archive
+                .load_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .tip()
+                .index(),
+            committed.applied_index
+        );
     }
 
     #[tokio::test]
@@ -4250,7 +4609,10 @@ mod tests {
             remote: None,
         });
 
-        let first = tokio::spawn(serve(configs[0].clone()));
+        let (first_shutdown, first_wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(serve_until(configs[0].clone(), async move {
+            let _ = first_wait.await;
+        }));
         wait_for_tcp(&recorder_addresses[0]).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!first.is_finished());
@@ -4258,19 +4620,32 @@ mod tests {
             .await
             .is_err());
 
-        let second = tokio::spawn(serve(configs[1].clone()));
+        let (second_shutdown, second_wait) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(serve_until(configs[1].clone(), async move {
+            let _ = second_wait.await;
+        }));
         wait_until_ready(&client_addresses[0]).await;
         wait_until_ready(&client_addresses[1]).await;
 
-        let third = tokio::spawn(serve(configs[2].clone()));
+        let (third_shutdown, third_wait) = tokio::sync::oneshot::channel();
+        let third = tokio::spawn(serve_until(configs[2].clone(), async move {
+            let _ = third_wait.await;
+        }));
         for address in &client_addresses {
             wait_until_ready(address).await;
         }
 
-        first.abort();
-        second.abort();
-        third.abort();
-        let _ = tokio::join!(first, second, third);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+        let _ = third_shutdown.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second, third)
+        })
+        .await
+        .expect("servers must stop within the graceful shutdown bound");
+        assert!(joined.0.unwrap().is_ok());
+        assert!(joined.1.unwrap().is_ok());
+        assert!(joined.2.unwrap().is_ok());
     }
 
     #[derive(Clone, Default)]
@@ -4986,6 +5361,90 @@ mod tests {
 
         server.abort();
         assert!(!error.contains(token));
+    }
+
+    #[tokio::test]
+    async fn admin_transport_errors_do_not_expose_url_credentials() {
+        let address = unused_local_address();
+        let username = "url-user-that-must-stay-private";
+        let password = "url-password-that-must-stay-private";
+        let config = AdminClientConfig {
+            url: format!("http://{username}:{password}@{address}"),
+            token: "admin-secret".into(),
+        };
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+
+        let error = admin_get_with_client::<serde_json::Value>(&config, ADMIN_STATUS_PATH, &client)
+            .await
+            .unwrap_err();
+
+        assert!(!error.contains(username));
+        assert!(!error.contains(password));
+        assert!(!error.contains(&address));
+    }
+
+    #[tokio::test]
+    async fn health_request_respects_the_configured_deadline() {
+        let app = Router::new().route(
+            LIVEZ_PATH,
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = request_health_with_client(
+            &HealthArgs {
+                url: format!("http://{address}"),
+                ready: false,
+            },
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.starts_with("request failed:"));
+    }
+
+    #[tokio::test]
+    async fn admin_request_respects_the_configured_deadline() {
+        let app = Router::new().route(
+            ADMIN_STATUS_PATH,
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Json(serde_json::json!({}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = admin_get_with_client::<serde_json::Value>(
+            &AdminClientConfig {
+                url: format!("http://{address}"),
+                token: "admin-secret".into(),
+            },
+            ADMIN_STATUS_PATH,
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.starts_with("admin request failed:"));
     }
 
     #[tokio::test]
