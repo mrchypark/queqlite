@@ -317,21 +317,26 @@ async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_resta
 #[tokio::test(flavor = "multi_thread")]
 async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
     let root = tempfile::tempdir().unwrap();
-    let first_runtime = runtime(root.path(), "node", 1, peers(), None);
+    let consensus_recorders = consensus_recorders(root.path(), 1, &old_membership());
+    let first_runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders.clone(),
+    );
     let successor = Membership::new(["node-1", "node-2", "node-4"]).unwrap();
     let stop = first_runtime
         .stop_current_configuration_for_successor(&successor)
         .unwrap();
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, shutdown, server) = serve_until_shutdown(
-        node_router_with_admin(
-            first_runtime.clone(),
-            recorder.clone(),
-            AdminConfig::new(ADMIN_TOKEN).unwrap(),
-        )
-        .unwrap(),
+    let first_router = node_router_with_admin(
+        first_runtime.clone(),
+        recorder.clone(),
+        AdminConfig::new(ADMIN_TOKEN).unwrap(),
     )
-    .await;
+    .unwrap();
     let request = AdminInstallSuccessorRequest {
         operation_id: "install-001".into(),
         expected_config_id: 1,
@@ -347,33 +352,32 @@ async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
     let request: AdminInstallSuccessorRequest =
         serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
 
-    let first = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
+    let first = router_admin_post(first_router, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    let first = first.json::<AdminInstallSuccessorResponse>().await.unwrap();
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let first = response_json::<AdminInstallSuccessorResponse>(first).await;
     drop(first_runtime);
 
-    let runtime = runtime(root.path(), "node", 1, peers(), None);
-    let (addr, server) = serve(
-        node_router_with_admin(runtime, recorder, AdminConfig::new(ADMIN_TOKEN).unwrap()).unwrap(),
-    )
-    .await;
-    let replay = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
+    let runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders,
+    );
+    let router =
+        node_router_with_admin(runtime, recorder, AdminConfig::new(ADMIN_TOKEN).unwrap()).unwrap();
+    let replay = router_admin_post(router.clone(), ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        replay
-            .json::<AdminInstallSuccessorResponse>()
-            .await
-            .unwrap(),
+        response_json::<AdminInstallSuccessorResponse>(replay).await,
         first
     );
 
     let mut changed = request;
     changed.successor.digest = LogHash::ZERO;
-    let conflict = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &changed).await;
+    let conflict = router_admin_post(router, ADMIN_INSTALL_SUCCESSOR_PATH, &changed).await;
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -569,27 +573,6 @@ async fn serve(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (addr, server)
-}
-
-async fn serve_until_shutdown(
-    router: Router,
-) -> (
-    SocketAddr,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown, wait_for_shutdown) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = wait_for_shutdown.await;
-            })
-            .await
-            .unwrap()
-    });
-    (addr, shutdown, server)
 }
 
 async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
