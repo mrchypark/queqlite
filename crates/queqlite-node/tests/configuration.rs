@@ -6,9 +6,9 @@ use std::{
 
 use queqlite_core::{Command, CommandKind, ConfigurationState, LogHash};
 use queqlite_node::{
-    install_successor_recorder, log_peer_router, ConfigError, FetchLogRequest, InMemoryLogPeer,
-    NodeConfig, NodeError, NodeRuntime, PeerConfig, RuntimeConfigurationStatus, LOG_FETCH_PATH,
-    NODE_ID_HEADER, PROTOCOL_VERSION, VERSION_HEADER,
+    install_successor_recorder, log_peer_router, AdminConfig, ConfigError, FetchLogRequest,
+    InMemoryLogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, RuntimeConfigurationStatus,
+    LOG_FETCH_PATH, NODE_ID_HEADER, PROTOCOL_VERSION, VERSION_HEADER,
 };
 use queqlite_quepaxa::{
     DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderReply,
@@ -27,6 +27,113 @@ fn peers(count: usize) -> Vec<PeerConfig> {
             .unwrap()
         })
         .collect()
+}
+
+#[test]
+fn peer_config_rejects_base_urls_that_cannot_be_safely_extended() {
+    for url in [
+        "http://127.0.0.1:9101/prefix",
+        "http://127.0.0.1:9101?tenant=a",
+        "http://127.0.0.1:9101#fragment",
+        "http://user@127.0.0.1:9101",
+        "http://user:password@127.0.0.1:9101",
+    ] {
+        assert!(matches!(
+            PeerConfig::new("n1", url, "peer-1"),
+            Err(queqlite_node::ConfigError::InvalidPeerBaseUrl(actual)) if actual == url
+        ));
+        assert!(matches!(
+            PeerConfig::new_with_log_url("n1", "http://127.0.0.1:9101", url, "peer-1"),
+            Err(queqlite_node::ConfigError::InvalidPeerBaseUrl(actual)) if actual == url
+        ));
+    }
+}
+
+#[test]
+fn http_configuration_rejects_blank_or_unrepresentable_header_values() {
+    for invalid in [" ", "line\nbreak", "café"] {
+        assert!(matches!(
+            PeerConfig::new(invalid, "http://127.0.0.1:9101", "peer-1"),
+            Err(ConfigError::EmptyPeerNodeId)
+        ));
+        assert!(matches!(
+            PeerConfig::new("n1", "http://127.0.0.1:9101", invalid),
+            Err(ConfigError::EmptyPeerToken)
+        ));
+        assert!(matches!(
+            NodeConfig::new(
+                "cluster-a",
+                "n1",
+                std::path::PathBuf::from("node"),
+                1,
+                1,
+                peers(3),
+                invalid,
+            ),
+            Err(ConfigError::EmptyClientToken)
+        ));
+        assert!(matches!(
+            AdminConfig::new(invalid),
+            Err(ConfigError::EmptyAdminToken)
+        ));
+    }
+
+    for invalid_token in [" secret ", "a b", "secret\tvalue"] {
+        assert!(matches!(
+            PeerConfig::new("n1", "http://127.0.0.1:9101", invalid_token),
+            Err(ConfigError::EmptyPeerToken)
+        ));
+        assert!(matches!(
+            NodeConfig::new(
+                "cluster-a",
+                "n1",
+                std::path::PathBuf::from("node"),
+                1,
+                1,
+                peers(3),
+                invalid_token,
+            ),
+            Err(ConfigError::EmptyClientToken)
+        ));
+        assert!(matches!(
+            AdminConfig::new(invalid_token),
+            Err(ConfigError::EmptyAdminToken)
+        ));
+    }
+}
+
+#[test]
+fn node_config_rejects_authentication_credential_collisions() {
+    let duplicate_peer_token = vec![
+        PeerConfig::new("n1", "http://127.0.0.1:9101", "shared").unwrap(),
+        PeerConfig::new("n2", "http://127.0.0.1:9102", "shared").unwrap(),
+        PeerConfig::new("n3", "http://127.0.0.1:9103", "peer-3").unwrap(),
+    ];
+    assert!(matches!(
+        NodeConfig::new(
+            "cluster-a",
+            "n1",
+            std::path::PathBuf::from("node"),
+            1,
+            1,
+            duplicate_peer_token,
+            "client-token",
+        ),
+        Err(ConfigError::DuplicatePeerToken)
+    ));
+
+    assert!(matches!(
+        NodeConfig::new(
+            "cluster-a",
+            "n1",
+            std::path::PathBuf::from("node"),
+            1,
+            1,
+            peers(3),
+            "peer-2",
+        ),
+        Err(ConfigError::ClientTokenConflictsWithPeer)
+    ));
 }
 
 #[test]

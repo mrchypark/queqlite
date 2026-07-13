@@ -932,6 +932,36 @@ struct PendingPublisherFlush {
     result: tokio::sync::oneshot::Sender<Result<LoadedCheckpointManifest>>,
 }
 
+fn coalesce_pending_entries(
+    pending: &[PendingPublisherFlush],
+    published_index: LogIndex,
+) -> Result<Vec<LogEntry>> {
+    let mut entries = pending
+        .iter()
+        .flat_map(|flush| flush.entries.iter())
+        .filter(|entry| entry.index > published_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.index);
+
+    let mut coalesced = Vec::<LogEntry>::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(previous) = coalesced.last() {
+            if previous.index == entry.index {
+                if previous != &entry {
+                    return Err(Error::InvalidCheckpoint(format!(
+                        "conflicting concurrent publications at index {}",
+                        entry.index
+                    )));
+                }
+                continue;
+            }
+        }
+        coalesced.push(entry);
+    }
+    Ok(coalesced)
+}
+
 struct CheckpointPublisherState {
     loaded: LoadedCheckpointManifest,
     pending: Vec<PendingPublisherFlush>,
@@ -1050,21 +1080,21 @@ impl CheckpointPublisher {
             }
             (std::mem::take(&mut state.pending), state.loaded.clone())
         };
-        let entries = pending
-            .iter()
-            .max_by_key(|flush| flush.entries.last().map(|entry| entry.index).unwrap_or(0))
-            .expect("non-empty pending publisher flushes")
-            .entries
-            .clone();
-        let published = self
-            .store
-            .publish_committed_from_loaded_unleased(
-                &entries,
-                &self.lease_id,
-                self.options.lease_duration_ms,
-                loaded,
-            )
-            .await;
+        let published_index = loaded.manifest().tip().index();
+        let published = match coalesce_pending_entries(&pending, published_index) {
+            Ok(entries) if entries.is_empty() => Ok(loaded),
+            Ok(entries) => {
+                self.store
+                    .publish_committed_from_loaded_unleased(
+                        &entries,
+                        &self.lease_id,
+                        self.options.lease_duration_ms,
+                        loaded,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
 
         if let Ok(loaded) = &published {
             self.state.lock().await.loaded = loaded.clone();
@@ -1731,7 +1761,47 @@ impl ObjectArchiveStore {
             stop_entry: stop_entry.clone(),
             successor,
         };
-        self.copy_checkpoint_to(target, Some(transition)).await
+        if let Some(advanced) = target
+            .load_valid_advanced_successor(&transition, stop_entry.index)
+            .await?
+        {
+            return Ok(advanced);
+        }
+        match self
+            .copy_checkpoint_to(target, Some(transition.clone()))
+            .await
+        {
+            Err(Error::CheckpointTargetConflict) => target
+                .load_valid_advanced_successor(&transition, stop_entry.index)
+                .await?
+                .ok_or(Error::CheckpointTargetConflict),
+            result => result,
+        }
+    }
+
+    async fn load_valid_advanced_successor(
+        &self,
+        transition: &CheckpointSuccessorTransition,
+        stop_index: u64,
+    ) -> Result<Option<LoadedCheckpointManifest>> {
+        let Some(loaded) = self.load_checkpoint().await? else {
+            return Ok(None);
+        };
+        if loaded.manifest.successor_transition.as_ref() != Some(transition)
+            || loaded.manifest.tip.index() <= stop_index
+        {
+            return Ok(None);
+        }
+        self.restore_checkpoint_v2().await?;
+        let reloaded = self.load_checkpoint().await?.ok_or_else(|| {
+            Error::InvalidCheckpoint("advanced successor checkpoint disappeared".into())
+        })?;
+        if reloaded.manifest.successor_transition.as_ref() != Some(transition)
+            || reloaded.manifest.tip.index() <= stop_index
+        {
+            return Err(Error::CheckpointTargetConflict);
+        }
+        Ok(Some(reloaded))
     }
 
     async fn copy_checkpoint_to(

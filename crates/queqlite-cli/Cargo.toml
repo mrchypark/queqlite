@@ -16,7 +16,7 @@ queqlite-sqlite = { path = "../queqlite-sqlite" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["signal", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

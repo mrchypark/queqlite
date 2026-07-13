@@ -3,7 +3,7 @@ use std::{fmt, fs, path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use futures::{lock::Mutex, TryStreamExt};
 use object_store::{
-    aws::{AmazonS3Builder, S3ConditionalPut},
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     azure::MicrosoftAzureBuilder,
     gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem,
@@ -53,10 +53,10 @@ pub enum ObjStoreConfig {
         root: PathBuf,
     },
     S3 {
-        endpoint: String,
+        endpoint: Option<String>,
         bucket: String,
-        access_key: String,
-        secret_key: String,
+        access_key: Option<String>,
+        secret_key: Option<String>,
         region: String,
         allow_http: bool,
     },
@@ -121,7 +121,7 @@ pub struct ObjStore {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionedObject {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     version: UpdateVersion,
 }
 
@@ -214,19 +214,31 @@ impl ObjStore {
                 region,
                 allow_http,
             } => {
-                validate_required("S3 endpoint", &endpoint)?;
+                validate_optional("S3 endpoint", endpoint.as_deref())?;
                 validate_required("S3 bucket", &bucket)?;
-                validate_required("S3 access key", &access_key)?;
-                validate_required("S3 secret key", &secret_key)?;
+                validate_optional("S3 access key", access_key.as_deref())?;
+                validate_optional("S3 secret key", secret_key.as_deref())?;
                 validate_required("S3 region", &region)?;
-                let store = AmazonS3Builder::new()
-                    .with_endpoint(endpoint)
+                let mut builder = match (access_key, secret_key) {
+                    (Some(access_key), Some(secret_key)) => AmazonS3Builder::new()
+                        .with_access_key_id(access_key)
+                        .with_secret_access_key(secret_key),
+                    (None, None) => AmazonS3Builder::from_env(),
+                    _ => {
+                        return Err(Error::Configuration(
+                            "S3 access key and secret key must be provided together".to_string(),
+                        ));
+                    }
+                };
+                if let Some(endpoint) = endpoint {
+                    builder = builder
+                        .with_config(AmazonS3ConfigKey::S3Endpoint, endpoint)
+                        .with_virtual_hosted_style_request(false);
+                }
+                let store = builder
                     .with_bucket_name(bucket)
-                    .with_access_key_id(access_key)
-                    .with_secret_access_key(secret_key)
                     .with_region(region)
                     .with_allow_http(allow_http)
-                    .with_virtual_hosted_style_request(false)
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
                     .build()
                     .map_err(|err| Error::Configuration(err.to_string()))?;
@@ -320,7 +332,7 @@ impl ObjStore {
     }
 
     pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
-        Ok(self.get_with_version(key).await?.bytes)
+        Ok(self.get_with_version(key).await?.bytes.to_vec())
     }
 
     pub async fn get_with_version(&self, key: &str) -> Result<VersionedObject> {
@@ -337,10 +349,7 @@ impl ObjStore {
             .bytes()
             .await
             .map_err(|err| map_store_error(key, err))?;
-        Ok(VersionedObject {
-            bytes: bytes.to_vec(),
-            version,
-        })
+        Ok(VersionedObject { bytes, version })
     }
 
     pub async fn get_versioned(&self, key: &str) -> Result<VersionedObject> {

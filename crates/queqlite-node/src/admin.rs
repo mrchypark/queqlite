@@ -3,6 +3,7 @@ use std::{
     fmt, fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
 };
 
@@ -21,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    client_authenticated, install_successor_recorder, ConfigError, NodeError, NodeRuntime,
-    NodeStatus, StopInformation,
+    client_authenticated, install_successor_recorder, valid_auth_token, ConfigError, NodeError,
+    NodeRuntime, NodeStatus, StopInformation,
 };
 use crate::{CheckpointCoordinator, DurabilityError};
 
@@ -40,7 +41,7 @@ pub struct AdminConfig {
 impl AdminConfig {
     pub fn new(token: impl Into<String>) -> Result<Self, ConfigError> {
         let token = token.into();
-        if token.trim().is_empty() {
+        if !valid_auth_token(&token) {
             return Err(ConfigError::EmptyAdminToken);
         }
         Ok(Self { token })
@@ -58,6 +59,8 @@ impl fmt::Debug for AdminConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct AdminStatusResponse {
+    pub cluster_id: String,
+    pub epoch: u64,
     pub node: NodeStatus,
     pub members: Vec<String>,
     pub recovery_generation: u64,
@@ -162,6 +165,83 @@ pub struct AdminErrorResponse {
 struct AdminGateState {
     token: String,
     admission: Arc<tokio::sync::Semaphore>,
+    tasks: AdminTaskTracker,
+}
+
+#[derive(Clone)]
+pub struct AdminTaskTracker {
+    state: Arc<AdminTaskState>,
+}
+
+struct AdminTaskState {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl AdminTaskTracker {
+    fn new() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self {
+            state: Arc::new(AdminTaskState {
+                accepting: AtomicBool::new(true),
+                active: AtomicUsize::new(0),
+                changed,
+            }),
+        }
+    }
+
+    fn try_start(&self) -> Option<AdminTaskGuard> {
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.state.active.fetch_add(1, Ordering::AcqRel);
+        if self.state.accepting.load(Ordering::Acquire) {
+            Some(AdminTaskGuard {
+                state: Arc::clone(&self.state),
+            })
+        } else {
+            finish_admin_task(&self.state);
+            None
+        }
+    }
+
+    pub fn stop_admission(&self) {
+        self.state.accepting.store(false, Ordering::Release);
+    }
+
+    pub async fn wait_for_idle(&self) {
+        let mut changed = self.state.changed.subscribe();
+        loop {
+            if self.state.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct AdminTaskGuard {
+    state: Arc<AdminTaskState>,
+}
+
+impl Drop for AdminTaskGuard {
+    fn drop(&mut self) {
+        finish_admin_task(&self.state);
+    }
+}
+
+fn finish_admin_task(state: &AdminTaskState) {
+    if state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+        state.changed.send_replace(());
+    }
+}
+
+struct AdminPermit {
+    _admission: tokio::sync::OwnedSemaphorePermit,
+    _task: AdminTaskGuard,
 }
 
 #[derive(Clone)]
@@ -169,7 +249,7 @@ struct AdminRouteState {
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     coordinator: Option<Arc<CheckpointCoordinator>>,
-    operations: Arc<tokio::sync::Mutex<HashMap<String, OperationRecord>>>,
+    operations: Arc<tokio::sync::Mutex<Option<HashMap<String, OperationRecord>>>>,
     ledger_path: PathBuf,
 }
 
@@ -190,9 +270,21 @@ pub fn node_router_with_admin(
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     admin: AdminConfig,
-) -> Router {
-    crate::node_router(runtime.clone(), recorder.clone())
-        .merge(admin_router(runtime, recorder, None, admin))
+) -> Result<Router, ConfigError> {
+    node_router_with_admin_and_tasks(runtime, recorder, admin).map(|(router, _)| router)
+}
+
+pub fn node_router_with_admin_and_tasks(
+    runtime: Arc<NodeRuntime>,
+    recorder: RecorderFileStore,
+    admin: AdminConfig,
+) -> Result<(Router, AdminTaskTracker), ConfigError> {
+    validate_admin_token(&runtime, &admin)?;
+    let (admin_router, tasks) = admin_router(runtime.clone(), recorder.clone(), None, admin);
+    Ok((
+        crate::node_router(runtime, recorder).merge(admin_router),
+        tasks,
+    ))
 }
 
 pub fn node_router_with_checkpoint_and_admin(
@@ -200,9 +292,41 @@ pub fn node_router_with_checkpoint_and_admin(
     recorder: RecorderFileStore,
     coordinator: Arc<CheckpointCoordinator>,
     admin: AdminConfig,
-) -> Router {
-    crate::node_router_with_checkpoint(runtime.clone(), recorder.clone(), coordinator.clone())
-        .merge(admin_router(runtime, recorder, Some(coordinator), admin))
+) -> Result<Router, ConfigError> {
+    node_router_with_checkpoint_and_admin_tasks(runtime, recorder, coordinator, admin)
+        .map(|(router, _)| router)
+}
+
+pub fn node_router_with_checkpoint_and_admin_tasks(
+    runtime: Arc<NodeRuntime>,
+    recorder: RecorderFileStore,
+    coordinator: Arc<CheckpointCoordinator>,
+    admin: AdminConfig,
+) -> Result<(Router, AdminTaskTracker), ConfigError> {
+    validate_admin_token(&runtime, &admin)?;
+    let (admin_router, tasks) = admin_router(
+        runtime.clone(),
+        recorder.clone(),
+        Some(coordinator.clone()),
+        admin,
+    );
+    Ok((
+        crate::node_router_with_checkpoint(runtime, recorder, coordinator).merge(admin_router),
+        tasks,
+    ))
+}
+
+fn validate_admin_token(runtime: &NodeRuntime, admin: &AdminConfig) -> Result<(), ConfigError> {
+    if runtime.config().client_token() == admin.token
+        || runtime
+            .config()
+            .peers()
+            .iter()
+            .any(|peer| peer.token() == admin.token)
+    {
+        return Err(ConfigError::AdminTokenConflictsWithRuntime);
+    }
+    Ok(())
 }
 
 fn admin_router(
@@ -210,9 +334,14 @@ fn admin_router(
     recorder: RecorderFileStore,
     coordinator: Option<Arc<CheckpointCoordinator>>,
     admin: AdminConfig,
-) -> Router {
+) -> (Router, AdminTaskTracker) {
     let ledger_path = runtime.config().data_dir().join("admin-operations-v1.json");
-    let operations = load_operations(&ledger_path).unwrap_or_default();
+    let operations = load_operations(&ledger_path)
+        .map(Some)
+        .unwrap_or_else(|error| {
+            eprintln!("admin operation ledger is unavailable: {error}");
+            None
+        });
     let state = AdminRouteState {
         runtime,
         recorder,
@@ -220,7 +349,8 @@ fn admin_router(
         operations: Arc::new(tokio::sync::Mutex::new(operations)),
         ledger_path,
     };
-    Router::new()
+    let tasks = AdminTaskTracker::new();
+    let router = Router::new()
         .route(ADMIN_STATUS_PATH, get(handle_status))
         .route(ADMIN_STOP_PATH, post(handle_stop))
         .route(ADMIN_INSTALL_SUCCESSOR_PATH, post(handle_install_successor))
@@ -230,10 +360,12 @@ fn admin_router(
             AdminGateState {
                 token: admin.token,
                 admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                tasks: tasks.clone(),
             },
             admin_gate,
         ))
-        .with_state(state)
+        .with_state(state);
+    (router, tasks)
 }
 
 async fn admin_gate(
@@ -244,8 +376,15 @@ async fn admin_gate(
     if !client_authenticated(request.headers(), &state.token) {
         return admin_error(StatusCode::UNAUTHORIZED, AdminErrorCode::Unauthorized);
     }
+    let task = match state.tasks.try_start() {
+        Some(task) => task,
+        None => return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable),
+    };
     let permit = match state.admission.try_acquire_owned() {
-        Ok(permit) => Arc::new(permit),
+        Ok(admission) => Arc::new(AdminPermit {
+            _admission: admission,
+            _task: task,
+        }),
         Err(_) => return admin_error(StatusCode::TOO_MANY_REQUESTS, AdminErrorCode::Unavailable),
     };
     request.extensions_mut().insert(permit);
@@ -254,7 +393,7 @@ async fn admin_gate(
 
 async fn handle_status(
     State(state): State<AdminRouteState>,
-    Extension(_permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(_permit): Extension<Arc<AdminPermit>>,
 ) -> Response {
     let _operations = state.operations.lock().await;
     match status_response(&state) {
@@ -265,7 +404,7 @@ async fn handle_status(
 
 async fn handle_stop(
     State(state): State<AdminRouteState>,
-    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(permit): Extension<Arc<AdminPermit>>,
     payload: Result<Json<AdminStopRequest>, JsonRejection>,
 ) -> Response {
     let request = match payload {
@@ -298,7 +437,7 @@ async fn handle_stop(
 
 async fn handle_install_successor(
     State(state): State<AdminRouteState>,
-    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(permit): Extension<Arc<AdminPermit>>,
     payload: Result<Json<AdminInstallSuccessorRequest>, JsonRejection>,
 ) -> Response {
     let request = match payload {
@@ -320,7 +459,7 @@ async fn handle_install_successor(
 
 async fn handle_activate(
     State(state): State<AdminRouteState>,
-    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(permit): Extension<Arc<AdminPermit>>,
     payload: Result<Json<AdminActivateRequest>, JsonRejection>,
 ) -> Response {
     let request = match payload {
@@ -347,7 +486,7 @@ async fn handle_activate(
 
 async fn handle_compact(
     State(state): State<AdminRouteState>,
-    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(permit): Extension<Arc<AdminPermit>>,
     payload: Result<Json<AdminCompactRequest>, JsonRejection>,
 ) -> Response {
     let request = match payload {
@@ -380,7 +519,7 @@ async fn handle_compact(
 
 async fn run_async_operation<T, R, F>(
     state: &AdminRouteState,
-    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    permit: Arc<AdminPermit>,
     kind: &str,
     request: &T,
     operation: F,
@@ -403,7 +542,10 @@ where
     };
     {
         let operations = state.operations.lock().await;
-        if let Some(response) = replay(&operations, &operation_id, &fingerprint) {
+        let Some(operations) = operations.as_ref() else {
+            return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
+        };
+        if let Some(response) = replay(operations, &operation_id, &fingerprint) {
             return response;
         }
     }
@@ -418,13 +560,15 @@ where
         let _permit = permit;
         let result = operation.await;
         let mut operations = detached_state.operations.lock().await;
-        let _ = store_result(
-            &mut operations,
-            detached_operation_id,
-            detached_fingerprint,
-            result,
-        );
-        let _ = persist_operations(&detached_state.ledger_path, &operations);
+        let Some(records) = operations.as_mut() else {
+            completed.send_replace(true);
+            return;
+        };
+        let _ = store_result(records, detached_operation_id, detached_fingerprint, result);
+        if let Err(error) = persist_operations(&detached_state.ledger_path, records) {
+            eprintln!("admin operation ledger persistence failed: {error}");
+            *operations = None;
+        }
         completed.send_replace(true);
     });
     let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -439,7 +583,10 @@ where
         return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
     }
     let operations = state.operations.lock().await;
-    replay(&operations, &operation_id, &fingerprint)
+    let Some(operations) = operations.as_ref() else {
+        return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
+    };
+    replay(operations, &operation_id, &fingerprint)
         .unwrap_or_else(|| admin_error(StatusCode::INTERNAL_SERVER_ERROR, AdminErrorCode::Internal))
 }
 
@@ -507,6 +654,8 @@ fn status_response(state: &AdminRouteState) -> Result<AdminStatusResponse, NodeE
     });
     let stopped_transition = stopped_transition(&state.runtime)?;
     Ok(AdminStatusResponse {
+        cluster_id: state.runtime.config.cluster_id().to_owned(),
+        epoch: state.runtime.config.epoch(),
         node,
         members: state.runtime.config.membership().members().to_vec(),
         recovery_generation: state.runtime.config.recovery_generation(),
@@ -745,4 +894,63 @@ fn admin_error(status: StatusCode, code: AdminErrorCode) -> Response {
 fn error_value(code: AdminErrorCode) -> Value {
     serde_json::to_value(AdminErrorResponse { code })
         .unwrap_or_else(|_| serde_json::json!({"code": "internal"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::AdminTaskTracker;
+
+    #[tokio::test]
+    async fn shutdown_observes_a_late_admin_mutation_before_sampling_state() {
+        let tasks = AdminTaskTracker::new();
+        let guard = tasks.try_start().unwrap();
+        let committed_tip = Arc::new(AtomicUsize::new(1));
+        let late_tip = Arc::clone(&committed_tip);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let _ = wait.await;
+            late_tip.store(2, Ordering::Release);
+            drop(guard);
+        });
+
+        tasks.stop_admission();
+        assert!(tasks.try_start().is_none());
+        let mut idle = Box::pin(tasks.wait_for_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut idle)
+                .await
+                .is_err()
+        );
+
+        let _ = release.send(());
+        idle.await;
+        operation.await.unwrap();
+        assert_eq!(committed_tip.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_until_every_admitted_admin_task_finishes() {
+        let tasks = AdminTaskTracker::new();
+        let first = tasks.try_start().unwrap();
+        let second = tasks.try_start().unwrap();
+        tasks.stop_admission();
+
+        let mut idle = Box::pin(tasks.wait_for_idle());
+        drop(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut idle)
+                .await
+                .is_err()
+        );
+
+        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), idle)
+            .await
+            .expect("last task completion must wake the shutdown waiter");
+    }
 }

@@ -157,6 +157,21 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
     assert!(write.await.unwrap().is_err());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.members = vec!["node-1".into(), "node-2".into(), "node-4".into()];
+
+    assert!(matches!(
+        Queqlite::open(config).await,
+        Err(Error::Config(
+            queqlite_node::ConfigError::PeerMembershipMismatch
+        ))
+    ));
+    assert!(!root.path().join("node").exists());
+}
+
 fn config(root: &std::path::Path) -> EmbeddedConfig {
     let identity = EmbeddedIdentity::new("cluster-a", "node-1", 1, 1);
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();

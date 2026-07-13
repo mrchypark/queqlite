@@ -34,17 +34,22 @@ resource_json() {
 }
 
 ready_now() {
-  resource_json statefulset "$name" | jq -e --argjson replicas "$replicas" '
+  statefulset_json="$(resource_json statefulset "$name")" || return 1
+  update_revision="$(jq -er '.status.updateRevision | select(type == "string" and length > 0)' \
+    <<< "$statefulset_json")" || return 1
+  jq -e --argjson replicas "$replicas" '
     .metadata.generation != null and
     (.status.observedGeneration // 0) >= .metadata.generation and
     .spec.replicas == $replicas and
     (.status.readyReplicas // 0) == $replicas
-  ' >/dev/null || return 1
+  ' <<< "$statefulset_json" >/dev/null || return 1
 
   for ((ordinal=0; ordinal<replicas; ordinal++)); do
-    resource_json pod "${name}-${ordinal}" | jq -e --arg id "$config_id" '
+    resource_json pod "${name}-${ordinal}" | jq -e \
+      --arg id "$config_id" --arg revision "$update_revision" '
       (.metadata.deletionTimestamp == null) and
       .metadata.labels["queqlite.dev/config-id"] == $id and
+      .metadata.labels["controller-revision-hash"] == $revision and
       any(.status.conditions[]?; .type == "Ready" and .status == "True")
     ' >/dev/null || return 1
   done

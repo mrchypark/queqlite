@@ -84,7 +84,12 @@ vcluster node load-image "$node" --image "$image"
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
-peer_token="$(openssl rand -hex 24)"
+peer_tokens="$(jq -cn \
+  --arg first "$(openssl rand -hex 24)" \
+  --arg second "$(openssl rand -hex 24)" \
+  --arg third "$(openssl rand -hex 24)" \
+  '[$first, $second, $third]')"
+[ "$(jq 'unique | length' <<< "$peer_tokens")" = 3 ] || die "peer tokens must be unique"
 k create secret generic queqlite-auth \
   --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" >/dev/null
@@ -101,28 +106,34 @@ rustfs_uid="$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0]
 
 make_bundle() {
   id="$1" output="$2"
-  jq -n --argjson id "$id" --arg token "$peer_token" '
+  jq -n --argjson id "$id" --argjson tokens "$peer_tokens" '
     {version:1, config_id:$id, members:[range(3) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8081"),
       log_url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8080"),
-      token:$token
+      token:$tokens[$n]
     }]}
   ' > "$output"
   chmod 600 "$output"
 }
 make_bundle 1 "$target/config-c1.json"
 make_bundle 2 "$target/config-c2-draft.json"
+jq -e '[.members[].token] | unique | length == 3' \
+  "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
+jq -se '(.[0].members | map(.token)) == (.[1].members | map(.token))' \
+  "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
 k create secret generic queqlite-c1-bundle --from-file=config.json="$target/config-c1.json" \
   --dry-run=client -o yaml | yq eval '.immutable = true' - | k create -f - >/dev/null
 
 export QUEQLITE_IMAGE="$image" QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace"
 export QUEQLITE_CLUSTER_ID=queqlite-vind QUEQLITE_RECOVERY_GENERATION=1
 export QUEQLITE_CHECKPOINT_LEASE_MS=5000
+export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials
+export QUEQLITE_S3_ALLOW_HTTP=true
 
 echo "== initialize object checkpoint and bootstrap config 1 =="
 scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null
-QUEQLITE_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh \
+QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   1 3 "$target/config-c1.json" "$target/config-c1.yaml"
 k create -f "$target/config-c1.yaml" >/dev/null
 scripts/wait-k8s-statefulset-ready.sh queqlite-c1 3 1
@@ -220,6 +231,28 @@ for ((attempt=1; attempt<=20; attempt++)); do
 done
 jq -e '.anchor.format_version == 2 and .anchor.configuration_state.phase == "active"' \
   "$generation_compact" >/dev/null
+
+echo "== restart successor container in place and rejoin preserved emptyDir state =="
+restart_pod=queqlite-c2-1
+restart_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
+restart_count="$(k get pod "$restart_pod" \
+  -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+k exec "$restart_pod" -- /bin/sh -ec 'kill -TERM 1' >/dev/null 2>&1 || true
+for ((attempt=1; attempt<=120; attempt++)); do
+  current_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
+  [ "$current_uid" = "$restart_uid" ] || die "successor Pod was recreated during container restart"
+  current_count="$(k get pod "$restart_pod" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+  ready="$(k get pod "$restart_pod" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+  if [ "$current_count" -gt "$restart_count" ] && [ "$ready" = True ]; then
+    break
+  fi
+  [ "$attempt" -lt 120 ] || die "successor container did not rejoin with preserved state"
+  sleep 1
+done
+retry_client "$restart_pod" read --key suffix --consistency barrier --expect replayed
+
 scripts/k8s-object-job.sh 2 "$successor" roll-checkpoint \
   --from-generation 1 --to-generation 2 >/dev/null
 echo "== replace generation-1 pods with generation-2 S3 restores =="

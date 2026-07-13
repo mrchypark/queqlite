@@ -1,5 +1,6 @@
 use std::{
     env, fmt, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -12,14 +13,15 @@ use queqlite_archive::{
 };
 use queqlite_core::{ConfigChange, ConfigurationState, LogAnchor, LogEntry, StoredCommand};
 use queqlite_node::{
-    install_successor_recorder, node_router, node_router_with_admin, node_router_with_checkpoint,
-    node_router_with_checkpoint_and_admin, recorder_router_for_generation,
-    recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
-    restore_checkpoint_to_fresh_data_dir_for_node, restore_successor_checkpoint_to_fresh_data_dir,
-    run_e2e, AdminActivateRequest, AdminActivateResponse, AdminCompactRequest,
-    AdminCompactResponse, AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest,
-    AdminInstallSuccessorResponse, AdminStatusResponse, AdminStopRequest, AdminStopResponse,
-    AdminSuccessorBundle, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
+    install_successor_recorder, node_router, node_router_with_admin_and_tasks,
+    node_router_with_checkpoint, node_router_with_checkpoint_and_admin_tasks,
+    recorder_router_for_generation, recover_successor_recorder_after_checkpoint,
+    rehydrate_recorder_after_checkpoint, restore_checkpoint_to_fresh_data_dir_for_node,
+    restore_successor_checkpoint_to_fresh_data_dir, run_e2e, AdminActivateRequest,
+    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
+    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
+    AdminTaskTracker, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
     HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
     ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse, SqlQueryRequest,
     SqlQueryResponse, StopInformation, WriteRequest, WriteResponse, ADMIN_ACTIVATE_PATH,
@@ -114,6 +116,16 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
                 0
             }
             Err(error) => fail("checkpoint compact", error),
+        },
+        Command::ValidateConfigBundle(config_id) => match config_id
+            .map(Ok)
+            .unwrap_or_else(validate_config_bundle_stdin)
+        {
+            Ok(config_id) => {
+                println!("{{\"config_id\":{config_id}}}");
+                0
+            }
+            Err(error) => fail("validate-config-bundle", error),
         },
         Command::GcPlan(config) => match run_gc_plan(config).await {
             Ok(json) => {
@@ -220,6 +232,7 @@ enum Command {
     CheckpointInspect(CheckpointCommandConfig),
     CheckpointForkSuccessor(CheckpointForkSuccessorConfig),
     CheckpointCompact(Box<AdminCommandConfig>),
+    ValidateConfigBundle(Option<u64>),
     GcPlan(GcPlanConfig),
     GcInspect(GcInspectConfig),
     GcApply(GcInspectConfig),
@@ -275,6 +288,12 @@ struct AdminClientConfig {
     url: String,
     token: String,
 }
+
+const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 impl fmt::Debug for AdminClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -519,13 +538,13 @@ impl ServeConfig {
         let data_dir = PathBuf::from(required_env(&mut lookup, "QUEQLITE_DATA_DIR")?);
         let epoch = positive_env(&mut lookup, "QUEQLITE_EPOCH")?;
         let client_token = required_env(&mut lookup, "QUEQLITE_CLIENT_TOKEN")?;
-        let admin_token = match lookup("QUEQLITE_ADMIN_TOKEN") {
-            Some(token) if token.trim().is_empty() => {
-                return Err("QUEQLITE_ADMIN_TOKEN must not be empty".into())
-            }
-            Some(token) => Some(token),
-            None => None,
-        };
+        let admin_token = lookup("QUEQLITE_ADMIN_TOKEN")
+            .map(|token| {
+                AdminConfig::new(token.clone())
+                    .map(|_| token)
+                    .map_err(|error| format!("invalid QUEQLITE_ADMIN_TOKEN: {error}"))
+            })
+            .transpose()?;
         let bundle = load_configuration_bundle(&mut lookup, |path| fs::read_to_string(path))?;
         let client_listen =
             lookup("QUEQLITE_CLIENT_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
@@ -670,6 +689,18 @@ where
         }
         "roll-checkpoint" => parse_roll_checkpoint(args).map(Command::RollCheckpoint),
         "checkpoint" => parse_checkpoint_command(args),
+        "validate-config-bundle" => {
+            let args = args.collect::<Vec<_>>();
+            if args == ["--stdin"] {
+                Ok(Command::ValidateConfigBundle(None))
+            } else {
+                reject_extra_args(args.into_iter())?;
+                parse_validate_config_bundle(
+                    |name| env::var(name).ok(),
+                    |path| fs::read_to_string(path),
+                )
+            }
+        }
         "gc" => parse_gc_command(args),
         "membership" => parse_membership_command(args),
         "write" => parse_write(args).map(Command::Write),
@@ -678,6 +709,22 @@ where
         "health" => parse_health(args).map(Command::Health),
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_validate_config_bundle(
+    lookup: impl FnMut(&str) -> Option<String>,
+    read_file: impl FnOnce(&str) -> std::io::Result<String>,
+) -> Result<Command, String> {
+    load_configuration_bundle(lookup, read_file)
+        .map(|bundle| Command::ValidateConfigBundle(Some(bundle.config_id)))
+}
+
+fn validate_config_bundle_stdin() -> Result<u64, String> {
+    let mut json = String::new();
+    io::stdin()
+        .read_to_string(&mut json)
+        .map_err(|error| format!("cannot read configuration bundle from stdin: {error}"))?;
+    parse_configuration_bundle(&json).map(|bundle| bundle.config_id)
 }
 
 fn parse_write(args: impl IntoIterator<Item = String>) -> Result<WriteArgs, String> {
@@ -931,9 +978,41 @@ fn client_token(
     flag: Option<String>,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String, String> {
-    flag.or_else(|| lookup("QUEQLITE_CLIENT_TOKEN"))
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| "missing client token: pass --token or set QUEQLITE_CLIENT_TOKEN".into())
+    let token = flag
+        .or_else(|| lookup("QUEQLITE_CLIENT_TOKEN"))
+        .ok_or_else(|| {
+            "missing client token: pass --token or set QUEQLITE_CLIENT_TOKEN".to_string()
+        })?;
+    validate_auth_token(&token, "client token")?;
+    Ok(token)
+}
+
+fn validate_auth_token(token: &str, name: &str) -> Result<(), String> {
+    if token.trim().is_empty()
+        || token.chars().any(char::is_whitespace)
+        || !header::HeaderValue::try_from(token).is_ok_and(|value| value.to_str().is_ok())
+    {
+        return Err(format!(
+            "{name} must be a nonempty whitespace-free HTTP header value"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_origin_url(url: String, name: &str) -> Result<String, String> {
+    let url = url.trim_end_matches('/').to_string();
+    let parsed = reqwest::Url::parse(&url).map_err(|_| format!("invalid {name}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!("invalid {name}"));
+    }
+    Ok(url)
 }
 
 fn reject_extra_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -1257,16 +1336,14 @@ fn parse_admin_command_config(
         .ok_or_else(|| {
             "missing admin URL: pass --admin-url or set QUEQLITE_ADMIN_URL".to_string()
         })?;
-    let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid admin URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("invalid admin URL".into());
-    }
+    let url = validate_origin_url(url, "admin URL")?;
     let token = token
         .or_else(|| lookup("QUEQLITE_ADMIN_TOKEN"))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             "missing admin token: pass --admin-token or set QUEQLITE_ADMIN_TOKEN".to_string()
         })?;
+    AdminConfig::new(token.clone()).map_err(|error| format!("invalid admin token: {error}"))?;
     let operation_id = operation_id
         .or_else(|| lookup("QUEQLITE_ADMIN_OPERATION_ID"))
         .filter(|value| !value.trim().is_empty());
@@ -1607,15 +1684,44 @@ fn peer_env(
 }
 
 async fn serve(config: ServeConfig) -> Result<(), String> {
+    serve_until(config, shutdown_signal()).await
+}
+
+async fn serve_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     if config.bundle.legacy {
         eprintln!(
             "warning: QUEQLITE_CONFIG_ID and QUEQLITE_PEER_1..3 are deprecated; use QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE"
         );
     }
     if config.remote.is_some() {
-        serve_remote(config).await
+        serve_remote_until(config, shutdown).await
     } else {
-        serve_legacy(config).await
+        serve_legacy_until(config, shutdown).await
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("cannot install SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -1627,10 +1733,59 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn serve_legacy(config: ServeConfig) -> Result<(), String> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ServeExit {
+    Shutdown,
+    Client,
+    Recorder,
+    CheckpointWorker,
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn stop_admin_admission(tasks: Option<&AdminTaskTracker>) {
+    if let Some(tasks) = tasks {
+        tasks.stop_admission();
+    }
+}
+
+async fn wait_for_admin_tasks(tasks: Option<&AdminTaskTracker>) {
+    if let Some(tasks) = tasks {
+        tasks.wait_for_idle().await;
+    }
+}
+
+fn shutdown_deadline_error(timeout: Duration) -> String {
+    format!(
+        "shutdown did not complete within {} seconds; final checkpoint durability is unconfirmed",
+        timeout.as_secs_f64()
+    )
+}
+
+async fn before_shutdown_deadline<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| shutdown_deadline_error(timeout))
+}
+
+async fn serve_legacy_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let node_config = config.node_config()?;
     let recorder = open_recorder(&config)?;
-    let mut recorder_server = spawn_recorder_server(&config, recorder.clone()).await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut recorder_server =
+        spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
     tokio::task::yield_now().await;
 
     let consensus = build_consensus(&config)?;
@@ -1645,23 +1800,65 @@ async fn serve_legacy(config: ServeConfig) -> Result<(), String> {
         "queqlite serving client={} recorder={}",
         config.client_listen, config.recorder_listen
     );
-    let _materializer = materializer_worker(runtime.clone());
+    let mut materializer = materializer_worker(runtime.clone(), shutdown_rx.clone());
 
-    let app = match config.admin_config()? {
-        Some(admin) => node_router_with_admin(runtime, recorder, admin),
-        None => node_router(runtime, recorder),
+    let (app, admin_tasks) = match config.admin_config()? {
+        Some(admin) => {
+            let (router, tasks) =
+                node_router_with_admin_and_tasks(runtime.clone(), recorder, admin)
+                    .map_err(|error| error.to_string())?;
+            (router, Some(tasks))
+        }
+        None => (node_router(runtime.clone(), recorder), None),
     };
-    let client_server = async move { axum::serve(client_listener, app).await };
-    tokio::pin!(client_server);
-    let result = tokio::select! {
-        result = &mut client_server =>
-            result.map_err(|error| format!("client server stopped: {error}")),
-        result = &mut recorder_server.0 => Err(recorder_task_error(result)),
+    let mut client_server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(client_listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+            .await
+            .map_err(|error| format!("client server stopped: {error}"))
+    }));
+    tokio::pin!(shutdown);
+    let (exit, result) = tokio::select! {
+        biased;
+        () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+        result = &mut client_server.0 =>
+            (ServeExit::Client, server_task_result(result, "client server")),
+        result = &mut recorder_server.0 =>
+            (ServeExit::Recorder, Err(recorder_task_error(result))),
     };
-    result
+    stop_admin_admission(admin_tasks.as_ref());
+    shutdown_tx.send_replace(true);
+    runtime.cancel_operations();
+    let drained = before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+        let mut drained = Ok(());
+        if exit != ServeExit::Client {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut client_server.0).await, "client server"),
+            );
+        }
+        if exit != ServeExit::Recorder {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut recorder_server.0).await, "recorder server"),
+            );
+        }
+        retain_first_error(
+            &mut drained,
+            task_result((&mut materializer.0).await, "materializer worker"),
+        );
+        wait_for_admin_tasks(admin_tasks.as_ref()).await;
+        drained
+    })
+    .await?;
+    result.and(drained)
 }
 
-async fn serve_remote(config: ServeConfig) -> Result<(), String> {
+async fn serve_remote_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let remote = config
         .remote
         .clone()
@@ -1682,9 +1879,7 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let node_config = config.node_config()?;
     let preparation = if config.bundle.predecessor.is_some() {
-        if remote.startup != StartupMode::Disaster {
-            return Err("successor startup requires disaster mode and a fresh restore".into());
-        }
+        require_successor_startup_mode(remote.startup)?;
         let restored =
             restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
                 .await
@@ -1700,7 +1895,8 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
     let recorder = open_recorder(&config)?;
     let mut recorder_server = match preparation {
         StartupPreparation::RecorderFirst => {
-            let server = spawn_recorder_server(&config, recorder.clone()).await?;
+            let server =
+                spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
             tokio::task::yield_now().await;
             Some(server)
         }
@@ -1726,7 +1922,8 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
         rehydrate_recorder_with_retry(runtime.clone(), recorder.clone(), checkpoint_index).await?;
     }
     if recorder_server.is_none() {
-        recorder_server = Some(spawn_recorder_server(&config, recorder.clone()).await?);
+        recorder_server =
+            Some(spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?);
         tokio::task::yield_now().await;
     }
 
@@ -1747,34 +1944,124 @@ async fn serve_remote(config: ServeConfig) -> Result<(), String> {
         "queqlite serving client={} recorder={} recovery_generation={}",
         config.client_listen, config.recorder_listen, config.recovery_generation
     );
-    let _materializer = materializer_worker(runtime.clone());
+    let mut materializer = materializer_worker(runtime.clone(), shutdown_rx.clone());
 
-    let app = match config.admin_config()? {
-        Some(admin) => node_router_with_checkpoint_and_admin(
-            runtime.clone(),
-            recorder,
-            coordinator.clone(),
-            admin,
+    let (app, admin_tasks) = match config.admin_config()? {
+        Some(admin) => {
+            let (router, tasks) = node_router_with_checkpoint_and_admin_tasks(
+                runtime.clone(),
+                recorder,
+                coordinator.clone(),
+                admin,
+            )
+            .map_err(|error| error.to_string())?;
+            (router, Some(tasks))
+        }
+        None => (
+            node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
+            None,
         ),
-        None => node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
     };
-    let client_server = async move { axum::serve(client_listener, app).await };
-    tokio::pin!(client_server);
+    let client_shutdown = shutdown_rx.clone();
+    let mut client_server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(client_listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(client_shutdown))
+            .await
+            .map_err(|error| format!("client server stopped: {error}"))
+    }));
     let mut recorder_server = recorder_server.expect("remote recorder server started");
-    let mut worker = checkpoint_worker(remote.durability, runtime, coordinator);
-    let result = if let Some(worker) = worker.as_mut() {
+    let mut worker = checkpoint_worker(
+        remote.durability,
+        Arc::clone(&runtime),
+        Arc::clone(&coordinator),
+        shutdown_rx.clone(),
+    );
+    tokio::pin!(shutdown);
+    let (exit, result) = if let Some(worker) = worker.as_mut() {
         tokio::select! {
-            result = &mut client_server => result.map_err(|error| format!("client server stopped: {error}")),
-            result = &mut recorder_server.0 => Err(recorder_task_error(result)),
-            result = &mut worker.0 => Err(checkpoint_worker_error(result)),
+            biased;
+            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
+            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
+            result = &mut worker.0 => (ServeExit::CheckpointWorker, Err(checkpoint_worker_error(result))),
         }
     } else {
         tokio::select! {
-            result = &mut client_server => result.map_err(|error| format!("client server stopped: {error}")),
-            result = &mut recorder_server.0 => Err(recorder_task_error(result)),
+            biased;
+            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
+            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
         }
     };
-    result
+    stop_admin_admission(admin_tasks.as_ref());
+    shutdown_tx.send_replace(true);
+    runtime.cancel_operations();
+    before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+        let mut drained = Ok(());
+        if exit != ServeExit::Client {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut client_server.0).await, "client server"),
+            );
+        }
+        if exit != ServeExit::Recorder {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut recorder_server.0).await, "recorder server"),
+            );
+        }
+        if exit != ServeExit::CheckpointWorker {
+            if let Some(worker) = worker.as_mut() {
+                retain_first_error(
+                    &mut drained,
+                    task_result((&mut worker.0).await, "checkpoint worker"),
+                );
+            }
+        }
+        retain_first_error(
+            &mut drained,
+            task_result((&mut materializer.0).await, "materializer worker"),
+        );
+        wait_for_admin_tasks(admin_tasks.as_ref()).await;
+        finish_remote_serve(result.and(drained), runtime, coordinator).await
+    })
+    .await?
+}
+
+fn require_successor_startup_mode(mode: StartupMode) -> Result<(), String> {
+    if mode == StartupMode::Rejoin {
+        Ok(())
+    } else {
+        Err("successor startup requires rejoin mode".into())
+    }
+}
+
+async fn finish_remote_serve(
+    result: Result<(), String>,
+    runtime: Arc<NodeRuntime>,
+    coordinator: Arc<CheckpointCoordinator>,
+) -> Result<(), String> {
+    runtime.cancel_operations();
+    let final_flush = match runtime.applied_index() {
+        Ok(applied_index) => coordinator
+            .flush_runtime(&runtime, applied_index)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "final checkpoint durability is unconfirmed because the flush failed: {error}"
+                )
+            }),
+        Err(error) => Err(format!(
+            "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
+        )),
+    };
+    match (result, final_flush) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(durability_error)) => Err(format!("{error}; {durability_error}")),
+    }
 }
 
 fn install_successor_recorder_for_startup(config: &ServeConfig) -> Result<(), String> {
@@ -1811,7 +2098,11 @@ fn redact_object_store_error(config: &ObjStoreConfig, mut message: String) -> St
             access_key,
             secret_key,
             ..
-        } => vec![access_key, secret_key],
+        } => access_key
+            .iter()
+            .chain(secret_key.iter())
+            .map(String::as_str)
+            .collect(),
         ObjStoreConfig::Gcs {
             service_account_key,
             ..
@@ -1841,6 +2132,7 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
 async fn spawn_recorder_server(
     config: &ServeConfig,
     recorder: RecorderFileStore,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<AbortOnDrop<Result<(), String>>, String> {
     let listener = tokio::net::TcpListener::bind(&config.recorder_listen)
         .await
@@ -1852,6 +2144,7 @@ async fn spawn_recorder_server(
     );
     Ok(AbortOnDrop(tokio::spawn(async move {
         axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown))
             .await
             .map_err(|error| format!("recorder server stopped: {error}"))
     })))
@@ -1875,6 +2168,7 @@ fn checkpoint_worker(
     mode: DurabilityMode,
     runtime: Arc<NodeRuntime>,
     coordinator: Arc<CheckpointCoordinator>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<AbortOnDrop<()>> {
     let cadence = match mode {
         DurabilityMode::Sync => return None,
@@ -1883,23 +2177,51 @@ fn checkpoint_worker(
     };
     Some(AbortOnDrop(tokio::spawn(async move {
         loop {
-            tokio::time::sleep(cadence).await;
-            if let Err(error) = coordinator.flush_runtime(&runtime, u64::MAX).await {
-                eprintln!("checkpoint flush failed; retrying after {cadence:?}: {error}");
+            tokio::select! {
+                () = wait_for_shutdown(shutdown.clone()) => return,
+                () = tokio::time::sleep(cadence) => {}
+            }
+            tokio::select! {
+                () = wait_for_shutdown(shutdown.clone()) => return,
+                result = coordinator.flush_runtime(&runtime, u64::MAX) => {
+                    if let Err(error) = result {
+                        eprintln!("checkpoint flush failed; retrying after {cadence:?}: {error}");
+                    }
+                }
             }
         }
     })))
 }
 
-fn materializer_worker(runtime: Arc<NodeRuntime>) -> AbortOnDrop<()> {
+fn materializer_worker(
+    runtime: Arc<NodeRuntime>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> AbortOnDrop<()> {
     AbortOnDrop(tokio::spawn(async move {
         if let Err(error) = runtime
-            .run_background_materializer(Duration::from_millis(100), std::future::pending())
+            .run_background_materializer(Duration::from_millis(100), wait_for_shutdown(shutdown))
             .await
         {
             eprintln!("background materializer stopped: {error}");
         }
     }))
+}
+
+fn task_result<T>(result: Result<T, tokio::task::JoinError>, name: &str) -> Result<T, String> {
+    result.map_err(|error| format!("{name} task failed: {error}"))
+}
+
+fn retain_first_error(current: &mut Result<(), String>, next: Result<(), String>) {
+    if current.is_ok() && next.is_err() {
+        *current = next;
+    }
+}
+
+fn server_task_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+    name: &str,
+) -> Result<(), String> {
+    task_result(result, name)?
 }
 
 fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String {
@@ -2418,13 +2740,22 @@ async fn admin_get<T: DeserializeOwned>(
     config: &AdminClientConfig,
     path: &str,
 ) -> Result<T, String> {
-    let response = reqwest::Client::new()
+    let client = bounded_http_client(ADMIN_CONNECT_TIMEOUT, ADMIN_REQUEST_TIMEOUT)?;
+    admin_get_with_client(config, path, &client).await
+}
+
+async fn admin_get_with_client<T: DeserializeOwned>(
+    config: &AdminClientConfig,
+    path: &str,
+    client: &reqwest::Client,
+) -> Result<T, String> {
+    let response = client
         .get(admin_url(config, path))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth(&config.token)
         .send()
         .await
-        .map_err(|error| format!("admin request failed: {error}"))?;
+        .map_err(admin_request_error)?;
     decode_admin_response(response).await
 }
 
@@ -2433,19 +2764,34 @@ async fn admin_post<T: Serialize, R: DeserializeOwned>(
     path: &str,
     body: &T,
 ) -> Result<R, String> {
-    let response = reqwest::Client::new()
+    let response = bounded_http_client(ADMIN_CONNECT_TIMEOUT, ADMIN_REQUEST_TIMEOUT)?
         .post(admin_url(config, path))
         .header(VERSION_HEADER, PROTOCOL_VERSION)
         .bearer_auth(&config.token)
         .json(body)
         .send()
         .await
-        .map_err(|error| format!("admin request failed: {error}"))?;
+        .map_err(admin_request_error)?;
     decode_admin_response(response).await
 }
 
 fn admin_url(config: &AdminClientConfig, path: &str) -> String {
     format!("{}{path}", config.url.trim_end_matches('/'))
+}
+
+fn admin_request_error(error: reqwest::Error) -> String {
+    format!("admin request failed: {}", error.without_url())
+}
+
+fn bounded_http_client(
+    connect_timeout: Duration,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        .build()
+        .map_err(|error| format!("cannot build HTTP client: {error}"))
 }
 
 async fn decode_admin_response<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -2572,9 +2918,13 @@ async fn prepare_remote_startup(
                 restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), data_dir, node_id)
                     .await
                     .map_err(|error| error.to_string())?;
-            Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_index: tip.index(),
-            })
+            if tip.index() == 0 {
+                Ok(StartupPreparation::RecorderFirst)
+            } else {
+                Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                    checkpoint_index: tip.index(),
+                })
+            }
         }
         StartupMode::Rejoin => Ok(StartupPreparation::RecorderFirst),
         StartupMode::Disaster => {
@@ -2887,8 +3237,16 @@ async fn client_attempt_response<T: DeserializeOwned>(
 }
 
 async fn request_health(args: &HealthArgs) -> Result<(), String> {
+    let client = bounded_http_client(HEALTH_CONNECT_TIMEOUT, HEALTH_REQUEST_TIMEOUT)?;
+    request_health_with_client(args, &client).await
+}
+
+async fn request_health_with_client(
+    args: &HealthArgs,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let path = if args.ready { READYZ_PATH } else { LIVEZ_PATH };
-    let response = protocol_request(&reqwest::Client::new(), Method::GET, &args.url, path)
+    let response = protocol_request(client, Method::GET, &args.url, path)
         .send()
         .await
         .map_err(request_error)?;
@@ -2996,14 +3354,24 @@ fn parse_object_store_with_lookup(
         });
     }
     match value {
-        "s3" => Ok(ObjStoreConfig::S3 {
-            endpoint: required_env(lookup, "QUEQLITE_S3_ENDPOINT")?,
-            bucket: required_env(lookup, "QUEQLITE_S3_BUCKET")?,
-            access_key: required_env(lookup, "QUEQLITE_S3_ACCESS_KEY")?,
-            secret_key: required_env(lookup, "QUEQLITE_S3_SECRET_KEY")?,
-            region: lookup("QUEQLITE_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
-            allow_http: parse_optional_bool(lookup, "QUEQLITE_S3_ALLOW_HTTP")?.unwrap_or(false),
-        }),
+        "s3" => {
+            let endpoint = optional_env(lookup, "QUEQLITE_S3_ENDPOINT")?;
+            let access_key = optional_env(lookup, "QUEQLITE_S3_ACCESS_KEY")?;
+            let secret_key = optional_env(lookup, "QUEQLITE_S3_SECRET_KEY")?;
+            if access_key.is_some() != secret_key.is_some() {
+                return Err(
+                    "QUEQLITE_S3_ACCESS_KEY and QUEQLITE_S3_SECRET_KEY must be set together".into(),
+                );
+            }
+            Ok(ObjStoreConfig::S3 {
+                endpoint,
+                bucket: required_env(lookup, "QUEQLITE_S3_BUCKET")?,
+                access_key,
+                secret_key,
+                region: lookup("QUEQLITE_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+                allow_http: parse_optional_bool(lookup, "QUEQLITE_S3_ALLOW_HTTP")?.unwrap_or(false),
+            })
+        }
         "gcs" => {
             let service_account_path = optional_env(lookup, "QUEQLITE_GCS_SERVICE_ACCOUNT_PATH")?;
             let service_account_key = optional_env(lookup, "QUEQLITE_GCS_SERVICE_ACCOUNT_KEY")?;
@@ -3040,10 +3408,10 @@ fn parse_optional_bool(
     }
 }
 
+const USAGE: &str = "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite validate-config-bundle [--stdin]\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate [--offline]\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve, validate-config-bundle, and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+
 fn usage() {
-    eprintln!(
-        "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. membership and checkpoint compact are offline commands and fail while the local data root is serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it."
-    );
+    eprintln!("{USAGE}");
 }
 
 #[cfg(test)]
@@ -3551,31 +3919,36 @@ mod tests {
         assert!(bundle.require_predecessor().is_err());
     }
 
-    #[test]
-    fn configuration_bundle_accepts_exact_predecessor_stop_material() {
-        let predecessor = Membership::new(["n1", "n2", "n3"]).unwrap();
+    fn exact_predecessor_bundle() -> serde_json::Value {
+        predecessor_bundle_bound_to(["node-1", "node-2", "node-3"])
+    }
+
+    fn predecessor_bundle_bound_to<const N: usize>(
+        successor_members: [&str; N],
+    ) -> serde_json::Value {
+        let predecessor = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
         let command = ConfigChange::bound_stop(
-            "cluster-a",
-            4,
+            "queqlite-vind",
+            3,
             predecessor.digest(),
-            5,
-            vec!["n1".into(), "n2".into(), "n4".into()],
+            4,
+            successor_members.into_iter().map(String::from).collect(),
         )
         .unwrap()
         .to_stored_command();
         let entry = LogEntry {
-            cluster_id: "cluster-a".into(),
+            cluster_id: "queqlite-vind".into(),
             epoch: 1,
-            config_id: 4,
+            config_id: 3,
             index: 10,
             entry_type: command.entry_type,
             payload: command.payload.clone(),
             prev_hash: LogHash::ZERO,
             hash: LogEntry::calculate_hash(
-                "cluster-a",
+                "queqlite-vind",
                 10,
                 1,
-                4,
+                3,
                 command.entry_type,
                 LogHash::ZERO,
                 &command.payload,
@@ -3585,17 +3958,17 @@ mod tests {
             queqlite_quepaxa::ProposalPriority::MAX,
             "n1",
             1,
-            AcceptedValue::from_command("cluster-a", 10, 1, 4, LogHash::ZERO, &command),
+            AcceptedValue::from_command("queqlite-vind", 10, 1, 3, LogHash::ZERO, &command),
         );
         let proof = DecisionProof::Phase2 {
-            cluster_id: "cluster-a".into(),
+            cluster_id: "queqlite-vind".into(),
             slot: 10,
             epoch: 1,
-            config_id: 4,
+            config_id: 3,
             config_digest: predecessor.digest(),
             step: 6,
             proposal: proposal.clone(),
-            summaries: ["n1", "n2"]
+            summaries: ["node-1", "node-2"]
                 .into_iter()
                 .map(|id| queqlite_quepaxa::RecorderSummary {
                     recorder_id: id.into(),
@@ -3606,29 +3979,121 @@ mod tests {
                 })
                 .collect(),
         };
-        let json = serde_json::json!({
+        serde_json::json!({
             "version": 1,
-            "config_id": 5,
+            "config_id": 4,
             "members": [
-                {"node_id": "n1", "url": "http://n1", "token": "t1"},
-                {"node_id": "n2", "url": "http://n2", "token": "t2"},
-                {"node_id": "n4", "url": "http://n4", "token": "t4"},
+                {"node_id": "node-1", "url": "http://queqlite-c4-0.queqlite-c4:8081", "log_url": "http://queqlite-c4-0.queqlite-c4:8080", "token": "peer-1-secret"},
+                {"node_id": "node-2", "url": "http://queqlite-c4-1.queqlite-c4:8081", "log_url": "http://queqlite-c4-1.queqlite-c4:8080", "token": "peer-2-secret"},
+                {"node_id": "node-3", "url": "http://queqlite-c4-2.queqlite-c4:8081", "log_url": "http://queqlite-c4-2.queqlite-c4:8080", "token": "peer-3-secret"},
             ],
             "predecessor": {
                 "version": 2,
-                "members": ["n1", "n2", "n3"],
+                "members": ["node-1", "node-2", "node-3"],
                 "stop_entry": entry,
                 "stop_proof": proof,
             },
-        });
+        })
+    }
+
+    #[test]
+    fn validate_config_bundle_uses_the_production_parser() {
+        let json = exact_predecessor_bundle().to_string();
+        let values = HashMap::from([("QUEQLITE_CONFIG_BUNDLE", json.as_str())]);
+
+        let command = parse_validate_config_bundle(
+            |name| values.get(name).map(ToString::to_string),
+            |_| unreachable!("inline bundle must not read a file"),
+        )
+        .unwrap();
+
+        assert!(matches!(command, Command::ValidateConfigBundle(Some(4))));
+        assert!(matches!(
+            parse_command(["validate-config-bundle", "--stdin"]).unwrap(),
+            Command::ValidateConfigBundle(None)
+        ));
+    }
+
+    #[test]
+    fn configuration_bundle_accepts_exact_predecessor_stop_material() {
+        let json = exact_predecessor_bundle();
 
         let bundle = parse_configuration_bundle(&json.to_string()).unwrap();
 
-        assert_eq!(bundle.config_id, 5);
-        assert_eq!(bundle.configuration_state.config_id(), 4);
-        assert_eq!(bundle.configuration_state.digest(), predecessor.digest());
+        assert_eq!(bundle.config_id, 4);
+        assert_eq!(bundle.configuration_state.config_id(), 3);
+        assert_eq!(
+            bundle.configuration_state.digest(),
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest()
+        );
         assert_eq!(bundle.configuration_state.stop().unwrap().index(), 10);
         assert!(bundle.require_predecessor().is_ok());
+    }
+
+    #[test]
+    fn predecessor_fixture_is_generated_by_and_accepted_by_production_types() {
+        let fixture = include_str!("../../../scripts/test-fixtures/config-4-predecessor.json");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(fixture).unwrap(),
+            exact_predecessor_bundle()
+        );
+        assert!(parse_configuration_bundle(fixture).is_ok());
+        let wrong_successor =
+            include_str!("../../../scripts/test-fixtures/config-4-wrong-successor.json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(wrong_successor).unwrap(),
+            predecessor_bundle_bound_to(["node-1", "node-2", "node-4"])
+        );
+        assert!(parse_configuration_bundle(wrong_successor).is_err());
+    }
+
+    #[test]
+    fn configuration_bundle_rejects_semantically_invalid_predecessor_material() {
+        let valid = exact_predecessor_bundle();
+        let mut mutations = Vec::new();
+
+        let mut digest = valid.clone();
+        digest["predecessor"]["stop_proof"]["Phase2"]["config_digest"][0] = serde_json::json!(1);
+        mutations.push(digest);
+
+        let mut entry_hash = valid.clone();
+        entry_hash["predecessor"]["stop_entry"]["hash"][0] = serde_json::json!(1);
+        mutations.push(entry_hash);
+
+        let mut command_binding = valid.clone();
+        command_binding["predecessor"]["stop_proof"]["Phase2"]["proposal"]["value"]
+            ["command_hash"][0] = serde_json::json!(1);
+        mutations.push(command_binding);
+
+        mutations.push(predecessor_bundle_bound_to(["node-1", "node-2", "node-4"]));
+
+        let mut phase2_maximum = valid;
+        let low_priority = serde_json::json!([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1
+        ]);
+        let high_priority = serde_json::json!([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 2
+        ]);
+        phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["proposal"]["priority"] =
+            low_priority.clone();
+        for summary in phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["summaries"]
+            .as_array_mut()
+            .unwrap()
+        {
+            summary["aggregate_prior"]["priority"] = low_priority.clone();
+        }
+        phase2_maximum["predecessor"]["stop_proof"]["Phase2"]["summaries"][0]["aggregate_prior"]
+            ["priority"] = high_priority;
+        mutations.push(phase2_maximum);
+
+        for mutation in mutations {
+            assert!(parse_configuration_bundle(&mutation.to_string()).is_err());
+        }
     }
 
     fn base_serve_env() -> HashMap<&'static str, &'static str> {
@@ -3672,6 +4137,68 @@ mod tests {
         assert!(parse_serve_env(&values).unwrap_err().contains("distinct"));
         values.insert("QUEQLITE_ADMIN_TOKEN", "peer-2-secret");
         assert!(parse_serve_env(&values).unwrap_err().contains("distinct"));
+        for invalid in [" admin ", "admin secret", "admin\tsecret", "café"] {
+            values.insert("QUEQLITE_ADMIN_TOKEN", invalid);
+            assert!(parse_serve_env(&values).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn client_and_admin_commands_reject_unsafe_auth_and_non_origin_admin_urls() {
+        for invalid in [" secret ", "a b", "a\tb", "café"] {
+            assert!(parse_write_with_lookup(
+                [
+                    "--url",
+                    "http://127.0.0.1:8080",
+                    "--token",
+                    invalid,
+                    "--request-id",
+                    "r1",
+                    "--key",
+                    "k",
+                    "--value",
+                    "v",
+                ]
+                .map(String::from),
+                |_| None,
+            )
+            .is_err());
+            assert!(parse_admin_command_config(
+                [
+                    "--admin-url",
+                    "http://127.0.0.1:8080",
+                    "--admin-token",
+                    invalid,
+                ]
+                .map(String::from)
+                .into_iter(),
+                false,
+                false,
+                |_| None,
+            )
+            .is_err());
+        }
+
+        for invalid in [
+            "http://user@127.0.0.1:8080",
+            "http://user:password@127.0.0.1:8080",
+            "http://127.0.0.1:8080/prefix",
+            "http://127.0.0.1:8080?query=1",
+            "http://127.0.0.1:8080#fragment",
+        ] {
+            assert!(
+                parse_admin_command_config(
+                    ["--admin-url", invalid, "--admin-token", "admin-secret"]
+                        .map(String::from)
+                        .into_iter(),
+                    false,
+                    false,
+                    |_| None,
+                )
+                .is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -3831,10 +4358,10 @@ mod tests {
     #[test]
     fn object_store_errors_redact_provider_credentials() {
         let config = ObjStoreConfig::S3 {
-            endpoint: "https://s3.example.test".into(),
+            endpoint: Some("https://s3.example.test".into()),
             bucket: "checkpoints".into(),
-            access_key: "access-secret".into(),
-            secret_key: "private-secret".into(),
+            access_key: Some("access-secret".into()),
+            secret_key: Some("private-secret".into()),
             region: "us-east-1".into(),
             allow_http: false,
         };
@@ -3843,6 +4370,67 @@ mod tests {
             "failed with access-secret and private-secret".into(),
         );
         assert_eq!(message, "failed with [redacted] and [redacted]");
+    }
+
+    #[test]
+    fn s3_configuration_supports_aws_discovery_and_rejects_partial_credentials() {
+        let base = HashMap::from([
+            ("QUEQLITE_S3_BUCKET", "checkpoints"),
+            ("QUEQLITE_S3_REGION", "ap-northeast-2"),
+        ]);
+        let discovered = parse_object_store_with_lookup("s3", false, &mut |name| {
+            base.get(name).map(ToString::to_string)
+        })
+        .unwrap();
+        assert!(matches!(
+            discovered,
+            ObjStoreConfig::S3 {
+                endpoint: None,
+                access_key: None,
+                secret_key: None,
+                ..
+            }
+        ));
+
+        let full = HashMap::from([
+            ("QUEQLITE_S3_ENDPOINT", "http://rustfs:9000"),
+            ("QUEQLITE_S3_BUCKET", "checkpoints"),
+            ("QUEQLITE_S3_ACCESS_KEY", "access"),
+            ("QUEQLITE_S3_SECRET_KEY", "secret"),
+        ]);
+        assert!(matches!(
+            parse_object_store_with_lookup("s3", false, &mut |name| {
+                full.get(name).map(ToString::to_string)
+            })
+            .unwrap(),
+            ObjStoreConfig::S3 {
+                endpoint: Some(_),
+                access_key: Some(_),
+                secret_key: Some(_),
+                ..
+            }
+        ));
+
+        for values in [
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_ACCESS_KEY", "access"),
+            ]),
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_SECRET_KEY", "secret"),
+            ]),
+            HashMap::from([
+                ("QUEQLITE_S3_BUCKET", "checkpoints"),
+                ("QUEQLITE_S3_ACCESS_KEY", ""),
+                ("QUEQLITE_S3_SECRET_KEY", "secret"),
+            ]),
+        ] {
+            assert!(parse_object_store_with_lookup("s3", false, &mut |name| {
+                values.get(name).map(ToString::to_string)
+            })
+            .is_err());
+        }
     }
 
     #[test]
@@ -3984,6 +4572,136 @@ mod tests {
             .collect()
     }
 
+    fn runtime_for_final_flush(root: &Path) -> Arc<NodeRuntime> {
+        Arc::new(
+            NodeRuntime::open(
+                NodeConfig::new(
+                    "cluster-a",
+                    "node-1",
+                    root.join("node"),
+                    1,
+                    1,
+                    [
+                        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+                        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+                        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+                    ],
+                    "client-token",
+                )
+                .unwrap(),
+                Arc::new(
+                    ThreeNodeConsensus::from_recovered_tip(
+                        "cluster-a",
+                        "node-1",
+                        1,
+                        1,
+                        [
+                            root.join("recorders/node-1"),
+                            root.join("recorders/node-2"),
+                            root.join("recorders/node-3"),
+                        ],
+                        1,
+                        LogHash::ZERO,
+                    )
+                    .unwrap(),
+                ),
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_flushes_the_applied_tip_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive.clone(),
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+
+        finish_remote_serve(Ok(()), Arc::clone(&runtime), Arc::clone(&coordinator))
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
+        assert_eq!(
+            archive
+                .load_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .tip()
+                .index(),
+            committed.applied_index
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_bounds_a_stalled_drain_or_final_flush() {
+        let result = before_shutdown_deadline(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .contains("final checkpoint durability is unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_worker_stops_before_the_final_flush_phase() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let (shutdown, wait) = tokio::sync::watch::channel(false);
+        let mut worker = checkpoint_worker(
+            DurabilityMode::Periodic {
+                interval: Duration::from_secs(3600),
+            },
+            runtime,
+            coordinator,
+            wait,
+        )
+        .unwrap();
+
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), &mut worker.0)
+            .await
+            .expect("checkpoint worker must stop before final flush")
+            .unwrap();
+    }
+
+    #[test]
+    fn usage_describes_live_admin_as_the_default_and_offline_as_explicit() {
+        assert!(USAGE.contains("live admin API by default"));
+        assert!(USAGE.contains("pass --offline only as an explicit local fallback"));
+    }
+
     #[tokio::test]
     async fn init_checkpoint_is_idempotent_only_for_an_empty_matching_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -4109,6 +4827,13 @@ mod tests {
                 .unwrap(),
             StartupPreparation::RecorderFirst
         );
+        let empty_rejoin_dir = root.path().join("empty-rejoin");
+        assert_eq!(
+            prepare_remote_startup(StartupMode::Rejoin, &archive, &empty_rejoin_dir, "node-1",)
+                .await
+                .unwrap(),
+            StartupPreparation::RecorderFirst
+        );
         archive.publish_committed(&entries(2)).await.unwrap();
         assert!(
             prepare_remote_startup(StartupMode::Bootstrap, &archive, &data_dir, "node-1")
@@ -4150,6 +4875,13 @@ mod tests {
             StartupPreparation::RecorderFirst
         );
         assert!(fresh_disaster_dir.join("consensus/log").exists());
+    }
+
+    #[test]
+    fn successor_startup_uses_rejoin_as_its_steady_mode() {
+        assert!(require_successor_startup_mode(StartupMode::Rejoin).is_ok());
+        assert!(require_successor_startup_mode(StartupMode::Bootstrap).is_err());
+        assert!(require_successor_startup_mode(StartupMode::Disaster).is_err());
     }
 
     fn unused_local_address() -> String {
@@ -4250,7 +4982,10 @@ mod tests {
             remote: None,
         });
 
-        let first = tokio::spawn(serve(configs[0].clone()));
+        let (first_shutdown, first_wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(serve_until(configs[0].clone(), async move {
+            let _ = first_wait.await;
+        }));
         wait_for_tcp(&recorder_addresses[0]).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!first.is_finished());
@@ -4258,19 +4993,35 @@ mod tests {
             .await
             .is_err());
 
-        let second = tokio::spawn(serve(configs[1].clone()));
+        let (second_shutdown, second_wait) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(serve_until(configs[1].clone(), async move {
+            let _ = second_wait.await;
+        }));
         wait_until_ready(&client_addresses[0]).await;
         wait_until_ready(&client_addresses[1]).await;
 
-        let third = tokio::spawn(serve(configs[2].clone()));
+        let (third_shutdown, third_wait) = tokio::sync::oneshot::channel();
+        let third = tokio::spawn(serve_until(configs[2].clone(), async move {
+            let _ = third_wait.await;
+        }));
         for address in &client_addresses {
             wait_until_ready(address).await;
         }
 
-        first.abort();
-        second.abort();
-        third.abort();
-        let _ = tokio::join!(first, second, third);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+        let _ = third_shutdown.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second, third)
+        })
+        .await
+        .expect("servers must stop within the graceful shutdown bound");
+        assert!(joined.0.unwrap().is_ok());
+        assert!(joined.1.unwrap().is_ok());
+        assert!(joined.2.unwrap().is_ok());
+        for address in &recorder_addresses {
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        }
     }
 
     #[derive(Clone, Default)]
@@ -4986,6 +5737,90 @@ mod tests {
 
         server.abort();
         assert!(!error.contains(token));
+    }
+
+    #[tokio::test]
+    async fn admin_transport_errors_do_not_expose_url_credentials() {
+        let address = unused_local_address();
+        let username = "url-user-that-must-stay-private";
+        let password = "url-password-that-must-stay-private";
+        let config = AdminClientConfig {
+            url: format!("http://{username}:{password}@{address}"),
+            token: "admin-secret".into(),
+        };
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+
+        let error = admin_get_with_client::<serde_json::Value>(&config, ADMIN_STATUS_PATH, &client)
+            .await
+            .unwrap_err();
+
+        assert!(!error.contains(username));
+        assert!(!error.contains(password));
+        assert!(!error.contains(&address));
+    }
+
+    #[tokio::test]
+    async fn health_request_respects_the_configured_deadline() {
+        let app = Router::new().route(
+            LIVEZ_PATH,
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = request_health_with_client(
+            &HealthArgs {
+                url: format!("http://{address}"),
+                ready: false,
+            },
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.starts_with("request failed:"));
+    }
+
+    #[tokio::test]
+    async fn admin_request_respects_the_configured_deadline() {
+        let app = Router::new().route(
+            ADMIN_STATUS_PATH,
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Json(serde_json::json!({}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client =
+            bounded_http_client(Duration::from_millis(20), Duration::from_millis(40)).unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = admin_get_with_client::<serde_json::Value>(
+            &AdminClientConfig {
+                url: format!("http://{address}"),
+                token: "admin-secret".into(),
+            },
+            ADMIN_STATUS_PATH,
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.starts_with("admin request failed:"));
     }
 
     #[tokio::test]

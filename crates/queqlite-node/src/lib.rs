@@ -103,12 +103,15 @@ pub enum ConfigError {
     EmptyPeerBaseUrl,
     InvalidPeerBaseUrl(String),
     EmptyPeerToken,
+    DuplicatePeerToken,
     InvalidPeerCount(usize),
     DuplicatePeerNodeId(String),
     LocalNodeMissing,
     PeerMembershipMismatch,
     EmptyClientToken,
+    ClientTokenConflictsWithPeer,
     EmptyAdminToken,
+    AdminTokenConflictsWithRuntime,
     HttpClient(String),
 }
 
@@ -135,6 +138,7 @@ impl fmt::Display for ConfigError {
             Self::EmptyPeerBaseUrl => write!(f, "peer base_url must not be empty"),
             Self::InvalidPeerBaseUrl(url) => write!(f, "invalid peer base_url: {url}"),
             Self::EmptyPeerToken => write!(f, "peer token must not be empty"),
+            Self::DuplicatePeerToken => write!(f, "peer tokens must be unique"),
             Self::InvalidPeerCount(count) => {
                 write!(
                     f,
@@ -152,7 +156,13 @@ impl fmt::Display for ConfigError {
                 )
             }
             Self::EmptyClientToken => write!(f, "client token must not be empty"),
+            Self::ClientTokenConflictsWithPeer => {
+                write!(f, "client token must differ from every peer token")
+            }
             Self::EmptyAdminToken => write!(f, "admin token must not be empty"),
+            Self::AdminTokenConflictsWithRuntime => {
+                write!(f, "admin token must differ from client and peer tokens")
+            }
             Self::HttpClient(message) => write!(f, "HTTP client configuration failed: {message}"),
         }
     }
@@ -1861,7 +1871,8 @@ fn recovery_generation_matches(headers: &HeaderMap, expected: u64) -> bool {
 }
 
 fn client_authenticated(headers: &HeaderMap, expected_token: &str) -> bool {
-    version_matches(headers)
+    !expected_token.is_empty()
+        && version_matches(headers)
         && bearer_token(headers)
             .is_some_and(|token| secrets_equal(expected_token.as_bytes(), token.as_bytes()))
 }
@@ -2282,29 +2293,13 @@ impl PeerConfig {
         token: impl Into<String>,
     ) -> Result<Self, ConfigError> {
         let node_id = node_id.into();
-        let base_url = base_url.into().trim_end_matches('/').to_string();
-        let log_base_url = log_base_url.into().trim_end_matches('/').to_string();
-        let token = token.into();
-        if node_id.trim().is_empty() {
+        if !valid_nonblank_header_value(&node_id) {
             return Err(ConfigError::EmptyPeerNodeId);
         }
-        if base_url.trim().is_empty() {
-            return Err(ConfigError::EmptyPeerBaseUrl);
-        }
-        let parsed = reqwest::Url::parse(&base_url)
-            .map_err(|_| ConfigError::InvalidPeerBaseUrl(base_url.clone()))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(ConfigError::InvalidPeerBaseUrl(base_url));
-        }
-        if log_base_url.trim().is_empty() {
-            return Err(ConfigError::EmptyPeerBaseUrl);
-        }
-        let parsed = reqwest::Url::parse(&log_base_url)
-            .map_err(|_| ConfigError::InvalidPeerBaseUrl(log_base_url.clone()))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(ConfigError::InvalidPeerBaseUrl(log_base_url));
-        }
-        if token.is_empty() {
+        let base_url = validate_peer_base_url(base_url.into())?;
+        let log_base_url = validate_peer_base_url(log_base_url.into())?;
+        let token = token.into();
+        if !valid_auth_token(&token) {
             return Err(ConfigError::EmptyPeerToken);
         }
         Ok(Self {
@@ -2330,6 +2325,35 @@ impl PeerConfig {
     pub fn token(&self) -> &str {
         &self.token
     }
+}
+
+fn validate_peer_base_url(url: String) -> Result<String, ConfigError> {
+    let url = url.trim_end_matches('/').to_string();
+    if url.trim().is_empty() {
+        return Err(ConfigError::EmptyPeerBaseUrl);
+    }
+    let parsed =
+        reqwest::Url::parse(&url).map_err(|_| ConfigError::InvalidPeerBaseUrl(url.clone()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidPeerBaseUrl(url));
+    }
+    Ok(url)
+}
+
+pub(crate) fn valid_nonblank_header_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && axum::http::HeaderValue::try_from(value).is_ok_and(|value| value.to_str().is_ok())
+}
+
+pub(crate) fn valid_auth_token(value: &str) -> bool {
+    valid_nonblank_header_value(value) && !value.chars().any(char::is_whitespace)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -2469,9 +2493,13 @@ impl NodeConfig {
             return Err(ConfigError::InvalidPeerCount(peers.len()));
         }
         let mut peer_ids = HashSet::with_capacity(peers.len());
+        let mut peer_tokens = HashSet::with_capacity(peers.len());
         for peer in &peers {
             if !peer_ids.insert(peer.node_id.clone()) {
                 return Err(ConfigError::DuplicatePeerNodeId(peer.node_id.clone()));
+            }
+            if !peer_tokens.insert(peer.token.as_str()) {
+                return Err(ConfigError::DuplicatePeerToken);
             }
         }
         if !peer_ids.contains(&node_id) {
@@ -2488,8 +2516,11 @@ impl NodeConfig {
         if configuration_state.is_active() && configuration_state.digest() != membership.digest() {
             return Err(ConfigError::PeerMembershipMismatch);
         }
-        if client_token.is_empty() {
+        if !valid_auth_token(&client_token) {
             return Err(ConfigError::EmptyClientToken);
+        }
+        if peer_tokens.contains(client_token.as_str()) {
+            return Err(ConfigError::ClientTokenConflictsWithPeer);
         }
 
         Ok(Self::from_validated_parts(
@@ -4216,7 +4247,21 @@ pub fn rehydrate_recorder_after_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_sync_flush_retry, Duration, SYNC_FLUSH_RETRY_INITIAL};
+    use axum::http::HeaderValue;
+
+    use super::{
+        client_authenticated, next_sync_flush_retry, Duration, HeaderMap, PROTOCOL_VERSION,
+        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+    };
+
+    #[test]
+    fn client_authentication_rejects_empty_expected_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(VERSION_HEADER, HeaderValue::from_static(PROTOCOL_VERSION));
+        headers.insert("authorization", HeaderValue::from_static("Bearer "));
+
+        assert!(!client_authenticated(&headers, ""));
+    }
 
     #[test]
     fn sync_flush_retry_doubles_to_a_jitter_free_cap() {

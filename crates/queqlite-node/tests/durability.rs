@@ -904,7 +904,7 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
     assert!(!completed.requires_recorder_install());
     assert_eq!(completed.tip().index(), stop.entry.index);
     drop(completed);
-    let reopened = NodeRuntime::open(config.clone(), consensus, &[]).unwrap();
+    let reopened = NodeRuntime::open(config.clone(), consensus.clone(), &[]).unwrap();
     assert_eq!(
         reopened.status().unwrap().configuration_status,
         RuntimeConfigurationStatus::Active
@@ -925,6 +925,20 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
     assert!(active_anchor.configuration_state().is_active());
     assert_eq!(active_anchor.configuration_state().config_id(), 2);
     drop(reopened);
+
+    let rejoin = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
+        .await
+        .unwrap();
+    assert!(!rejoin.requires_recorder_install());
+    assert_eq!(rejoin.tip().index(), activation.index);
+    drop(rejoin);
+    let rejoined = NodeRuntime::open(config.clone(), consensus, &[]).unwrap();
+    assert_eq!(
+        rejoined.status().unwrap().configuration_status,
+        RuntimeConfigurationStatus::Active
+    );
+    drop(rejoined);
+
     let wrong = NodeConfig::new_with_configuration(
         "cluster-a",
         "other-1",

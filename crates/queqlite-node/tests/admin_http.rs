@@ -24,11 +24,14 @@ async fn admin_authentication_precedes_body_parsing_and_routes_are_optional() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(root.path(), "node", 1, peers(), None);
     let admin_recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        admin_recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            admin_recorder,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
 
     let malformed = reqwest::Client::new()
@@ -81,16 +84,117 @@ async fn admin_authentication_precedes_body_parsing_and_routes_are_optional() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_router_rejects_tokens_shared_with_lower_privilege_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+
+    assert!(matches!(
+        node_router_with_admin(
+            runtime.clone(),
+            recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+            AdminConfig::new("client-token").unwrap(),
+        ),
+        Err(queqlite_node::ConfigError::AdminTokenConflictsWithRuntime)
+    ));
+
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let coordinator = Arc::new(
+        CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        node_router_with_checkpoint_and_admin(
+            runtime,
+            recorder(
+                root.path(),
+                "checkpoint-admin-recorder",
+                "node-1",
+                1,
+                old_membership(),
+            ),
+            coordinator,
+            AdminConfig::new("peer-token-1").unwrap(),
+        ),
+        Err(queqlite_node::ConfigError::AdminTokenConflictsWithRuntime)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_operation_ledger_blocks_admin_operations() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+    std::fs::write(
+        runtime.config().data_dir().join("admin-operations-v1.json"),
+        b"not json",
+    )
+    .unwrap();
+    let router = node_router_with_admin(
+        runtime.clone(),
+        recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+        AdminConfig::new(ADMIN_TOKEN).unwrap(),
+    )
+    .unwrap();
+    let (addr, server) = serve(router).await;
+
+    let response = admin_post(
+        addr,
+        ADMIN_STOP_PATH,
+        &AdminStopRequest {
+            operation_id: "blocked-by-corrupt-ledger".into(),
+            expected_config_id: 1,
+            successor: successor_bundle(2, old_membership()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(runtime.applied_index().unwrap(), 0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operation_ledger_persist_failure_is_not_reported_as_success() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+    let router = node_router_with_admin(
+        runtime.clone(),
+        recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+        AdminConfig::new(ADMIN_TOKEN).unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir(runtime.config().data_dir().join("admin-operations-v1.json")).unwrap();
+    let (addr, server) = serve(router).await;
+
+    let response = admin_post(
+        addr,
+        ADMIN_STOP_PATH,
+        &AdminStopRequest {
+            operation_id: "persist-must-succeed".into(),
+            expected_config_id: 1,
+            successor: successor_bundle(2, old_membership()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(root.path(), "node", 1, peers(), None);
     runtime.write("before-stop", "key", "value").unwrap();
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            recorder,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     let request = AdminStopRequest {
         operation_id: "stop-001".into(),
@@ -118,6 +222,9 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
 
     let status = admin_status(addr).await;
+    assert_eq!(status.cluster_id, "cluster-a");
+    assert_eq!(status.epoch, 1);
+    assert_eq!(status.recovery_generation, 1);
     assert_eq!(
         status.node.configuration_status,
         RuntimeConfigurationStatus::Stopped
@@ -159,11 +266,14 @@ async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_resta
         expected_config_id: 1,
         successor: successor_bundle(2, old_membership()),
     };
-    let (addr, shutdown, server) = serve_until_shutdown(node_router_with_admin(
-        first_runtime.clone(),
-        admin_recorder.clone(),
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, shutdown, server) = serve_until_shutdown(
+        node_router_with_admin(
+            first_runtime.clone(),
+            admin_recorder.clone(),
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     let first = admin_post(addr, ADMIN_STOP_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
@@ -173,11 +283,14 @@ async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_resta
     drop(first_runtime);
 
     let runtime = runtime(root.path(), "node", 1, peers(), None);
-    let (addr, server) = serve(node_router_with_admin(
-        runtime,
-        admin_recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime,
+            admin_recorder,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     let replay = admin_post(addr, ADMIN_STOP_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
@@ -198,11 +311,14 @@ async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
         .stop_current_configuration_for_successor(&successor)
         .unwrap();
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, shutdown, server) = serve_until_shutdown(node_router_with_admin(
-        first_runtime.clone(),
-        recorder.clone(),
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, shutdown, server) = serve_until_shutdown(
+        node_router_with_admin(
+            first_runtime.clone(),
+            recorder.clone(),
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     let request = AdminInstallSuccessorRequest {
         operation_id: "install-001".into(),
@@ -227,11 +343,9 @@ async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
     drop(first_runtime);
 
     let runtime = runtime(root.path(), "node", 1, peers(), None);
-    let (addr, server) = serve(node_router_with_admin(
-        runtime,
-        recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(runtime, recorder, AdminConfig::new(ADMIN_TOKEN).unwrap()).unwrap(),
+    )
     .await;
     let replay = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
@@ -299,11 +413,14 @@ async fn stopped_successor_activates_through_live_admin_and_reopens_writes() {
             .unwrap(),
     );
     let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        local.unwrap(),
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            local.unwrap(),
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
 
     let before = admin_status(addr).await;
@@ -348,12 +465,15 @@ async fn compact_archive_failure_preserves_local_qlog() {
         runtime.applied_hash().unwrap(),
     );
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_checkpoint_and_admin(
-        runtime.clone(),
-        recorder,
-        coordinator,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_checkpoint_and_admin(
+            runtime.clone(),
+            recorder,
+            coordinator,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     std::fs::remove_dir_all(&archive_root).unwrap();
     std::fs::write(&archive_root, b"unavailable").unwrap();

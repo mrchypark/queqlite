@@ -182,6 +182,9 @@ impl Queqlite {
             identity.config_id,
             recorders,
         )?);
+        if node_config.membership() != consensus.membership() {
+            return Err(ConfigError::PeerMembershipMismatch.into());
+        }
         let peers: Vec<&dyn LogPeer> = log_peers.iter().map(Box::as_ref).collect();
         let runtime = Arc::new(NodeRuntime::open(node_config, consensus, &peers)?);
 

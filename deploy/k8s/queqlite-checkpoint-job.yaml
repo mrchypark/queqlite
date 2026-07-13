@@ -27,8 +27,6 @@ spec:
               value: /etc/queqlite/config/config.json
             - name: QUEQLITE_OBJECT_STORE
               value: s3
-            - name: QUEQLITE_S3_ENDPOINT
-              value: __S3_ENDPOINT__
             - name: QUEQLITE_S3_BUCKET
               value: __S3_BUCKET__
             - name: QUEQLITE_S3_REGION
@@ -40,11 +38,13 @@ spec:
                 secretKeyRef:
                   name: __OBJECT_SECRET__
                   key: access-key
+                  optional: true
             - name: QUEQLITE_S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: __OBJECT_SECRET__
                   key: secret-key
+                  optional: true
             - name: QUEQLITE_RECOVERY_GENERATION
               value: "__RECOVERY_GENERATION__"
           volumeMounts:
