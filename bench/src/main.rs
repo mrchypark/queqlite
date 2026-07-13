@@ -81,6 +81,9 @@ fn run(config: Config) -> Result<(), String> {
         config.fault.clone(),
     )?;
     let run_failure = benchmark_failure(&warmup, &measurement);
+    let measurement_window = measurement
+        .measurement_window
+        .ok_or_else(|| "measurement phase did not record its wall-clock window".to_string())?;
     let report = BenchmarkReport {
         schema_version: 1,
         run_id,
@@ -98,6 +101,7 @@ fn run(config: Config) -> Result<(), String> {
         },
         warmup: warmup.stats.output(config.warmup),
         measurement: MeasurementOutput {
+            measurement_window,
             configured_duration_seconds: config.duration.as_secs_f64(),
             observed_wall_seconds: measurement.wall_elapsed.as_secs_f64(),
             totals: measurement.stats.output(config.duration),
@@ -134,6 +138,34 @@ fn validate_instant_duration(name: &str, duration: Duration) -> Result<(), Strin
         .checked_add(duration)
         .map(|_| ())
         .ok_or_else(|| format!("{name} duration exceeds the platform clock range"))
+}
+
+fn epoch_seconds(time: SystemTime, boundary: &str) -> Result<f64, String> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("capture {boundary} wall clock: {error}"))?
+        .as_secs_f64();
+    if seconds.is_finite() {
+        Ok(seconds)
+    } else {
+        Err(format!("capture {boundary} wall clock: non-finite epoch"))
+    }
+}
+
+fn measurement_window(
+    started_at_epoch_seconds: f64,
+    finished_at_epoch_seconds: f64,
+) -> Result<MeasurementWindowOutput, String> {
+    if !started_at_epoch_seconds.is_finite()
+        || !finished_at_epoch_seconds.is_finite()
+        || finished_at_epoch_seconds < started_at_epoch_seconds
+    {
+        return Err("measurement wall-clock window is invalid".into());
+    }
+    Ok(MeasurementWindowOutput {
+        started_at_epoch_seconds,
+        finished_at_epoch_seconds,
+    })
 }
 
 fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), String> {
@@ -194,6 +226,7 @@ fn run_phase(
     if duration.is_zero() {
         return Ok(PhaseResult::default());
     }
+    let started_at_epoch_seconds = epoch_seconds(SystemTime::now(), &format!("{phase} start"))?;
     let phase_start = Instant::now();
     let phase_deadline = phase_start
         .checked_add(duration)
@@ -264,10 +297,15 @@ fn run_phase(
         }
     }
     result.wall_elapsed = phase_start.elapsed();
+    let finished_at_epoch_seconds = epoch_seconds(SystemTime::now(), &format!("{phase} end"));
     result.fault = fault_handle.map(|((tag, offset), handle)| match handle.join() {
         Ok(output) => output,
         Err(_) => FaultOutput::thread_panicked(tag, offset),
     });
+    result.measurement_window = Some(measurement_window(
+        started_at_epoch_seconds,
+        finished_at_epoch_seconds?,
+    )?);
     Ok(result)
 }
 
@@ -754,6 +792,7 @@ struct PhaseResult {
     offered_iterations: u64,
     dropped_schedule_iterations: u64,
     worker_panicked: bool,
+    measurement_window: Option<MeasurementWindowOutput>,
 }
 
 impl PhaseResult {
@@ -794,6 +833,7 @@ struct ConfigOutput {
 
 #[derive(Serialize)]
 struct MeasurementOutput {
+    measurement_window: MeasurementWindowOutput,
     configured_duration_seconds: f64,
     observed_wall_seconds: f64,
     totals: StatsOutput,
@@ -801,6 +841,12 @@ struct MeasurementOutput {
     completed_iterations: u64,
     dropped_schedule_iterations: u64,
     fault_windows: FaultWindowsOutput,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct MeasurementWindowOutput {
+    started_at_epoch_seconds: f64,
+    finished_at_epoch_seconds: f64,
 }
 
 #[derive(Serialize)]
@@ -998,8 +1044,9 @@ mod tests {
     use reqwest::blocking::Client;
 
     use super::{
-        benchmark_failure, endpoint_candidates, run, setup_table, spawn_fault_hook, wait_for_rate,
-        write_request_id, FaultWindows, PhaseResult, BEFORE, WORKER_PANIC_DIAGNOSTIC,
+        benchmark_failure, endpoint_candidates, run, run_phase, setup_table, spawn_fault_hook,
+        wait_for_rate, write_request_id, FaultWindows, PhaseResult, BEFORE,
+        WORKER_PANIC_DIAGNOSTIC,
     };
 
     fn config(endpoint: String) -> Config {
@@ -1106,6 +1153,63 @@ mod tests {
         setup_table(&client, &config, "first").unwrap();
         setup_table(&client, &config, "second").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn measurement_window_uses_phase_boundaries_not_warmup_or_fault_join() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let _ = read_request_body(&mut stream);
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"columns":[],"rows":[[{"type":"text","value":"queqlite-bench-seed"},{"type":"text","value":"value-queqlite-bench-seed"}]]}"#,
+                );
+            }
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut config = config(endpoint);
+        config.target_rate = Some(0.001);
+        let warmup = run_phase(
+            &client,
+            &config,
+            "run",
+            "warmup",
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        let call_started = Instant::now();
+        let measurement = run_phase(
+            &client,
+            &config,
+            "run",
+            "measurement",
+            Duration::from_millis(10),
+            Some(FaultConfig {
+                offset: Duration::ZERO,
+                tag: "slow-join".into(),
+                command: "sleep 0.2".into(),
+            }),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let warmup_window = warmup.measurement_window.unwrap();
+        let measurement_window = measurement.measurement_window.unwrap();
+        let reported_span = measurement_window.finished_at_epoch_seconds
+            - measurement_window.started_at_epoch_seconds;
+        assert!(
+            measurement_window.started_at_epoch_seconds >= warmup_window.finished_at_epoch_seconds
+        );
+        assert!((reported_span - measurement.wall_elapsed.as_secs_f64()).abs() < 0.05);
+        assert!(call_started.elapsed().as_secs_f64() > reported_span + 0.1);
     }
 
     #[test]
