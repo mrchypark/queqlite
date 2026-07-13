@@ -15,6 +15,53 @@ grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/bench-vind.sh
 
 # shellcheck disable=SC1091 # Repository-local source; callers run from repo root.
 source scripts/bench-vind.sh
+
+: > "$tmp/empty-resources.jsonl"
+if validate_resource_samples "$tmp/empty-resources.jsonl"; then
+  echo "empty resource evidence was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"timestamp":"2026-07-13T00:00:00Z","source":"containerd_cri_stats","app":"queqlite","pod":"q-0","pod_uid":"u","container":"queqlite","container_id":"c","restart_count":0,"cpu_usage_usec":1,"memory_bytes":2}' > "$tmp/resources.jsonl"
+if validate_resource_samples "$tmp/resources.jsonl"; then
+  echo "resource evidence without simulator samples was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"timestamp":"2026-07-13T00:00:00Z","source":"containerd_cri_stats","app":"simulator","pod":"rustfs-0","pod_uid":"u2","container":"rustfs","container_id":"c2","restart_count":0,"cpu_usage_usec":1,"memory_bytes":2}' >> "$tmp/resources.jsonl"
+validate_resource_samples "$tmp/resources.jsonl"
+
+: > "$tmp/empty-access.jsonl"
+printf '%s\n' '{"metering":{"enabled":true,"status":"failed","requests":0},"retained":{"status":"ok","object_count":0,"retained_bytes":0}}' > "$tmp/invalid-meter.json"
+if validate_object_evidence "$tmp/missing-access.jsonl" "$tmp/invalid-meter.json"; then
+  echo "unreadable object meter output was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"metering":{"enabled":true,"status":"ok","requests":0},"retained":{"status":"ok","object_count":0,"retained_bytes":0}}' > "$tmp/empty-usage.json"
+validate_object_evidence "$tmp/empty-access.jsonl" "$tmp/empty-usage.json"
+printf '%s\n' '{"metering":{"enabled":true,"status":"ok","requests":0},"retained":{"status":"failed","object_count":null,"retained_bytes":null}}' > "$tmp/invalid-usage.json"
+if validate_object_evidence "$tmp/empty-access.jsonl" "$tmp/invalid-usage.json"; then
+  echo "null object inventory was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"method":"PUT","status":"200","request_bytes":"1","response_bytes":"2"}' > "$tmp/access.jsonl"
+printf '%s\n' '{"metering":{"enabled":true,"status":"ok","requests":1},"retained":{"status":"ok","object_count":1,"retained_bytes":2}}' > "$tmp/usage.json"
+validate_object_evidence "$tmp/access.jsonl" "$tmp/usage.json"
+[ "$(evidence_exit_status 0 failed ok)" = 1 ]
+[ "$(evidence_exit_status 7 ok ok)" = 7 ]
+failed_evidence="$(render_evidence_json failed ok true true)"
+jq -e '.status == "failed" and .resource_sampling.status == "failed" and
+  .object_metering.status == "ok"' <<< "$failed_evidence" >/dev/null
+jq -e '.status == "disabled" and
+  (.resource_sampling.enabled | not) and (.object_metering.enabled | not)' \
+  <<< "$(render_evidence_json disabled disabled false false)" >/dev/null
+
+build_line="$(grep -n 'cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench' scripts/bench-vind.sh | cut -d: -f1)"
+# shellcheck disable=SC2016 # Literal source-order check.
+sample_line="$(grep -n ': > "$resources_jsonl"' scripts/bench-vind.sh | cut -d: -f1)"
+meter_line="$(grep -n "k exec .*': > /var/log/nginx/s3-access.log'" scripts/bench-vind.sh | cut -d: -f1)"
+[ -n "$build_line" ] && [ "$build_line" -lt "$sample_line" ] && [ "$build_line" -lt "$meter_line" ]
+# shellcheck disable=SC2016 # Literal direct-execution check.
+grep -Fq 'QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}"' scripts/bench-vind.sh
+
 printf '%s\n' 'fixture port-forward failure' > "$tmp/port-forward-0.log"
 if failure="$(
   # shellcheck disable=SC2034 # Read by assert_port_forward_alive from the sourced script.

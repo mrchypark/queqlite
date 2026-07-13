@@ -43,6 +43,15 @@ created_cluster=false
 port_forward_pids=()
 sampler_pid=""
 benchmark_status=255
+cleanup_status=0
+resource_evidence_status=disabled
+object_evidence_status=disabled
+object_meter_reset_status=disabled
+[ "$resource_sampling" = 0 ] || resource_evidence_status=pending
+[ "$object_metering" = 0 ] || {
+  object_evidence_status=pending
+  object_meter_reset_status=pending
+}
 
 usage() {
   printf '%s\n' \
@@ -76,6 +85,62 @@ assert_port_forward_alive() {
   echo "port-forward exited with status $status: ${endpoint_urls[$index]}" >&2
   sed 's/^/  /' "$target/port-forward-$index.log" >&2
   exit 1
+}
+
+validate_resource_samples() {
+  jq -s -e '
+    any(.[]; .app == "queqlite") and any(.[]; .app == "simulator") and all(.[];
+      (.timestamp | type == "string" and length > 0) and
+      .source == "containerd_cri_stats" and
+      (.app == "queqlite" or .app == "simulator") and
+      ([.pod,.pod_uid,.container,.container_id] | all(type == "string")) and
+      ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0)))
+  ' "$1" >/dev/null 2>&1
+}
+
+validate_object_evidence() {
+  local request_count
+  [ -r "$1" ] || return 1
+  request_count="$(jq -s -er '
+    def numeric: type == "number" or (type == "string" and test("^[0-9]+$"));
+    if all(.[];
+      (.method | type == "string" and length > 0) and
+      (.status | numeric) and (.request_bytes | numeric) and (.response_bytes | numeric))
+    then length else error("invalid meter output") end
+  ' "$1" 2>/dev/null)" || return 1
+  jq -e --argjson request_count "$request_count" '
+      .metering.enabled == true and .metering.status == "ok" and
+      .metering.requests == $request_count and
+      .retained.status == "ok" and
+      (.retained.object_count | type == "number" and . >= 0) and
+      (.retained.retained_bytes | type == "number" and . >= 0)
+    ' "$2" >/dev/null 2>&1
+}
+
+evidence_overall_status() {
+  if [ "$1" = failed ] || [ "$2" = failed ]; then
+    echo failed
+  elif [ "$1" = disabled ] && [ "$2" = disabled ]; then
+    echo disabled
+  else
+    echo ok
+  fi
+}
+
+evidence_exit_status() {
+  if [ "$1" -ne 0 ]; then echo "$1"
+  elif [ "$(evidence_overall_status "$2" "$3")" = failed ]; then echo 1
+  else echo 0
+  fi
+}
+
+render_evidence_json() {
+  jq -n --arg resource "$1" --arg object "$2" \
+    --argjson resource_enabled "$3" --argjson object_enabled "$4" \
+    --arg overall "$(evidence_overall_status "$1" "$2")" \
+    '{status:$overall,
+      resource_sampling:{enabled:$resource_enabled,status:$resource},
+      object_metering:{enabled:$object_enabled,status:$object}}'
 }
 
 # Allow the static check to exercise process-failure handling without starting a cluster.
@@ -192,28 +257,39 @@ sample_resources() {
 }
 
 collect_object_usage() {
-  local pod phase usage_pod meter_enabled
+  local pod phase usage_pod meter_enabled meter_status inventory_status retained retained_output usage_tmp
   meter_enabled=false
   [ "$object_metering" = 1 ] && meter_enabled=true
   if [ -z "$context" ] || ! k get service rustfs >/dev/null 2>&1; then
     : > "$object_access_log"
     jq -n --argjson enabled "$meter_enabled" \
-      '{metering:{enabled:$enabled,source:(if $enabled then "nginx_access_log" else null end),requests:0,
+      '{metering:{enabled:$enabled,status:(if $enabled then "failed" else "disabled" end),
+        error:(if $enabled then "rustfs service unavailable" else null end),
+        source:(if $enabled then "nginx_access_log" else null end),requests:0,
         request_bytes:0,response_bytes:0,by_method_status:[]},
-        retained:{object_count:null,retained_bytes:null}}' > "$object_usage_json"
-    return
+        retained:{status:"failed",object_count:null,retained_bytes:null}}' > "$object_usage_json"
+    if [ "$object_metering" = 0 ]; then return 0; else return 1; fi
   fi
   pod="$(k get pod -l app.kubernetes.io/name=rustfs -o json 2>/dev/null | jq -r \
     '.items[] | select(any(.spec.containers[]; .name == "object-meter")) | .metadata.name' | head -n 1 || true)"
+  meter_status=disabled
   if [ "$object_metering" = 1 ] && [ -n "$pod" ]; then
-    k exec "$pod" -c object-meter -- cat /var/log/nginx/s3-access.log > "$object_access_log" 2>/dev/null || true
+    if k exec "$pod" -c object-meter -- cat /var/log/nginx/s3-access.log > "$object_access_log" 2>/dev/null; then
+      meter_status=ok
+    else
+      meter_status=failed
+    fi
+  elif [ "$object_metering" = 1 ]; then
+    meter_status=failed
+    : > "$object_access_log"
   else
     : > "$object_access_log"
   fi
 
   usage_pod="bench-object-usage"
   k delete pod "$usage_pod" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-  jq -n --arg image "$aws_image" '{apiVersion:"v1",kind:"Pod",metadata:{name:"bench-object-usage"},spec:{
+  inventory_status=failed
+  if jq -n --arg image "$aws_image" '{apiVersion:"v1",kind:"Pod",metadata:{name:"bench-object-usage"},spec:{
     automountServiceAccountToken:false,enableServiceLinks:false,restartPolicy:"Never",containers:[{
       name:"aws-cli",image:$image,imagePullPolicy:"IfNotPresent",
       command:["/bin/sh","-c"],args:["aws --endpoint-url http://rustfs:9000 s3api list-objects-v2 --bucket queqlite --output json"],
@@ -221,28 +297,49 @@ collect_object_usage() {
         {name:"AWS_ACCESS_KEY_ID",valueFrom:{secretKeyRef:{name:"rustfs-credentials",key:"access-key"}}},
         {name:"AWS_SECRET_ACCESS_KEY",valueFrom:{secretKeyRef:{name:"rustfs-credentials",key:"secret-key"}}},
         {name:"AWS_DEFAULT_REGION",value:"us-east-1"},{name:"AWS_EC2_METADATA_DISABLED",value:"true"}
-      ]}]}}' | k apply -f - >/dev/null 2>&1 || true
+      ]}]}}' | k apply -f - >/dev/null 2>&1; then
+    inventory_status=pending
+  fi
   phase=""
-  for _ in $(seq 1 90); do
-    phase="$(k get pod "$usage_pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    case "$phase" in Succeeded|Failed) break ;; esac
-    sleep 1
-  done
+  if [ "$inventory_status" = pending ]; then
+    for _ in $(seq 1 90); do
+      phase="$(k get pod "$usage_pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      case "$phase" in Succeeded|Failed) break ;; esac
+      sleep 1
+    done
+  fi
   retained='{"object_count":null,"retained_bytes":null}'
   if [ "$phase" = Succeeded ]; then
-    retained="$(k logs "$usage_pod" 2>/dev/null | jq -c \
-      '{object_count:((.Contents // []) | length),retained_bytes:((.Contents // []) | map(.Size) | add // 0)}' \
-      2>/dev/null || printf '%s' "$retained")"
+    if retained_output="$(k logs "$usage_pod" 2>/dev/null)" &&
+      retained="$(jq -ce \
+        '{object_count:((.Contents // []) | length),retained_bytes:((.Contents // []) | map(.Size) | add // 0)} |
+         select((.object_count | type == "number" and . >= 0) and
+           (.retained_bytes | type == "number" and . >= 0))' <<< "$retained_output" 2>/dev/null)"; then
+      inventory_status=ok
+    fi
   fi
-  jq -s --argjson enabled "$meter_enabled" --argjson retained "$retained" '
-    {metering:{enabled:$enabled,source:(if $enabled then "nginx_access_log" else null end),
+  [ "$inventory_status" = ok ] || inventory_status=failed
+  usage_tmp="$object_usage_json.tmp"
+  if ! jq -s --argjson enabled "$meter_enabled" --arg meter_status "$meter_status" \
+    --arg inventory_status "$inventory_status" --argjson retained "$retained" '
+    {metering:{enabled:$enabled,status:$meter_status,
+      source:(if $enabled then "nginx_access_log" else null end),
       requests:length,request_bytes:(map(.request_bytes | tonumber) | add // 0),
       response_bytes:(map(.response_bytes | tonumber) | add // 0),
       by_method_status:(group_by([.method,.status]) | map({method:.[0].method,status:(.[0].status | tonumber),
         requests:length,request_bytes:(map(.request_bytes | tonumber) | add),
-        response_bytes:(map(.response_bytes | tonumber) | add)}))},retained:$retained}' \
-    "$object_access_log" > "$object_usage_json"
+        response_bytes:(map(.response_bytes | tonumber) | add)}))},
+     retained:($retained + {status:$inventory_status})}' \
+    "$object_access_log" > "$usage_tmp"; then
+    jq -n --argjson enabled "$meter_enabled" \
+      '{metering:{enabled:$enabled,status:(if $enabled then "failed" else "disabled" end),
+        error:"invalid meter output",source:(if $enabled then "nginx_access_log" else null end),
+        requests:0,request_bytes:0,response_bytes:0,by_method_status:[]},
+       retained:{status:"failed",object_count:null,retained_bytes:null}}' > "$usage_tmp"
+  fi
+  mv "$usage_tmp" "$object_usage_json"
   k delete pod "$usage_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  [ "$object_metering" = 0 ] || validate_object_evidence "$object_access_log" "$object_usage_json"
 }
 
 wait_for_checkpoint_drain() {
@@ -279,8 +376,12 @@ wait_for_checkpoint_drain() {
 }
 
 emit_artifacts() {
-  local cleaned_up=true
+  local cleaned_up=true resource_enabled=false object_enabled=false evidence
   [ "$keep" = true ] && cleaned_up=false
+  [ "$resource_sampling" = 0 ] || resource_enabled=true
+  [ "$object_metering" = 0 ] || object_enabled=true
+  evidence="$(render_evidence_json "$resource_evidence_status" "$object_evidence_status" \
+    "$resource_enabled" "$object_enabled")"
   jq -n \
     --arg run_id "$run_id" \
     --arg cluster "$cluster" \
@@ -297,8 +398,11 @@ emit_artifacts() {
     --arg durability_max_lag "$durability_max_lag" \
     --arg durability_interval "$durability_interval" \
     --argjson benchmark_exit "$benchmark_status" \
+    --argjson run_exit "$cleanup_status" \
+    --argjson evidence "$evidence" \
     --argjson cleaned_up "$cleaned_up" \
     '{run_id:$run_id,cluster:$cluster,namespace:$namespace,benchmark_exit_status:$benchmark_exit,
+      exit_status:$run_exit,evidence:$evidence,
       configuration:{durability:{mode:$durability_mode,
         max_lag:(if $durability_max_lag == "" then null else $durability_max_lag end),
         interval:(if $durability_interval == "" then null else $durability_interval end)}},
@@ -309,16 +413,32 @@ emit_artifacts() {
 }
 
 cleanup_run() {
-  status="$1"
+  cleanup_status="$1"
   mkdir -p "$target"
+  if [ "$resource_sampling" = 1 ] &&
+    { [ -z "$sampler_pid" ] || ! kill -0 "$sampler_pid" 2>/dev/null; }; then
+    resource_evidence_status=failed
+  fi
   touch "$stop_sampler" 2>/dev/null || true
   [ -z "$sampler_pid" ] || kill "$sampler_pid" 2>/dev/null || true
   [ -z "$sampler_pid" ] || wait "$sampler_pid" 2>/dev/null || true
   for pid in "${port_forward_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${port_forward_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-  collect_object_usage || true
-  if [ -s "$resources_jsonl" ]; then
-    jq -s '
+  if [ "$object_metering" = 0 ]; then
+    : > "$object_access_log"
+    jq -n '{metering:{enabled:false,status:"disabled",source:null,requests:0,
+      request_bytes:0,response_bytes:0,by_method_status:[]},
+      retained:{status:"disabled",object_count:null,retained_bytes:null}}' > "$object_usage_json"
+  elif collect_object_usage && [ "$object_meter_reset_status" = ok ]; then
+    object_evidence_status=ok
+  else
+    object_evidence_status=failed
+  fi
+  if [ "$resource_sampling" = 0 ]; then
+    jq -n '{status:"disabled",samples:0,container_cpu_usage_usec_deltas:[],apps:[]}' \
+      > "$resource_summary"
+  elif [ "$resource_evidence_status" != failed ] &&
+    validate_resource_samples "$resources_jsonl" && jq -s '
       def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) | map(sort_by(.timestamp) as $g |
         {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
          container_id:$g[0].container_id,first:$g[0].cpu_usage_usec,last:$g[-1].cpu_usage_usec,
@@ -326,18 +446,26 @@ cleanup_run() {
       def memory_by_app: group_by([.timestamp,.app]) | map({timestamp:.[0].timestamp,app:.[0].app,
         memory_bytes:(map(.memory_bytes) | add)});
       . as $samples | ($samples | cpu_deltas) as $cpu | ($samples | memory_by_app) as $memory |
-      {samples:($samples | length),container_cpu_usage_usec_deltas:$cpu,
+      {status:"ok",samples:($samples | length),container_cpu_usage_usec_deltas:$cpu,
        apps:(["queqlite","simulator"] | map(. as $app |
          ($memory | map(select(.app == $app))) as $app_memory |
          {app:$app,cpu_usage_usec:($cpu | map(select(.app == $app) | .delta_usec) | add // 0),
           memory_samples:($app_memory | length),
           average_memory_bytes:(if ($app_memory | length) == 0 then null else (($app_memory | map(.memory_bytes) | add) / ($app_memory | length) | floor) end),
           peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))}' \
-      "$resources_jsonl" > "$resource_summary"
+      "$resources_jsonl" > "$resource_summary"; then
+    resource_evidence_status=ok
   else
-    jq -n '{samples:0,container_cpu_usage_usec_deltas:[],apps:[]}' > "$resource_summary"
+    resource_evidence_status=failed
+    jq -n '{status:"failed",error:"resource samples unavailable or invalid",samples:0,
+      container_cpu_usage_usec_deltas:[],apps:[]}' > "$resource_summary"
   fi
-  emit_artifacts
+  cleanup_status="$(evidence_exit_status "$cleanup_status" \
+    "$resource_evidence_status" "$object_evidence_status")"
+  if ! emit_artifacts; then
+    echo "failed to write benchmark artifacts" >&2
+    [ "$cleanup_status" -ne 0 ] || cleanup_status=1
+  fi
   if [ "$keep" = false ] && [ -n "$context" ]; then
     k delete namespace "$namespace" --wait=true >/dev/null 2>&1 || true
   fi
@@ -345,7 +473,7 @@ cleanup_run() {
     vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || true
   fi
   [ -z "$previous_context" ] || kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
-  if [ "$status" -eq 0 ]; then
+  if [ "$cleanup_status" -eq 0 ]; then
     cat "$artifacts_json"
   else
     echo "benchmark artifacts: $artifacts_json" >&2
@@ -356,7 +484,7 @@ on_exit() {
   status=$?
   trap - EXIT
   cleanup_run "$status"
-  exit "$status"
+  exit "$cleanup_status"
 }
 trap on_exit EXIT
 
@@ -505,25 +633,34 @@ curl -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $client_token" \
   -H 'Content-Type: application/json' \
   --data "$setup_body" "http://127.0.0.1:${local_port}/v1/sql/execute" >/dev/null
 
+bench_target_dir="$(cargo metadata --locked --manifest-path bench/Cargo.toml --format-version 1 --no-deps | jq -r .target_directory)"
+cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench
+bench_binary="$bench_target_dir/release/queqlite-bench"
+[ -x "$bench_binary" ] || die "benchmark binary was not built: $bench_binary"
+
 : > "$resources_jsonl"
 if [ "$resource_sampling" = 1 ]; then
   sample_resources >"$resource_sampler_log" 2>&1 &
   sampler_pid=$!
   for _ in $(seq 1 10); do
-    [ -s "$resources_jsonl" ] && break
+    validate_resource_samples "$resources_jsonl" && break
     kill -0 "$sampler_pid" 2>/dev/null || break
     sleep 1
   done
-  if [ ! -s "$resources_jsonl" ]; then
-    printf 'resource sampler did not produce an initial sample\n' >> "$resource_sampler_log"
-  fi
+  validate_resource_samples "$resources_jsonl" ||
+    die "resource sampler did not produce a valid initial sample"
 else
   printf 'resource sampling disabled\n' > "$resource_sampler_log"
 fi
 if [ "$object_metering" = 1 ]; then
   meter_pod="$(k get pod -l app.kubernetes.io/name=rustfs -o json | jq -r \
     '.items[] | select(any(.spec.containers[]; .name == "object-meter")) | .metadata.name' | head -n 1)"
-  k exec "$meter_pod" -c object-meter -- sh -c ': > /var/log/nginx/s3-access.log'
+  if k exec "$meter_pod" -c object-meter -- sh -c ': > /var/log/nginx/s3-access.log'; then
+    object_meter_reset_status=ok
+  else
+    object_meter_reset_status=failed
+    die "failed to reset object meter"
+  fi
 fi
 bench_args=(--duration "$duration" --warmup "$warmup" --concurrency "$concurrency"
   --workload "$workload" --write-percent "$write_percent" --skip-setup)
@@ -535,7 +672,7 @@ case "$fault" in
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
-if QUEQLITE_CLIENT_TOKEN="$client_token" cargo run --release --manifest-path bench/Cargo.toml -- "${bench_args[@]}" > "$benchmark_json"; then
+if QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
   benchmark_status=0
 else
   benchmark_status=$?
