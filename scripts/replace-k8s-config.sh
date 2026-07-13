@@ -29,7 +29,9 @@ old_name="queqlite-c${old_id}"
 new_name="queqlite-c${new_id}"
 mkdir -p "$work_dir"
 chmod 700 "$work_dir"
+umask 077
 stop_json="$work_dir/stop-c${old_id}.json"
+stop_state="$work_dir/stop-c${old_id}.state.json"
 successor_bundle="$work_dir/config-c${new_id}.json"
 successor_yaml="$work_dir/config-c${new_id}.yaml"
 source_inspect_json="$work_dir/checkpoint-c${old_id}.json"
@@ -78,34 +80,80 @@ successor_digest() {
 }
 
 echo "stopping configuration $old_id"
-if "$resume"; then
-  stop_operation="$(jq -er '.operation_id' "$stop_json")"
-else
-  stop_operation="stop-c${old_id}-to-c${new_id}-$(date -u +%Y%m%dT%H%M%SZ)"
-fi
 successor_members="$(jq -c '[.members[].node_id] | sort' "$successor_draft")"
 successor_digest_json="$(successor_digest)"
-stop_request="$(jq -cn --arg op "$stop_operation" --argjson id "$old_id" \
-  --argjson successor_id "$new_id" --argjson members "$successor_members" \
+stop_successor="$(jq -cn --argjson id "$new_id" --argjson members "$successor_members" \
   --argjson digest "$successor_digest_json" \
-  '{operation_id:$op, expected_config_id:$id,
-    successor:{config_id:$successor_id,members:$members,digest:$digest}}')"
-if ! "$resume"; then
-stop_attempt_json="$stop_json.attempt"
-for ((attempt=1; attempt<=60; attempt++)); do
-  if admin "$old_name" "${old_name}-0" POST "$stop_path" "$stop_request" \
-    > "$stop_attempt_json"; then
-    mv "$stop_attempt_json" "$stop_json"
-    break
+  '{config_id:$id,members:$members,digest:$digest}')"
+if [ -s "$stop_json" ]; then
+  jq -e --argjson successor "$stop_successor" '.successor == $successor' \
+    "$stop_json" >/dev/null || { echo "existing Stop response differs from successor draft" >&2; exit 65; }
+  stop_candidate="$(jq -er '.operation_id' "$stop_json")"
+else
+  stop_candidate="stop-c${old_id}-to-c${new_id}-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+stop_operation="$(scripts/k8s-stop-state.sh prepare "$stop_state" \
+  "$old_id" "$new_id" "$stop_successor" "$stop_candidate")"
+stop_request="$(jq -cn --arg op "$stop_operation" --argjson id "$old_id" \
+  --argjson successor "$stop_successor" \
+  '{operation_id:$op, expected_config_id:$id, successor:$successor}')"
+
+validate_stop_response() {
+  jq -e --arg operation "$stop_operation" --argjson id "$old_id" \
+    --argjson successor "$stop_successor" '
+    .operation_id == $operation and .stop.version == 2 and
+    .stop.entry.config_id == $id and .stop.proof != null and
+    .successor == $successor
+  ' "$1" >/dev/null
+}
+
+recover_stop_from_status() {
+  local rc
+  admin "$old_name" "${old_name}-0" GET "$status_path" > "$status_json" || return 1
+  if scripts/k8s-stop-state.sh recover "$stop_state" "$status_json" "$stop_json"; then
+    return 0
+  else
+    rc=$?
   fi
-  rm -f "$stop_attempt_json"
-  [ "$attempt" -lt 60 ] || { echo "configuration stop did not converge" >&2; exit 1; }
-  sleep 1
-done
-jq -e --argjson id "$old_id" '
-  (.operation_id | length > 0) and .stop.version == 2 and
-  .stop.entry.config_id == $id and .stop.proof and .successor
-' "$stop_json" >/dev/null
+  [ "$rc" -eq 1 ] && return 1
+  return "$rc"
+}
+if ! "$resume"; then
+stop_ready=false
+if recover_stop_from_status; then
+  stop_ready=true
+else
+  rc=$?
+  [ "$rc" -eq 1 ] || exit "$rc"
+fi
+if ! "$stop_ready"; then
+  stop_attempt_json="$stop_json.attempt"
+  for ((attempt=1; attempt<=60; attempt++)); do
+    if admin "$old_name" "${old_name}-0" POST "$stop_path" "$stop_request" \
+      > "$stop_attempt_json"; then
+      validate_stop_response "$stop_attempt_json" || {
+        rm -f "$stop_attempt_json"
+        echo "Stop response does not match persisted Stop state" >&2
+        exit 65
+      }
+      mv "$stop_attempt_json" "$stop_json"
+      break
+    fi
+    rm -f "$stop_attempt_json"
+    if recover_stop_from_status; then
+      break
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] || exit "$rc"
+    fi
+    [ "$attempt" -lt 60 ] || { echo "configuration stop did not converge" >&2; exit 1; }
+    sleep 1
+  done
+fi
+validate_stop_response "$stop_json" || {
+  echo "Stop response does not match persisted Stop state" >&2
+  exit 65
+}
 
 for ((attempt=1; attempt<=60; attempt++)); do
   all_stopped=true

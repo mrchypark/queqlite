@@ -63,6 +63,39 @@ if scripts/render-k8s-config.sh 3 3 \
   exit 1
 fi
 
+stop_successor="$(jq -cn '{config_id:4,members:["node-1","node-2","node-3"],
+  digest:[range(32) | 0]}')"
+stop_state="$tmp/stop-c3.state.json"
+first_stop_operation="$(scripts/k8s-stop-state.sh prepare \
+  "$stop_state" 3 4 "$stop_successor" stop-first)"
+second_stop_operation="$(scripts/k8s-stop-state.sh prepare \
+  "$stop_state" 3 4 "$stop_successor" stop-should-not-replace)"
+[ "$first_stop_operation" = stop-first ]
+[ "$second_stop_operation" = "$first_stop_operation" ]
+jq -n --argjson successor "$stop_successor" '{
+  node:{configuration_status:"stopped",active_config_id:3,
+    configuration_state:{phase:"stopped"}},
+  stopped_transition:{
+    stop:{version:2,entry:{config_id:3,index:9,hash:[range(32) | 1]},proof:{}},
+    successor:$successor}
+}' > "$tmp/stopped-status.json"
+scripts/k8s-stop-state.sh recover \
+  "$stop_state" "$tmp/stopped-status.json" "$tmp/recovered-stop.json"
+jq -e --arg operation "$first_stop_operation" --argjson successor "$stop_successor" '
+  .operation_id == $operation and .stop.version == 2 and .successor == $successor
+' "$tmp/recovered-stop.json" >/dev/null
+jq '.stopped_transition.successor.members = ["other-1","other-2","other-3"]' \
+  "$tmp/stopped-status.json" > "$tmp/mismatched-stopped-status.json"
+set +e
+scripts/k8s-stop-state.sh recover \
+  "$stop_state" "$tmp/mismatched-stopped-status.json" "$tmp/invalid-stop.json"
+mismatched_stop_rc=$?
+set -e
+[ "$mismatched_stop_rc" = 65 ]
+for attempt in "$stop_state".attempt.*; do
+  [ ! -e "$attempt" ] || { echo "atomic Stop state attempt file leaked" >&2; exit 1; }
+done
+
 QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
 QUEQLITE_OBJECT_SECRET=rustfs-credentials \
 QUEQLITE_S3_ALLOW_HTTP=true \
@@ -81,8 +114,8 @@ QUEQLITE_S3_ALLOW_HTTP=true \
   select(.name == "QUEQLITE_S3_ACCESS_KEY" or
     .name == "QUEQLITE_S3_SECRET_KEY") |
   .valueFrom.secretKeyRef |
-  .name + ":" + (.optional | tostring)' "$tmp/config-3-rustfs.yaml" |
-  grep -c '^rustfs-credentials:true$')" = 2 ]
+  .name + ":" + (has("optional") | tostring)' "$tmp/config-3-rustfs.yaml" |
+  grep -c '^rustfs-credentials:false$')" = 2 ]
 if QUEQLITE_S3_ENDPOINT='' scripts/render-k8s-config.sh 3 3 \
   "$tmp/config-3.json" "$tmp/invalid-empty-endpoint.yaml"; then
   echo "render accepted an explicitly empty S3 endpoint" >&2
@@ -94,8 +127,16 @@ if QUEQLITE_OBJECT_SECRET='' scripts/render-k8s-config.sh 3 3 \
   exit 1
 fi
 
-grep -Fq "successor:{config_id:\$successor_id,members:\$members,digest:\$digest}" \
+# shellcheck disable=SC2016
+grep -Fq '{config_id:$id,members:$members,digest:$digest}' \
   scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq 'scripts/k8s-stop-state.sh prepare "$stop_state"' scripts/replace-k8s-config.sh
+stop_state_line="$(grep -n 'k8s-stop-state.sh prepare' scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+stop_post_line="$(grep -n 'POST "$stop_path"' scripts/replace-k8s-config.sh | cut -d: -f1)"
+[ "$stop_state_line" -lt "$stop_post_line" ]
+grep -Fq 'k8s-stop-state.sh recover' scripts/replace-k8s-config.sh
 grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/replace-k8s-config.sh
 compact_line="$(grep -n 'publishing final checkpoint V2' scripts/replace-k8s-config.sh | cut -d: -f1)"
 fork_line="$(grep -n 'forking stopped checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
@@ -154,8 +195,8 @@ QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/object-job-rustfs.yaml" \
   select(.name == "QUEQLITE_S3_ACCESS_KEY" or
     .name == "QUEQLITE_S3_SECRET_KEY") |
   .valueFrom.secretKeyRef |
-  .name + ":" + (.optional | tostring)' "$tmp/object-job-rustfs.yaml" |
-  grep -c '^rustfs-credentials:true$')" = 2 ]
+  .name + ":" + (has("optional") | tostring)' "$tmp/object-job-rustfs.yaml" |
+  grep -c '^rustfs-credentials:false$')" = 2 ]
 if QUEQLITE_S3_ENDPOINT='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
   echo "object Job accepted an explicitly empty S3 endpoint" >&2

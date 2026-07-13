@@ -62,9 +62,9 @@ yq eval '
       map(select(strenv(S3_ENDPOINT_SET) == "x"))) +
     ([
       {"name":"QUEQLITE_S3_ACCESS_KEY", "valueFrom":{"secretKeyRef":{
-        "name":strenv(OBJECT_SECRET), "key":"access-key", "optional":true}}},
+        "name":strenv(OBJECT_SECRET), "key":"access-key"}}},
       {"name":"QUEQLITE_S3_SECRET_KEY", "valueFrom":{"secretKeyRef":{
-        "name":strenv(OBJECT_SECRET), "key":"secret-key", "optional":true}}}
+        "name":strenv(OBJECT_SECRET), "key":"secret-key"}}}
     ] | map(select(strenv(OBJECT_SECRET_SET) == "x")))
   )
 ' deploy/k8s/queqlite-checkpoint-job.yaml > "$manifest"
