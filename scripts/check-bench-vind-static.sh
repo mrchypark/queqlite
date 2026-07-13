@@ -61,17 +61,24 @@ resource_sample queqlite 201 >> "$tmp/resources.jsonl"
 resource_sample simulator 201 >> "$tmp/resources.jsonl"
 validate_resource_samples "$tmp/resources.jsonl" 120 200 2
 
-for epoch in 0 100 150 200 999; do
-  if [ "$epoch" = 0 ] || [ "$epoch" = 999 ]; then cpu=999999; memory=999999
-  else cpu="$epoch"; memory=2
-  fi
-  resource_sample queqlite "$epoch" "$cpu" "$memory"
-  resource_sample simulator "$epoch" "$cpu" "$memory"
-done > "$tmp/window-resources.jsonl"
+{
+  resource_sample queqlite 0 999999 999999
+  resource_sample queqlite 100
+  resource_sample queqlite 150
+  resource_sample queqlite 200
+  resource_sample queqlite 999 999999 999999
+  resource_sample simulator 0 999999 999999
+  resource_sample simulator 99
+  resource_sample simulator 149
+  resource_sample simulator 201
+  resource_sample simulator 999 999999 999999
+} > "$tmp/window-resources.jsonl"
+validate_resource_samples "$tmp/window-resources.jsonl" 120 190 2
 summarize_resource_samples "$tmp/window-resources.jsonl" 120 190 > "$tmp/resource-summary.json"
 jq -e '.samples == 6 and
   (all(.apps[]; .peak_memory_bytes == 2 and .average_memory_bytes == 2)) and
-  (all(.container_cpu_usage_usec_deltas[]; .delta_usec == 100))' \
+  ([.container_cpu_usage_usec_deltas[] | {key:.app,value:.delta_usec}] | from_entries) ==
+    {queqlite:100,simulator:102}' \
   "$tmp/resource-summary.json" >/dev/null
 
 : > "$tmp/empty-access.jsonl"
@@ -116,19 +123,32 @@ image_id="sha256:$(printf 'a%.0s' {1..64})"
 repo_digest="example/queqlite@sha256:$(printf 'b%.0s' {1..64})"
 source_commit="$(printf 'c%.0s' {1..40})"
 inspect="$(jq -cn --arg id "$image_id" --arg digest "$repo_digest" '[{Id:$id,RepoDigests:[$digest]}]')"
-for mode in built skip-build; do
-  provenance="$(render_provenance_json "$source_commit" false "$mode" queqlite:dev "$inspect")"
-  jq -e --arg mode "$mode" --arg id "$image_id" --arg digest "$repo_digest" '
-    .publishable == true and .source.dirty == false and .image.build_mode == $mode and
-    .image.content_id == $id and .image.repo_digests == [$digest] and .reasons == []
-  ' <<< "$provenance" >/dev/null
+matching_inspect="$(jq -cn --arg id "$image_id" --arg digest "$repo_digest" --arg revision "$source_commit" \
+  '[{Id:$id,RepoDigests:[$digest],Config:{Labels:{"org.opencontainers.image.revision":$revision}}}]')"
+built_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect")"
+printf '%s\n' "$built_provenance" | jq -e --arg id "$image_id" --arg digest "$repo_digest" '
+  .publishable == true and .source.dirty == false and .image.build_mode == "built" and
+  .image.content_id == $id and .image.repo_digests == [$digest] and .reasons == []
+' >/dev/null
+matching_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev "$matching_inspect")"
+printf '%s\n' "$matching_provenance" | jq -e --arg commit "$source_commit" '
+  .publishable == true and .image.source_revision == $commit and .reasons == []
+' >/dev/null
+for revision in missing mismatch; do
+  if [ "$revision" = missing ]; then candidate="$inspect"
+  else candidate="$(jq -cn --arg id "$image_id" --arg revision deadbeef \
+    '[{Id:$id,RepoDigests:[],Config:{Labels:{"org.opencontainers.image.revision":$revision}}}]')"
+  fi
+  unverified="$(render_provenance_json "$source_commit" false skip-build queqlite:dev "$candidate")"
+  printf '%s\n' "$unverified" | jq -e \
+    '.publishable == false and .reasons == ["unverified_image_source"]' >/dev/null
 done
 dirty_provenance="$(render_provenance_json "$source_commit" true built queqlite:dev "$inspect")"
-jq -e '.publishable == false and (.reasons | index("dirty_source") != null)' \
-  <<< "$dirty_provenance" >/dev/null
+printf '%s\n' "$dirty_provenance" | jq -e \
+  '.publishable == false and (.reasons | index("dirty_source") != null)' >/dev/null
 missing_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev '[{"Id":"","RepoDigests":[]}]')"
-jq -e '.publishable == false and (.reasons | index("missing_immutable_image_identity") != null)' \
-  <<< "$missing_provenance" >/dev/null
+printf '%s\n' "$missing_provenance" | jq -e \
+  '.publishable == false and (.reasons | index("missing_immutable_image_identity") != null)' >/dev/null
 
 build_line="$(grep -n 'cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench' scripts/bench-vind.sh | cut -d: -f1)"
 # shellcheck disable=SC2016 # Literal source-order check.

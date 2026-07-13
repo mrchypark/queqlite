@@ -137,12 +137,15 @@ resource_samples_cover_end() {
 summarize_resource_samples() {
   jq -s --argjson start "$2" --argjson end "$3" '
     . as $samples |
-    ([$samples[].timestamp_epoch_seconds | select(. <= $start)] | max) as $before |
-    ([$samples[].timestamp_epoch_seconds | select(. >= $end)] | min) as $after |
-    [$samples[] | select(
-      .timestamp_epoch_seconds == $before or
-      (.timestamp_epoch_seconds >= $start and .timestamp_epoch_seconds <= $end) or
-      .timestamp_epoch_seconds == $after)] as $window |
+    [["queqlite","simulator"][] as $app |
+      ([$samples[] | select(.app == $app and .timestamp_epoch_seconds <= $start) |
+        .timestamp_epoch_seconds] | max) as $before |
+      ([$samples[] | select(.app == $app and .timestamp_epoch_seconds >= $end) |
+        .timestamp_epoch_seconds] | min) as $after |
+      $samples[] | select(.app == $app and (
+        .timestamp_epoch_seconds == $before or
+        (.timestamp_epoch_seconds >= $start and .timestamp_epoch_seconds <= $end) or
+        .timestamp_epoch_seconds == $after))] as $window |
     def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) |
       map(sort_by(.timestamp_epoch_seconds) as $g |
         {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
@@ -241,14 +244,19 @@ render_provenance_json() {
     --arg image_reference "$4" --argjson inspect "$5" '
     ($inspect[0].Id // "") as $content_id |
     (($inspect[0].RepoDigests // []) | map(select(type == "string"))) as $repo_digests |
+    (($inspect[0].Config.Labels["org.opencontainers.image.revision"] // "") |
+      if type == "string" then . else "" end) as $source_revision |
     ([if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
       if $dirty then "dirty_source" else empty end,
       if ($content_id | test("^sha256:[0-9a-f]{64}$") | not)
-        then "missing_immutable_image_identity" else empty end]) as $reasons |
+        then "missing_immutable_image_identity" else empty end,
+      if $build_mode == "skip-build" and $source_revision != $commit
+        then "unverified_image_source" else empty end]) as $reasons |
     {publishable:($reasons | length == 0),reasons:$reasons,
      source:{git_commit:(if $commit == "" then null else $commit end),dirty:$dirty,clean:($dirty | not)},
      image:{reference:$image_reference,build_mode:$build_mode,
-       content_id:(if $content_id == "" then null else $content_id end),repo_digests:$repo_digests}}
+       content_id:(if $content_id == "" then null else $content_id end),repo_digests:$repo_digests,
+       source_revision:(if $source_revision == "" then null else $source_revision end)}}
   '
 }
 
