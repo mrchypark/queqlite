@@ -769,6 +769,7 @@ fn run_fault_hook(
                     fault.offset,
                     command_start_offset,
                     command_start.elapsed(),
+                    fault_timeout,
                     status,
                     kill_error,
                 );
@@ -1063,10 +1064,11 @@ impl FaultOutput {
         offset: Duration,
         command_start_offset: Duration,
         elapsed: Duration,
+        timeout: Duration,
         command_status: Option<i32>,
         kill_error: Option<std::io::Error>,
     ) -> Self {
-        let mut error = "fault command did not finish before measurement ended".to_string();
+        let mut error = format!("fault command exceeded configured timeout of {timeout:?}");
         if let Some(kill_error) = kill_error {
             error.push_str(&format!("; kill failed: {kill_error}"));
         }
@@ -1495,6 +1497,10 @@ mod tests {
         assert!(!output.command_completed);
         assert_eq!(output.status, "unfinished");
         assert!(output.failure().unwrap().contains("did not finish"));
+        assert_eq!(
+            output.command_error.as_deref(),
+            Some("fault command exceeded configured timeout of 40ms")
+        );
         let json = serde_json::to_value(output).unwrap();
         assert_eq!(json["command_completed"], false);
         assert_eq!(json["status"], "unfinished");
