@@ -16,6 +16,10 @@ grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/bench-vind.sh
 # shellcheck disable=SC1091 # Repository-local source; callers run from repo root.
 source scripts/bench-vind.sh
 
+[ "$(resource_continuity_budget_seconds 2)" = 13 ]
+[ "$(resource_coverage_wait_budget_seconds)" = 17 ]
+grep -Fq 'timeout --kill-after=' scripts/bench-vind.sh
+
 render_verified_provenance_json() {
   render_provenance_json "$@" 0 0 ok ok
 }
@@ -40,100 +44,179 @@ if validate_resource_sample_schema "$tmp/empty-resources.jsonl"; then
   echo "empty resource evidence was accepted" >&2
   exit 1
 fi
-resource_sample() {
-  jq -cn --arg app "$1" --argjson epoch "$2" --argjson cpu "${3:-$2}" \
-    --argjson memory "${4:-2}" \
+component_sample() {
+  local pod="$1" container="$2" epoch="$3" cpu="${4:-$3}" identity="${5:-original}"
+  local app=simulator
+  [ "$container" != queqlite ] || app=queqlite
+  jq -cn --arg app "$app" --arg pod "$pod" --arg container "$container" \
+    --arg identity "$identity" --argjson epoch "$epoch" --argjson cpu "$cpu" \
     '{timestamp:"2026-07-13T00:00:00Z",timestamp_epoch_seconds:$epoch,
-      source:"containerd_cri_stats",app:$app,pod:($app + "-0"),pod_uid:($app + "-uid"),
-      container:$app,container_id:($app + "-container"),restart_count:0,
-      cpu_usage_usec:$cpu,memory_bytes:$memory}'
+      source:"containerd_cri_stats",app:$app,pod:$pod,
+      pod_uid:($pod + "-uid-" + $identity),container:$container,
+      container_id:($container + "-id-" + $identity),restart_count:0,
+      cpu_usage_usec:$cpu,memory_bytes:2}'
 }
-resource_sample queqlite 100 > "$tmp/resources.jsonl"
-if validate_resource_sample_schema "$tmp/resources.jsonl"; then
+resource_cycle() {
+  local epoch="$1" omit="${2:-}" meter="${3:-false}" cpu="${4:-$1}" pod
+  for pod in queqlite-c1-0 queqlite-c1-1 queqlite-c1-2; do
+    [ "$pod" = "$omit" ] || component_sample "$pod" queqlite "$epoch" "$cpu"
+  done
+  [ "$omit" = rustfs ] || component_sample rustfs-abc rustfs "$epoch" "$cpu"
+  if [ "$meter" = true ] && [ "$omit" != object-meter ]; then
+    component_sample rustfs-abc object-meter "$epoch" "$cpu"
+  fi
+}
+gap_fixture() {
+  local file="$1" omitted="$2" epoch
+  {
+    resource_cycle 118
+    resource_cycle 124
+    resource_cycle 130
+    for epoch in $(seq 136 6 184); do resource_cycle "$epoch" "$omitted"; done
+    for epoch in 190 196 202; do
+      resource_cycle "$epoch" "$omitted"
+      component_sample "$omitted" queqlite "$epoch" "$epoch" replacement
+    done
+  } > "$file"
+}
+component_sample queqlite-c1-0 queqlite 100 > "$tmp/resources.jsonl"
+if validate_resource_sample_schema "$tmp/resources.jsonl" false; then
   echo "resource evidence without simulator samples was accepted" >&2
   exit 1
 fi
-resource_sample simulator 100 >> "$tmp/resources.jsonl"
-validate_resource_sample_schema "$tmp/resources.jsonl"
+component_sample rustfs-abc rustfs 100 >> "$tmp/resources.jsonl"
 if validate_resource_samples "$tmp/resources.jsonl" 120 200 2; then
   echo "single resource sample per app was accepted" >&2
   exit 1
 fi
 cp "$tmp/resources.jsonl" "$tmp/stale-resources.jsonl"
-resource_sample queqlite 150 >> "$tmp/stale-resources.jsonl"
-resource_sample simulator 150 >> "$tmp/stale-resources.jsonl"
+component_sample queqlite-c1-0 queqlite 150 >> "$tmp/stale-resources.jsonl"
+component_sample rustfs-abc rustfs 150 >> "$tmp/stale-resources.jsonl"
 if validate_resource_samples "$tmp/stale-resources.jsonl" 120 200 2; then
   echo "resource evidence that ends before measurement coverage was accepted" >&2
   exit 1
 fi
 {
-  resource_sample queqlite 150
-  resource_sample simulator 150
-  resource_sample queqlite 199
-  resource_sample simulator 199
+  resource_cycle 150
+  resource_cycle 199
 } > "$tmp/late-resources.jsonl"
-if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2; then
+if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2 false; then
   echo "resource evidence that starts after measurement was accepted" >&2
   exit 1
 fi
 {
-  resource_sample queqlite 118
-  resource_sample simulator 118
-  resource_sample queqlite 122
-  resource_sample simulator 122
-  resource_sample queqlite 198
-  resource_sample simulator 198
-  resource_sample queqlite 202
-  resource_sample simulator 202
+  resource_cycle 118
+  resource_cycle 122
+  resource_cycle 198
+  resource_cycle 202
 } > "$tmp/gapped-resources.jsonl"
-if validate_resource_samples "$tmp/gapped-resources.jsonl" 120 200 2; then
+if validate_resource_samples "$tmp/gapped-resources.jsonl" 120 200 2 false; then
   echo "resource evidence with a measurement outage was accepted" >&2
   exit 1
 fi
-resource_sample queqlite 201 >> "$tmp/resources.jsonl"
-resource_sample simulator 201 >> "$tmp/resources.jsonl"
+component_sample queqlite-c1-0 queqlite 201 >> "$tmp/resources.jsonl"
+component_sample rustfs-abc rustfs 201 >> "$tmp/resources.jsonl"
 {
   for epoch in $(seq 118 6 202); do
-    resource_sample queqlite "$epoch"
-    resource_sample simulator "$epoch"
+    resource_cycle "$epoch"
   done
 } > "$tmp/jittered-resources.jsonl"
-validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2
+validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 false
 
 {
-  resource_sample queqlite 100
-  resource_sample simulator 100
+  resource_cycle 100
   for epoch in $(seq 122 6 200); do
-    resource_sample queqlite "$epoch"
-    resource_sample simulator "$epoch"
+    resource_cycle "$epoch"
   done
-  resource_sample queqlite 202
-  resource_sample simulator 202
+  resource_cycle 202
 } > "$tmp/stale-boundary-resources.jsonl"
-if validate_resource_samples "$tmp/stale-boundary-resources.jsonl" 120 200 2; then
+if validate_resource_samples "$tmp/stale-boundary-resources.jsonl" 120 200 2 false; then
   echo "resource evidence with a stale measurement boundary was accepted" >&2
   exit 1
 fi
 
 {
-  resource_sample queqlite 0 999999 999999
-  resource_sample queqlite 100
-  resource_sample queqlite 150
-  resource_sample queqlite 200
-  resource_sample queqlite 999 999999 999999
-  resource_sample simulator 0 999999 999999
-  resource_sample simulator 99
-  resource_sample simulator 149
-  resource_sample simulator 201
-  resource_sample simulator 999 999999 999999
+  resource_cycle 0 "" false 999999
+  resource_cycle 100
+  resource_cycle 150
+  resource_cycle 200
+  resource_cycle 999 "" false 999999
 } > "$tmp/window-resources.jsonl"
-validate_resource_samples "$tmp/window-resources.jsonl" 120 190 50
+validate_resource_samples "$tmp/window-resources.jsonl" 120 190 50 false
 summarize_resource_samples "$tmp/window-resources.jsonl" 120 190 > "$tmp/resource-summary.json"
-jq -e '.samples == 6 and
-  (all(.apps[]; .peak_memory_bytes == 2 and .average_memory_bytes == 2)) and
-  ([.container_cpu_usage_usec_deltas[] | {key:.app,value:.delta_usec}] | from_entries) ==
-    {queqlite:100,simulator:102}' \
+jq -e '.samples == 12 and
+  ([.apps[] | {key:.app,value:.peak_memory_bytes}] | from_entries) ==
+    {queqlite:6,simulator:2} and
+  ([.apps[] | {key:.app,value:.average_memory_bytes}] | from_entries) ==
+    {queqlite:6,simulator:2} and
+  ([.apps[] | {key:.app,value:.cpu_usage_usec}] | from_entries) ==
+    {queqlite:300,simulator:100}' \
   "$tmp/resource-summary.json" >/dev/null
+
+gap_fixture "$tmp/fault-gap-resources.jsonl" queqlite-c1-1
+validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 false \
+  queqlite-c1-1 135 185
+sed 's/-replacement"/-original"/g' "$tmp/fault-gap-resources.jsonl" \
+  > "$tmp/fault-omission-resources.jsonl"
+if validate_resource_samples "$tmp/fault-omission-resources.jsonl" 120 200 2 false \
+  queqlite-c1-1 135 185; then
+  echo "collection omission was mistaken for a pod replacement" >&2
+  exit 1
+fi
+if validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 false "" "" ""; then
+  echo "pod absence without an explicit fault window was accepted" >&2
+  exit 1
+fi
+gap_fixture "$tmp/non-fault-gap-resources.jsonl" queqlite-c1-2
+if validate_resource_samples "$tmp/non-fault-gap-resources.jsonl" 120 200 2 false \
+  queqlite-c1-1 135 185; then
+  echo "collection omission for a non-faulted pod was accepted" >&2
+  exit 1
+fi
+
+{
+  resource_cycle 118 queqlite-c1-2
+  resource_cycle 124 queqlite-c1-2
+  resource_cycle 202 queqlite-c1-2
+} > "$tmp/missing-component-resources.jsonl"
+if validate_resource_sample_schema "$tmp/missing-component-resources.jsonl" false; then
+  echo "resource evidence without every Queqlite ordinal was accepted" >&2
+  exit 1
+fi
+if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 true "" "" ""; then
+  echo "resource evidence without the enabled object meter was accepted" >&2
+  exit 1
+fi
+cp "$tmp/window-resources.jsonl" "$tmp/meter-resources.jsonl"
+for epoch in 100 150 200; do
+  component_sample rustfs-abc object-meter "$epoch" "$epoch" >> "$tmp/meter-resources.jsonl"
+done
+validate_resource_samples "$tmp/meter-resources.jsonl" 120 190 50 true "" "" ""
+{
+  component_sample queqlite-c1-0 queqlite 100 100 original
+  component_sample queqlite-c1-0 queqlite 150 130 original
+  component_sample queqlite-c1-0 queqlite 170 20 replacement
+  component_sample queqlite-c1-0 queqlite 200 50 replacement
+  for epoch in 100 150 200; do
+    component_sample queqlite-c1-1 queqlite "$epoch" "$epoch"
+    component_sample queqlite-c1-2 queqlite "$epoch" "$epoch"
+    component_sample rustfs-abc rustfs "$epoch" "$epoch"
+  done
+} > "$tmp/lifecycle-resources.jsonl"
+summarize_resource_samples "$tmp/lifecycle-resources.jsonl" 120 190 \
+  > "$tmp/lifecycle-summary.json"
+jq -e '
+  ([.container_cpu_usage_usec_deltas[] |
+    select(.pod == "queqlite-c1-0") | {key:.container_id,value:.delta_usec}] |
+    from_entries) == {"queqlite-id-original":30,"queqlite-id-replacement":50}
+' "$tmp/lifecycle-summary.json" >/dev/null
+
+component_sample queqlite-c1-2 queqlite 180 100 >> "$tmp/lifecycle-resources.jsonl"
+if summarize_resource_samples "$tmp/lifecycle-resources.jsonl" 120 190 \
+  > "$tmp/regressed-counter-summary.json" 2>/dev/null; then
+  echo "same-container CPU counter regression was accepted" >&2
+  exit 1
+fi
 
 : > "$tmp/empty-access.jsonl"
 printf '%s\n' '{"metering":{"enabled":true,"status":"failed","requests":0},"retained":{"status":"ok","object_count":0,"retained_bytes":0}}' > "$tmp/invalid-meter.json"
@@ -172,6 +255,9 @@ jq -e '.started_at_epoch_seconds == 120 and .finished_at_epoch_seconds == 200' \
 printf '%s\n' '{"measurement":{"measurement_window":{"started_at_epoch_seconds":120.25,"finished_at_epoch_seconds":200.75}}}' > "$tmp/benchmark-report.json"
 jq -e '.started_at_epoch_seconds == 120.25 and .finished_at_epoch_seconds == 200.75' \
   <<< "$(measurement_window_from_report "$tmp/benchmark-report.json")" >/dev/null
+printf '%s\n' '{"fault":{"tag":"pod-delete","command_completed":true,"command_start_offset_seconds":10.5,"command_elapsed_seconds":20.25}}' > "$tmp/fault-report.json"
+jq -e '.started_at_epoch_seconds == 130.5 and .finished_at_epoch_seconds == 150.75' \
+  <<< "$(resource_fault_window_from_report "$tmp/fault-report.json" 120)" >/dev/null
 
 image_digest="sha256:$(printf 'a%.0s' {1..64})"
 image_id="docker-pullable://queqlite@${image_digest}"

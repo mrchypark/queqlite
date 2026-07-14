@@ -135,14 +135,22 @@ It applies fixed default resources to make comparisons controlled on the
 simulator and its resources are reported separately from Queqlite. Override them through
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_CPU_{REQUEST,LIMIT}` and
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_MEMORY_{REQUEST,LIMIT}`. Resource JSONL
-samples use containerd CRI stats and cover both services; `resource-summary.json`
-reports restart-safe CPU deltas plus average/peak memory using only the samples
-inside, or immediately bracketing, the Rust-reported measurement window; warmup
-and later cleanup samples are excluded. Publishable evidence permits one missed
-collection plus one second of scheduling jitter: for each service, the boundary
-samples and every adjacent sample across the measurement window must be no more
-than twice the sample interval plus twice the three-second collection timeout
-and one second apart. Disable resource sampling with
+samples use containerd CRI stats and require all three Queqlite ordinals plus
+RustFS and, when enabled, its object-meter sidecar. `resource-summary.json`
+reports container-lifecycle CPU deltas plus average/peak memory using samples
+inside, or immediately bracketing, the Rust-reported measurement window. A
+pre-existing container uses its last pre-window counter as the baseline; a
+container born in the window uses zero, and a same-identity counter regression
+invalidates the evidence. Warmup and later cleanup samples are excluded.
+Publishable evidence permits one missed collection plus one second of scheduling
+jitter. The three-second collection timeout sends TERM and forces a kill one
+second later, so the default continuity and final-coverage budget is twice the
+two-second interval plus twice the four-second hard collection bound plus one
+second (13 seconds). Final coverage may additionally finish the last hard-bounded
+collection, for a 17-second wait budget. A pod-delete gap is accepted only for
+the named Queqlite ordinal and only when it brackets the measured fault window
+within the continuity budget; other missing component samples invalidate
+publication. Disable resource sampling with
 `QUEQLITE_BENCH_RESOURCE_SAMPLING=0`. A default-on nginx sidecar meters S3 method,
 status, and byte counts, while an AWS CLI inventory records logical object count
 and retained bytes in `object-usage.json`. Disable it with

@@ -29,6 +29,7 @@ fault_offset=10s
 fault_pod=queqlite-c1-1
 sample_interval=2
 resource_sample_timeout=3
+resource_sample_kill_after=1
 resource_sample_jitter=1
 queqlite_cpu_request="${QUEQLITE_BENCH_QUEQLITE_CPU_REQUEST:-250m}"
 queqlite_cpu_limit="${QUEQLITE_BENCH_QUEQLITE_CPU_LIMIT:-1000m}"
@@ -56,6 +57,8 @@ object_evidence_status=disabled
 object_meter_reset_status=disabled
 measurement_started_at_epoch_seconds=""
 measurement_finished_at_epoch_seconds=""
+resource_fault_started_at_epoch_seconds=""
+resource_fault_finished_at_epoch_seconds=""
 source_git_commit=""
 source_dirty=true
 image_build_mode="unknown"
@@ -191,69 +194,126 @@ build_pod_delete_fault_command() {
 }
 
 validate_resource_sample_schema() {
-  jq -s -e '
-    any(.[]; .app == "queqlite") and any(.[]; .app == "simulator") and all(.[];
+  local meter_enabled="${2:-$object_metering}" expected
+  expected="$(expected_resource_components "$meter_enabled")"
+  jq -s -e --argjson expected "$expected" --argjson meter_enabled "$meter_enabled" '
+    def component: if .app == "queqlite" then .pod else .container end;
+    . as $samples |
+    length > 0 and all(.[];
       (.timestamp | type == "string" and length > 0) and
       (.timestamp_epoch_seconds | type == "number" and . >= 0) and
       .source == "containerd_cri_stats" and
-      (.app == "queqlite" or .app == "simulator") and
-      ([.pod,.pod_uid,.container,.container_id] | all(type == "string")) and
-      ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0)))
+      ([.pod,.pod_uid,.container,.container_id] |
+        all(type == "string" and length > 0)) and
+      ((.app == "queqlite" and .container == "queqlite" and
+          (.pod | test("^queqlite-c1-[0-2]$"))) or
+        (.app == "simulator" and
+          (.container == "rustfs" or .container == "object-meter") and
+          (.pod | startswith("rustfs-")))) and
+      ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0))) and
+    all($expected[]; . as $required | any($samples[]; component == $required)) and
+    ([$samples[] | select(.container == "rustfs") | .pod] | unique | length) == 1 and
+    (if $meter_enabled then
+       ([$samples[] | select(.container == "object-meter") | .pod] | unique) ==
+       ([$samples[] | select(.container == "rustfs") | .pod] | unique)
+     else true end)
   ' "$1" >/dev/null 2>&1
+}
+
+expected_resource_components() {
+  if [ "$1" = true ] || [ "$1" = 1 ]; then
+    echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs","object-meter"]'
+  else
+    echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs"]'
+  fi
+}
+
+resource_continuity_budget_seconds() {
+  local interval="${1:-$sample_interval}"
+  echo $((2 * (interval + resource_sample_timeout + resource_sample_kill_after) +
+    resource_sample_jitter))
+}
+
+resource_coverage_wait_budget_seconds() {
+  echo $(($(resource_continuity_budget_seconds) + resource_sample_timeout +
+    resource_sample_kill_after))
 }
 
 validate_resource_samples() {
-  validate_resource_sample_schema "$1" && jq -s -e \
+  local meter_enabled="${5:-$object_metering}" fault_pod_name="${6:-}"
+  local fault_start="${7:-}" fault_end="${8:-}"
+  local continuity_budget
+  continuity_budget="$(resource_continuity_budget_seconds "$4")"
+  local expected
+  expected="$(expected_resource_components "$meter_enabled")"
+  validate_resource_sample_schema "$1" "$meter_enabled" && jq -s -e \
     --argjson start "$2" --argjson end "$3" --argjson interval "$4" \
-    --argjson collection_timeout "$resource_sample_timeout" \
-    --argjson jitter "$resource_sample_jitter" '
+    --argjson max_gap "$continuity_budget" --arg fault_pod "$fault_pod_name" \
+    --arg fault_start "$fault_start" --arg fault_end "$fault_end" \
+    --argjson expected "$expected" '
+    def component: if .app == "queqlite" then .pod else .container end;
+    def fault_gap($component; $left; $right):
+      $component == $fault_pod and
+      ($left.pod_uid != $right.pod_uid or $left.container_id != $right.container_id) and
+      ($fault_start | test("^[0-9]+([.][0-9]+)?$")) and
+      ($fault_end | test("^[0-9]+([.][0-9]+)?$")) and
+      ($fault_end | tonumber) >= ($fault_start | tonumber) and
+      $left.timestamp_epoch_seconds <= ($fault_end | tonumber) and
+      $right.timestamp_epoch_seconds >= ($fault_start | tonumber) and
+      (($fault_start | tonumber) - $left.timestamp_epoch_seconds) <= $max_gap and
+      ($right.timestamp_epoch_seconds - ($fault_end | tonumber)) <= $max_gap;
     . as $samples |
-    ($interval * 2 + $collection_timeout * 2 + $jitter) as $max_gap |
     $start >= 0 and $end >= $start and $interval > 0 and
-    all(["queqlite","simulator"][];
-      . as $app |
-      ([$samples[] | select(.app == $app) | .timestamp_epoch_seconds] |
-        unique | sort) as $times |
-      ([$times[] | select(. <= $start)] | max) as $before |
-      ([$times[] | select(. >= $end)] | min) as $after |
-      ($times | length) >= 2 and $before != null and $after != null and
-      ($start - $before) <= $max_gap and ($after - $end) <= $max_gap and
-      (([$times[] | select(. >= $before and . <= $after)]) as $covered |
+    all($expected[];
+      . as $component |
+      ([$samples[] | select(component == $component)] |
+        unique_by([.timestamp_epoch_seconds,.container_id]) |
+        sort_by(.timestamp_epoch_seconds)) as $observed |
+      ([$observed[] | select(.timestamp_epoch_seconds <= $start)] | last) as $before |
+      ([$observed[] | select(.timestamp_epoch_seconds >= $end)] | first) as $after |
+      ($observed | length) >= 2 and $before != null and $after != null and
+      ($start - $before.timestamp_epoch_seconds) <= $max_gap and
+      ($after.timestamp_epoch_seconds - $end) <= $max_gap and
+      (([$observed[] | select(.timestamp_epoch_seconds >= $before.timestamp_epoch_seconds and
+          .timestamp_epoch_seconds <= $after.timestamp_epoch_seconds)]) as $covered |
         ($covered | length) >= 2 and
-        ([range(1; $covered | length) as $i |
-          $covered[$i] - $covered[$i - 1]] | max) <= $max_gap))
-  ' "$1" >/dev/null 2>&1
-}
-
-resource_samples_cover_end() {
-  jq -s -e --argjson end "$2" '
-    . as $samples |
-    all(["queqlite","simulator"][];
-      . as $app | any($samples[]; .app == $app and .timestamp_epoch_seconds >= $end))
+        all(range(1; $covered | length);
+          . as $i | ($covered[$i].timestamp_epoch_seconds -
+            $covered[$i - 1].timestamp_epoch_seconds) <= $max_gap or
+            fault_gap($component; $covered[$i - 1]; $covered[$i]))))
   ' "$1" >/dev/null 2>&1
 }
 
 summarize_resource_samples() {
   jq -s --argjson start "$2" --argjson end "$3" '
     . as $samples |
-    [["queqlite","simulator"][] as $app |
-      ([$samples[] | select(.app == $app and .timestamp_epoch_seconds <= $start) |
-        .timestamp_epoch_seconds] | max) as $before |
-      ([$samples[] | select(.app == $app and .timestamp_epoch_seconds >= $end) |
-        .timestamp_epoch_seconds] | min) as $after |
-      $samples[] | select(.app == $app and (
-        .timestamp_epoch_seconds == $before or
-        (.timestamp_epoch_seconds >= $start and .timestamp_epoch_seconds <= $end) or
-        .timestamp_epoch_seconds == $after))] as $window |
-    def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) |
+    ($samples | sort_by([.app,.pod_uid,.container,.container_id,.timestamp_epoch_seconds]) |
+      group_by([.app,.pod_uid,.container,.container_id]) |
       map(sort_by(.timestamp_epoch_seconds) as $g |
+        ([$g[] | select(.timestamp_epoch_seconds <= $start)] | last) as $before |
+        ([$g[] | select(.timestamp_epoch_seconds >= $start and
+          .timestamp_epoch_seconds <= $end)]) as $inside |
+        ([$g[] | select(.timestamp_epoch_seconds >= $end)] | first) as $after |
+        select(($inside | length) > 0 or ($before != null and $after != null)) |
+        ([$before] + $inside + [$after] | map(select(. != null)) |
+          unique_by(.timestamp_epoch_seconds)))) as $groups |
+    ($groups | map(.[])) as $window |
+    def regressed:
+      . as $g | any(range(1; length); . as $i |
+        $g[$i].cpu_usage_usec < $g[$i - 1].cpu_usage_usec);
+    def cpu_deltas: $groups |
+      map(. as $g |
+        ([$g[] | select(.timestamp_epoch_seconds <= $start)] | last) as $baseline |
+        ($baseline.cpu_usage_usec // 0) as $first |
         {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
-         container_id:$g[0].container_id,first:$g[0].cpu_usage_usec,last:$g[-1].cpu_usage_usec,
-         delta_usec:([0,($g[-1].cpu_usage_usec - $g[0].cpu_usage_usec)] | max)});
+         container_id:$g[0].container_id,first:$first,last:$g[-1].cpu_usage_usec,
+         baseline:(if $baseline == null then "born_in_window" else "preexisting" end),
+         delta_usec:($g[-1].cpu_usage_usec - $first)});
     def memory_by_app: group_by([.timestamp_epoch_seconds,.app]) |
       map({timestamp:.[0].timestamp,timestamp_epoch_seconds:.[0].timestamp_epoch_seconds,
         app:.[0].app,memory_bytes:(map(.memory_bytes) | add)});
-    ($window | cpu_deltas) as $cpu | ($window | memory_by_app) as $memory |
+    if any($groups[]; regressed) then error("container CPU counter regressed") else
+    (cpu_deltas) as $cpu | ($window | memory_by_app) as $memory |
     {status:"ok",measurement_window:{started_at_epoch_seconds:$start,
       finished_at_epoch_seconds:$end},samples:($window | length),
      container_cpu_usage_usec_deltas:$cpu,
@@ -263,7 +323,7 @@ summarize_resource_samples() {
         memory_samples:($app_memory | length),
         average_memory_bytes:(if ($app_memory | length) == 0 then null else
           (($app_memory | map(.memory_bytes) | add) / ($app_memory | length) | floor) end),
-        peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))}
+        peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))} end
   ' "$1"
 }
 
@@ -349,6 +409,18 @@ measurement_window_from_report() {
     select(($window.started_at_epoch_seconds | type == "number" and . >= 0) and
       ($window.finished_at_epoch_seconds | type == "number" and . >= 0) and
       ($window.finished_at_epoch_seconds >= $window.started_at_epoch_seconds))
+  ' "$1"
+}
+
+resource_fault_window_from_report() {
+  jq -ce --argjson measurement_start "$2" '
+    .fault as $fault |
+    select($fault.tag == "pod-delete" and $fault.command_completed == true and
+      ($fault.command_start_offset_seconds | type == "number" and . >= 0) and
+      ($fault.command_elapsed_seconds | type == "number" and . >= 0)) |
+    {started_at_epoch_seconds:($measurement_start + $fault.command_start_offset_seconds),
+     finished_at_epoch_seconds:($measurement_start + $fault.command_start_offset_seconds +
+       $fault.command_elapsed_seconds)}
   ' "$1"
 }
 
@@ -513,7 +585,9 @@ sample_resources() {
   while [ ! -e "$stop_sampler" ]; do
     timestamp_epoch_seconds="$(date -u +%s)"
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    summary="$(timeout "$resource_sample_timeout" docker exec "vcluster.cp.$cluster" crictl stats -o json 2>/dev/null || true)"
+    summary="$(timeout --kill-after="${resource_sample_kill_after}s" \
+      "${resource_sample_timeout}s" docker exec "vcluster.cp.$cluster" \
+      crictl stats -o json 2>/dev/null || true)"
     if ! jq -e --arg namespace "$namespace" '
       any(.stats[]?; .attributes.labels["io.kubernetes.pod.namespace"] == $namespace)
     ' <<< "$summary" >/dev/null 2>&1; then
@@ -543,8 +617,11 @@ sample_resources() {
 }
 
 wait_for_resource_coverage() {
-  local deadline=$((SECONDS + sample_interval + 2))
-  while ! resource_samples_cover_end "$resources_jsonl" "$measurement_finished_at_epoch_seconds"; do
+  local deadline=$((SECONDS + $(resource_coverage_wait_budget_seconds)))
+  while ! validate_resource_samples "$resources_jsonl" \
+    "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds" \
+    "$sample_interval" "$object_metering" "${fault_pod:-}" \
+    "$resource_fault_started_at_epoch_seconds" "$resource_fault_finished_at_epoch_seconds"; do
     kill -0 "$sampler_pid" 2>/dev/null || return 1
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 1
@@ -758,7 +835,9 @@ cleanup_run() {
       > "$resource_summary"
   elif [ "$resource_evidence_status" != failed ] &&
     validate_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
-      "$measurement_finished_at_epoch_seconds" "$sample_interval" &&
+      "$measurement_finished_at_epoch_seconds" "$sample_interval" "$object_metering" \
+      "${fault_pod:-}" "$resource_fault_started_at_epoch_seconds" \
+      "$resource_fault_finished_at_epoch_seconds" &&
     summarize_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
       "$measurement_finished_at_epoch_seconds" > "$resource_summary"; then
     resource_evidence_status=ok
@@ -999,12 +1078,13 @@ cargo_version="$(cargo --version)"
 if [ "$resource_sampling" = 1 ]; then
   sample_resources >"$resource_sampler_log" 2>&1 &
   sampler_pid=$!
-  for _ in $(seq 1 10); do
-    validate_resource_sample_schema "$resources_jsonl" && break
+  initial_resource_deadline=$((SECONDS + $(resource_coverage_wait_budget_seconds)))
+  while ! validate_resource_sample_schema "$resources_jsonl" "$object_metering"; do
     kill -0 "$sampler_pid" 2>/dev/null || break
+    [ "$SECONDS" -lt "$initial_resource_deadline" ] || break
     sleep 1
   done
-  validate_resource_sample_schema "$resources_jsonl" ||
+  validate_resource_sample_schema "$resources_jsonl" "$object_metering" ||
     die "resource sampler did not produce a valid initial sample"
 else
   printf 'resource sampling disabled\n' > "$resource_sampler_log"
@@ -1049,6 +1129,14 @@ measurement_window="$(measurement_window_from_report "$benchmark_json")" ||
   die "benchmark report has no valid measurement window"
 measurement_started_at_epoch_seconds="$(jq -r .started_at_epoch_seconds <<< "$measurement_window")"
 measurement_finished_at_epoch_seconds="$(jq -r .finished_at_epoch_seconds <<< "$measurement_window")"
+if [ "$fault" = pod-delete ]; then
+  resource_fault_window="$(resource_fault_window_from_report "$benchmark_json" \
+    "$measurement_started_at_epoch_seconds")" || die "benchmark report has no valid fault window"
+  resource_fault_started_at_epoch_seconds="$(jq -r .started_at_epoch_seconds \
+    <<< "$resource_fault_window")"
+  resource_fault_finished_at_epoch_seconds="$(jq -r .finished_at_epoch_seconds \
+    <<< "$resource_fault_window")"
+fi
 if [ "$resource_sampling" = 1 ]; then
   wait_for_resource_coverage || die "resource sampler did not cover the measurement end"
 fi
