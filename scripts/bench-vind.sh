@@ -28,6 +28,8 @@ fault=none
 fault_offset=10s
 fault_pod=queqlite-c1-1
 sample_interval=2
+resource_sample_timeout=3
+resource_sample_jitter=1
 queqlite_cpu_request="${QUEQLITE_BENCH_QUEQLITE_CPU_REQUEST:-250m}"
 queqlite_cpu_limit="${QUEQLITE_BENCH_QUEQLITE_CPU_LIMIT:-1000m}"
 queqlite_memory_request="${QUEQLITE_BENCH_QUEQLITE_MEMORY_REQUEST:-512Mi}"
@@ -202,17 +204,24 @@ validate_resource_sample_schema() {
 
 validate_resource_samples() {
   validate_resource_sample_schema "$1" && jq -s -e \
-    --argjson start "$2" --argjson end "$3" --argjson interval "$4" '
+    --argjson start "$2" --argjson end "$3" --argjson interval "$4" \
+    --argjson collection_timeout "$resource_sample_timeout" \
+    --argjson jitter "$resource_sample_jitter" '
     . as $samples |
+    ($interval * 2 + $collection_timeout * 2 + $jitter) as $max_gap |
     $start >= 0 and $end >= $start and $interval > 0 and
     all(["queqlite","simulator"][];
       . as $app |
-      [$samples[] | select(.app == $app)] as $app_samples |
-      ($app_samples | length) >= 2 and
-      ([$app_samples[].timestamp_epoch_seconds] | min) <= $start and
-      ([$app_samples[].timestamp_epoch_seconds] | max) >= $end and
-      ([$app_samples[].timestamp_epoch_seconds] | max) >
-        ([$app_samples[].timestamp_epoch_seconds] | min))
+      ([$samples[] | select(.app == $app) | .timestamp_epoch_seconds] |
+        unique | sort) as $times |
+      ([$times[] | select(. <= $start)] | max) as $before |
+      ([$times[] | select(. >= $end)] | min) as $after |
+      ($times | length) >= 2 and $before != null and $after != null and
+      ($start - $before) <= $max_gap and ($after - $end) <= $max_gap and
+      (([$times[] | select(. >= $before and . <= $after)]) as $covered |
+        ($covered | length) >= 2 and
+        ([range(1; $covered | length) as $i |
+          $covered[$i] - $covered[$i - 1]] | max) <= $max_gap))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -504,7 +513,7 @@ sample_resources() {
   while [ ! -e "$stop_sampler" ]; do
     timestamp_epoch_seconds="$(date -u +%s)"
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    summary="$(timeout 3 docker exec "vcluster.cp.$cluster" crictl stats -o json 2>/dev/null || true)"
+    summary="$(timeout "$resource_sample_timeout" docker exec "vcluster.cp.$cluster" crictl stats -o json 2>/dev/null || true)"
     if ! jq -e --arg namespace "$namespace" '
       any(.stats[]?; .attributes.labels["io.kubernetes.pod.namespace"] == $namespace)
     ' <<< "$summary" >/dev/null 2>&1; then

@@ -138,7 +138,11 @@ simulator and its resources are reported separately from Queqlite. Override them
 samples use containerd CRI stats and cover both services; `resource-summary.json`
 reports restart-safe CPU deltas plus average/peak memory using only the samples
 inside, or immediately bracketing, the Rust-reported measurement window; warmup
-and later cleanup samples are excluded. Disable resource sampling with
+and later cleanup samples are excluded. Publishable evidence permits one missed
+collection plus one second of scheduling jitter: for each service, the boundary
+samples and every adjacent sample across the measurement window must be no more
+than twice the sample interval plus twice the three-second collection timeout
+and one second apart. Disable resource sampling with
 `QUEQLITE_BENCH_RESOURCE_SAMPLING=0`. A default-on nginx sidecar meters S3 method,
 status, and byte counts, while an AWS CLI inventory records logical object count
 and retained bytes in `object-usage.json`. Disable it with

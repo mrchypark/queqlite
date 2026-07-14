@@ -76,9 +76,44 @@ if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2; then
   echo "resource evidence that starts after measurement was accepted" >&2
   exit 1
 fi
+{
+  resource_sample queqlite 118
+  resource_sample simulator 118
+  resource_sample queqlite 122
+  resource_sample simulator 122
+  resource_sample queqlite 198
+  resource_sample simulator 198
+  resource_sample queqlite 202
+  resource_sample simulator 202
+} > "$tmp/gapped-resources.jsonl"
+if validate_resource_samples "$tmp/gapped-resources.jsonl" 120 200 2; then
+  echo "resource evidence with a measurement outage was accepted" >&2
+  exit 1
+fi
 resource_sample queqlite 201 >> "$tmp/resources.jsonl"
 resource_sample simulator 201 >> "$tmp/resources.jsonl"
-validate_resource_samples "$tmp/resources.jsonl" 120 200 2
+{
+  for epoch in $(seq 118 6 202); do
+    resource_sample queqlite "$epoch"
+    resource_sample simulator "$epoch"
+  done
+} > "$tmp/jittered-resources.jsonl"
+validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2
+
+{
+  resource_sample queqlite 100
+  resource_sample simulator 100
+  for epoch in $(seq 122 6 200); do
+    resource_sample queqlite "$epoch"
+    resource_sample simulator "$epoch"
+  done
+  resource_sample queqlite 202
+  resource_sample simulator 202
+} > "$tmp/stale-boundary-resources.jsonl"
+if validate_resource_samples "$tmp/stale-boundary-resources.jsonl" 120 200 2; then
+  echo "resource evidence with a stale measurement boundary was accepted" >&2
+  exit 1
+fi
 
 {
   resource_sample queqlite 0 999999 999999
@@ -92,7 +127,7 @@ validate_resource_samples "$tmp/resources.jsonl" 120 200 2
   resource_sample simulator 201
   resource_sample simulator 999 999999 999999
 } > "$tmp/window-resources.jsonl"
-validate_resource_samples "$tmp/window-resources.jsonl" 120 190 2
+validate_resource_samples "$tmp/window-resources.jsonl" 120 190 50
 summarize_resource_samples "$tmp/window-resources.jsonl" 120 190 > "$tmp/resource-summary.json"
 jq -e '.samples == 6 and
   (all(.apps[]; .peak_memory_bytes == 2 and .average_memory_bytes == 2)) and
