@@ -4965,6 +4965,9 @@ mod tests {
                 .unwrap();
             executor.block_on(async move {
                 let runtime = runtime_for_final_flush(&root_path);
+                finish_pending_consensus_rpcs(&runtime, HANG_GUARD).expect(
+                    "startup consensus RPCs must drain before saturating the blocking pool",
+                );
                 let blocker = tokio::task::spawn_blocking(move || {
                     blocker_started_tx.send(()).unwrap();
                     release_blocker_rx.recv().unwrap();
