@@ -277,9 +277,21 @@ validate_resource_samples() {
       $right.timestamp_epoch_seconds >= ($fault_start | tonumber) and
       (($fault_start | tonumber) - $left.timestamp_epoch_seconds) <= $max_gap and
       ($right.timestamp_epoch_seconds - ($fault_end | tonumber)) <= $max_gap;
+    def complete_or_fault_batch:
+      . as $batch |
+      ([$batch[] | component] | unique | sort) as $components |
+      $components == ($expected | sort) or
+      ($fault_pod != "" and
+       ($fault_start | test("^[0-9]+([.][0-9]+)?$")) and
+       ($fault_end | test("^[0-9]+([.][0-9]+)?$")) and
+       $components == ($expected | map(select(. != $fault_pod)) | sort) and
+       all($batch[];
+         .timestamp_epoch_seconds >= ($fault_start | tonumber) and
+         .timestamp_epoch_seconds <= ($fault_end | tonumber)));
     . as $samples |
     $start >= 0 and $end >= $start and $interval > 0 and
     ($fault_pod == "" or ($fault_pod | test("^queqlite-c1-[0-2]$"))) and
+    all(($samples | group_by(.collection_batch))[]; complete_or_fault_batch) and
     all($expected[];
       . as $component |
       ([$samples[] | select(component == $component)] |
@@ -317,7 +329,11 @@ validate_resource_samples() {
 
 summarize_resource_samples() {
   jq -s --argjson start "$2" --argjson end "$3" '
+    def component: if .app == "queqlite" then .pod else .container end;
     . as $samples |
+    ($samples | group_by(.app) |
+      map({key:.[0].app,value:(map(component) | unique | sort)}) |
+      from_entries) as $expected_by_app |
     ($samples | sort_by([.app,.pod_uid,.container,.container_id,.timestamp_epoch_seconds]) |
       group_by([.app,.pod_uid,.container,.container_id]) |
       map(sort_by(.timestamp_epoch_seconds) as $g |
@@ -341,8 +357,11 @@ summarize_resource_samples() {
          baseline:(if $baseline == null then "born_in_window" else "preexisting" end),
          delta_usec:($g[-1].cpu_usage_usec - $first)});
     def memory_by_app: group_by([.collection_batch,.app]) |
-      map({collection_batch:.[0].collection_batch,app:.[0].app,
-        memory_bytes:(map(.memory_bytes) | add)});
+      map(. as $batch |
+        select(([$batch[] | component] | unique | sort) ==
+          $expected_by_app[$batch[0].app]) |
+        {collection_batch:$batch[0].collection_batch,app:$batch[0].app,
+         memory_bytes:($batch | map(.memory_bytes) | add)});
     if any($samples[]; ((.collection_batch | type != "number") or
         .collection_batch < 0 or (.collection_batch | floor) != .collection_batch)) then
       error("resource sample collection batch is missing or invalid")

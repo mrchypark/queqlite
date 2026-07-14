@@ -123,6 +123,24 @@ jq -e '.apps[] | select(.app == "queqlite") |
   .memory_samples == 1 and .average_memory_bytes == 60 and .peak_memory_bytes == 60' \
   "$tmp/staggered-memory-summary.json" >/dev/null
 
+{
+  for epoch in 118 124 130 136 142; do
+    resource_cycle "$epoch" "" false "$epoch" | jq -c \
+      'if .app == "queqlite" then .memory_bytes = 10 else . end'
+  done
+} > "$tmp/complete-memory-batches.jsonl"
+jq -c 'select(.collection_batch != 130 or .pod != "queqlite-c1-2")' \
+  "$tmp/complete-memory-batches.jsonl" > "$tmp/partial-memory-batch.jsonl"
+if validate_resource_samples "$tmp/partial-memory-batch.jsonl" 120 140 2 0; then
+  echo "incomplete non-fault collection batch was accepted" >&2
+  exit 1
+fi
+summarize_resource_samples "$tmp/partial-memory-batch.jsonl" 120 140 \
+  > "$tmp/partial-memory-summary.json"
+jq -e '.apps[] | select(.app == "queqlite") |
+  .memory_samples == 4 and .average_memory_bytes == 30 and .peak_memory_bytes == 30' \
+  "$tmp/partial-memory-summary.json" >/dev/null
+
 resource_cycle 150 > "$tmp/valid-collection-batch.jsonl"
 jq -c 'del(.collection_batch)' "$tmp/valid-collection-batch.jsonl" \
   > "$tmp/missing-collection-batch.jsonl"
@@ -268,6 +286,18 @@ jq -e '.samples == 12 and
 gap_fixture "$tmp/fault-gap-resources.jsonl" queqlite-c1-1
 validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 0 \
   queqlite-c1-1 135 185
+summarize_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 \
+  > "$tmp/fault-gap-summary.json"
+jq -e '.apps[] | select(.app == "queqlite") |
+  .memory_samples == 6 and .average_memory_bytes == 6 and .peak_memory_bytes == 6' \
+  "$tmp/fault-gap-summary.json" >/dev/null
+jq -c 'select(.pod != "queqlite-c1-1" or .timestamp_epoch_seconds != 130)' \
+  "$tmp/fault-gap-resources.jsonl" > "$tmp/outside-fault-window-gap-resources.jsonl"
+if validate_resource_samples "$tmp/outside-fault-window-gap-resources.jsonl" 120 200 2 0 \
+  queqlite-c1-1 135 185; then
+  echo "incomplete fault batch outside the verified fault window was accepted" >&2
+  exit 1
+fi
 cp "$tmp/fault-gap-resources.jsonl" "$tmp/fault-with-other-restart-resources.jsonl"
 jq -c 'if .pod == "queqlite-c1-2" and .timestamp_epoch_seconds >= 150
   then .restart_count = 1 else . end' "$tmp/fault-with-other-restart-resources.jsonl" \
@@ -320,7 +350,7 @@ if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 1 "" "" "
   exit 1
 fi
 cp "$tmp/window-resources.jsonl" "$tmp/meter-resources.jsonl"
-for epoch in 100 150 200; do
+for epoch in 0 100 150 200 999; do
   component_sample rustfs-abc object-meter "$epoch" "$epoch" >> "$tmp/meter-resources.jsonl"
 done
 validate_resource_samples "$tmp/meter-resources.jsonl" 120 190 50 1 "" "" ""

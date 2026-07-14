@@ -148,8 +148,11 @@ rather than the time the potentially slow collection started. CPU and memory
 values must share that timestamp. Every stats response also receives a unique
 collection batch ID, so app memory is summed across containers from the same
 response even when their CRI timestamps are staggered. Missing, invalid, or
-reused batch IDs invalidate the resource evidence. Samples require all three
-Queqlite ordinals plus RustFS and, when enabled, its object-meter sidecar.
+reused batch IDs invalidate the resource evidence. Each batch requires all three
+Queqlite ordinals plus RustFS and, when enabled, its object-meter sidecar. Only
+the named pod-delete target may be absent, only while the batch timestamps are
+inside the verified fault window; that incomplete Queqlite batch is excluded
+from memory averages and peaks instead of being counted as a partial snapshot.
 `resource-summary.json`
 reports container-lifecycle CPU deltas plus average/peak memory using samples
 inside, or immediately bracketing, the Rust-reported measurement window. A
