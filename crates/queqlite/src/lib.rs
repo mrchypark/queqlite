@@ -24,6 +24,7 @@ pub use queqlite_quepaxa::RecorderRpc;
 pub use queqlite_sqlite::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
 const MATERIALIZER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddedIdentity {
@@ -85,6 +86,7 @@ pub enum Error {
     Consensus(ConsensusError),
     Node(NodeError),
     Durability(DurabilityError),
+    PendingConsensusRpcs,
     Worker(JoinError),
 }
 
@@ -96,6 +98,12 @@ impl fmt::Display for Error {
             Self::Consensus(error) => error.fmt(f),
             Self::Node(error) => error.fmt(f),
             Self::Durability(error) => error.fmt(f),
+            Self::PendingConsensusRpcs => {
+                write!(
+                    f,
+                    "consensus RPCs did not finish before the shutdown deadline"
+                )
+            }
             Self::Worker(error) => write!(f, "embedded worker failed: {error}"),
         }
     }
@@ -109,6 +117,7 @@ impl std::error::Error for Error {
             Self::Consensus(error) => Some(error),
             Self::Node(error) => Some(error),
             Self::Durability(error) => Some(error),
+            Self::PendingConsensusRpcs => None,
             Self::Worker(error) => Some(error),
         }
     }
@@ -228,16 +237,24 @@ impl Queqlite {
         inner.closed.store(true, Ordering::Release);
         inner.runtime.cancel_operations();
         let operations = inner.operations.write().await;
-        let mut result = flush_applied_tip(&inner).await;
         stop_inner(&inner);
         drop(operations);
+        let mut worker_result = Ok(());
         for worker in self.workers.drain(..) {
             match worker.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) if result.is_ok() => result = Err(error),
-                Err(error) if result.is_ok() => result = Err(Error::Worker(error)),
+                Ok(Err(error)) if worker_result.is_ok() => worker_result = Err(error),
+                Err(error) if worker_result.is_ok() => worker_result = Err(Error::Worker(error)),
                 _ => {}
             }
+        }
+        let mut result = flush_applied_tip(&inner).await;
+        let consensus_result = finish_pending_consensus_rpcs(&inner, SHUTDOWN_RPC_TIMEOUT).await;
+        if result.is_ok() {
+            result = consensus_result;
+        }
+        if result.is_ok() {
+            result = worker_result;
         }
         drop(inner);
         result
@@ -360,6 +377,18 @@ async fn flush_applied_tip(inner: &Inner) -> Result<(), Error> {
         .flush_runtime(&inner.runtime, applied_tip)
         .await?;
     Ok(())
+}
+
+async fn finish_pending_consensus_rpcs(inner: &Inner, timeout: Duration) -> Result<(), Error> {
+    let consensus = Arc::clone(inner.runtime.consensus());
+    let finished = tokio::task::spawn_blocking(move || consensus.finish_pending_rpcs(timeout))
+        .await
+        .map_err(Error::Worker)?;
+    if finished {
+        Ok(())
+    } else {
+        Err(Error::PendingConsensusRpcs)
+    }
 }
 
 fn stop_inner(inner: &Inner) {

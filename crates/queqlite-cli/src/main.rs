@@ -1777,6 +1777,25 @@ async fn before_shutdown_deadline<T>(
         .map_err(|_| shutdown_deadline_error(timeout))
 }
 
+fn pending_consensus_rpc_result(finished: bool) -> Result<(), String> {
+    if finished {
+        Ok(())
+    } else {
+        Err("consensus RPCs did not finish before the shutdown deadline".into())
+    }
+}
+
+async fn finish_pending_consensus_rpcs(
+    runtime: &Arc<NodeRuntime>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let consensus = Arc::clone(runtime.consensus());
+    let finished = tokio::task::spawn_blocking(move || consensus.finish_pending_rpcs(timeout))
+        .await
+        .map_err(|error| format!("consensus RPC drain task failed: {error}"))?;
+    pending_consensus_rpc_result(finished)
+}
+
 async fn serve_legacy_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -1848,6 +1867,10 @@ where
             task_result((&mut materializer.0).await, "materializer worker"),
         );
         wait_for_admin_tasks(admin_tasks.as_ref()).await;
+        retain_first_error(
+            &mut drained,
+            finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).await,
+        );
         drained
     })
     .await?;
@@ -2056,11 +2079,19 @@ async fn finish_remote_serve(
             "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
         )),
     };
-    match (result, final_flush) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(durability_error)) => Err(format!("{error}; {durability_error}")),
+    let consensus_drain = finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).await;
+    match (result, final_flush, consensus_drain) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(()), Err(error)) | (Ok(()), Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(durability_error), Err(drain_error)) => {
+            Err(format!("{durability_error}; {drain_error}"))
+        }
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Err(error), Err(durability_error), Ok(())) => Err(format!("{error}; {durability_error}")),
+        (Err(error), Ok(()), Err(drain_error)) => Err(format!("{error}; {drain_error}")),
+        (Err(error), Err(durability_error), Err(drain_error)) => {
+            Err(format!("{error}; {durability_error}; {drain_error}"))
+        }
     }
 }
 
@@ -4646,6 +4677,45 @@ mod tests {
                 .index(),
             committed.applied_index
         );
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_preserves_the_primary_error_after_the_final_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+
+        let error = finish_remote_serve(
+            Err("client server failed".into()),
+            Arc::clone(&runtime),
+            Arc::clone(&coordinator),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "client server failed");
+        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
+    }
+
+    #[test]
+    fn unfinished_consensus_rpcs_fail_an_otherwise_successful_shutdown() {
+        assert!(pending_consensus_rpc_result(true).is_ok());
+        assert!(pending_consensus_rpc_result(false)
+            .unwrap_err()
+            .contains("consensus RPCs did not finish"));
     }
 
     #[tokio::test]

@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{mpsc, Arc, Condvar, Mutex},
+    time::Duration,
+};
 
 use queqlite::{
     CheckpointCoordinator, DurabilityHealth, DurabilityMode, EmbeddedConfig, EmbeddedIdentity,
@@ -6,7 +9,9 @@ use queqlite::{
 };
 use queqlite_archive::{CheckpointIdentity, ObjectArchiveStore};
 use queqlite_obj_store::{ObjStore, ObjStoreConfig};
-use queqlite_quepaxa::{Membership, RecorderFileStore};
+use queqlite_quepaxa::{
+    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderReply,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn executes_and_queries_sql_with_in_process_recorders() {
@@ -176,6 +181,40 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_a_minority_rpc_before_releasing_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let (blocked_config, started, release) = config_with_blocked_minority(root.path());
+    let queqlite = Queqlite::open(blocked_config).await.unwrap();
+    let handle = queqlite.handle();
+
+    handle.put("request", "key", "value").await.unwrap();
+    tokio::task::spawn_blocking(move || started.recv().unwrap())
+        .await
+        .unwrap();
+
+    let status = handle.clone();
+    let shutdown = tokio::spawn(queqlite.shutdown());
+    loop {
+        match status.status().await {
+            Err(Error::Closed) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected status error during shutdown: {error}"),
+        }
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown released runtime storage while a minority RPC was still running"
+    );
+
+    release.release();
+    shutdown.await.unwrap().unwrap();
+
+    let reopened = Queqlite::open(config(root.path())).await.unwrap();
+    reopened.shutdown().await.unwrap();
+    root.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
     let root = tempfile::tempdir().unwrap();
     let mut config = config(root.path());
@@ -217,6 +256,113 @@ fn config(root: &std::path::Path) -> EmbeddedConfig {
         vec![],
         None,
     )
+}
+
+fn config_with_blocked_minority(
+    root: &std::path::Path,
+) -> (EmbeddedConfig, mpsc::Receiver<()>, BlockingRelease) {
+    let identity = EmbeddedIdentity::new("cluster-a", "node-1", 1, 1);
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = BlockingRelease::default();
+    let recorders = membership
+        .members()
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let recorder = RecorderFileStore::new_with_membership(
+                root.join("recorders").join(id),
+                id.clone(),
+                "cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            let recorder: Box<dyn RecorderRpc> = if index == 2 {
+                Box::new(BlockingRecorder {
+                    inner: recorder,
+                    started: started_tx.clone(),
+                    release: release.clone(),
+                })
+            } else {
+                Box::new(recorder)
+            };
+            (id.clone(), recorder)
+        })
+        .collect();
+    (
+        EmbeddedConfig::new(
+            identity,
+            root.join("node"),
+            membership.members().to_vec(),
+            recorders,
+            vec![],
+            None,
+        ),
+        started_rx,
+        release,
+    )
+}
+
+#[derive(Clone, Default)]
+struct BlockingRelease(Arc<(Mutex<bool>, Condvar)>);
+
+impl BlockingRelease {
+    fn wait(&self) {
+        let (released, condition) = &*self.0;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = condition.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let (released, condition) = &*self.0;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
+}
+
+struct BlockingRecorder {
+    inner: RecorderFileStore,
+    started: mpsc::Sender<()>,
+    release: BlockingRelease,
+}
+
+impl RecorderRpc for BlockingRecorder {
+    fn call(
+        &self,
+        request: queqlite_quepaxa::RecorderRequest,
+    ) -> queqlite_quepaxa::Result<RecorderReply> {
+        self.inner.call(request)
+    }
+
+    fn record(&self, request: RecordRequest) -> queqlite_quepaxa::Result<RecordSummary> {
+        let _ = self.started.send(());
+        self.release.wait();
+        self.inner.record(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> queqlite_quepaxa::Result<()> {
+        self.inner.install_decision_proof(proof, membership)
+    }
+
+    fn inspect_decision_proof(&self, slot: u64) -> queqlite_quepaxa::Result<Option<DecisionProof>> {
+        self.inner.inspect_decision_proof(slot)
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> queqlite_quepaxa::Result<Option<RecordSummary>> {
+        self.inner.inspect_record_summary(slot)
+    }
+
+    fn uses_typed_protocol(&self) -> bool {
+        true
+    }
 }
 
 async fn initialized_checkpoint(root: &std::path::Path) -> ObjectArchiveStore {
