@@ -500,6 +500,59 @@ render_provenance_json() {
   '
 }
 
+wait_for_checkpoint_drain() {
+  local status elapsed endpoint_url
+  local start_epoch=$SECONDS
+  local status_file="$target/.checkpoint-status.json"
+  local statuses_file="$target/.checkpoint-statuses.jsonl"
+  for _ in $(seq 1 120); do
+    : > "$statuses_file"
+    for endpoint_url in "${endpoint_urls[@]}"; do
+      status="$(curl --max-time 3 -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $admin_token" \
+        "$endpoint_url/v1/admin/membership/status" 2>/dev/null || true)"
+      [ -n "$status" ] || continue
+      jq -cse --arg endpoint "$endpoint_url" '
+        if length == 1 and (.[0] | type) == "object"
+        then {endpoint:$endpoint,status:.[0]}
+        else error("invalid status response") end
+      ' \
+        <<< "$status" >> "$statuses_file" 2>/dev/null || true
+    done
+    elapsed=$((SECONDS - start_epoch))
+    jq -s '.' "$statuses_file" > "$status_file"
+    if jq -e --argjson expected "${#endpoint_urls[@]}" '
+      . as $statuses |
+      ($statuses[0].status.qlog_root // null) as $root |
+      length == $expected and
+      ($root | type) == "object" and
+      ($root.index | type) == "number" and
+      ($root.hash | type) == "string" and
+      all($statuses[];
+        (.status | type) == "object" and
+        (.status.qlog_root | type) == "object" and
+        (.status.checkpoint_root | type) == "object" and
+        .status.qlog_root == $root and .status.checkpoint_root == $root)
+    ' "$status_file" >/dev/null 2>&1; then
+      jq --argjson wait_seconds "$elapsed" \
+        '. as $statuses | $statuses[0].status.qlog_root as $root |
+         {wait_seconds:$wait_seconds,qlog_root:$root,checkpoint_root:$root,
+          endpoints:[$statuses[] | {endpoint,qlog_root:.status.qlog_root,
+            checkpoint_root:.status.checkpoint_root}]}' \
+        "$status_file" > "$checkpoint_drain_json"
+      rm -f "$status_file" "$statuses_file"
+      return 0
+    fi
+    sleep 1
+  done
+  jq --argjson wait_seconds "$((SECONDS - start_epoch))" \
+    '{wait_seconds:$wait_seconds,qlog_root:null,checkpoint_root:null,
+      endpoints:[.[] | {endpoint,qlog_root:(.status.qlog_root // null),
+        checkpoint_root:(.status.checkpoint_root // null)}]}' \
+    "$status_file" > "$checkpoint_drain_json" 2>/dev/null || true
+  rm -f "$status_file" "$statuses_file"
+  return 1
+}
+
 # Allow the static check to exercise process-failure handling without starting a cluster.
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
@@ -717,39 +770,6 @@ collect_object_usage() {
   mv "$usage_tmp" "$object_usage_json"
   k delete pod "$usage_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   [ "$object_metering" = 0 ] || validate_object_evidence "$object_access_log" "$object_usage_json"
-}
-
-wait_for_checkpoint_drain() {
-  local status elapsed endpoint_url
-  local start_epoch=$SECONDS
-  local status_file="$target/.checkpoint-status.json"
-  for _ in $(seq 1 120); do
-    status=""
-    for endpoint_url in "${endpoint_urls[@]}"; do
-      status="$(curl --max-time 3 -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $admin_token" \
-        "$endpoint_url/v1/admin/membership/status" 2>/dev/null || true)"
-      [ -z "$status" ] || break
-    done
-    elapsed=$((SECONDS - start_epoch))
-    printf '%s' "$status" > "$status_file"
-    if jq -e '
-      .checkpoint_root != null and
-      .checkpoint_root.index == .qlog_root.index and
-      .checkpoint_root.hash == .qlog_root.hash
-    ' "$status_file" >/dev/null 2>&1; then
-      jq --argjson wait_seconds "$elapsed" \
-        '{wait_seconds:$wait_seconds,qlog_root:.qlog_root,checkpoint_root:.checkpoint_root}' \
-        "$status_file" > "$checkpoint_drain_json"
-      rm -f "$status_file"
-      return 0
-    fi
-    sleep 1
-  done
-  jq --argjson wait_seconds "$((SECONDS - start_epoch))" \
-    '{wait_seconds:$wait_seconds,qlog_root:(.qlog_root // null),checkpoint_root:(.checkpoint_root // null)}' \
-    "$status_file" > "$checkpoint_drain_json" 2>/dev/null || true
-  rm -f "$status_file"
-  return 1
 }
 
 emit_artifacts() {

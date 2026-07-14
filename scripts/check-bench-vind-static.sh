@@ -80,7 +80,7 @@ gap_fixture() {
   } > "$file"
 }
 component_sample queqlite-c1-0 queqlite 100 > "$tmp/resources.jsonl"
-if validate_resource_sample_schema "$tmp/resources.jsonl" false; then
+if validate_resource_sample_schema "$tmp/resources.jsonl" 0; then
   echo "resource evidence without simulator samples was accepted" >&2
   exit 1
 fi
@@ -100,7 +100,7 @@ fi
   resource_cycle 150
   resource_cycle 199
 } > "$tmp/late-resources.jsonl"
-if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2 false; then
+if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2 0; then
   echo "resource evidence that starts after measurement was accepted" >&2
   exit 1
 fi
@@ -110,7 +110,7 @@ fi
   resource_cycle 198
   resource_cycle 202
 } > "$tmp/gapped-resources.jsonl"
-if validate_resource_samples "$tmp/gapped-resources.jsonl" 120 200 2 false; then
+if validate_resource_samples "$tmp/gapped-resources.jsonl" 120 200 2 0; then
   echo "resource evidence with a measurement outage was accepted" >&2
   exit 1
 fi
@@ -122,7 +122,7 @@ component_sample rustfs-abc rustfs 201 >> "$tmp/resources.jsonl"
   done
 } > "$tmp/jittered-resources.jsonl"
 validate_resource_sample_schema "$tmp/jittered-resources.jsonl" 0
-validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 false
+validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 0
 
 {
   resource_cycle 100
@@ -131,7 +131,7 @@ validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 false
   done
   resource_cycle 202
 } > "$tmp/stale-boundary-resources.jsonl"
-if validate_resource_samples "$tmp/stale-boundary-resources.jsonl" 120 200 2 false; then
+if validate_resource_samples "$tmp/stale-boundary-resources.jsonl" 120 200 2 0; then
   echo "resource evidence with a stale measurement boundary was accepted" >&2
   exit 1
 fi
@@ -143,7 +143,7 @@ fi
   resource_cycle 200
   resource_cycle 999 "" false 999999
 } > "$tmp/window-resources.jsonl"
-validate_resource_samples "$tmp/window-resources.jsonl" 120 190 50 false
+validate_resource_samples "$tmp/window-resources.jsonl" 120 190 50 0
 summarize_resource_samples "$tmp/window-resources.jsonl" 120 190 > "$tmp/resource-summary.json"
 jq -e '.samples == 12 and
   ([.apps[] | {key:.app,value:.peak_memory_bytes}] | from_entries) ==
@@ -155,21 +155,21 @@ jq -e '.samples == 12 and
   "$tmp/resource-summary.json" >/dev/null
 
 gap_fixture "$tmp/fault-gap-resources.jsonl" queqlite-c1-1
-validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 false \
+validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 0 \
   queqlite-c1-1 135 185
 sed 's/-replacement"/-original"/g' "$tmp/fault-gap-resources.jsonl" \
   > "$tmp/fault-omission-resources.jsonl"
-if validate_resource_samples "$tmp/fault-omission-resources.jsonl" 120 200 2 false \
+if validate_resource_samples "$tmp/fault-omission-resources.jsonl" 120 200 2 0 \
   queqlite-c1-1 135 185; then
   echo "collection omission was mistaken for a pod replacement" >&2
   exit 1
 fi
-if validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 false "" "" ""; then
+if validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 0 "" "" ""; then
   echo "pod absence without an explicit fault window was accepted" >&2
   exit 1
 fi
 gap_fixture "$tmp/non-fault-gap-resources.jsonl" queqlite-c1-2
-if validate_resource_samples "$tmp/non-fault-gap-resources.jsonl" 120 200 2 false \
+if validate_resource_samples "$tmp/non-fault-gap-resources.jsonl" 120 200 2 0 \
   queqlite-c1-1 135 185; then
   echo "collection omission for a non-faulted pod was accepted" >&2
   exit 1
@@ -180,7 +180,7 @@ fi
   resource_cycle 124 queqlite-c1-2
   resource_cycle 202 queqlite-c1-2
 } > "$tmp/missing-component-resources.jsonl"
-if validate_resource_sample_schema "$tmp/missing-component-resources.jsonl" false; then
+if validate_resource_sample_schema "$tmp/missing-component-resources.jsonl" 0; then
   echo "resource evidence without every Queqlite ordinal was accepted" >&2
   exit 1
 fi
@@ -467,6 +467,41 @@ fi
 printf '%s\n' '#!/bin/sh' 'printf "1\n"' > "$fake_bin/seq"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/sleep"
 chmod +x "$fake_bin/seq" "$fake_bin/sleep"
+
+checkpoint_fixture="$tmp/checkpoint-drain"
+mkdir "$checkpoint_fixture"
+(
+  target="$checkpoint_fixture"
+  checkpoint_drain_json="$checkpoint_fixture/result.json"
+  endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
+  admin_token=fixture
+  checkpoint_fixture_mode=stale
+  seq() { printf '1\n'; }
+  sleep() { :; }
+  curl() {
+    local url="${!#}" index=6 hash=six
+    if [ "$checkpoint_fixture_mode" = stale ] && [[ "$url" == *:18080/* ]]; then
+      index=5
+      hash=five
+    fi
+    jq -cn --argjson index "$index" --arg hash "$hash" \
+      '{qlog_root:{index:$index,hash:$hash},checkpoint_root:{index:$index,hash:$hash}}'
+  }
+  if wait_for_checkpoint_drain; then
+    echo "a stale endpoint with a locally matching checkpoint was accepted" >&2
+    exit 1
+  fi
+  jq -e '.qlog_root == null and .checkpoint_root == null and
+    (.endpoints | length) == 2' "$checkpoint_drain_json" >/dev/null
+
+  checkpoint_fixture_mode=converged
+  wait_for_checkpoint_drain
+  jq -e '.qlog_root == {index:6,hash:"six"} and
+    .checkpoint_root == .qlog_root and (.endpoints | length) == 2 and
+    all(.endpoints[]; .qlog_root == {index:6,hash:"six"} and
+      .checkpoint_root == .qlog_root)' "$checkpoint_drain_json" >/dev/null
+)
+
 : > "$KUBECTL_LOG"
 if KUBECTL_DELETE_FAIL=0 PATH="$fake_bin:$PATH" sh -c "$failed_delete_command"; then
   echo "same-identity replacement pod was accepted" >&2
