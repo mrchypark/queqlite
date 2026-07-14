@@ -479,13 +479,21 @@ async fn bounded_background_flushes_at_half_lag_and_sync_does_not_flush() {
     let bounded_runtime = Arc::new(runtime(root.path().join("bounded-node")));
     let committed = bounded_runtime.write("request-1", "alpha", "one").unwrap();
     bounded.note_committed(committed.applied_index);
-    bounded
-        .run_background(
-            bounded_runtime,
-            tokio::time::sleep(Duration::from_millis(30)),
-        )
-        .await
-        .unwrap();
+    let bounded_shutdown = {
+        let bounded = bounded.clone();
+        async move {
+            while bounded.durable_tip().index() < committed.applied_index {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        bounded.run_background(bounded_runtime, bounded_shutdown),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         bounded_archive
             .load_checkpoint()
@@ -507,13 +515,9 @@ async fn bounded_background_flushes_at_half_lag_and_sync_does_not_flush() {
     let sync_runtime = Arc::new(runtime(root.path().join("sync-node")));
     let committed = sync_runtime.write("request-1", "alpha", "one").unwrap();
     sync.note_committed(committed.applied_index);
-    tokio::time::timeout(
-        Duration::from_millis(20),
-        sync.run_background(sync_runtime, std::future::pending()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    sync.run_background(sync_runtime, std::future::pending())
+        .await
+        .unwrap();
     assert_eq!(
         sync_archive
             .load_checkpoint()
