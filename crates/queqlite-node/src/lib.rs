@@ -1841,7 +1841,16 @@ async fn confirm_write_durability(
                 })
             }
             Err(DurabilityError::Archive(_) | DurabilityError::Io(_)) => {
-                tokio::time::sleep(retry_delay).await;
+                let cancelled = runtime.operation_cancelled_notify.notified();
+                tokio::pin!(cancelled);
+                cancelled.as_mut().enable();
+                if runtime.operation_cancelled.load(Ordering::Acquire) {
+                    return Err(DurabilityError::Unavailable);
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(retry_delay) => {}
+                    () = &mut cancelled => return Err(DurabilityError::Unavailable),
+                }
                 retry_delay = next_sync_flush_retry(retry_delay);
             }
             Err(error) => return Err(error),
@@ -2940,6 +2949,7 @@ pub struct NodeRuntime {
     commit: Mutex<()>,
     checkpointing: AtomicBool,
     operation_cancelled: AtomicBool,
+    operation_cancelled_notify: tokio::sync::Notify,
     ready: AtomicBool,
     fatal: AtomicBool,
     fatal_reason: Mutex<Option<String>>,
@@ -3044,6 +3054,7 @@ impl NodeRuntime {
             commit: Mutex::new(()),
             checkpointing: AtomicBool::new(false),
             operation_cancelled: AtomicBool::new(false),
+            operation_cancelled_notify: tokio::sync::Notify::new(),
             ready: AtomicBool::new(true),
             fatal: AtomicBool::new(false),
             fatal_reason: Mutex::new(None),
@@ -3483,6 +3494,7 @@ impl NodeRuntime {
 
     pub fn cancel_operations(&self) {
         self.operation_cancelled.store(true, Ordering::Release);
+        self.operation_cancelled_notify.notify_waiters();
     }
 
     pub fn materialize_next_decision(&self) -> Result<bool, NodeError> {

@@ -243,6 +243,7 @@ pub struct CheckpointCoordinator {
     publisher: CheckpointPublisher,
     mode: DurabilityMode,
     state: Mutex<CoordinatorState>,
+    publication_attempts: AtomicU64,
 }
 
 impl CheckpointCoordinator {
@@ -311,6 +312,7 @@ impl CheckpointCoordinator {
                 pending_lag: None,
                 health: DurabilityHealth::Available,
             }),
+            publication_attempts: AtomicU64::new(0),
         })
     }
 
@@ -324,6 +326,11 @@ impl CheckpointCoordinator {
 
     pub fn health(&self) -> DurabilityHealth {
         self.lock_state().health
+    }
+
+    #[doc(hidden)]
+    pub fn checkpoint_publication_attempts(&self) -> u64 {
+        self.publication_attempts.load(Ordering::Relaxed)
     }
 
     pub fn note_committed(&self, index: LogIndex) {
@@ -425,6 +432,7 @@ impl CheckpointCoordinator {
                 .log_store()
                 .read_range(IndexRange::new(next, end)?)?;
             validate_local_batch(&entries, next, end, durable_tip)?;
+            self.publication_attempts.fetch_add(1, Ordering::Relaxed);
             let published = self.publisher.publish_committed(&entries).await?;
             durable_tip = *published.manifest().tip();
             self.mark_durable(durable_tip);

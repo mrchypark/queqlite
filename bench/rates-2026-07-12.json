@@ -1,0 +1,58 @@
+{
+  "as_of": "2026-07-12",
+  "currency": "USD",
+  "providers": [
+    {
+      "id": "aws-s3-standard-us-east-1",
+      "provider": "AWS S3",
+      "storage_class": "Standard",
+      "region": "us-east-1",
+      "storage_unit": "GiB",
+      "storage_input_gb_month_multiplier": 0.9313225746154785,
+      "storage_usd_per_unit_month": 0.023,
+      "put_list_usd_per_1000": 0.005,
+      "get_usd_per_1000": 0.0004,
+      "delete_usd_per_1000": 0.0,
+      "default_egress_usd_per_gb": 0.0
+    },
+    {
+      "id": "gcs-standard-us-central1",
+      "provider": "Google Cloud Storage",
+      "storage_class": "Standard",
+      "region": "us-central1",
+      "storage_unit": "GiB",
+      "storage_input_gb_month_multiplier": 0.9313225746154785,
+      "storage_usd_per_unit_month": 0.02,
+      "put_list_usd_per_1000": 0.005,
+      "get_usd_per_1000": 0.0004,
+      "delete_usd_per_1000": 0.0,
+      "default_egress_usd_per_gb": 0.0
+    },
+    {
+      "id": "azure-blob-hot-lrs-eastus2",
+      "provider": "Azure Blob Storage",
+      "storage_class": "Hot LRS",
+      "region": "eastus2",
+      "storage_unit": "GiB",
+      "storage_input_gb_month_multiplier": 0.9313225746154785,
+      "storage_usd_per_unit_month": 0.0184,
+      "put_list_usd_per_1000": 0.005,
+      "get_usd_per_1000": 0.0004,
+      "delete_usd_per_1000": 0.0,
+      "default_egress_usd_per_gb": 0.0
+    },
+    {
+      "id": "rustfs-local",
+      "provider": "RustFS",
+      "storage_class": "local",
+      "region": "local",
+      "storage_unit": "GB",
+      "storage_input_gb_month_multiplier": 1.0,
+      "storage_usd_per_unit_month": 0.0,
+      "put_list_usd_per_1000": 0.0,
+      "get_usd_per_1000": 0.0,
+      "delete_usd_per_1000": 0.0,
+      "default_egress_usd_per_gb": 0.0
+    }
+  ]
+}

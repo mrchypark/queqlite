@@ -916,4 +916,5 @@ object_retry_stdout="$(
 [ "$object_retry_stdout" = checkpoint-retried ]
 [ "$(cat "$tmp/object-kubectl-state")" = 3 ]
 
+scripts/check-bench-vind-static.sh
 echo "deployment static checks passed"
