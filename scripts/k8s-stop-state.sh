@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+profile="${RHIZA_EXECUTION_PROFILE-}"
+case "$profile" in
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+esac
+
 die() {
   echo "$*" >&2
   exit 65

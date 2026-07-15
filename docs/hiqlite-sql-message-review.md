@@ -31,7 +31,7 @@ Reads do not normally enter the replicated log. Hiqlite offers local reads and
 a more expensive consistent read routed through the leader. Writes, migrations,
 backups, and an RTT marker are separate `QueryWrite` variants.
 
-## Useful Patterns for Queqlite
+## Useful Patterns for rhiza sql
 
 Adopt or retain these patterns:
 
@@ -44,7 +44,7 @@ Adopt or retain these patterns:
 - Separate local and consistency-barrier read paths.
 - A response envelope correlated to the client request ID.
 
-Queqlite now has this shape in QSQL v2: it carries a stable request ID, typed
+rhiza sql now has this shape in QSQL v2: it carries a stable request ID, typed
 statements, an executor fingerprint, and a statement-level result with
 `rows_affected` plus bounded typed `RETURNING` rows. QSQL v2 persists that
 typed result with the request record, making exact retries return the original
@@ -77,7 +77,7 @@ pseudo-randomly. No SQL function appears for an authorizer or function denylist
 to reject. SQLite versions, compile options, extensions, collations, and
 connection settings are additional executor-compatibility boundaries.
 
-Therefore Queqlite's statement-replay fallback calls its write surface
+Therefore rhiza sql's statement-replay fallback calls its write surface
 **admitted deterministic SQL**. It supports DDL and DML within an explicit
 policy, but it must not promise unrestricted SQLite write semantics. Direct
 statement-replay `RETURNING` is rejected because its typed rows must be

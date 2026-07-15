@@ -102,8 +102,8 @@ spec:
                 sleep 1
               done
               "$ready" || { echo "RustFS did not become ready" >&2; exit 1; }
-              aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket queqlite >/dev/null 2>&1 \
-                || aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket queqlite
+              aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket rhiza >/dev/null 2>&1 \
+                || aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket rhiza
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:

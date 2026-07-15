@@ -1,0 +1,1459 @@
+//! A bounded, deterministic key/value materializer backed by redb.
+//!
+//! The replicated surface is deliberately semantic: callers may submit only
+//! versioned put/delete commands. Arbitrary redb transactions are not exposed.
+
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::Path;
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use rhiza_core::{
+    ConfigChange, EntryType, ExecutionProfile, LogEntry, LogHash, ReplicatedCommandEnvelope,
+};
+use tempfile::NamedTempFile;
+
+const COMMAND_MAGIC: &[u8; 6] = b"RHKV\0\x01";
+const RECEIPT_MAGIC: &[u8; 6] = b"RHKR\0\x01";
+const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-kv-snapshot-v1\0";
+const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"RHKS";
+const SNAPSHOT_WIRE_VERSION: u16 = 1;
+const MATERIALIZER_DOMAIN: &[u8] = b"rhiza-kv-materializer-v1\0";
+const COMMAND_VERSION: u16 = 1;
+
+const DATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__rhiza_kv_data_v1");
+const REQUEST_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__rhiza_kv_requests_v1");
+const PROGRESS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("__rhiza_kv_progress_v1");
+
+const META_CLUSTER_ID: &str = "cluster_id";
+const META_NODE_ID: &str = "node_id";
+const META_EPOCH: &str = "epoch";
+const META_CONFIG_ID: &str = "config_id";
+const META_APPLIED_INDEX: &str = "applied_index";
+const META_APPLIED_HASH: &str = "applied_hash";
+const META_MATERIALIZER_FINGERPRINT: &str = "materializer_fingerprint";
+
+/// Maximum accepted request-id size in bytes.
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+/// Maximum accepted key size in bytes.
+pub const MAX_KV_KEY_BYTES: usize = 4 * 1024;
+/// Maximum accepted value size in bytes.
+pub const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
+
+/// Stable compatibility identity for redb bytes and deterministic KV semantics.
+pub fn kv_materializer_fingerprint() -> LogHash {
+    LogHash::digest(&[
+        MATERIALIZER_DOMAIN,
+        b"redb=4.1.0",
+        b"schema=1",
+        COMMAND_MAGIC,
+        &COMMAND_VERSION.to_be_bytes(),
+    ])
+}
+
+/// Errors returned by the bounded KV codec or materializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    Codec(String),
+    InvalidCommand(String),
+    InvalidEntry(String),
+    PartialInitialization,
+    RequestConflict { request_id: String },
+    Database(String),
+    Io(String),
+    InvalidSnapshot(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codec(message) => write!(formatter, "KV codec error: {message}"),
+            Self::InvalidCommand(message) => write!(formatter, "invalid KV command: {message}"),
+            Self::InvalidEntry(message) => write!(formatter, "invalid log entry: {message}"),
+            Self::PartialInitialization => {
+                formatter.write_str("partial or corrupt KV initialization")
+            }
+            Self::RequestConflict { request_id } => {
+                write!(
+                    formatter,
+                    "request id {request_id:?} was reused with another command"
+                )
+            }
+            Self::Database(message) => write!(formatter, "redb error: {message}"),
+            Self::Io(message) => write!(formatter, "KV snapshot I/O failed: {message}"),
+            Self::InvalidSnapshot(message) => write!(formatter, "invalid KV snapshot: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+fn database_error(error: impl fmt::Display) -> Error {
+    Error::Database(error.to_string())
+}
+
+fn io_error(error: impl fmt::Display) -> Error {
+    Error::Io(error.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum KvOperationV1 {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// Stable `RHKV v1` semantic command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvCommandV1 {
+    request_id: String,
+    operation: KvOperationV1,
+}
+
+impl KvCommandV1 {
+    pub fn put(request_id: impl Into<String>, key: Vec<u8>, value: Vec<u8>) -> Result<Self, Error> {
+        let command = Self {
+            request_id: request_id.into(),
+            operation: KvOperationV1::Put { key, value },
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub fn delete(request_id: impl Into<String>, key: Vec<u8>) -> Result<Self, Error> {
+        let command = Self {
+            request_id: request_id.into(),
+            operation: KvOperationV1::Delete { key },
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.validate()
+            .expect("KvCommandV1 constructors and decode preserve invariants");
+        let (key, value_len) = match &self.operation {
+            KvOperationV1::Put { key, value } => (key, Some(value.len())),
+            KvOperationV1::Delete { key } => (key, None),
+        };
+        let mut encoded = Vec::with_capacity(
+            COMMAND_MAGIC.len()
+                + 2
+                + self.request_id.len()
+                + 1
+                + 4
+                + key.len()
+                + value_len.map_or(0, |length| 4 + length),
+        );
+        encoded.extend_from_slice(COMMAND_MAGIC);
+        encoded.extend_from_slice(&(self.request_id.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(self.request_id.as_bytes());
+        match &self.operation {
+            KvOperationV1::Put { key, value } => {
+                encoded.push(1);
+                encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                encoded.extend_from_slice(key);
+                encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                encoded.extend_from_slice(value);
+            }
+            KvOperationV1::Delete { key } => {
+                encoded.push(2);
+                encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                encoded.extend_from_slice(key);
+            }
+        }
+        encoded
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, Error> {
+        let mut decoder = Decoder::new(encoded);
+        if decoder.take(COMMAND_MAGIC.len())? != COMMAND_MAGIC {
+            return Err(Error::Codec("invalid RHKV magic or version".into()));
+        }
+        let request_len = usize::from(decoder.u16()?);
+        let request_bytes = decoder.take(request_len)?;
+        let request_id = std::str::from_utf8(request_bytes)
+            .map_err(|_| Error::Codec("request id is not UTF-8".into()))?
+            .to_owned();
+        let operation = match decoder.u8()? {
+            1 => {
+                let key = decoder.length_prefixed_u32(MAX_KV_KEY_BYTES, "key")?;
+                let value = decoder.length_prefixed_u32(MAX_KV_VALUE_BYTES, "value")?;
+                KvOperationV1::Put { key, value }
+            }
+            2 => {
+                let key = decoder.length_prefixed_u32(MAX_KV_KEY_BYTES, "key")?;
+                KvOperationV1::Delete { key }
+            }
+            tag => return Err(Error::Codec(format!("unknown operation tag {tag}"))),
+        };
+        decoder.finish()?;
+        let command = Self {
+            request_id,
+            operation,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        if self.request_id.is_empty() {
+            return Err(Error::InvalidCommand("request id must not be empty".into()));
+        }
+        if self.request_id.len() > MAX_REQUEST_ID_BYTES {
+            return Err(Error::InvalidCommand(format!(
+                "request id exceeds {MAX_REQUEST_ID_BYTES} bytes"
+            )));
+        }
+        let (key, value) = match &self.operation {
+            KvOperationV1::Put { key, value } => (key.as_slice(), Some(value.as_slice())),
+            KvOperationV1::Delete { key } => (key.as_slice(), None),
+        };
+        validate_key(key)?;
+        if value.is_some_and(|value| value.len() > MAX_KV_VALUE_BYTES) {
+            return Err(Error::InvalidCommand(format!(
+                "value exceeds {MAX_KV_VALUE_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_key(key: &[u8]) -> Result<(), Error> {
+    if key.is_empty() {
+        return Err(Error::InvalidCommand("key must not be empty".into()));
+    }
+    if key.len() > MAX_KV_KEY_BYTES {
+        return Err(Error::InvalidCommand(format!(
+            "key exceeds {MAX_KV_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Encodes a command inside the shared `QCMD` envelope for the KV profile.
+pub fn encode_replicated_kv_command(command: &KvCommandV1) -> Result<Vec<u8>, Error> {
+    command.validate()?;
+    ReplicatedCommandEnvelope::new(
+        ExecutionProfile::Kv,
+        COMMAND_VERSION,
+        command.request_id(),
+        command.encode(),
+    )
+    .and_then(|envelope| envelope.encode())
+    .map_err(|error| Error::Codec(error.to_string()))
+}
+
+fn decode_replicated_kv_command(payload: &[u8]) -> Result<KvCommandV1, Error> {
+    let envelope = ReplicatedCommandEnvelope::decode(payload)
+        .map_err(|error| Error::Codec(error.to_string()))?;
+    if envelope.profile() != ExecutionProfile::Kv {
+        return Err(Error::InvalidCommand(format!(
+            "expected kv profile, got {}",
+            envelope.profile()
+        )));
+    }
+    if envelope.command_version() != COMMAND_VERSION {
+        return Err(Error::InvalidCommand(format!(
+            "unsupported command version {}",
+            envelope.command_version()
+        )));
+    }
+    let command = KvCommandV1::decode(envelope.body())?;
+    if command.request_id() != envelope.request_id() {
+        return Err(Error::InvalidCommand(
+            "envelope and body request ids differ".into(),
+        ));
+    }
+    Ok(command)
+}
+
+/// Observable result of a semantic KV command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KvCommandResultV1 {
+    Put { replaced: bool },
+    Delete { existed: bool },
+}
+
+/// Durable idempotency record for one request id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvRequestRecord {
+    payload_hash: LogHash,
+    original_log_index: u64,
+    original_log_hash: LogHash,
+    result: KvCommandResultV1,
+}
+
+impl KvRequestRecord {
+    pub const fn original_log_index(&self) -> u64 {
+        self.original_log_index
+    }
+
+    pub const fn original_log_hash(&self) -> LogHash {
+        self.original_log_hash
+    }
+
+    pub const fn result(&self) -> &KvCommandResultV1 {
+        &self.result
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(80);
+        encoded.extend_from_slice(RECEIPT_MAGIC);
+        encoded.extend_from_slice(self.payload_hash.as_bytes());
+        encoded.extend_from_slice(&self.original_log_index.to_be_bytes());
+        encoded.extend_from_slice(self.original_log_hash.as_bytes());
+        match self.result {
+            KvCommandResultV1::Put { replaced } => {
+                encoded.push(1);
+                encoded.push(u8::from(replaced));
+            }
+            KvCommandResultV1::Delete { existed } => {
+                encoded.push(2);
+                encoded.push(u8::from(existed));
+            }
+        }
+        encoded
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, Error> {
+        let mut decoder = Decoder::new(encoded);
+        if decoder.take(RECEIPT_MAGIC.len())? != RECEIPT_MAGIC {
+            return Err(Error::Codec(
+                "invalid request receipt magic or version".into(),
+            ));
+        }
+        let payload_hash = LogHash::from_bytes(decoder.array_32()?);
+        let original_log_index = decoder.u64()?;
+        let original_log_hash = LogHash::from_bytes(decoder.array_32()?);
+        let tag = decoder.u8()?;
+        let flag = match decoder.u8()? {
+            0 => false,
+            1 => true,
+            value => return Err(Error::Codec(format!("invalid receipt boolean {value}"))),
+        };
+        let result = match tag {
+            1 => KvCommandResultV1::Put { replaced: flag },
+            2 => KvCommandResultV1::Delete { existed: flag },
+            value => return Err(Error::Codec(format!("invalid receipt result tag {value}"))),
+        };
+        decoder.finish()?;
+        Ok(Self {
+            payload_hash,
+            original_log_index,
+            original_log_hash,
+            result,
+        })
+    }
+}
+
+/// Result of applying one committed qlog entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplyOutcome {
+    applied_index: u64,
+    applied_hash: LogHash,
+    result: Option<KvCommandResultV1>,
+}
+
+/// A self-verifying point-in-time image of the authoritative redb materializer.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RedbSnapshot {
+    cluster_id: String,
+    created_by: String,
+    epoch: u64,
+    config_id: u64,
+    applied_index: u64,
+    applied_hash: LogHash,
+    materializer_fingerprint: LogHash,
+    digest: LogHash,
+    db_bytes: Vec<u8>,
+}
+
+impl RedbSnapshot {
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub fn created_by(&self) -> &str {
+        &self.created_by
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn config_id(&self) -> u64 {
+        self.config_id
+    }
+
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn applied_hash(&self) -> LogHash {
+        self.applied_hash
+    }
+
+    pub const fn materializer_fingerprint(&self) -> LogHash {
+        self.materializer_fingerprint
+    }
+
+    pub const fn digest(&self) -> LogHash {
+        self.digest
+    }
+
+    pub fn db_bytes(&self) -> &[u8] {
+        &self.db_bytes
+    }
+
+    fn recompute_digest(&self) -> LogHash {
+        let cluster_id = length_prefixed(self.cluster_id.as_bytes());
+        let created_by = length_prefixed(self.created_by.as_bytes());
+        let database_length = u64::try_from(self.db_bytes.len()).expect("usize fits in u64");
+        LogHash::digest(&[
+            SNAPSHOT_DOMAIN,
+            &cluster_id,
+            &created_by,
+            &self.epoch.to_be_bytes(),
+            &self.config_id.to_be_bytes(),
+            &self.applied_index.to_be_bytes(),
+            self.applied_hash.as_bytes(),
+            self.materializer_fingerprint.as_bytes(),
+            &database_length.to_be_bytes(),
+            &self.db_bytes,
+        ])
+    }
+}
+
+/// Encodes a complete redb snapshot as one canonical, versioned archive object.
+pub fn encode_snapshot(snapshot: &RedbSnapshot) -> Result<Vec<u8>, Error> {
+    validate_snapshot_envelope(snapshot)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(SNAPSHOT_WIRE_MAGIC);
+    encoded.extend_from_slice(&SNAPSHOT_WIRE_VERSION.to_be_bytes());
+    encode_snapshot_bytes(&mut encoded, snapshot.cluster_id.as_bytes());
+    encode_snapshot_bytes(&mut encoded, snapshot.created_by.as_bytes());
+    encoded.extend_from_slice(&snapshot.epoch.to_be_bytes());
+    encoded.extend_from_slice(&snapshot.config_id.to_be_bytes());
+    encoded.extend_from_slice(&snapshot.applied_index.to_be_bytes());
+    encoded.extend_from_slice(snapshot.applied_hash.as_bytes());
+    encoded.extend_from_slice(snapshot.materializer_fingerprint.as_bytes());
+    encoded.extend_from_slice(snapshot.digest.as_bytes());
+    encode_snapshot_bytes(&mut encoded, &snapshot.db_bytes);
+    Ok(encoded)
+}
+
+/// Decodes and verifies a canonical redb snapshot archive object.
+pub fn decode_snapshot(encoded: &[u8]) -> Result<RedbSnapshot, Error> {
+    let mut decoder = SnapshotDecoder::new(encoded);
+    if decoder.take(SNAPSHOT_WIRE_MAGIC.len())? != SNAPSHOT_WIRE_MAGIC {
+        return Err(Error::InvalidSnapshot(
+            "snapshot envelope magic does not match RHKS".into(),
+        ));
+    }
+    let version = decoder.u16()?;
+    if version != SNAPSHOT_WIRE_VERSION {
+        return Err(Error::InvalidSnapshot(format!(
+            "unsupported snapshot envelope version {version}"
+        )));
+    }
+    let snapshot = RedbSnapshot {
+        cluster_id: decoder.string()?,
+        created_by: decoder.string()?,
+        epoch: decoder.u64()?,
+        config_id: decoder.u64()?,
+        applied_index: decoder.u64()?,
+        applied_hash: LogHash::from_bytes(decoder.array()?),
+        materializer_fingerprint: LogHash::from_bytes(decoder.array()?),
+        digest: LogHash::from_bytes(decoder.array()?),
+        db_bytes: decoder.bytes()?.to_vec(),
+    };
+    if !decoder.is_empty() {
+        return Err(Error::InvalidSnapshot(
+            "snapshot envelope has trailing bytes".into(),
+        ));
+    }
+    validate_snapshot_envelope(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_snapshot_envelope(snapshot: &RedbSnapshot) -> Result<(), Error> {
+    if snapshot.cluster_id.is_empty() || snapshot.created_by.is_empty() {
+        return Err(Error::InvalidSnapshot(
+            "snapshot identity contains an empty cluster or source node".into(),
+        ));
+    }
+    if snapshot.materializer_fingerprint != kv_materializer_fingerprint() {
+        return Err(Error::InvalidSnapshot(
+            "materializer fingerprint does not match this binary".into(),
+        ));
+    }
+    if snapshot.recompute_digest() != snapshot.digest {
+        return Err(Error::InvalidSnapshot(
+            "snapshot digest does not match its contents".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_snapshot_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+    encoded.extend_from_slice(
+        &u64::try_from(value.len())
+            .expect("usize fits in u64")
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(value);
+}
+
+struct SnapshotDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| Error::InvalidSnapshot("snapshot envelope length overflow".into()))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| Error::InvalidSnapshot("snapshot envelope is truncated".into()))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        Ok(self.take(N)?.try_into().expect("length checked"))
+    }
+
+    fn u16(&mut self) -> Result<u16, Error> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], Error> {
+        let length = usize::try_from(self.u64()?).map_err(|_| {
+            Error::InvalidSnapshot("snapshot envelope length exceeds this platform".into())
+        })?;
+        self.take(length)
+    }
+
+    fn string(&mut self) -> Result<String, Error> {
+        String::from_utf8(self.bytes()?.to_vec())
+            .map_err(|_| Error::InvalidSnapshot("snapshot identity is not valid UTF-8".into()))
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+impl ApplyOutcome {
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn applied_hash(&self) -> LogHash {
+        self.applied_hash
+    }
+
+    pub const fn result(&self) -> Option<&KvCommandResultV1> {
+        self.result.as_ref()
+    }
+}
+
+/// redb-backed, continuity-checking materialized state machine.
+pub struct RedbStateMachine {
+    database: Database,
+    cluster_id: String,
+    node_id: String,
+    epoch: u64,
+    config_id: u64,
+}
+
+impl RedbStateMachine {
+    pub fn open(
+        path: impl AsRef<Path>,
+        cluster_id: impl Into<String>,
+        node_id: impl Into<String>,
+        epoch: u64,
+        config_id: u64,
+    ) -> Result<Self, Error> {
+        let cluster_id = cluster_id.into();
+        let node_id = node_id.into();
+        if cluster_id.is_empty() || node_id.is_empty() {
+            return Err(Error::InvalidEntry(
+                "cluster and node ids must not be empty".into(),
+            ));
+        }
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent).map_err(database_error)?;
+        }
+        let database = Database::create(path).map_err(database_error)?;
+        initialize_or_validate(&database, &cluster_id, &node_id, epoch, config_id)?;
+        Ok(Self {
+            database,
+            cluster_id,
+            node_id,
+            epoch,
+            config_id,
+        })
+    }
+
+    /// Returns a copied value. No raw transaction or iterator is exposed.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        validate_key(key)?;
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(DATA_TABLE).map_err(database_error)?;
+        Ok(table
+            .get(key)
+            .map_err(database_error)?
+            .map(|value| value.value().to_vec()))
+    }
+
+    pub fn applied_index(&self) -> Result<u64, Error> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        read_u64_meta(&table, META_APPLIED_INDEX)
+    }
+
+    pub fn applied_hash(&self) -> Result<LogHash, Error> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        read_hash_meta(&table, META_APPLIED_HASH)
+    }
+
+    /// Builds a consistent online snapshot by logically copying one redb read transaction.
+    pub fn create_snapshot(&self, target_index: u64) -> Result<RedbSnapshot, Error> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let data = read.open_table(DATA_TABLE).map_err(database_error)?;
+        let requests = read.open_table(REQUEST_TABLE).map_err(database_error)?;
+        let progress = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        validate_snapshot_identity(
+            &progress,
+            &self.cluster_id,
+            &self.node_id,
+            self.epoch,
+            self.config_id,
+        )?;
+        let applied_index = snapshot_u64_meta(&progress, META_APPLIED_INDEX)?;
+        if applied_index != target_index {
+            return Err(Error::InvalidSnapshot(format!(
+                "snapshot target {target_index} does not match applied index {applied_index}"
+            )));
+        }
+        let applied_hash = snapshot_hash_meta(&progress, META_APPLIED_HASH)?;
+
+        let temporary = NamedTempFile::new().map_err(io_error)?;
+        let snapshot_database = Database::builder()
+            .create_file(temporary.reopen().map_err(io_error)?)
+            .map_err(database_error)?;
+        let write = snapshot_database.begin_write().map_err(database_error)?;
+        {
+            let mut destination = write.open_table(DATA_TABLE).map_err(database_error)?;
+            for row in data.iter().map_err(database_error)? {
+                let (key, value) = row.map_err(database_error)?;
+                destination
+                    .insert(key.value(), value.value())
+                    .map_err(database_error)?;
+            }
+        }
+        {
+            let mut destination = write.open_table(REQUEST_TABLE).map_err(database_error)?;
+            for row in requests.iter().map_err(database_error)? {
+                let (key, value) = row.map_err(database_error)?;
+                destination
+                    .insert(key.value(), value.value())
+                    .map_err(database_error)?;
+            }
+        }
+        {
+            let mut destination = write.open_table(PROGRESS_TABLE).map_err(database_error)?;
+            for row in progress.iter().map_err(database_error)? {
+                let (key, value) = row.map_err(database_error)?;
+                destination
+                    .insert(key.value(), value.value())
+                    .map_err(database_error)?;
+            }
+        }
+        write.commit().map_err(database_error)?;
+        drop(snapshot_database);
+        temporary.as_file().sync_all().map_err(io_error)?;
+        let db_bytes = read_stable_file(temporary.path())?;
+
+        let mut snapshot = RedbSnapshot {
+            cluster_id: self.cluster_id.clone(),
+            created_by: self.node_id.clone(),
+            epoch: self.epoch,
+            config_id: self.config_id,
+            applied_index,
+            applied_hash,
+            materializer_fingerprint: kv_materializer_fingerprint(),
+            digest: LogHash::ZERO,
+            db_bytes,
+        };
+        snapshot.digest = snapshot.recompute_digest();
+        Ok(snapshot)
+    }
+
+    pub fn check_request(
+        &self,
+        request_id: &str,
+        replicated_payload: &[u8],
+    ) -> Result<Option<KvRequestRecord>, Error> {
+        let command = decode_replicated_kv_command(replicated_payload)?;
+        if command.request_id() != request_id {
+            return Err(Error::InvalidCommand(
+                "provided and encoded request ids differ".into(),
+            ));
+        }
+        let payload_hash = LogHash::digest(&[replicated_payload]);
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(REQUEST_TABLE).map_err(database_error)?;
+        let record = table
+            .get(request_id.as_bytes())
+            .map_err(database_error)?
+            .map(|value| KvRequestRecord::decode(value.value()))
+            .transpose()?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.payload_hash != payload_hash)
+        {
+            return Err(Error::RequestConflict {
+                request_id: request_id.into(),
+            });
+        }
+        Ok(record)
+    }
+
+    /// Applies one qlog entry in exactly one redb write transaction.
+    pub fn apply_entry(&self, entry: &LogEntry) -> Result<ApplyOutcome, Error> {
+        self.validate_entry_identity(entry)?;
+        if entry.recompute_hash() != entry.hash {
+            return Err(Error::InvalidEntry(
+                "entry hash does not match content".into(),
+            ));
+        }
+
+        let write = self.database.begin_write().map_err(database_error)?;
+        let mut progress = write.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        let current_index = read_u64_meta(&progress, META_APPLIED_INDEX)?;
+        let current_hash = read_hash_meta(&progress, META_APPLIED_HASH)?;
+
+        if entry.index == current_index {
+            if entry.hash != current_hash {
+                return Err(Error::InvalidEntry(
+                    "replayed index has a different hash".into(),
+                ));
+            }
+            let result = if entry.entry_type == EntryType::Command {
+                let command = decode_replicated_kv_command(&entry.payload)?;
+                let requests = write.open_table(REQUEST_TABLE).map_err(database_error)?;
+                let record = read_request(&requests, command.request_id())?.ok_or_else(|| {
+                    Error::InvalidEntry("replayed command has no durable receipt".into())
+                })?;
+                if record.payload_hash != LogHash::digest(&[&entry.payload]) {
+                    return Err(Error::RequestConflict {
+                        request_id: command.request_id().into(),
+                    });
+                }
+                Some(record.result)
+            } else {
+                None
+            };
+            return Ok(ApplyOutcome {
+                applied_index: current_index,
+                applied_hash: current_hash,
+                result,
+            });
+        }
+
+        let expected_index = current_index
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidEntry("applied index overflow".into()))?;
+        if entry.index != expected_index {
+            return Err(Error::InvalidEntry(format!(
+                "expected log index {expected_index}, got {}",
+                entry.index
+            )));
+        }
+        if entry.prev_hash != current_hash {
+            return Err(Error::InvalidEntry(
+                "entry previous hash does not match applied hash".into(),
+            ));
+        }
+
+        let result = match entry.entry_type {
+            EntryType::Command => {
+                let command = decode_replicated_kv_command(&entry.payload)?;
+                let payload_hash = LogHash::digest(&[&entry.payload]);
+                let mut requests = write.open_table(REQUEST_TABLE).map_err(database_error)?;
+                if let Some(record) = read_request(&requests, command.request_id())? {
+                    if record.payload_hash != payload_hash {
+                        return Err(Error::RequestConflict {
+                            request_id: command.request_id().into(),
+                        });
+                    }
+                    Some(record.result)
+                } else {
+                    let mut data = write.open_table(DATA_TABLE).map_err(database_error)?;
+                    let command_result = match &command.operation {
+                        KvOperationV1::Put { key, value } => {
+                            let replaced =
+                                data.get(key.as_slice()).map_err(database_error)?.is_some();
+                            data.insert(key.as_slice(), value.as_slice())
+                                .map_err(database_error)?;
+                            KvCommandResultV1::Put { replaced }
+                        }
+                        KvOperationV1::Delete { key } => {
+                            let existed = data
+                                .remove(key.as_slice())
+                                .map_err(database_error)?
+                                .is_some();
+                            KvCommandResultV1::Delete { existed }
+                        }
+                    };
+                    let record = KvRequestRecord {
+                        payload_hash,
+                        original_log_index: entry.index,
+                        original_log_hash: entry.hash,
+                        result: command_result.clone(),
+                    };
+                    let encoded_record = record.encode();
+                    requests
+                        .insert(command.request_id().as_bytes(), encoded_record.as_slice())
+                        .map_err(database_error)?;
+                    Some(command_result)
+                }
+            }
+            EntryType::Noop => {
+                if !entry.payload.is_empty() {
+                    return Err(Error::InvalidEntry(
+                        "noop entry payload must be empty".into(),
+                    ));
+                }
+                None
+            }
+            EntryType::ConfigChange => {
+                ConfigChange::recognize_parts(entry.entry_type, &entry.payload)
+                    .map_err(|_| Error::InvalidEntry("invalid configuration change".into()))?;
+                None
+            }
+            EntryType::SnapshotBarrier | EntryType::SnapshotPublished => None,
+        };
+
+        progress
+            .insert(META_APPLIED_INDEX, entry.index.to_be_bytes().as_slice())
+            .map_err(database_error)?;
+        progress
+            .insert(META_APPLIED_HASH, entry.hash.as_bytes().as_slice())
+            .map_err(database_error)?;
+        drop(progress);
+        write.commit().map_err(database_error)?;
+
+        Ok(ApplyOutcome {
+            applied_index: entry.index,
+            applied_hash: entry.hash,
+            result,
+        })
+    }
+
+    fn validate_entry_identity(&self, entry: &LogEntry) -> Result<(), Error> {
+        if entry.cluster_id != self.cluster_id {
+            return Err(Error::InvalidEntry(
+                "entry belongs to another cluster".into(),
+            ));
+        }
+        if entry.epoch != self.epoch {
+            return Err(Error::InvalidEntry("entry epoch does not match".into()));
+        }
+        if entry.config_id != self.config_id {
+            return Err(Error::InvalidEntry(
+                "entry configuration id does not match".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Installs a verified snapshot at a new path without replacing existing bytes.
+pub fn restore_snapshot_file(
+    path: impl AsRef<Path>,
+    snapshot: &RedbSnapshot,
+    target_node_id: &str,
+) -> Result<(), Error> {
+    if target_node_id.is_empty() {
+        return Err(Error::InvalidSnapshot("target node id is empty".into()));
+    }
+    if snapshot.recompute_digest() != snapshot.digest {
+        return Err(Error::InvalidSnapshot(
+            "snapshot digest does not match its contents".into(),
+        ));
+    }
+    let path = path.as_ref();
+    if path.exists() {
+        return Err(Error::InvalidSnapshot(
+            "restore target already exists".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(io_error)?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(io_error)?;
+    temporary.write_all(&snapshot.db_bytes).map_err(io_error)?;
+    temporary.as_file().sync_all().map_err(io_error)?;
+
+    let database = Database::builder()
+        .create_file(temporary.reopen().map_err(io_error)?)
+        .map_err(|error| {
+            Error::InvalidSnapshot(format!("redb database validation failed: {error}"))
+        })?;
+    validate_restored_database(&database, snapshot, &snapshot.created_by)?;
+    rebind_snapshot_node(&database, target_node_id)?;
+    let validation = validate_restored_database(&database, snapshot, target_node_id);
+    drop(database);
+    validation?;
+
+    temporary.persist_noclobber(path).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::InvalidSnapshot("restore target already exists".into())
+        } else {
+            io_error(error.error)
+        }
+    })?;
+    if let Err(error) = File::open(path).and_then(|file| file.sync_all()) {
+        remove_failed_install(path, parent);
+        return Err(io_error(error));
+    }
+    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        remove_failed_install(path, parent);
+        return Err(io_error(error));
+    }
+    Ok(())
+}
+
+fn remove_failed_install(path: &Path, parent: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = File::open(parent).and_then(|directory| directory.sync_all());
+}
+
+fn read_stable_file(path: &Path) -> Result<Vec<u8>, Error> {
+    let mut file = File::open(path).map_err(io_error)?;
+    let expected_length = usize::try_from(file.metadata().map_err(io_error)?.len())
+        .map_err(|_| Error::Io("snapshot file length does not fit this platform".into()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_length)
+        .map_err(|error| Error::Io(format!("could not allocate snapshot buffer: {error}")))?;
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() != expected_length {
+        return Err(Error::Io(format!(
+            "snapshot file length changed while reading: expected {expected_length}, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_restored_database(
+    database: &Database,
+    snapshot: &RedbSnapshot,
+    expected_node_id: &str,
+) -> Result<(), Error> {
+    if snapshot.materializer_fingerprint != kv_materializer_fingerprint() {
+        return Err(Error::InvalidSnapshot(
+            "materializer fingerprint does not match this binary".into(),
+        ));
+    }
+    let read = database.begin_read().map_err(invalid_snapshot_error)?;
+    let mut data_exists = false;
+    let mut requests_exist = false;
+    let mut progress_exists = false;
+    for table in read.list_tables().map_err(invalid_snapshot_error)? {
+        match table.name() {
+            name if name == DATA_TABLE.name() => data_exists = true,
+            name if name == REQUEST_TABLE.name() => requests_exist = true,
+            name if name == PROGRESS_TABLE.name() => progress_exists = true,
+            _ => {}
+        }
+    }
+    if !(data_exists && requests_exist && progress_exists) {
+        return Err(Error::InvalidSnapshot(
+            "snapshot is missing a required KV table".into(),
+        ));
+    }
+    read.open_table(DATA_TABLE)
+        .map_err(invalid_snapshot_error)?;
+    read.open_table(REQUEST_TABLE)
+        .map_err(invalid_snapshot_error)?;
+    let progress = read
+        .open_table(PROGRESS_TABLE)
+        .map_err(invalid_snapshot_error)?;
+    validate_snapshot_identity(
+        &progress,
+        &snapshot.cluster_id,
+        expected_node_id,
+        snapshot.epoch,
+        snapshot.config_id,
+    )?;
+    if snapshot_u64_meta(&progress, META_APPLIED_INDEX)? != snapshot.applied_index {
+        return Err(Error::InvalidSnapshot(
+            "inner applied index does not match snapshot metadata".into(),
+        ));
+    }
+    if snapshot_hash_meta(&progress, META_APPLIED_HASH)? != snapshot.applied_hash {
+        return Err(Error::InvalidSnapshot(
+            "inner applied hash does not match snapshot metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rebind_snapshot_node(database: &Database, target_node_id: &str) -> Result<(), Error> {
+    let write = database.begin_write().map_err(invalid_snapshot_error)?;
+    {
+        let mut progress = write
+            .open_table(PROGRESS_TABLE)
+            .map_err(invalid_snapshot_error)?;
+        progress
+            .insert(META_NODE_ID, target_node_id.as_bytes())
+            .map_err(invalid_snapshot_error)?;
+    }
+    write.commit().map_err(invalid_snapshot_error)
+}
+
+fn validate_snapshot_identity(
+    progress: &impl ReadableTable<&'static str, &'static [u8]>,
+    cluster_id: &str,
+    node_id: &str,
+    epoch: u64,
+    config_id: u64,
+) -> Result<(), Error> {
+    snapshot_meta(progress, META_CLUSTER_ID, cluster_id.as_bytes())?;
+    snapshot_meta(progress, META_NODE_ID, node_id.as_bytes())?;
+    snapshot_meta(progress, META_EPOCH, &epoch.to_be_bytes())?;
+    snapshot_meta(progress, META_CONFIG_ID, &config_id.to_be_bytes())?;
+    snapshot_meta(
+        progress,
+        META_MATERIALIZER_FINGERPRINT,
+        kv_materializer_fingerprint().as_bytes(),
+    )
+}
+
+fn snapshot_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+    expected: &[u8],
+) -> Result<(), Error> {
+    let actual = table
+        .get(key)
+        .map_err(invalid_snapshot_error)?
+        .ok_or_else(|| Error::InvalidSnapshot(format!("missing progress metadata {key}")))?;
+    if actual.value() != expected {
+        return Err(Error::InvalidSnapshot(format!(
+            "progress metadata {key} does not match the snapshot identity"
+        )));
+    }
+    Ok(())
+}
+
+fn snapshot_u64_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<u64, Error> {
+    let value = table
+        .get(key)
+        .map_err(invalid_snapshot_error)?
+        .ok_or_else(|| Error::InvalidSnapshot(format!("missing progress metadata {key}")))?;
+    let bytes: [u8; 8] = value
+        .value()
+        .try_into()
+        .map_err(|_| Error::InvalidSnapshot(format!("invalid u64 progress metadata {key}")))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn snapshot_hash_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<LogHash, Error> {
+    let value = table
+        .get(key)
+        .map_err(invalid_snapshot_error)?
+        .ok_or_else(|| Error::InvalidSnapshot(format!("missing progress metadata {key}")))?;
+    let bytes: [u8; 32] = value
+        .value()
+        .try_into()
+        .map_err(|_| Error::InvalidSnapshot(format!("invalid hash progress metadata {key}")))?;
+    Ok(LogHash::from_bytes(bytes))
+}
+
+fn invalid_snapshot_error(error: impl fmt::Display) -> Error {
+    Error::InvalidSnapshot(error.to_string())
+}
+
+fn length_prefixed(value: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(8 + value.len());
+    let length = u64::try_from(value.len()).expect("usize fits in u64");
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+fn initialize_or_validate(
+    database: &Database,
+    cluster_id: &str,
+    node_id: &str,
+    epoch: u64,
+    config_id: u64,
+) -> Result<(), Error> {
+    let read = database.begin_read().map_err(database_error)?;
+    let mut data_exists = false;
+    let mut requests_exist = false;
+    let mut progress_exists = false;
+    for table in read.list_tables().map_err(database_error)? {
+        match table.name() {
+            name if name == DATA_TABLE.name() => data_exists = true,
+            name if name == REQUEST_TABLE.name() => requests_exist = true,
+            name if name == PROGRESS_TABLE.name() => progress_exists = true,
+            _ => {}
+        }
+    }
+
+    match (data_exists, requests_exist, progress_exists) {
+        (false, false, false) => {}
+        (true, true, true) => {
+            let progress = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+            if progress
+                .get(META_CLUSTER_ID)
+                .map_err(database_error)?
+                .is_none()
+            {
+                return Err(Error::PartialInitialization);
+            }
+            require_meta(&progress, META_CLUSTER_ID, cluster_id.as_bytes())?;
+            require_meta(&progress, META_NODE_ID, node_id.as_bytes())?;
+            require_meta(&progress, META_EPOCH, &epoch.to_be_bytes())?;
+            require_meta(&progress, META_CONFIG_ID, &config_id.to_be_bytes())?;
+            require_meta(
+                &progress,
+                META_MATERIALIZER_FINGERPRINT,
+                kv_materializer_fingerprint().as_bytes(),
+            )?;
+            read_u64_meta(&progress, META_APPLIED_INDEX)?;
+            read_hash_meta(&progress, META_APPLIED_HASH)?;
+            return Ok(());
+        }
+        _ => return Err(Error::PartialInitialization),
+    }
+    drop(read);
+
+    let write = database.begin_write().map_err(database_error)?;
+    write.open_table(DATA_TABLE).map_err(database_error)?;
+    write.open_table(REQUEST_TABLE).map_err(database_error)?;
+    let mut progress = write.open_table(PROGRESS_TABLE).map_err(database_error)?;
+    progress
+        .insert(META_CLUSTER_ID, cluster_id.as_bytes())
+        .map_err(database_error)?;
+    progress
+        .insert(META_NODE_ID, node_id.as_bytes())
+        .map_err(database_error)?;
+    progress
+        .insert(META_EPOCH, epoch.to_be_bytes().as_slice())
+        .map_err(database_error)?;
+    progress
+        .insert(META_CONFIG_ID, config_id.to_be_bytes().as_slice())
+        .map_err(database_error)?;
+    progress
+        .insert(META_APPLIED_INDEX, 0_u64.to_be_bytes().as_slice())
+        .map_err(database_error)?;
+    progress
+        .insert(META_APPLIED_HASH, LogHash::ZERO.as_bytes().as_slice())
+        .map_err(database_error)?;
+    progress
+        .insert(
+            META_MATERIALIZER_FINGERPRINT,
+            kv_materializer_fingerprint().as_bytes().as_slice(),
+        )
+        .map_err(database_error)?;
+    drop(progress);
+    write.commit().map_err(database_error)
+}
+
+fn require_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+    expected: &[u8],
+) -> Result<(), Error> {
+    let actual = table
+        .get(key)
+        .map_err(database_error)?
+        .ok_or_else(|| Error::Database(format!("missing progress metadata {key}")))?;
+    if actual.value() != expected {
+        return Err(Error::InvalidEntry(format!(
+            "database metadata {key} does not match open parameters"
+        )));
+    }
+    Ok(())
+}
+
+fn read_u64_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<u64, Error> {
+    let value = table
+        .get(key)
+        .map_err(database_error)?
+        .ok_or_else(|| Error::Database(format!("missing progress metadata {key}")))?;
+    let bytes: [u8; 8] = value
+        .value()
+        .try_into()
+        .map_err(|_| Error::Database(format!("invalid u64 progress metadata {key}")))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn read_hash_meta(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<LogHash, Error> {
+    let value = table
+        .get(key)
+        .map_err(database_error)?
+        .ok_or_else(|| Error::Database(format!("missing progress metadata {key}")))?;
+    let bytes: [u8; 32] = value
+        .value()
+        .try_into()
+        .map_err(|_| Error::Database(format!("invalid hash progress metadata {key}")))?;
+    Ok(LogHash::from_bytes(bytes))
+}
+
+fn read_request(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    request_id: &str,
+) -> Result<Option<KvRequestRecord>, Error> {
+    table
+        .get(request_id.as_bytes())
+        .map_err(database_error)?
+        .map(|value| KvRequestRecord::decode(value.value()))
+        .transpose()
+}
+
+struct Decoder<'a> {
+    encoded: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Decoder<'a> {
+    const fn new(encoded: &'a [u8]) -> Self {
+        Self { encoded, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| Error::Codec("length overflow".into()))?;
+        let value = self
+            .encoded
+            .get(self.offset..end)
+            .ok_or_else(|| Error::Codec("truncated encoding".into()))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, Error> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("u16 slice length"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("u32 slice length"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("u64 slice length"),
+        ))
+    }
+
+    fn array_32(&mut self) -> Result<[u8; 32], Error> {
+        Ok(self.take(32)?.try_into().expect("hash slice length"))
+    }
+
+    fn length_prefixed_u32(&mut self, maximum: usize, name: &str) -> Result<Vec<u8>, Error> {
+        let length = usize::try_from(self.u32()?)
+            .map_err(|_| Error::Codec(format!("{name} length does not fit usize")))?;
+        if length > maximum {
+            return Err(Error::Codec(format!("{name} exceeds {maximum} bytes")));
+        }
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        if self.offset != self.encoded.len() {
+            return Err(Error::Codec("trailing bytes".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn entry(index: u64, prev_hash: LogHash, payload: Vec<u8>) -> LogEntry {
+        let hash = LogEntry::calculate_hash(
+            "cluster-1",
+            index,
+            7,
+            3,
+            EntryType::Command,
+            prev_hash,
+            &payload,
+        );
+        LogEntry {
+            cluster_id: "cluster-1".into(),
+            epoch: 7,
+            config_id: 3,
+            index,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash,
+            hash,
+        }
+    }
+
+    fn snapshot_fixture() -> (tempfile::TempDir, RedbSnapshot) {
+        let dir = tempfile::tempdir().unwrap();
+        let source =
+            RedbStateMachine::open(dir.path().join("source.redb"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        let command = KvCommandV1::put("put-1", b"key".to_vec(), b"value".to_vec()).unwrap();
+        let payload = encode_replicated_kv_command(&command).unwrap();
+        source
+            .apply_entry(&entry(1, LogHash::ZERO, payload))
+            .unwrap();
+        let snapshot = source.create_snapshot(1).unwrap();
+        (dir, snapshot)
+    }
+
+    #[test]
+    fn snapshot_codec_round_trips_one_canonical_envelope() {
+        let (_dir, snapshot) = snapshot_fixture();
+
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        let decoded = decode_snapshot(&encoded).unwrap();
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(encode_snapshot(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn snapshot_codec_rejects_unknown_version_and_tamper() {
+        let (_dir, snapshot) = snapshot_fixture();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+
+        let mut unknown_version = encoded.clone();
+        unknown_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&unknown_version),
+            Err(Error::InvalidSnapshot(message)) if message.contains("version")
+        ));
+
+        let mut tampered = encoded;
+        *tampered.last_mut().unwrap() ^= 0xff;
+        assert!(matches!(
+            decode_snapshot(&tampered),
+            Err(Error::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_tampered_bytes_and_leaves_target_absent() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.db_bytes[0] ^= 0xff;
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_rejects_tampered_digest_and_leaves_target_absent() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.digest = LogHash::ZERO;
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_rejects_outer_identity_that_differs_from_inner_metadata() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.cluster_id.push_str("-other");
+        snapshot.digest = snapshot.recompute_digest();
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_rejects_truncated_physical_database_with_a_valid_outer_digest() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.db_bytes.truncate(16);
+        snapshot.digest = snapshot.recompute_digest();
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_rejects_a_tampered_materializer_fingerprint() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.materializer_fingerprint = LogHash::ZERO;
+        snapshot.digest = snapshot.recompute_digest();
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+}

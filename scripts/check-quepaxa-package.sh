@@ -7,7 +7,7 @@ trap 'rm -rf "$work_dir"' EXIT
 
 cd "$repo_root"
 rm -rf target/package
-cargo package -p queqlite-core -p queqlite-quepaxa --no-verify "$@"
+cargo package -p rhiza-core -p rhiza-quepaxa --no-verify "$@"
 
 shopt -s nullglob
 
@@ -47,8 +47,8 @@ archive_root() {
   printf '%s\n' "$root"
 }
 
-core_archive="$(find_package_archive queqlite-core)"
-quepaxa_archive="$(find_package_archive queqlite-quepaxa)"
+core_archive="$(find_package_archive rhiza-core)"
+quepaxa_archive="$(find_package_archive rhiza-quepaxa)"
 core_root="$(archive_root "$core_archive")"
 quepaxa_root="$(archive_root "$quepaxa_archive")"
 
@@ -63,14 +63,14 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-queqlite-quepaxa = { path = "$work_dir/$quepaxa_root" }
+rhiza-quepaxa = { path = "$work_dir/$quepaxa_root" }
 
 [patch.crates-io]
-queqlite-core = { path = "$work_dir/$core_root" }
+rhiza-core = { path = "$work_dir/$core_root" }
 EOF
 
 cat >"$work_dir/consumer/src/main.rs" <<'EOF'
-use queqlite_quepaxa::{Command, CommandKind, Membership};
+use rhiza_quepaxa::{Command, CommandKind, Membership};
 
 fn main() {
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();

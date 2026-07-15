@@ -8,11 +8,17 @@ set -euo pipefail
 name="$1"
 replicas="$2"
 config_id="$3"
-namespace="${QUEQLITE_K8S_NAMESPACE:-queqlite-e2e}"
-context="${QUEQLITE_KUBE_CONTEXT:-}"
-timeout_seconds="${QUEQLITE_STATEFULSET_READY_TIMEOUT:-420}"
+profile="${RHIZA_EXECUTION_PROFILE-}"
+namespace="${RHIZA_K8S_NAMESPACE:-rhiza-e2e}"
+context="${RHIZA_KUBE_CONTEXT:-}"
+timeout_seconds="${RHIZA_STATEFULSET_READY_TIMEOUT:-420}"
 
 case "$name" in ''|*[!a-z0-9-]*) exit 64;; esac
+case "$profile" in
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+esac
+[ "$name" = "rhiza-${profile}-c${config_id}" ] || exit 64
 case "$replicas" in 3|4|5|6|7) ;; *) exit 64;; esac
 case "$config_id" in ''|*[!0-9]*|0) exit 64;; esac
 case "$timeout_seconds" in ''|*[!0-9]*|0) exit 64;; esac
@@ -23,10 +29,10 @@ k+=(-n "$namespace")
 
 resource_json() {
   kind="$1" resource="$2"
-  if [ -n "${QUEQLITE_STATEFULSET_FIXTURE_DIR:-}" ]; then
+  if [ -n "${RHIZA_STATEFULSET_FIXTURE_DIR:-}" ]; then
     case "$kind" in
-      statefulset) cat "$QUEQLITE_STATEFULSET_FIXTURE_DIR/statefulset.json" ;;
-      pod) cat "$QUEQLITE_STATEFULSET_FIXTURE_DIR/${resource}.json" ;;
+      statefulset) cat "$RHIZA_STATEFULSET_FIXTURE_DIR/statefulset.json" ;;
+      pod) cat "$RHIZA_STATEFULSET_FIXTURE_DIR/${resource}.json" ;;
     esac
   else
     "${k[@]}" get "$kind" "$resource" -o json 2>/dev/null
@@ -46,16 +52,17 @@ ready_now() {
 
   for ((ordinal=0; ordinal<replicas; ordinal++)); do
     resource_json pod "${name}-${ordinal}" | jq -e \
-      --arg id "$config_id" --arg revision "$update_revision" '
+      --arg id "$config_id" --arg profile "$profile" --arg revision "$update_revision" '
       (.metadata.deletionTimestamp == null) and
-      .metadata.labels["queqlite.dev/config-id"] == $id and
+      .metadata.labels["rhiza.dev/config-id"] == $id and
+      .metadata.labels["rhiza.dev/execution-profile"] == $profile and
       .metadata.labels["controller-revision-hash"] == $revision and
       any(.status.conditions[]?; .type == "Ready" and .status == "True")
     ' >/dev/null || return 1
   done
 }
 
-if [ -n "${QUEQLITE_STATEFULSET_FIXTURE_DIR:-}" ]; then
+if [ -n "${RHIZA_STATEFULSET_FIXTURE_DIR:-}" ]; then
   ready_now
   exit
 fi

@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  labels:
+    app.kubernetes.io/name: rhiza-object-admin
+    rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      containers:
+        - name: rhiza
+          image: __RHIZA_IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: __COMMAND_JSON__
+          env:
+            - name: RHIZA_EXECUTION_PROFILE
+              value: __EXECUTION_PROFILE__
+            - name: RHIZA_CLUSTER_ID
+              value: __CLUSTER_ID__
+            - name: RHIZA_EPOCH
+              value: "__EPOCH__"
+            - name: RHIZA_CONFIG_BUNDLE_FILE
+              value: /etc/rhiza/__EXECUTION_PROFILE__/config.json
+            - name: RHIZA_OBJECT_STORE
+              value: s3
+            - name: RHIZA_S3_BUCKET
+              value: __S3_BUCKET__
+            - name: RHIZA_S3_REGION
+              value: __S3_REGION__
+            - name: RHIZA_S3_ALLOW_HTTP
+              value: "__S3_ALLOW_HTTP__"
+            - name: RHIZA_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: __OBJECT_SECRET__
+                  key: access-key
+                  optional: true
+            - name: RHIZA_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: __OBJECT_SECRET__
+                  key: secret-key
+                  optional: true
+            - name: RHIZA_RECOVERY_GENERATION
+              value: "__RECOVERY_GENERATION__"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rhiza/__EXECUTION_PROFILE__
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: __BUNDLE_SECRET__

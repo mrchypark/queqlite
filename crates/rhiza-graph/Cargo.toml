@@ -1,0 +1,16 @@
+[package]
+name = "rhiza-graph"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "LadybugDB materialized state machine for rhiza graph"
+
+[dependencies]
+lbug = "=0.18.1"
+rhiza-core = { path = "../rhiza-core" }
+tempfile.workspace = true
+
+[dev-dependencies]
+proptest = "1"

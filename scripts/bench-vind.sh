@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export RHIZA_EXECUTION_PROFILE=sql
 
 repo_root="$(git rev-parse --show-toplevel)"
 run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
-cluster="${QUEQLITE_VIND_CLUSTER:-queqlite-bench-${run_id}}"
-namespace="${QUEQLITE_K8S_NAMESPACE:-queqlite-bench}"
-image="${QUEQLITE_IMAGE:-queqlite:dev}"
-rustfs_image="${QUEQLITE_RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.8}"
-aws_image="${QUEQLITE_AWS_CLI_IMAGE:-amazon/aws-cli:2.17.36}"
-nginx_image="${QUEQLITE_NGINX_IMAGE:-nginx:1.27-alpine}"
-object_metering="${QUEQLITE_BENCH_OBJECT_USAGE_METERING:-1}"
-resource_sampling="${QUEQLITE_BENCH_RESOURCE_SAMPLING:-1}"
-multi_endpoint="${QUEQLITE_BENCH_MULTI_ENDPOINT:-0}"
-durability_mode="${QUEQLITE_DURABILITY_MODE-sync}"
-durability_max_lag="${QUEQLITE_DURABILITY_MAX_LAG-}"
-durability_interval="${QUEQLITE_DURABILITY_INTERVAL-}"
-durability_max_lag_set="${QUEQLITE_DURABILITY_MAX_LAG+x}"
-durability_interval_set="${QUEQLITE_DURABILITY_INTERVAL+x}"
-target_base="${QUEQLITE_BENCH_TARGET_DIR:-target/queqlite-bench}"
+cluster="${RHIZA_VIND_CLUSTER:-rhiza-bench-${run_id}}"
+namespace="${RHIZA_K8S_NAMESPACE:-rhiza-bench}"
+image="${RHIZA_IMAGE:-rhiza:dev}"
+rustfs_image="${RHIZA_RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.8}"
+aws_image="${RHIZA_AWS_CLI_IMAGE:-amazon/aws-cli:2.17.36}"
+nginx_image="${RHIZA_NGINX_IMAGE:-nginx:1.27-alpine}"
+object_metering="${RHIZA_BENCH_OBJECT_USAGE_METERING:-1}"
+resource_sampling="${RHIZA_BENCH_RESOURCE_SAMPLING:-1}"
+multi_endpoint="${RHIZA_BENCH_MULTI_ENDPOINT:-0}"
+durability_mode="${RHIZA_DURABILITY_MODE-sync}"
+durability_max_lag="${RHIZA_DURABILITY_MAX_LAG-}"
+durability_interval="${RHIZA_DURABILITY_INTERVAL-}"
+durability_max_lag_set="${RHIZA_DURABILITY_MAX_LAG+x}"
+durability_interval_set="${RHIZA_DURABILITY_INTERVAL+x}"
+recorder_transport="${RHIZA_RECORDER_TRANSPORT:-http}"
+target_base="${RHIZA_BENCH_TARGET_DIR:-target/rhiza-bench}"
 duration=30s
 warmup=5s
 concurrency=4
@@ -26,19 +28,19 @@ workload=mixed
 write_percent=50
 fault=none
 fault_offset=10s
-fault_pod=queqlite-c1-1
+fault_pod=rhiza-sql-c1-1
 sample_interval=2
 resource_sample_timeout=3
 resource_sample_kill_after=1
 resource_sample_jitter=1
-queqlite_cpu_request="${QUEQLITE_BENCH_QUEQLITE_CPU_REQUEST:-250m}"
-queqlite_cpu_limit="${QUEQLITE_BENCH_QUEQLITE_CPU_LIMIT:-1000m}"
-queqlite_memory_request="${QUEQLITE_BENCH_QUEQLITE_MEMORY_REQUEST:-512Mi}"
-queqlite_memory_limit="${QUEQLITE_BENCH_QUEQLITE_MEMORY_LIMIT:-1Gi}"
-rustfs_cpu_request="${QUEQLITE_BENCH_RUSTFS_CPU_REQUEST:-250m}"
-rustfs_cpu_limit="${QUEQLITE_BENCH_RUSTFS_CPU_LIMIT:-1000m}"
-rustfs_memory_request="${QUEQLITE_BENCH_RUSTFS_MEMORY_REQUEST:-512Mi}"
-rustfs_memory_limit="${QUEQLITE_BENCH_RUSTFS_MEMORY_LIMIT:-1Gi}"
+rhiza_cpu_request="${RHIZA_BENCH_RHIZA_CPU_REQUEST:-250m}"
+rhiza_cpu_limit="${RHIZA_BENCH_RHIZA_CPU_LIMIT:-1000m}"
+rhiza_memory_request="${RHIZA_BENCH_RHIZA_MEMORY_REQUEST:-512Mi}"
+rhiza_memory_limit="${RHIZA_BENCH_RHIZA_MEMORY_LIMIT:-1Gi}"
+rustfs_cpu_request="${RHIZA_BENCH_RUSTFS_CPU_REQUEST:-250m}"
+rustfs_cpu_limit="${RHIZA_BENCH_RUSTFS_CPU_LIMIT:-1000m}"
+rustfs_memory_request="${RHIZA_BENCH_RUSTFS_MEMORY_REQUEST:-512Mi}"
+rustfs_memory_limit="${RHIZA_BENCH_RUSTFS_MEMORY_LIMIT:-1Gi}"
 keep=false
 context=""
 previous_context=""
@@ -66,7 +68,7 @@ image_inspect_json='[]'
 benchmark_binary_sha256=""
 rustc_vv=""
 cargo_version=""
-runtime_image_ids_json='{"queqlite":[],"rustfs":[],"object_meter":[],"aws_cli_inventory":[]}'
+runtime_image_ids_json='{"rhiza":[],"rustfs":[],"object_meter":[],"aws_cli_inventory":[]}'
 [ "$resource_sampling" = 0 ] || resource_evidence_status=pending
 [ "$object_metering" = 0 ] || {
   object_evidence_status=pending
@@ -83,16 +85,17 @@ usage() {
     '  --sample-interval SECONDS --keep' \
     '' \
     'Resource defaults are 250m/512Mi requests and 1000m/1Gi limits for each' \
-    'Queqlite or RustFS container. Override with QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_*' \
+    'rhiza or RustFS container. Override with RHIZA_BENCH_{RHIZA,RUSTFS}_*' \
     'CPU_{REQUEST,LIMIT} and MEMORY_{REQUEST,LIMIT} environment variables.' \
-    'Set QUEQLITE_BENCH_RESOURCE_SAMPLING=0 to omit containerd CRI sampling.' \
-    'Set QUEQLITE_BENCH_OBJECT_USAGE_METERING=0 to omit the nginx S3 counting proxy.' \
-    'Set QUEQLITE_BENCH_MULTI_ENDPOINT=1 to route retries across all three nodes.' \
-    'Durability defaults to sync. Set QUEQLITE_DURABILITY_MODE=bounded with' \
-    'QUEQLITE_DURABILITY_MAX_LAG, or periodic with QUEQLITE_DURABILITY_INTERVAL.' \
+    'Set RHIZA_BENCH_RESOURCE_SAMPLING=0 to omit containerd CRI sampling.' \
+    'Set RHIZA_BENCH_OBJECT_USAGE_METERING=0 to omit the nginx S3 counting proxy.' \
+    'Set RHIZA_BENCH_MULTI_ENDPOINT=1 to route retries across all three nodes.' \
+    'Durability defaults to sync. Set RHIZA_DURABILITY_MODE=bounded with' \
+    'RHIZA_DURABILITY_MAX_LAG, or periodic with RHIZA_DURABILITY_INTERVAL.' \
+    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard to benchmark the plaintext TCP/Postcard recorder.' \
     '' \
-    'It creates a vind cluster, deploys RustFS plus a three-node Queqlite cluster,' \
-    'runs bench/queqlite-bench through a local port-forward, and emits artifacts.json.' >&2
+    'It creates a vind cluster, deploys RustFS plus a three-node rhiza cluster,' \
+    'runs bench/rhiza-bench through a local port-forward, and emits artifacts.json.' >&2
 }
 
 die() { echo "$*" >&2; exit 1; }
@@ -207,7 +210,7 @@ validate_resource_sample_schema() {
   local meter_enabled="${2:-$object_metering}" expected
   expected="$(expected_resource_components "$meter_enabled")"
   jq -s -e --argjson expected "$expected" --argjson meter_enabled "$meter_enabled" '
-    def component: if .app == "queqlite" then .pod else .container end;
+    def component: if .app == "rhiza" then .pod else .container end;
     . as $samples |
     length > 0 and all(.[];
       (.timestamp | type == "string" and length > 0) and
@@ -216,8 +219,8 @@ validate_resource_sample_schema() {
       .source == "containerd_cri_stats" and
       ([.pod,.pod_uid,.container,.container_id] |
         all(type == "string" and length > 0)) and
-      ((.app == "queqlite" and .container == "queqlite" and
-          (.pod | test("^queqlite-c1-[0-2]$"))) or
+      ((.app == "rhiza" and .container == "rhiza" and
+          (.pod | test("^rhiza-sql-c1-[0-2]$"))) or
         (.app == "simulator" and
           (.container == "rustfs" or .container == "object-meter") and
           (.pod | startswith("rustfs-")))) and
@@ -236,9 +239,9 @@ validate_resource_sample_schema() {
 
 expected_resource_components() {
   if [ "$1" = 1 ]; then
-    echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs","object-meter"]'
+    echo '["rhiza-sql-c1-0","rhiza-sql-c1-1","rhiza-sql-c1-2","rustfs","object-meter"]'
   else
-    echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs"]'
+    echo '["rhiza-sql-c1-0","rhiza-sql-c1-1","rhiza-sql-c1-2","rustfs"]'
   fi
 }
 
@@ -265,7 +268,7 @@ validate_resource_samples() {
     --argjson max_gap "$continuity_budget" --arg fault_pod "$fault_pod_name" \
     --arg fault_start "$fault_start" --arg fault_end "$fault_end" \
     --argjson expected "$expected" '
-    def component: if .app == "queqlite" then .pod else .container end;
+    def component: if .app == "rhiza" then .pod else .container end;
     def identity: [.pod_uid,.container_id,.restart_count];
     def fault_gap($component; $left; $right):
       $component == $fault_pod and
@@ -290,7 +293,7 @@ validate_resource_samples() {
          .timestamp_epoch_seconds <= ($fault_end | tonumber)));
     . as $samples |
     $start >= 0 and $end >= $start and $interval > 0 and
-    ($fault_pod == "" or ($fault_pod | test("^queqlite-c1-[0-2]$"))) and
+    ($fault_pod == "" or ($fault_pod | test("^rhiza-sql-c1-[0-2]$"))) and
     all(($samples | group_by(.collection_batch))[]; complete_or_fault_batch) and
     all($expected[];
       . as $component |
@@ -329,7 +332,7 @@ validate_resource_samples() {
 
 summarize_resource_samples() {
   jq -s --argjson start "$2" --argjson end "$3" '
-    def component: if .app == "queqlite" then .pod else .container end;
+    def component: if .app == "rhiza" then .pod else .container end;
     . as $samples |
     ($samples | group_by(.app) |
       map({key:.[0].app,value:(map(component) | unique | sort)}) |
@@ -391,7 +394,7 @@ summarize_resource_samples() {
     {status:"ok",measurement_window:{started_at_epoch_seconds:$start,
       finished_at_epoch_seconds:$end},samples:($window | length),
      container_cpu_usage_usec_deltas:$cpu,
-     apps:(["queqlite","simulator"] | map(. as $app |
+     apps:(["rhiza","simulator"] | map(. as $app |
        ($memory | map(select(.app == $app))) as $app_memory |
        {app:$app,cpu_usage_usec:($cpu | map(select(.app == $app) | .delta_usec) | add // 0),
         memory_samples:($app_memory | length),
@@ -406,8 +409,8 @@ runtime_image_ids_from_pods() {
   jq -c '
     def image_id($container):
       (([.status.containerStatuses[]? | select(.name == $container) | (.imageID // "")][0]) // "");
-    {queqlite:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "queqlite") |
-        image_id("queqlite")],
+    {rhiza:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "rhiza") |
+        image_id("rhiza")],
      rustfs:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "rustfs") |
         image_id("rustfs")],
      object_meter:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "rustfs") |
@@ -524,7 +527,7 @@ render_provenance_json() {
     (($inspect[0].RepoDigests // []) | map(select(type == "string"))) as $repo_digests |
     (($inspect[0].Config.Labels["org.opencontainers.image.revision"] // "") |
       if type == "string" then . else "" end) as $source_revision |
-    runtime_component($runtime_image_ids.queqlite; true) as $queqlite_runtime |
+    runtime_component($runtime_image_ids.rhiza; true) as $rhiza_runtime |
     runtime_component($runtime_image_ids.rustfs; true) as $rustfs_runtime |
     runtime_component($runtime_image_ids.object_meter; $object_enabled) as $meter_runtime |
     runtime_component($runtime_image_ids.aws_cli_inventory; $object_enabled) as $inventory_runtime |
@@ -545,17 +548,17 @@ render_provenance_json() {
         then "missing_or_invalid_rustc_version" else empty end,
       if ($cargo_version | startswith("cargo ") | not)
         then "missing_or_invalid_cargo_version" else empty end,
-      if $queqlite_runtime.status != "verified"
-        then "missing_or_invalid_queqlite_runtime_image" else empty end,
-      if $queqlite_runtime.status == "verified" and $queqlite_runtime.observed_instances != 3
-        then "unexpected_queqlite_runtime_image_count" else empty end,
-      if $queqlite_runtime.status == "verified" and
-        ($queqlite_runtime.image_digests | length) != 1
-        then "heterogeneous_queqlite_runtime_images" else empty end,
-      if $queqlite_runtime.status == "verified" and
-        ($queqlite_runtime.image_digests | length) == 1 and $content_id != null and
-        $queqlite_runtime.image_digests[0] != $content_id
-        then "queqlite_runtime_image_mismatch" else empty end,
+      if $rhiza_runtime.status != "verified"
+        then "missing_or_invalid_rhiza_runtime_image" else empty end,
+      if $rhiza_runtime.status == "verified" and $rhiza_runtime.observed_instances != 3
+        then "unexpected_rhiza_runtime_image_count" else empty end,
+      if $rhiza_runtime.status == "verified" and
+        ($rhiza_runtime.image_digests | length) != 1
+        then "heterogeneous_rhiza_runtime_images" else empty end,
+      if $rhiza_runtime.status == "verified" and
+        ($rhiza_runtime.image_digests | length) == 1 and $content_id != null and
+        $rhiza_runtime.image_digests[0] != $content_id
+        then "rhiza_runtime_image_mismatch" else empty end,
       if $rustfs_runtime.status != "verified"
         then "missing_or_invalid_rustfs_runtime_image" else empty end,
       if $meter_runtime.status == "missing_or_invalid"
@@ -570,7 +573,7 @@ render_provenance_json() {
      execution:{benchmark_client:{sha256:(if $benchmark_sha256 == "" then null else $benchmark_sha256 end)},
        toolchain:{rustc_vv:(if $rustc_vv == "" then null else $rustc_vv end),
          cargo_version:(if $cargo_version == "" then null else $cargo_version end)},
-       runtime_images:{queqlite:$queqlite_runtime,rustfs:$rustfs_runtime,
+       runtime_images:{rhiza:$rhiza_runtime,rustfs:$rustfs_runtime,
          object_meter:$meter_runtime,aws_cli_inventory:$inventory_runtime}}}
   '
 }
@@ -583,7 +586,7 @@ wait_for_checkpoint_drain() {
   for _ in $(seq 1 120); do
     : > "$statuses_file"
     for endpoint_url in "${admin_endpoint_urls[@]}"; do
-      status="$(curl --max-time 3 -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $admin_token" \
+      status="$(curl --max-time 3 -fsS -H 'x-rhiza-version: 1' -H "Authorization: Bearer $admin_token" \
         "$endpoint_url/v1/admin/membership/status" 2>/dev/null || true)"
       [ -n "$status" ] || continue
       jq -cse --arg endpoint "$endpoint_url" '
@@ -645,8 +648,8 @@ resource_samples_from_cri_stats() {
     select(.attributes.labels["io.kubernetes.pod.namespace"] == $namespace) |
     .attributes.metadata.name as $container |
     .attributes.labels["io.kubernetes.pod.name"] as $pod |
-    select($container == "queqlite" or $container == "rustfs" or $container == "object-meter") |
-    select($container != "queqlite" or ($pod | startswith("queqlite-c1-"))) |
+    select($container == "rhiza" or $container == "rustfs" or $container == "object-meter") |
+    select($container != "rhiza" or ($pod | startswith("rhiza-sql-c1-"))) |
     (.cpu.timestamp | required_integer) as $cpu_timestamp_ns |
     (.memory.timestamp | required_integer) as $memory_timestamp_ns |
     if $cpu_timestamp_ns <= 0 or $memory_timestamp_ns <= 0 or
@@ -658,7 +661,7 @@ resource_samples_from_cri_stats() {
        timestamp_epoch_seconds:$cpu_timestamp,
        collection_batch:$collection_batch,
        source:"containerd_cri_stats",
-       app:(if $container == "queqlite" then "queqlite" else "simulator" end),
+       app:(if $container == "rhiza" then "rhiza" else "simulator" end),
        pod:$pod,
        pod_uid:(.attributes.labels["io.kubernetes.pod.uid"] // ""),container:$container,
        container_id:.attributes.id,
@@ -685,22 +688,22 @@ validate_duration() {
 
 case "$durability_mode" in
   sync)
-    [ -z "$durability_max_lag_set" ] || die "QUEQLITE_DURABILITY_MAX_LAG is irrelevant for sync durability"
-    [ -z "$durability_interval_set" ] || die "QUEQLITE_DURABILITY_INTERVAL is irrelevant for sync durability"
+    [ -z "$durability_max_lag_set" ] || die "RHIZA_DURABILITY_MAX_LAG is irrelevant for sync durability"
+    [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for sync durability"
     ;;
   bounded)
     [ -n "$durability_max_lag_set" ] && [ -n "$durability_max_lag" ] ||
-      die "QUEQLITE_DURABILITY_MAX_LAG is required for bounded durability"
-    [ -z "$durability_interval_set" ] || die "QUEQLITE_DURABILITY_INTERVAL is irrelevant for bounded durability"
-    validate_duration QUEQLITE_DURABILITY_MAX_LAG "$durability_max_lag"
+      die "RHIZA_DURABILITY_MAX_LAG is required for bounded durability"
+    [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for bounded durability"
+    validate_duration RHIZA_DURABILITY_MAX_LAG "$durability_max_lag"
     ;;
   periodic)
     [ -n "$durability_interval_set" ] && [ -n "$durability_interval" ] ||
-      die "QUEQLITE_DURABILITY_INTERVAL is required for periodic durability"
-    [ -z "$durability_max_lag_set" ] || die "QUEQLITE_DURABILITY_MAX_LAG is irrelevant for periodic durability"
-    validate_duration QUEQLITE_DURABILITY_INTERVAL "$durability_interval"
+      die "RHIZA_DURABILITY_INTERVAL is required for periodic durability"
+    [ -z "$durability_max_lag_set" ] || die "RHIZA_DURABILITY_MAX_LAG is irrelevant for periodic durability"
+    validate_duration RHIZA_DURABILITY_INTERVAL "$durability_interval"
     ;;
-  *) die "QUEQLITE_DURABILITY_MODE must be sync|bounded|periodic" ;;
+  *) die "RHIZA_DURABILITY_MODE must be sync|bounded|periodic" ;;
 esac
 
 while [ "$#" -gt 0 ]; do
@@ -727,9 +730,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$fault" in none|pod-delete) ;; *) die "--fault must be none or pod-delete";; esac
-case "$object_metering" in 0|1) ;; *) die "QUEQLITE_BENCH_OBJECT_USAGE_METERING must be 0 or 1";; esac
-case "$resource_sampling" in 0|1) ;; *) die "QUEQLITE_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
-case "$multi_endpoint" in 0|1) ;; *) die "QUEQLITE_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
+case "$object_metering" in 0|1) ;; *) die "RHIZA_BENCH_OBJECT_USAGE_METERING must be 0 or 1";; esac
+case "$resource_sampling" in 0|1) ;; *) die "RHIZA_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
+case "$multi_endpoint" in 0|1) ;; *) die "RHIZA_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
+case "$recorder_transport" in
+  http|tcp-postcard) ;;
+  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard" ;;
+esac
 case "$sample_interval" in ''|*[!0-9]*) die "--sample-interval must be a positive integer";; esac
 [ "$sample_interval" -gt 0 ] || die "--sample-interval must be a positive integer"
 for tool in cargo curl docker jq kubectl openssl rustc sed timeout vcluster yq; do require "$tool"; done
@@ -744,7 +751,7 @@ object_access_log="$target/s3-access.jsonl"
 object_usage_json="$target/object-usage.json"
 artifacts_json="$target/artifacts.json"
 rendered_rustfs="$target/rustfs.yaml"
-rendered_cluster="$target/queqlite-c1.yaml"
+rendered_cluster="$target/rhiza-sql-c1.yaml"
 stop_sampler="$target/.stop-sampler"
 
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
@@ -819,7 +826,7 @@ collect_object_usage() {
   if jq -n --arg image "$aws_image" '{apiVersion:"v1",kind:"Pod",metadata:{name:"bench-object-usage"},spec:{
     automountServiceAccountToken:false,enableServiceLinks:false,restartPolicy:"Never",containers:[{
       name:"aws-cli",image:$image,imagePullPolicy:"IfNotPresent",
-      command:["/bin/sh","-c"],args:["aws --endpoint-url http://rustfs:9000 s3api list-objects-v2 --bucket queqlite --output json"],
+      command:["/bin/sh","-c"],args:["aws --endpoint-url http://rustfs:9000 s3api list-objects-v2 --bucket rhiza --output json"],
       env:[
         {name:"AWS_ACCESS_KEY_ID",valueFrom:{secretKeyRef:{name:"rustfs-credentials",key:"access-key"}}},
         {name:"AWS_SECRET_ACCESS_KEY",valueFrom:{secretKeyRef:{name:"rustfs-credentials",key:"secret-key"}}},
@@ -904,6 +911,7 @@ emit_artifacts() {
     --arg durability_mode "$durability_mode" \
     --arg durability_max_lag "$durability_max_lag" \
     --arg durability_interval "$durability_interval" \
+    --arg recorder_transport "$recorder_transport" \
     --argjson benchmark_exit "$benchmark_status" \
     --argjson run_exit "$cleanup_status" \
     --argjson evidence "$evidence" \
@@ -914,7 +922,7 @@ emit_artifacts() {
     '{run_id:$run_id,cluster:$cluster,namespace:$namespace,benchmark_exit_status:$benchmark_exit,
       exit_status:$run_exit,evidence:$evidence,cleanup:$cleanup,provenance:$provenance,
       measurement_window:$measurement_window,
-      configuration:{durability:{mode:$durability_mode,
+      configuration:{recorder_transport:$recorder_transport,durability:{mode:$durability_mode,
         max_lag:(if $durability_max_lag == "" then null else $durability_max_lag end),
         interval:(if $durability_interval == "" then null else $durability_interval end)}},
       cleaned_up:$cleaned_up,artifacts:{benchmark_json:$benchmark,resource_samples_jsonl:$resources,
@@ -1033,7 +1041,7 @@ mkdir -p "$target"
 chmod 700 "$target"
 previous_context="$(kubectl config current-context 2>/dev/null || true)"
 
-if [ "${QUEQLITE_VIND_SKIP_BUILD:-0}" = 1 ]; then
+if [ "${RHIZA_VIND_SKIP_BUILD:-0}" = 1 ]; then
   docker image inspect "$image" >/dev/null 2>&1 || die "missing local image: $image"
   image_build_mode=skip-build
 else
@@ -1043,7 +1051,7 @@ fi
 image_inspect_json="$(docker image inspect "$image" 2>/dev/null || printf '[]')"
 vcluster use driver docker >/dev/null
 if vcluster list --driver docker --output json | grep -Fq "\"${cluster}\""; then
-  [ "${QUEQLITE_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
+  [ "${RHIZA_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
   vcluster connect "$cluster" --driver docker >/dev/null
   vcluster_cleanup_status=not_owned
 else
@@ -1055,15 +1063,15 @@ context="$(kubectl config current-context 2>/dev/null || true)"
 [ -n "$context" ] || die "vcluster did not select a Kubernetes context"
 
 if kubectl --context "$context" get namespace "$namespace" >/dev/null 2>&1; then
-  managed="$(kubectl --context "$context" get namespace "$namespace" -o go-template='{{index .metadata.labels "queqlite.dev/bench-managed"}}')"
+  managed="$(kubectl --context "$context" get namespace "$namespace" -o go-template='{{index .metadata.labels "rhiza.dev/bench-managed"}}')"
   [ "$managed" = true ] || die "refusing to replace unmanaged namespace $namespace"
   kubectl --context "$context" delete namespace "$namespace" --wait=true >/dev/null
 fi
 kubectl --context "$context" create namespace "$namespace" >/dev/null
 namespace_created=true
 namespace_cleanup_status=retained
-kubectl --context "$context" label namespace "$namespace" queqlite.dev/bench-managed=true \
-  "queqlite.dev/bench-run-id=$run_id" >/dev/null
+kubectl --context "$context" label namespace "$namespace" rhiza.dev/bench-managed=true \
+  "rhiza.dev/bench-run-id=$run_id" >/dev/null
 
 node="$(kubectl --context "$context" get nodes -o jsonpath='{.items[0].metadata.name}')"
 [ -n "$node" ] || die "cannot discover vind node"
@@ -1072,7 +1080,7 @@ vcluster node load-image "$node" --image "$image" >/dev/null
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
 peer_tokens="$(for _ in 1 2 3; do openssl rand -hex 24; done | jq -Rsc 'split("\n")[:-1]')"
-k create secret generic queqlite-auth --from-literal=client-token="$client_token" \
+k create secret generic rhiza-auth --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" >/dev/null
 sed -e "s|__RUSTFS_IMAGE__|$rustfs_image|g" -e "s|__AWS_CLI_IMAGE__|$aws_image|g" \
   deploy/k8s/rustfs-e2e.yaml > "$rendered_rustfs"
@@ -1116,44 +1124,55 @@ k rollout status deployment/rustfs --timeout=240s >/dev/null
 k wait --for=condition=complete job/rustfs-create-bucket --timeout=240s >/dev/null
 
 bundle="$target/config-c1.json"
-jq -n --argjson tokens "$peer_tokens" '
+jq -n --argjson tokens "$peer_tokens" --arg recorder_transport "$recorder_transport" '
   {version:1,config_id:1,members:[range(3) as $n | {
     node_id:("node-" + ($n + 1 | tostring)),
-    url:("http://queqlite-c1-" + ($n|tostring) + ".queqlite-c1:8081"),
-    log_url:("http://queqlite-c1-" + ($n|tostring) + ".queqlite-c1:8080"), token:$tokens[$n]
-  }]}
+    url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8081"),
+    log_url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8080"), token:$tokens[$n]
+  } + (if $recorder_transport == "tcp-postcard" then {
+    recorder_tcp_addr:("rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8082")
+  } else {} end)]}
 ' > "$bundle"
 chmod 600 "$bundle"
-k create secret generic queqlite-c1-bundle --from-file=config.json="$bundle" --dry-run=client -o yaml |
+k create secret generic rhiza-sql-c1-bundle --from-file=config.json="$bundle" --dry-run=client -o yaml |
   yq eval '.immutable = true' - | k create -f - >/dev/null
 
-export QUEQLITE_IMAGE="$image" QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace"
-export QUEQLITE_CLUSTER_ID=queqlite-vind QUEQLITE_RECOVERY_GENERATION=1
-export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials
-export QUEQLITE_S3_ALLOW_HTTP=true
+export RHIZA_IMAGE="$image" RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace"
+export RHIZA_CLUSTER_ID=rhiza-vind RHIZA_RECOVERY_GENERATION=1
+export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials
+export RHIZA_S3_ALLOW_HTTP=true
+export RHIZA_RECORDER_TRANSPORT="$recorder_transport"
 scripts/k8s-object-job.sh 1 "$bundle" init-checkpoint >/dev/null
-QUEQLITE_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
-export QUEQLITE_CPU_REQUEST="$queqlite_cpu_request" QUEQLITE_CPU_LIMIT="$queqlite_cpu_limit"
-export QUEQLITE_MEMORY_REQUEST="$queqlite_memory_request" QUEQLITE_MEMORY_LIMIT="$queqlite_memory_limit"
-yq eval -i '(select(.kind == "StatefulSet" and .metadata.name == "queqlite-c1") | .spec.template.spec.containers[] | select(.name == "queqlite") | .resources) = {"requests": {"cpu": strenv(QUEQLITE_CPU_REQUEST), "memory": strenv(QUEQLITE_MEMORY_REQUEST)}, "limits": {"cpu": strenv(QUEQLITE_CPU_LIMIT), "memory": strenv(QUEQLITE_MEMORY_LIMIT)}}' "$rendered_cluster"
+RHIZA_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
+export RHIZA_CPU_REQUEST="$rhiza_cpu_request" RHIZA_CPU_LIMIT="$rhiza_cpu_limit"
+export RHIZA_MEMORY_REQUEST="$rhiza_memory_request" RHIZA_MEMORY_LIMIT="$rhiza_memory_limit"
+yq eval -i '(select(.kind == "StatefulSet" and .metadata.name == "rhiza-sql-c1") | .spec.template.spec.containers[] | select(.name == "rhiza") | .resources) = {"requests": {"cpu": strenv(RHIZA_CPU_REQUEST), "memory": strenv(RHIZA_MEMORY_REQUEST)}, "limits": {"cpu": strenv(RHIZA_CPU_LIMIT), "memory": strenv(RHIZA_MEMORY_LIMIT)}}' "$rendered_cluster"
 k create -f "$rendered_cluster" >/dev/null
-scripts/wait-k8s-statefulset-ready.sh queqlite-c1 3 1
+scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c1 3 1
+if [ "$recorder_transport" = tcp-postcard ]; then
+  for ordinal in 0 1 2; do
+    k exec "rhiza-sql-c1-$ordinal" -- /bin/sh -ec '
+      grep -Eqi ":1F92[[:space:]]+[0-9A-F]+:[0-9A-F]+[[:space:]]+0A" /proc/net/tcp /proc/net/tcp6
+      ! grep -Eqi ":1F91[[:space:]]+[0-9A-F]+:[0-9A-F]+[[:space:]]+0A" /proc/net/tcp /proc/net/tcp6
+    '
+  done
+fi
 [ -z "$(k get persistentvolumeclaims -o name)" ] || die "benchmark deployment created a PVC"
 # Bootstrap is a one-time genesis operation. OnDelete keeps the current pods
 # running while making every future emptyDir replacement restore and rejoin.
-k set env statefulset/queqlite-c1 QUEQLITE_STARTUP_MODE=rejoin >/dev/null
+k set env statefulset/rhiza-sql-c1 RHIZA_STARTUP_MODE=rejoin >/dev/null
 
-local_port="${QUEQLITE_BENCH_PORT:-18080}"
+local_port="${RHIZA_BENCH_PORT:-18080}"
 admin_endpoint_urls=()
 workload_endpoint_urls=()
 fault_endpoint_index=""
 for ordinal in 0 1 2; do
   port=$((local_port + ordinal))
-  if [ "$fault" = pod-delete ] && [ "$fault_pod" = "queqlite-c1-$ordinal" ]; then
+  if [ "$fault" = pod-delete ] && [ "$fault_pod" = "rhiza-sql-c1-$ordinal" ]; then
     fault_endpoint_index="$ordinal"
     supervise_rebinding_port_forward "$ordinal" "$fault_pod" "$port" &
   else
-    k port-forward "pod/queqlite-c1-$ordinal" "${port}:8080" \
+    k port-forward "pod/rhiza-sql-c1-$ordinal" "${port}:8080" \
       > "$target/port-forward-$ordinal.log" 2>&1 &
   fi
   port_forward_pids+=("$!")
@@ -1176,19 +1195,19 @@ done
 
 setup_body="$(jq -n --arg request_id "$run_id-setup" '
   {request_id:$request_id,statements:[
-    {sql:"CREATE TABLE IF NOT EXISTS queqlite_bench (request_id TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",parameters:[]},
-    {sql:"INSERT INTO queqlite_bench (request_id, value) VALUES (?, ?)",parameters:[
-      {type:"text",value:"queqlite-bench-seed"},{type:"text",value:"value-queqlite-bench-seed"}
+    {sql:"CREATE TABLE IF NOT EXISTS rhiza_bench (request_id TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",parameters:[]},
+    {sql:"INSERT INTO rhiza_bench (request_id, value) VALUES (?, ?)",parameters:[
+      {type:"text",value:"rhiza-bench-seed"},{type:"text",value:"value-rhiza-bench-seed"}
     ]}
   ]}
 ')"
-curl -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $client_token" \
+curl -fsS -H 'x-rhiza-version: 1' -H "Authorization: Bearer $client_token" \
   -H 'Content-Type: application/json' \
   --data "$setup_body" "http://127.0.0.1:${local_port}/v1/sql/execute" >/dev/null
 
 bench_target_dir="$(cargo metadata --locked --manifest-path bench/Cargo.toml --format-version 1 --no-deps | jq -r .target_directory)"
-cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench
-bench_binary="$bench_target_dir/release/queqlite-bench"
+cargo build --release --locked --manifest-path bench/Cargo.toml --bin rhiza-bench
+bench_binary="$bench_target_dir/release/rhiza-bench"
 [ -x "$bench_binary" ] || die "benchmark binary was not built: $bench_binary"
 benchmark_binary_sha256="$(openssl dgst -sha256 -r "$bench_binary")"
 benchmark_binary_sha256="${benchmark_binary_sha256%% *}"
@@ -1239,7 +1258,7 @@ case "$fault" in
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
-if QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
+if RHIZA_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
   benchmark_status=0
 else
   benchmark_status=$?

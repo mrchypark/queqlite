@@ -1,5 +1,5 @@
 /target/
 **/target/
 /.git/
-/.queqlite-e2e/
-/.queqlite-objects/
+/.rhiza-e2e/
+/.rhiza-objects/

@@ -1,0 +1,32 @@
+[package]
+name = "rhiza-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["graph", "kv"]
+graph = ["rhiza-node/graph"]
+kv = ["rhiza-node/kv"]
+
+[dependencies]
+axum.workspace = true
+rhiza-archive = { path = "../rhiza-archive" }
+rhiza-core = { path = "../rhiza-core" }
+rhiza-log = { path = "../rhiza-log" }
+rhiza-node = { path = "../rhiza-node", default-features = false }
+rhiza-obj-store = { path = "../rhiza-obj-store" }
+rhiza-quepaxa = { path = "../rhiza-quepaxa" }
+rhiza-sql = { path = "../rhiza-sql" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "rhiza"
+path = "src/main.rs"

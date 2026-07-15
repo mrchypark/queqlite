@@ -41,10 +41,10 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.endpoints.is_empty() || self.endpoints.iter().any(|value| value.is_empty()) {
-            return Err("provide at least one --endpoint or QUEQLITE_BENCH_ENDPOINT".into());
+            return Err("provide at least one --endpoint or RHIZA_BENCH_ENDPOINT".into());
         }
         if self.token.is_empty() {
-            return Err("provide --token or QUEQLITE_CLIENT_TOKEN".into());
+            return Err("provide --token or RHIZA_CLIENT_TOKEN".into());
         }
         if self.duration.is_zero() {
             return Err("--duration must be greater than zero".into());
@@ -206,8 +206,8 @@ pub fn parse_config(
 
     if endpoints.is_empty() {
         endpoints.extend(
-            env_lookup("QUEQLITE_BENCH_ENDPOINT")
-                .or_else(|| env_lookup("QUEQLITE_ENDPOINT"))
+            env_lookup("RHIZA_BENCH_ENDPOINT")
+                .or_else(|| env_lookup("RHIZA_ENDPOINT"))
                 .unwrap_or_default()
                 .split(',')
                 .filter(|value| !value.is_empty())
@@ -217,8 +217,8 @@ pub fn parse_config(
     let config = Config {
         endpoints,
         token: token
-            .or_else(|| env_lookup("QUEQLITE_CLIENT_TOKEN"))
-            .or_else(|| env_lookup("QUEQLITE_BENCH_TOKEN"))
+            .or_else(|| env_lookup("RHIZA_CLIENT_TOKEN"))
+            .or_else(|| env_lookup("RHIZA_BENCH_TOKEN"))
             .unwrap_or_default(),
         duration: duration.unwrap_or(Duration::from_secs(30)),
         warmup: warmup.unwrap_or(Duration::from_secs(5)),
@@ -226,7 +226,7 @@ pub fn parse_config(
         target_rate,
         workload: workload.unwrap_or(Workload::Mixed),
         write_percent: write_percent.unwrap_or(50),
-        table: table.unwrap_or_else(|| "queqlite_bench".into()),
+        table: table.unwrap_or_else(|| "rhiza_bench".into()),
         request_timeout: request_timeout.unwrap_or(Duration::from_secs(10)),
         fault_timeout: fault_timeout.unwrap_or(Duration::from_secs(300)),
         skip_setup,
@@ -418,6 +418,7 @@ impl Stats {
                 p50_ms: self.percentile_ms(0.50),
                 p95_ms: self.percentile_ms(0.95),
                 p99_ms: self.percentile_ms(0.99),
+                p99_9_ms: self.percentile_ms(0.999),
             },
             error_classes: self.errors.clone(),
         }
@@ -440,15 +441,7 @@ impl Stats {
 }
 
 fn histogram_bucket(latency: Duration) -> u64 {
-    let micros = latency.as_micros().min(u128::from(u64::MAX)) as u64;
-    let mut upper_bound = 100_u64;
-    while upper_bound < micros {
-        upper_bound = upper_bound.saturating_mul(2);
-        if upper_bound == u64::MAX {
-            break;
-        }
-    }
-    upper_bound
+    latency.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -468,6 +461,7 @@ pub struct LatencyOutput {
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
+    pub p99_9_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -484,8 +478,8 @@ mod tests {
     #[test]
     fn config_accepts_environment_endpoint_and_fault_hook() {
         let values = BTreeMap::from([
-            ("QUEQLITE_BENCH_ENDPOINT", "http://node-a,http://node-b"),
-            ("QUEQLITE_CLIENT_TOKEN", "secret"),
+            ("RHIZA_BENCH_ENDPOINT", "http://node-a,http://node-b"),
+            ("RHIZA_CLIENT_TOKEN", "secret"),
         ]);
         let config = parse_config(
             [
@@ -623,9 +617,35 @@ mod tests {
         assert_eq!(output.errors, 1);
         assert_eq!(output.successful_committed_transactions, 1);
         assert_eq!(output.successful_committed_transactions_per_second, 0.5);
-        assert_eq!(output.latency.p50_ms, Some(0.2));
-        assert_eq!(output.latency.p95_ms, Some(0.4));
+        assert_eq!(output.latency.p50_ms, Some(0.15));
+        assert_eq!(output.latency.p95_ms, Some(0.25));
+        assert_eq!(output.latency.p99_9_ms, Some(0.25));
         assert_eq!(output.error_classes.get("http_503"), Some(&1));
+    }
+
+    #[test]
+    fn latency_percentiles_preserve_microsecond_resolution_and_emit_p99_9() {
+        let mut stats = Stats::default();
+        for _ in 0..998 {
+            stats.record(Duration::from_micros(1_001), true, true, None);
+        }
+        for _ in 0..2 {
+            stats.record(Duration::from_micros(12_345), true, true, None);
+        }
+
+        let output = stats.output(Duration::from_secs(1));
+
+        assert_eq!(output.latency.p99_ms, Some(1.001));
+        assert_eq!(output.latency.p99_9_ms, Some(12.345));
+        assert_eq!(
+            output
+                .latency
+                .histogram_us
+                .iter()
+                .map(|bucket| (bucket.upper_bound_us, bucket.count))
+                .collect::<Vec<_>>(),
+            vec![(1_001, 998), (12_345, 2)]
+        );
     }
 
     #[test]

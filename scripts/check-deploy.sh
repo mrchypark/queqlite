@@ -15,7 +15,7 @@ if grep -R -nE '^[[:space:]]*kind:[[:space:]]*PersistentVolumeClaim|^[[:space:]]
   echo "PVCs are forbidden" >&2
   exit 1
 fi
-if grep -R -nE 'QUEQLITE_PEER_[1-7]' deploy scripts; then
+if grep -R -nE 'RHIZA_PEER_[1-7]' deploy scripts; then
   echo "legacy peer environment variables are forbidden" >&2
   exit 1
 fi
@@ -23,42 +23,152 @@ if grep -R -nE 'kind:[[:space:]]*ConfigMap' deploy; then
   echo "deployment config and credentials must use Secrets" >&2
   exit 1
 fi
+if grep -R -nE '^[[:space:]]*kind:[[:space:]]*(Ingress|Gateway)|^[[:space:]]*type:[[:space:]]*(NodePort|LoadBalancer)|^[[:space:]]*(hostNetwork|hostPort|externalIPs):' deploy; then
+  echo "deployment must not expose rhiza listeners outside the cluster" >&2
+  exit 1
+fi
+for script in scripts/*.sh; do
+  [ "$script" = scripts/check-deploy.sh ] && continue
+  if grep -nE -- '--consistency[[:space:]]+barrier|"consistency"[[:space:]]*:[[:space:]]*"(Local|ReadBarrier|AppliedIndex)"|(^|[^[:alnum:]_-])verify-restore([^[:alnum:]_-]|$)' \
+    "$script"; then
+    echo "operational script uses a removed CLI or HTTP compatibility alias: $script" >&2
+    exit 1
+  fi
+done
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+for profile in sql graph kv; do
 for replicas in 3 7; do
   id="$replicas"
-  jq -n --argjson id "$id" --argjson replicas "$replicas" '
+  jq -n --arg profile "$profile" --argjson id "$id" --argjson replicas "$replicas" '
     {version:1, config_id:$id, members:[range($replicas) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
-      url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8081"),
-      log_url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8080"),
+      url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8081"),
+      log_url:("http://rhiza-" + $profile + "-c" + ($id|tostring) + "-" + ($n|tostring) + ".rhiza-" + $profile + "-c" + ($id|tostring) + ":8080"),
       token:("not-a-real-secret-" + ($n + 1 | tostring))
     }]}
-  ' > "$tmp/config-${id}.json"
-  [ "$(jq '[.members[].token] | unique | length' "$tmp/config-${id}.json")" = "$replicas" ]
-  scripts/render-k8s-config.sh "$id" "$replicas" \
-    "$tmp/config-${id}.json" "$tmp/config-${id}.yaml" successor
-  yq eval '.' "$tmp/config-${id}.yaml" >/dev/null
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${id}.yaml")" = "$replicas" ]
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${id}.yaml")" = OnDelete ]
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | has("emptyDir")' "$tmp/config-${id}.yaml")" = true ]
-  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec | has("initContainers")' "$tmp/config-${id}.yaml")" = false ]
+  ' > "$tmp/config-${profile}-${id}.json"
+  [ "$(jq '[.members[].token] | unique | length' "$tmp/config-${profile}-${id}.json")" = "$replicas" ]
+  RHIZA_EXECUTION_PROFILE="$profile" scripts/render-k8s-config.sh "$id" "$replicas" \
+    "$tmp/config-${profile}-${id}.json" "$tmp/config-${profile}-${id}.yaml" successor
+  yq eval '.' "$tmp/config-${profile}-${id}.yaml" >/dev/null
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .metadata.name' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}-c${id}" ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${profile}-${id}.yaml")" = OnDelete ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | has("emptyDir")' "$tmp/config-${profile}-${id}.yaml")" = true ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec | has("initContainers")' "$tmp/config-${profile}-${id}.yaml")" = false ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.selector.matchLabels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_DATA_DIR") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/var/lib/rhiza/${profile}" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/${profile}/config.json" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-${profile}-${id}.yaml")" = 250m ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.memory' "$tmp/config-${profile}-${id}.yaml")" = 512Mi ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.cpu' "$tmp/config-${profile}-${id}.yaml")" = 2 ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.memory' "$tmp/config-${profile}-${id}.yaml")" = 2Gi ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | .emptyDir.sizeLimit' "$tmp/config-${profile}-${id}.yaml")" = 20Gi ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[] |
-    select(.name == "QUEQLITE_S3_ALLOW_HTTP") | .value' \
-    "$tmp/config-${id}.yaml")" = false ]
+    select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
+    "$tmp/config-${profile}-${id}.yaml")" = false ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[] |
-    select(.name == "QUEQLITE_STARTUP_MODE") | .value' \
-    "$tmp/config-${id}.yaml")" = rejoin ]
+    select(.name == "RHIZA_STARTUP_MODE") | .value' \
+    "$tmp/config-${profile}-${id}.yaml")" = rejoin ]
   if yq eval -r 'select(.kind == "StatefulSet") |
-    .spec.template.spec.containers[0].env[].name' "$tmp/config-${id}.yaml" |
-    grep -Eq '^QUEQLITE_S3_(ENDPOINT|ACCESS_KEY|SECRET_KEY)$'; then
+    .spec.template.spec.containers[0].env[].name' "$tmp/config-${profile}-${id}.yaml" |
+    grep -Eq '^RHIZA_S3_(ENDPOINT|ACCESS_KEY|SECRET_KEY)$'; then
     echo "provider-chain render retained optional S3 endpoint or credentials" >&2
     exit 1
   fi
 done
+done
+
+jq '.members |= to_entries | .members |= map(
+  .value + {
+    recorder_tcp_addr:("rhiza-sql-c3-" + (.key|tostring) + ".rhiza-sql-c3:8082")
+  }
+)' "$tmp/config-sql-3.json" > "$tmp/config-sql-3-tcp.json"
+RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
+    "$tmp/config-sql-3-tcp.yaml"
+[ "$(yq eval -r 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
+  .spec.ports[] | select(.name == "recorder-tcp") | .port' \
+  "$tmp/config-sql-3-tcp.yaml")" = 8082 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
+  "$tmp/config-sql-3-tcp.yaml")" = tcp-postcard ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value' \
+  "$tmp/config-sql-3-tcp.yaml")" = '0.0.0.0:8082' ]
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[].name' "$tmp/config-sql-3-tcp.yaml" |
+  grep -q '^RHIZA_RECORDER_TLS_'; then
+  echo "plaintext recorder render retained TLS environment" >&2
+  exit 1
+fi
+if yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].volumeMounts[].name,
+  select(.kind == "StatefulSet") | .spec.template.spec.volumes[].name' \
+  "$tmp/config-sql-3-tcp.yaml" | grep -q '^recorder-tls$'; then
+  echo "plaintext recorder render retained TLS secret mount" >&2
+  exit 1
+fi
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-tls-postcard \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
+    "$tmp/removed-tls-transport.yaml"; then
+  echo "render accepted removed tcp-tls-postcard transport" >&2
+  exit 1
+fi
+
+RHIZA_CPU_REQUEST=100m RHIZA_MEMORY_REQUEST=256Mi \
+RHIZA_CPU_LIMIT=1 RHIZA_MEMORY_LIMIT=1Gi RHIZA_DATA_SIZE_LIMIT=8Gi \
+RHIZA_EXECUTION_PROFILE=sql \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+    "$tmp/config-custom-resources.yaml"
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-custom-resources.yaml")" = 100m ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.memory' "$tmp/config-custom-resources.yaml")" = 256Mi ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.cpu' "$tmp/config-custom-resources.yaml")" = 1 ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.limits.memory' "$tmp/config-custom-resources.yaml")" = 1Gi ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | .emptyDir.sizeLimit' "$tmp/config-custom-resources.yaml")" = 8Gi ]
+
+cp "$tmp/config-sql-3.json" "$tmp/config-3.json"
+cp "$tmp/config-sql-7.json" "$tmp/config-7.json"
+if scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" "$tmp/missing-profile.yaml"; then
+  echo "render accepted a missing RHIZA_EXECUTION_PROFILE" >&2
+  exit 1
+fi
+if RHIZA_EXECUTION_PROFILE=sqlite scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3.json" "$tmp/legacy-profile.yaml"; then
+  echo "render accepted legacy sqlite execution profile" >&2
+  exit 1
+fi
+export RHIZA_EXECUTION_PROFILE=sql
+
+for helper in \
+  "scripts/render-k8s-config.sh 3 3 '$tmp/config-3.json' '$tmp/missing-profile.yaml'" \
+  "scripts/replace-k8s-config.sh '$tmp/config-3.json' '$tmp/config-3.json'" \
+  'scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c3 3 3' \
+  'scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET /livez' \
+  "scripts/k8s-object-job.sh 3 '$tmp/config-3.json' checkpoint inspect" \
+  'scripts/k8s-stop-state.sh validate missing missing'; do
+  if env -u RHIZA_EXECUTION_PROFILE bash -c "$helper"; then
+    echo "profile-scoped helper accepted a missing RHIZA_EXECUTION_PROFILE: $helper" >&2
+    exit 1
+  fi
+done
+
+set +e
+env -u RHIZA_EXECUTION_PROFILE scripts/e2e-vind-rustfs.sh >/dev/null 2>&1
+missing_e2e_profile_rc=$?
+RHIZA_EXECUTION_PROFILE=sqlite scripts/e2e-vind-rustfs.sh >/dev/null 2>&1
+invalid_e2e_profile_rc=$?
+set -e
+[ "$missing_e2e_profile_rc" = 65 ]
+[ "$invalid_e2e_profile_rc" = 65 ]
 
 jq '(.members[].token) = "duplicate"' "$tmp/config-3.json" > "$tmp/config-3-duplicate.json"
 if scripts/render-k8s-config.sh 3 3 \
@@ -96,8 +206,8 @@ fi
 
 jq '.config_id = 4 |
   .members |= to_entries | .members |= map(
-    .value.url = "http://queqlite-c4-\(.key).queqlite-c4:8081" |
-    .value.log_url = "http://queqlite-c4-\(.key).queqlite-c4:8080" | .value
+    .value.url = "http://rhiza-sql-c4-\(.key).rhiza-sql-c4:8081" |
+    .value.log_url = "http://rhiza-sql-c4-\(.key).rhiza-sql-c4:8080" | .value
   )' "$tmp/config-3.json" > "$tmp/config-4.json"
 jq '.members[0].node_id = "other-1"' "$tmp/config-4.json" \
   > "$tmp/config-4-invalid-node.json"
@@ -124,7 +234,7 @@ assert_replace_rejects_before_kubectl() {
   local transition_dir="$tmp/${label}-transition" rc
   set +e
   PATH="$stub_bin:$PATH" KUBECTL_MARKER="$marker" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$draft" \
     >/dev/null 2>&1
   rc=$?
@@ -145,7 +255,7 @@ invalid_old_marker="$tmp/invalid-old-version.kubectl-called"
 invalid_old_dir="$tmp/invalid-old-version-transition"
 set +e
 PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_old_marker" \
-  QUEQLITE_RECONFIG_WORK_DIR="$invalid_old_dir" \
+  RHIZA_RECONFIG_WORK_DIR="$invalid_old_dir" \
   scripts/replace-k8s-config.sh \
     "$tmp/config-3-version-2.json" "$tmp/config-4.json" >/dev/null 2>&1
 invalid_old_rc=$?
@@ -155,19 +265,19 @@ set -e
 [ ! -e "$invalid_old_dir/stop-c3.state.json" ]
 
 for invalid_env in \
-  'QUEQLITE_EPOCH=abc' \
-  'QUEQLITE_EPOCH=0' \
-  'QUEQLITE_EPOCH=18446744073709551616' \
-  'QUEQLITE_RECOVERY_GENERATION=abc' \
-  'QUEQLITE_RECOVERY_GENERATION=0' \
-  'QUEQLITE_RECOVERY_GENERATION=18446744073709551616' \
-  'QUEQLITE_CHECKPOINT_LEASE_MS=18446744073709551616' \
-  'QUEQLITE_S3_ALLOW_HTTP=maybe'; do
+  'RHIZA_EPOCH=abc' \
+  'RHIZA_EPOCH=0' \
+  'RHIZA_EPOCH=18446744073709551616' \
+  'RHIZA_RECOVERY_GENERATION=abc' \
+  'RHIZA_RECOVERY_GENERATION=0' \
+  'RHIZA_RECOVERY_GENERATION=18446744073709551616' \
+  'RHIZA_CHECKPOINT_LEASE_MS=18446744073709551616' \
+  'RHIZA_S3_ALLOW_HTTP=maybe'; do
   invalid_env_marker="$tmp/${invalid_env//=/_}.kubectl-called"
   invalid_env_dir="$tmp/${invalid_env//=/_}-transition"
   set +e
   env "$invalid_env" PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_env_marker" \
-    QUEQLITE_RECONFIG_WORK_DIR="$invalid_env_dir" \
+    RHIZA_RECONFIG_WORK_DIR="$invalid_env_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   invalid_env_rc=$?
@@ -185,10 +295,10 @@ for oversized_duration in \
   invalid_env_marker="$tmp/${oversized_duration}.kubectl-called"
   invalid_env_dir="$tmp/${oversized_duration}-transition"
   set +e
-  env QUEQLITE_DURABILITY_MODE=bounded \
-    "QUEQLITE_DURABILITY_MAX_LAG=$oversized_duration" \
+  env RHIZA_DURABILITY_MODE=bounded \
+    "RHIZA_DURABILITY_MAX_LAG=$oversized_duration" \
     PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_env_marker" \
-    QUEQLITE_RECONFIG_WORK_DIR="$invalid_env_dir" \
+    RHIZA_RECONFIG_WORK_DIR="$invalid_env_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   invalid_env_rc=$?
@@ -198,9 +308,9 @@ for oversized_duration in \
   [ ! -e "$invalid_env_dir/stop-c3.state.json" ]
 done
 
-QUEQLITE_EPOCH=18446744073709551615 \
-QUEQLITE_RECOVERY_GENERATION=18446744073709551615 \
-QUEQLITE_CHECKPOINT_LEASE_MS=18446744073709551615 \
+RHIZA_EPOCH=18446744073709551615 \
+RHIZA_RECOVERY_GENERATION=18446744073709551615 \
+RHIZA_CHECKPOINT_LEASE_MS=18446744073709551615 \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" \
     "$tmp/max-u64.yaml" successor
 for maximum_duration in \
@@ -208,15 +318,16 @@ for maximum_duration in \
   18446744073709551s \
   307445734561825m \
   5124095576030h; do
-  QUEQLITE_DURABILITY_MODE=bounded \
-  QUEQLITE_DURABILITY_MAX_LAG="$maximum_duration" \
+  RHIZA_DURABILITY_MODE=bounded \
+  RHIZA_DURABILITY_MAX_LAG="$maximum_duration" \
     scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" \
       "$tmp/max-duration.yaml" successor
 done
 
 wrong_live_status="$tmp/wrong-live-members.json"
 jq -n '{
-  cluster_id:"queqlite-vind",
+  cluster_id:"rhiza:sql:rhiza-vind",
+  execution_profile:"sql",
   epoch:1,
   node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","other-node"],
@@ -231,17 +342,17 @@ preflight_bin="$tmp/preflight-bin"
 mkdir "$preflight_bin"
 cp scripts/test-fixtures/kubectl-preflight-failure.sh "$preflight_bin/kubectl"
 chmod +x "$preflight_bin/kubectl"
-if [ -n "${QUEQLITE_TEST_QUEQLITE_BIN:-}" ]; then
-  queqlite_fixture_bin="$QUEQLITE_TEST_QUEQLITE_BIN"
+if [ -n "${RHIZA_TEST_RHIZA_BIN:-}" ]; then
+  rhiza_fixture_bin="$RHIZA_TEST_RHIZA_BIN"
 else
-  cargo build --locked -p queqlite-cli
-  queqlite_fixture_bin=target/debug/queqlite
+  cargo build --locked -p rhiza-cli
+  rhiza_fixture_bin=target/debug/rhiza
 fi
-[ -x "$queqlite_fixture_bin" ]
-export QUEQLITE_KUBECTL_FIXTURE_QUEQLITE="$queqlite_fixture_bin"
-export QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE="$tmp/config-3.json"
-export QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE="$tmp/object-job.state"
-export QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE="$tmp/object-job.response"
+[ -x "$rhiza_fixture_bin" ]
+export RHIZA_KUBECTL_FIXTURE_RHIZA="$rhiza_fixture_bin"
+export RHIZA_KUBECTL_FIXTURE_BUNDLE_FILE="$tmp/config-3.json"
+export RHIZA_KUBECTL_FIXTURE_OBJECT_STATE="$tmp/object-job.state"
+export RHIZA_KUBECTL_FIXTURE_OBJECT_RESPONSE="$tmp/object-job.response"
 valid_auth_secret="$tmp/valid-auth-secret.json"
 jq -n \
   --arg client "$(printf '%s' successor-client | openssl base64 -A)" \
@@ -250,8 +361,8 @@ jq -n \
 
 jq 'del(.predecessor) | .config_id = 5 |
   .members |= to_entries | .members |= map(
-    .value.url = "http://queqlite-c5-\(.key).queqlite-c5:8081" |
-    .value.log_url = "http://queqlite-c5-\(.key).queqlite-c5:8080" | .value
+    .value.url = "http://rhiza-sql-c5-\(.key).rhiza-sql-c5:8081" |
+    .value.log_url = "http://rhiza-sql-c5-\(.key).rhiza-sql-c5:8080" | .value
   )' scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-5.json"
 jq '.predecessor.stop_proof.Phase2.config_digest[0] = 1' \
   scripts/test-fixtures/config-4-predecessor.json > "$tmp/config-4-bad-digest.json"
@@ -271,13 +382,13 @@ assert_semantic_bundle_rejected() {
   local transition_dir="$tmp/${label}-semantic-transition"
   local command_log="$tmp/${label}-semantic.kubectl-log" rc
   set +e
-  QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE="$bundle" \
+  RHIZA_KUBECTL_FIXTURE_BUNDLE_FILE="$bundle" \
     PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE=semantic \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
-    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE=semantic \
+    RHIZA_KUBECTL_FIXTURE_LOG="$command_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
+    RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$bundle" "$tmp/config-5.json" \
     >/dev/null 2>&1
   rc=$?
@@ -301,11 +412,11 @@ assert_semantic_bundle_rejected "$tmp/config-4-bad-phase2-maximum.json" bad-phas
 
 set +e
 PATH="$preflight_bin:$PATH" \
-  QUEQLITE_KUBECTL_FIXTURE_PROFILE=wrong-members \
-  QUEQLITE_KUBECTL_FIXTURE_LOG="$wrong_members_log" \
-  QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
-  QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-  QUEQLITE_RECONFIG_WORK_DIR="$wrong_members_dir" \
+  RHIZA_KUBECTL_FIXTURE_PROFILE=wrong-members \
+  RHIZA_KUBECTL_FIXTURE_LOG="$wrong_members_log" \
+  RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
+  RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+  RHIZA_RECONFIG_WORK_DIR="$wrong_members_dir" \
   scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
   >/dev/null 2>&1
 wrong_members_rc=$?
@@ -320,7 +431,8 @@ fi
 
 valid_live_status="$tmp/valid-live-members.json"
 jq -n '{
-  cluster_id:"queqlite-vind",
+  cluster_id:"rhiza:sql:rhiza-vind",
+  execution_profile:"sql",
   epoch:1,
   node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","node-3"],
@@ -336,11 +448,11 @@ assert_object_preflight_blocks_stop() {
   shift
   set +e
   env "$@" PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE="$profile" \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
-    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE="$profile" \
+    RHIZA_KUBECTL_FIXTURE_LOG="$command_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   rc=$?
@@ -356,7 +468,7 @@ assert_object_preflight_blocks_stop() {
 
 assert_object_preflight_blocks_stop provider
 assert_object_preflight_blocks_stop endpoint \
-  QUEQLITE_S3_ENDPOINT=http://127.0.0.1:1 QUEQLITE_S3_ALLOW_HTTP=true
+  RHIZA_S3_ENDPOINT=http://127.0.0.1:1 RHIZA_S3_ALLOW_HTTP=true
 
 assert_mutation_preflight_blocks_stop() {
   local profile="$1"
@@ -364,11 +476,11 @@ assert_mutation_preflight_blocks_stop() {
   local command_log="$tmp/${profile}.kubectl-log" rc
   set +e
   PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE="$profile" \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
-    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE="$profile" \
+    RHIZA_KUBECTL_FIXTURE_LOG="$command_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   rc=$?
@@ -376,11 +488,11 @@ assert_mutation_preflight_blocks_stop() {
   [ "$rc" != 0 ]
   [ ! -e "$transition_dir/stop-c3.state.json" ]
   grep -Fq 'checkpoint inspect' "$command_log"
-  grep -Fq 'create secret generic queqlite-c4-bundle' "$command_log"
+  grep -Fq 'create secret generic rhiza-sql-c4-bundle' "$command_log"
   case "$profile" in
-    dry-run-scale-denied) grep -Fq 'scale statefulset queqlite-c3' "$command_log" ;;
+    dry-run-scale-denied) grep -Fq 'scale statefulset rhiza-sql-c3' "$command_log" ;;
     dry-run-apply-denied)
-      grep -Fq 'scale statefulset queqlite-c3' "$command_log"
+      grep -Fq 'scale statefulset rhiza-sql-c3' "$command_log"
       grep -Fq 'apply --server-side --dry-run=server' "$command_log"
       ;;
   esac
@@ -407,11 +519,11 @@ assert_live_identity_rejected() {
   jq "$filter" "$valid_live_status" > "$status"
   set +e
   PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE=identity \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$status" \
-    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE=identity \
+    RHIZA_KUBECTL_FIXTURE_LOG="$command_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$status" \
+    RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   rc=$?
@@ -427,6 +539,7 @@ assert_live_identity_rejected() {
 }
 
 assert_live_identity_rejected '.cluster_id = "other-cluster"' wrong-cluster
+assert_live_identity_rejected '.execution_profile = "graph"' wrong-profile
 assert_live_identity_rejected '.epoch = 2' wrong-epoch
 assert_live_identity_rejected '.recovery_generation = 2' wrong-generation
 
@@ -436,18 +549,18 @@ assert_auth_secret_rejected() {
   local command_log="$tmp/${label}-auth.kubectl-log" rc
   set +e
   PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE=auth \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
-    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$secret" \
-    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE=auth \
+    RHIZA_KUBECTL_FIXTURE_LOG="$command_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$secret" \
+    RHIZA_RECONFIG_WORK_DIR="$transition_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   rc=$?
   set -e
   [ "$rc" = 65 ]
   [ ! -e "$transition_dir/stop-c3.state.json" ]
-  grep -Fq 'get secret queqlite-auth -o json' "$command_log"
+  grep -Fq 'get secret rhiza-auth -o json' "$command_log"
   if grep -Eq 'admin |checkpoint inspect|scale statefulset|apply |create secret' \
     "$command_log"; then
     echo "invalid auth Secret allowed a transition action: $label" >&2
@@ -471,12 +584,12 @@ missing_secret_dir="$tmp/missing-secret-transition"
 missing_secret_log="$tmp/missing-secret.kubectl-log"
 set +e
 PATH="$preflight_bin:$PATH" \
-  QUEQLITE_KUBECTL_FIXTURE_PROFILE=missing-secret \
-  QUEQLITE_KUBECTL_FIXTURE_LOG="$missing_secret_log" \
-  QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
-  QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
-  QUEQLITE_RECONFIG_WORK_DIR="$missing_secret_dir" \
-  QUEQLITE_OBJECT_SECRET=missing-object-credentials \
+  RHIZA_KUBECTL_FIXTURE_PROFILE=missing-secret \
+  RHIZA_KUBECTL_FIXTURE_LOG="$missing_secret_log" \
+  RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+  RHIZA_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+  RHIZA_RECONFIG_WORK_DIR="$missing_secret_dir" \
+  RHIZA_OBJECT_SECRET=missing-object-credentials \
   scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
   >/dev/null 2>&1
 missing_secret_rc=$?
@@ -492,19 +605,19 @@ fi
 fake_checkpoint="$tmp/fake-checkpoint.json"
 jq -n '{identity:{config_id:3}}' > "$fake_checkpoint"
 for bypass_env in \
-  "QUEQLITE_OBJECT_JOB_RESPONSE_FILE=$fake_checkpoint" \
-  "QUEQLITE_OBJECT_JOB_RENDER_ONLY=$tmp/render-only.yaml" \
-  "QUEQLITE_ADMIN_JOB_RESPONSE_FILE=$valid_live_status" \
-  "QUEQLITE_ADMIN_JOB_RENDER_ONLY=$tmp/admin-render-only.yaml" \
-  "QUEQLITE_STATEFULSET_FIXTURE_DIR=$tmp/statefulset-fixture"; do
+  "RHIZA_OBJECT_JOB_RESPONSE_FILE=$fake_checkpoint" \
+  "RHIZA_OBJECT_JOB_RENDER_ONLY=$tmp/render-only.yaml" \
+  "RHIZA_ADMIN_JOB_RESPONSE_FILE=$valid_live_status" \
+  "RHIZA_ADMIN_JOB_RENDER_ONLY=$tmp/admin-render-only.yaml" \
+  "RHIZA_STATEFULSET_FIXTURE_DIR=$tmp/statefulset-fixture"; do
   bypass_dir="$tmp/${bypass_env%%=*}-transition"
   bypass_log="$tmp/${bypass_env%%=*}.kubectl-log"
   set +e
   env "$bypass_env" PATH="$preflight_bin:$PATH" \
-    QUEQLITE_KUBECTL_FIXTURE_PROFILE=provider \
-    QUEQLITE_KUBECTL_FIXTURE_LOG="$bypass_log" \
-    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
-    QUEQLITE_RECONFIG_WORK_DIR="$bypass_dir" \
+    RHIZA_KUBECTL_FIXTURE_PROFILE=provider \
+    RHIZA_KUBECTL_FIXTURE_LOG="$bypass_log" \
+    RHIZA_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    RHIZA_RECONFIG_WORK_DIR="$bypass_dir" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   bypass_rc=$?
@@ -633,32 +746,32 @@ for attempt in "$stop_state".attempt.*; do
   [ ! -e "$attempt" ] || { echo "atomic Stop state attempt file leaked" >&2; exit 1; }
 done
 
-QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
-QUEQLITE_OBJECT_SECRET=rustfs-credentials \
-QUEQLITE_S3_ALLOW_HTTP=true \
+RHIZA_S3_ENDPOINT=http://rustfs:9000 \
+RHIZA_OBJECT_SECRET=rustfs-credentials \
+RHIZA_S3_ALLOW_HTTP=true \
   scripts/render-k8s-config.sh 3 3 \
     "$tmp/config-3.json" "$tmp/config-3-rustfs.yaml" successor
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ENDPOINT") | .value' \
+  select(.name == "RHIZA_S3_ENDPOINT") | .value' \
   "$tmp/config-3-rustfs.yaml")" = http://rustfs:9000 ]
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ALLOW_HTTP") | .value' \
+  select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
   "$tmp/config-3-rustfs.yaml")" = true ]
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ACCESS_KEY" or
-    .name == "QUEQLITE_S3_SECRET_KEY") |
+  select(.name == "RHIZA_S3_ACCESS_KEY" or
+    .name == "RHIZA_S3_SECRET_KEY") |
   .valueFrom.secretKeyRef |
   .name + ":" + (has("optional") | tostring)' "$tmp/config-3-rustfs.yaml" |
   grep -c '^rustfs-credentials:false$')" = 2 ]
-if QUEQLITE_S3_ENDPOINT='' scripts/render-k8s-config.sh 3 3 \
+if RHIZA_S3_ENDPOINT='' scripts/render-k8s-config.sh 3 3 \
   "$tmp/config-3.json" "$tmp/invalid-empty-endpoint.yaml"; then
   echo "render accepted an explicitly empty S3 endpoint" >&2
   exit 1
 fi
-if QUEQLITE_OBJECT_SECRET='' scripts/render-k8s-config.sh 3 3 \
+if RHIZA_OBJECT_SECRET='' scripts/render-k8s-config.sh 3 3 \
   "$tmp/config-3.json" "$tmp/invalid-empty-object-secret.yaml"; then
   echo "render accepted an explicitly empty object credential secret" >&2
   exit 1
@@ -697,6 +810,9 @@ grep -Fq 'incomplete successor bundle artifact will be rebuilt' \
   scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh write-bundle' scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh hydrate' scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+grep -Fq 'rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${old_id}' \
+  scripts/replace-k8s-config.sh
 grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/k8s-stop-state.sh
 compact_line="$(grep -n 'publishing final checkpoint V2' scripts/replace-k8s-config.sh | cut -d: -f1)"
 fork_line="$(grep -n 'forking stopped checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
@@ -705,17 +821,25 @@ durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-c
 # shellcheck disable=SC2016
 scale_down_line="$(grep -n 'scale statefulset "$old_name" --replicas=0' \
   scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
-start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=rejoin' scripts/replace-k8s-config.sh | cut -d: -f1)"
+start_line="$(grep -n 'RHIZA_STARTUP_MODE=rejoin' scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$compact_line" -lt "$fork_line" ]
 [ "$fork_line" -lt "$start_line" ]
 [ "$durable_secret_line" -lt "$scale_down_line" ]
 grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
-grep -Fq 'export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials' \
+grep -Fq 'export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials' \
   scripts/e2e-vind-rustfs.sh
-grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/e2e-vind-rustfs.sh
-grep -Fq 'QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh' \
+grep -Fq 'export RHIZA_S3_ALLOW_HTTP=true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'RHIZA_STARTUP_MODE=rejoin scripts/render-k8s-config.sh' \
   scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'profile="${RHIZA_EXECUTION_PROFILE-}"' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'name="rhiza-${profile}-c${id}"' scripts/e2e-vind-rustfs.sh
+if grep -Eq 'rhiza-c[0-9]' scripts/e2e-vind-rustfs.sh; then
+  echo "vind E2E retained an unscoped rhiza-cN resource name" >&2
+  exit 1
+fi
 grep -Fq "kill -TERM 1" scripts/e2e-vind-rustfs.sh
 grep -Fq "containerStatuses[0].restartCount" scripts/e2e-vind-rustfs.sh
 grep -Fq "current_uid\" = \"\$restart_uid" scripts/e2e-vind-rustfs.sh
@@ -735,56 +859,59 @@ if grep -Eq 'vcluster-docker_|for candidate in' scripts/e2e-vind-rustfs.sh; then
   exit 1
 fi
 
-QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/object-job.yaml" \
+RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/object-job.yaml" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" init-checkpoint $'multiline\nargument'
 yq eval '.' "$tmp/object-job.yaml" >/dev/null
+[ "$(yq eval -r '.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/object-job.yaml")" = sql ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/object-job.yaml")" = sql ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/object-job.yaml")" = /etc/rhiza/sql/config.json ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/object-job.yaml")" = init-checkpoint ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].args[1]' "$tmp/object-job.yaml")" = $'multiline\nargument' ]
 [ "$(yq eval '[.spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ENDPOINT" or
-    .name == "QUEQLITE_S3_ACCESS_KEY" or
-    .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$tmp/object-job.yaml")" = 0 ]
+  select(.name == "RHIZA_S3_ENDPOINT" or
+    .name == "RHIZA_S3_ACCESS_KEY" or
+    .name == "RHIZA_S3_SECRET_KEY")] | length' "$tmp/object-job.yaml")" = 0 ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ALLOW_HTTP") | .value' \
+  select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
   "$tmp/object-job.yaml")" = false ]
 if grep -Eq '__[A-Z0-9_]+__' "$tmp/object-job.yaml"; then
   echo "object Job contains an unrendered placeholder" >&2
   exit 1
 fi
-QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
-QUEQLITE_OBJECT_SECRET=rustfs-credentials \
-QUEQLITE_S3_ALLOW_HTTP=true \
-QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/object-job-rustfs.yaml" \
+RHIZA_S3_ENDPOINT=http://rustfs:9000 \
+RHIZA_OBJECT_SECRET=rustfs-credentials \
+RHIZA_S3_ALLOW_HTTP=true \
+RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/object-job-rustfs.yaml" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect
 [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ENDPOINT") | .value' \
+  select(.name == "RHIZA_S3_ENDPOINT") | .value' \
   "$tmp/object-job-rustfs.yaml")" = http://rustfs:9000 ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ALLOW_HTTP") | .value' \
+  select(.name == "RHIZA_S3_ALLOW_HTTP") | .value' \
   "$tmp/object-job-rustfs.yaml")" = true ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-  select(.name == "QUEQLITE_S3_ACCESS_KEY" or
-    .name == "QUEQLITE_S3_SECRET_KEY") |
+  select(.name == "RHIZA_S3_ACCESS_KEY" or
+    .name == "RHIZA_S3_SECRET_KEY") |
   .valueFrom.secretKeyRef |
   .name + ":" + (has("optional") | tostring)' "$tmp/object-job-rustfs.yaml" |
   grep -c '^rustfs-credentials:false$')" = 2 ]
-if QUEQLITE_S3_ENDPOINT='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+if RHIZA_S3_ENDPOINT='' RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
   echo "object Job accepted an explicitly empty S3 endpoint" >&2
   exit 1
 fi
-if QUEQLITE_OBJECT_SECRET='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+if RHIZA_OBJECT_SECRET='' RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
   echo "object Job accepted an explicitly empty object credential secret" >&2
   exit 1
 fi
 for invalid_env in \
-  'QUEQLITE_EPOCH=abc' \
-  'QUEQLITE_EPOCH=0' \
-  'QUEQLITE_RECOVERY_GENERATION=abc' \
-  'QUEQLITE_RECOVERY_GENERATION=0' \
-  'QUEQLITE_S3_ALLOW_HTTP=maybe'; do
-  if env "$invalid_env" QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+  'RHIZA_EPOCH=abc' \
+  'RHIZA_EPOCH=0' \
+  'RHIZA_RECOVERY_GENERATION=abc' \
+  'RHIZA_RECOVERY_GENERATION=0' \
+  'RHIZA_S3_ALLOW_HTTP=maybe'; do
+  if env "$invalid_env" RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
     scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
     echo "object Job accepted invalid environment: $invalid_env" >&2
     exit 1
@@ -797,50 +924,66 @@ jq -n '{metadata:{generation:4}, spec:{replicas:3},
   > "$tmp/ready-fixture/statefulset.json"
 for ordinal in 0 1 2; do
   jq -n --arg id 3 '{
-    metadata:{labels:{"queqlite.dev/config-id":$id,
+    metadata:{labels:{"rhiza.dev/config-id":$id,
+      "rhiza.dev/execution-profile":"sql",
       "controller-revision-hash":"revision-4"}},
     status:{conditions:[{type:"Ready",status:"True"}]}
-  }' > "$tmp/ready-fixture/queqlite-c3-${ordinal}.json"
+  }' > "$tmp/ready-fixture/rhiza-sql-c3-${ordinal}.json"
 done
-QUEQLITE_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
-  scripts/wait-k8s-statefulset-ready.sh queqlite-c3 3 3
+RHIZA_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
+  scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c3 3 3
 jq '.metadata.labels["controller-revision-hash"] = "revision-3"' \
-  "$tmp/ready-fixture/queqlite-c3-1.json" > "$tmp/ready-fixture/stale-pod.json"
-mv "$tmp/ready-fixture/stale-pod.json" "$tmp/ready-fixture/queqlite-c3-1.json"
-if QUEQLITE_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
-  scripts/wait-k8s-statefulset-ready.sh queqlite-c3 3 3; then
+  "$tmp/ready-fixture/rhiza-sql-c3-1.json" > "$tmp/ready-fixture/stale-pod.json"
+mv "$tmp/ready-fixture/stale-pod.json" "$tmp/ready-fixture/rhiza-sql-c3-1.json"
+if RHIZA_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
+  scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c3 3 3; then
   echo "StatefulSet readiness check accepted a stale controller revision" >&2
   exit 1
 fi
 jq '.metadata.labels["controller-revision-hash"] = "revision-4"' \
-  "$tmp/ready-fixture/queqlite-c3-1.json" > "$tmp/ready-fixture/current-pod.json"
-mv "$tmp/ready-fixture/current-pod.json" "$tmp/ready-fixture/queqlite-c3-1.json"
+  "$tmp/ready-fixture/rhiza-sql-c3-1.json" > "$tmp/ready-fixture/current-pod.json"
+mv "$tmp/ready-fixture/current-pod.json" "$tmp/ready-fixture/rhiza-sql-c3-1.json"
 jq '.status.readyReplicas = 2' "$tmp/ready-fixture/statefulset.json" \
   > "$tmp/ready-fixture/not-ready.json"
 mv "$tmp/ready-fixture/not-ready.json" "$tmp/ready-fixture/statefulset.json"
-if QUEQLITE_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
-  scripts/wait-k8s-statefulset-ready.sh queqlite-c3 3 3; then
+if RHIZA_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
+  scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c3 3 3; then
   echo "StatefulSet readiness check accepted insufficient ready replicas" >&2
   exit 1
 fi
 
-QUEQLITE_AUTH_SECRET=rendered-auth \
+RHIZA_AUTH_SECRET=rendered-auth \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" "$tmp/auth-cluster.yaml"
-QUEQLITE_AUTH_SECRET=rendered-auth QUEQLITE_ADMIN_JOB_RENDER_ONLY="$tmp/admin-job.yaml" \
-  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 GET /v1/admin/membership/status
+RHIZA_AUTH_SECRET=rendered-auth RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/admin-job.yaml" \
+  scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET /v1/admin/membership/status
 yq eval '.' "$tmp/admin-job.yaml" >/dev/null
+[ "$(yq eval -r '.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/admin-job.yaml")" = sql ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/admin-job.yaml")" = sql ]
+for invalid_target in \
+  'rhiza-graph-c3 rhiza-graph-c3-0' \
+  'rhiza-sql-c3 rhiza-sql-c4-0' \
+  'other-sql-c3 other-sql-c3-0'; do
+  read -r invalid_service invalid_pod <<< "$invalid_target"
+  if RHIZA_AUTH_SECRET=rendered-auth \
+    RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/invalid-admin-job.yaml" \
+    scripts/k8s-admin-job.sh "$invalid_service" "$invalid_pod" GET \
+      /v1/admin/membership/status; then
+    echo "admin Job accepted a target outside rhiza-sql-* scope: $invalid_target" >&2
+    exit 1
+  fi
+done
 post_body='{"operation_id":"op-1","expected_config_id":3,"successor":{"config_id":4}}'
-QUEQLITE_AUTH_SECRET=rendered-auth QUEQLITE_ADMIN_JOB_RENDER_ONLY="$tmp/admin-post-job.yaml" \
-  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 POST /v1/admin/membership/stop "$post_body"
+RHIZA_AUTH_SECRET=rendered-auth RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/admin-post-job.yaml" \
+  scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 POST /v1/admin/membership/stop "$post_body"
 yq eval '.' "$tmp/admin-post-job.yaml" >/dev/null
 post_command="$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/admin-post-job.yaml")"
 # Match variables expanded inside the Job container.
 # shellcheck disable=SC2016
 case "$post_command" in
-  *'--data "$QUEQLITE_ADMIN_BODY"'*'${QUEQLITE_ADMIN_PATH}'*) ;;
+  *'--data "$RHIZA_ADMIN_BODY"'*'${RHIZA_ADMIN_PATH}'*) ;;
   *) echo "admin Job must pass request data through quoted environment variables" >&2; exit 1;;
 esac
-[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_BODY") | .value' "$tmp/admin-post-job.yaml")" = "$post_body" ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_ADMIN_BODY") | .value' "$tmp/admin-post-job.yaml")" = "$post_body" ]
 tricky_path="/v1/admin/o'connor"
 printf -v tricky_body '%s\n' \
   '{' \
@@ -848,11 +991,11 @@ printf -v tricky_body '%s\n' \
   '  "note": "line one\nline two"' \
   '}'
 tricky_body="${tricky_body%$'\n'}"
-QUEQLITE_AUTH_SECRET=rendered-auth QUEQLITE_ADMIN_JOB_RENDER_ONLY="$tmp/admin-tricky-job.yaml" \
-  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 POST "$tricky_path" "$tricky_body"
+RHIZA_AUTH_SECRET=rendered-auth RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/admin-tricky-job.yaml" \
+  scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 POST "$tricky_path" "$tricky_body"
 yq eval '.' "$tmp/admin-tricky-job.yaml" >/dev/null
-[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_PATH") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_path" ]
-[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_ADMIN_BODY") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_body" ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_ADMIN_PATH") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_path" ]
+[ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_ADMIN_BODY") | .value' "$tmp/admin-tricky-job.yaml")" = "$tricky_body" ]
 tricky_command="$(yq eval -r '.spec.template.spec.containers[0].args[0]' "$tmp/admin-tricky-job.yaml")"
 case "$tricky_command" in
   *"$tricky_path"*|*"op's-safe"*)
@@ -862,13 +1005,13 @@ case "$tricky_command" in
 esac
 server_secret="$(yq eval -r '
   select(.kind == "StatefulSet") |
-  .spec.template.spec.containers[] | select(.name == "queqlite") |
-  .env[] | select(.name == "QUEQLITE_ADMIN_TOKEN") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_ADMIN_TOKEN") |
   .valueFrom.secretKeyRef.name + ":" + .valueFrom.secretKeyRef.key
 ' "$tmp/auth-cluster.yaml")"
 job_secret="$(yq eval -r '
   .spec.template.spec.containers[] | select(.name == "curl") |
-  .env[] | select(.name == "QUEQLITE_ADMIN_TOKEN") |
+  .env[] | select(.name == "RHIZA_ADMIN_TOKEN") |
   .valueFrom.secretKeyRef.name + ":" + .valueFrom.secretKeyRef.key
 ' "$tmp/admin-job.yaml")"
 [ "$server_secret" = "$job_secret" ]
@@ -876,22 +1019,22 @@ job_secret="$(yq eval -r '
 # shellcheck disable=SC2016
 yq eval -e '
   .spec.template.spec.containers[] | select(.name == "curl") |
-  .args[0] | (contains("Authorization: Bearer ${QUEQLITE_ADMIN_TOKEN}") and
-    contains("x-queqlite-version: 1"))
+  .args[0] | (contains("Authorization: Bearer ${RHIZA_ADMIN_TOKEN}") and
+    contains("x-rhiza-version: 1"))
 ' "$tmp/admin-job.yaml" >/dev/null
 
 representative='{"node":{"configuration_status":"active"},"qlog_root":{"index":1,"hash":"00"}}'
 printf '%s' "$representative" > "$tmp/admin-response.json"
-admin_stdout="$(QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$tmp/admin-response.json" \
-  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 GET /v1/admin/membership/status)"
+admin_stdout="$(RHIZA_ADMIN_JOB_RESPONSE_FILE="$tmp/admin-response.json" \
+  scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET /v1/admin/membership/status)"
 [ "$admin_stdout" = "$representative" ]
 printf '%s' "$representative" > "$tmp/object-response.json"
-inspect_stdout="$(QUEQLITE_OBJECT_JOB_RESPONSE_FILE="$tmp/object-response.json" \
+inspect_stdout="$(RHIZA_OBJECT_JOB_RESPONSE_FILE="$tmp/object-response.json" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect)"
 [ "$inspect_stdout" = "$representative" ]
 init_message='checkpoint initialized: durable_tip=0'
 printf '%s' "$init_message" > "$tmp/object-response.txt"
-init_stdout="$(QUEQLITE_OBJECT_JOB_RESPONSE_FILE="$tmp/object-response.txt" \
+init_stdout="$(RHIZA_OBJECT_JOB_RESPONSE_FILE="$tmp/object-response.txt" \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" init-checkpoint)"
 [ "$init_stdout" = "$init_message" ]
 
@@ -901,16 +1044,28 @@ chmod +x "$tmp/transient-bin/kubectl"
 transient_admin='{"status":"retried"}'
 admin_retry_stdout="$(
   PATH="$tmp/transient-bin:$PATH" \
-  QUEQLITE_KUBECTL_FIXTURE_STATE="$tmp/admin-kubectl-state" \
-  QUEQLITE_KUBECTL_FIXTURE_RESPONSE="$transient_admin" \
-  scripts/k8s-admin-job.sh queqlite-c3 queqlite-c3-0 GET /v1/admin/membership/status
+  RHIZA_KUBECTL_FIXTURE_STATE="$tmp/admin-kubectl-state" \
+  RHIZA_KUBECTL_FIXTURE_RESPONSE="$transient_admin" \
+  scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET /v1/admin/membership/status
 )"
 [ "$admin_retry_stdout" = "$transient_admin" ]
 [ "$(cat "$tmp/admin-kubectl-state")" = 3 ]
+for mismatch in service pod; do
+  mismatch_state="$tmp/admin-${mismatch}-mismatch-state"
+  if PATH="$tmp/transient-bin:$PATH" \
+    RHIZA_KUBECTL_FIXTURE_STATE="$mismatch_state" \
+    RHIZA_KUBECTL_FIXTURE_TARGET_MISMATCH="$mismatch" \
+    scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET \
+      /v1/admin/membership/status; then
+    echo "admin Job accepted a live $mismatch outside the selected profile" >&2
+    exit 1
+  fi
+  [ ! -e "$mismatch_state" ]
+done
 object_retry_stdout="$(
   PATH="$tmp/transient-bin:$PATH" \
-  QUEQLITE_KUBECTL_FIXTURE_STATE="$tmp/object-kubectl-state" \
-  QUEQLITE_KUBECTL_FIXTURE_RESPONSE=checkpoint-retried \
+  RHIZA_KUBECTL_FIXTURE_STATE="$tmp/object-kubectl-state" \
+  RHIZA_KUBECTL_FIXTURE_RESPONSE=checkpoint-retried \
   scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect
 )"
 [ "$object_retry_stdout" = checkpoint-retried ]

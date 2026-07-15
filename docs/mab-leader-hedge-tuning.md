@@ -1,7 +1,7 @@
 # MAB Preferred-Proposer and Hedge-Delay Auto-Tuning
 
 > **Status: DESIGN ONLY / NOT IMPLEMENTED.** This document proposes a bounded
-> performance policy. It does not describe current Queqlite behavior.
+> performance policy. It does not describe current rhiza sql behavior.
 
 ## Goals
 

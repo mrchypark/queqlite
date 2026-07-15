@@ -7,10 +7,11 @@ set -euo pipefail
 }
 config_id="$1" bundle="$2"
 shift 2
-namespace="${QUEQLITE_K8S_NAMESPACE:-queqlite-e2e}"
-context="${QUEQLITE_KUBE_CONTEXT:-}"
-name="queqlite-c${config_id}"
-job="ql-object-${config_id}-$(date +%s)-$$-${RANDOM}"
+profile="${RHIZA_EXECUTION_PROFILE-}"
+namespace="${RHIZA_K8S_NAMESPACE:-rhiza-e2e}"
+context="${RHIZA_KUBE_CONTEXT:-}"
+name="rhiza-${profile}-c${config_id}"
+job="rhiza-${profile}-object-${config_id}-$(date +%s)-$$-${RANDOM}"
 manifest="$(mktemp)"
 response="$(mktemp)"
 trap 'rm -f "$manifest" "$response"' EXIT
@@ -18,74 +19,83 @@ trap 'rm -f "$manifest" "$response"' EXIT
 emit_command_stdout() { cat "$1"; }
 
 case "$config_id" in ''|*[!0-9]*|0) exit 64;; esac
+case "$profile" in
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+esac
 jq -e --argjson id "$config_id" '.version == 1 and .config_id == $id' "$bundle" >/dev/null
 command_json="$(printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]')"
 
 export JOB_NAME="$job"
-export JOB_IMAGE="${QUEQLITE_IMAGE:-queqlite:dev}"
+export PROFILE="$profile"
+export JOB_IMAGE="${RHIZA_IMAGE:-rhiza:dev}"
 export COMMAND_JSON="$command_json"
-export CLUSTER_ID="${QUEQLITE_CLUSTER_ID:-queqlite-vind}"
-export EPOCH="${QUEQLITE_EPOCH:-1}"
-export S3_ENDPOINT="${QUEQLITE_S3_ENDPOINT-}"
-export S3_ENDPOINT_SET="${QUEQLITE_S3_ENDPOINT+x}"
-export S3_BUCKET="${QUEQLITE_S3_BUCKET:-queqlite}"
-export S3_REGION="${QUEQLITE_S3_REGION:-us-east-1}"
-export S3_ALLOW_HTTP="${QUEQLITE_S3_ALLOW_HTTP:-false}"
-export OBJECT_SECRET="${QUEQLITE_OBJECT_SECRET-}"
-export OBJECT_SECRET_SET="${QUEQLITE_OBJECT_SECRET+x}"
-export RECOVERY_GENERATION="${QUEQLITE_RECOVERY_GENERATION:-1}"
+export CLUSTER_ID="${RHIZA_CLUSTER_ID:-rhiza-vind}"
+export EPOCH="${RHIZA_EPOCH:-1}"
+export S3_ENDPOINT="${RHIZA_S3_ENDPOINT-}"
+export S3_ENDPOINT_SET="${RHIZA_S3_ENDPOINT+x}"
+export S3_BUCKET="${RHIZA_S3_BUCKET:-rhiza}"
+export S3_REGION="${RHIZA_S3_REGION:-us-east-1}"
+export S3_ALLOW_HTTP="${RHIZA_S3_ALLOW_HTTP:-false}"
+export OBJECT_SECRET="${RHIZA_OBJECT_SECRET-}"
+export OBJECT_SECRET_SET="${RHIZA_OBJECT_SECRET+x}"
+export RECOVERY_GENERATION="${RHIZA_RECOVERY_GENERATION:-1}"
 export BUNDLE_SECRET="${name}-bundle"
 die() { echo "$*" >&2; exit 65; }
 case "$EPOCH" in
-  ''|*[!0-9]*|0) die "QUEQLITE_EPOCH must be a positive integer" ;;
+  ''|*[!0-9]*|0) die "RHIZA_EPOCH must be a positive integer" ;;
 esac
 case "$RECOVERY_GENERATION" in
-  ''|*[!0-9]*|0) die "QUEQLITE_RECOVERY_GENERATION must be a positive integer" ;;
+  ''|*[!0-9]*|0) die "RHIZA_RECOVERY_GENERATION must be a positive integer" ;;
 esac
 case "$S3_ALLOW_HTTP" in
   true|false|1|0) ;;
-  *) die "QUEQLITE_S3_ALLOW_HTTP must be true|false|1|0" ;;
+  *) die "RHIZA_S3_ALLOW_HTTP must be true|false|1|0" ;;
 esac
 [ -z "$S3_ENDPOINT_SET" ] || [ -n "$S3_ENDPOINT" ] || {
-  echo "QUEQLITE_S3_ENDPOINT must not be empty when set" >&2
+  echo "RHIZA_S3_ENDPOINT must not be empty when set" >&2
   exit 65
 }
 [ -z "$OBJECT_SECRET_SET" ] || [ -n "$OBJECT_SECRET" ] || {
-  echo "QUEQLITE_OBJECT_SECRET must not be empty when set" >&2
+  echo "RHIZA_OBJECT_SECRET must not be empty when set" >&2
   exit 65
 }
 yq eval '
   .metadata.name = strenv(JOB_NAME) |
+  .metadata.labels["rhiza.dev/execution-profile"] = strenv(PROFILE) |
   .spec.template.spec.containers[0].image = strenv(JOB_IMAGE) |
   .spec.template.spec.containers[0].args = (strenv(COMMAND_JSON) | from_json) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_CLUSTER_ID").value) = strenv(CLUSTER_ID) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_EPOCH").value) = strenv(EPOCH) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_S3_BUCKET").value) = strenv(S3_BUCKET) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_S3_REGION").value) = strenv(S3_REGION) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_S3_ALLOW_HTTP").value) = strenv(S3_ALLOW_HTTP) |
-  (.spec.template.spec.containers[0].env[] | select(.name == "QUEQLITE_RECOVERY_GENERATION").value) = strenv(RECOVERY_GENERATION) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE").value) = strenv(PROFILE) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CLUSTER_ID").value) = strenv(CLUSTER_ID) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE").value) = ("/etc/rhiza/" + strenv(PROFILE) + "/config.json") |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EPOCH").value) = strenv(EPOCH) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_S3_BUCKET").value) = strenv(S3_BUCKET) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_S3_REGION").value) = strenv(S3_REGION) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_S3_ALLOW_HTTP").value) = strenv(S3_ALLOW_HTTP) |
+  (.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_RECOVERY_GENERATION").value) = strenv(RECOVERY_GENERATION) |
   (.spec.template.spec.volumes[] | select(.name == "config").secret.secretName) = strenv(BUNDLE_SECRET) |
+  (.spec.template.spec.containers[0].volumeMounts[] | select(.name == "config").mountPath) = ("/etc/rhiza/" + strenv(PROFILE)) |
   .spec.template.spec.containers[0].env |= (
-    map(select(.name != "QUEQLITE_S3_ENDPOINT" and
-      .name != "QUEQLITE_S3_ACCESS_KEY" and
-      .name != "QUEQLITE_S3_SECRET_KEY")) +
-    ([{"name":"QUEQLITE_S3_ENDPOINT", "value":strenv(S3_ENDPOINT)}] |
+    map(select(.name != "RHIZA_S3_ENDPOINT" and
+      .name != "RHIZA_S3_ACCESS_KEY" and
+      .name != "RHIZA_S3_SECRET_KEY")) +
+    ([{"name":"RHIZA_S3_ENDPOINT", "value":strenv(S3_ENDPOINT)}] |
       map(select(strenv(S3_ENDPOINT_SET) == "x"))) +
     ([
-      {"name":"QUEQLITE_S3_ACCESS_KEY", "valueFrom":{"secretKeyRef":{
+      {"name":"RHIZA_S3_ACCESS_KEY", "valueFrom":{"secretKeyRef":{
         "name":strenv(OBJECT_SECRET), "key":"access-key"}}},
-      {"name":"QUEQLITE_S3_SECRET_KEY", "valueFrom":{"secretKeyRef":{
+      {"name":"RHIZA_S3_SECRET_KEY", "valueFrom":{"secretKeyRef":{
         "name":strenv(OBJECT_SECRET), "key":"secret-key"}}}
     ] | map(select(strenv(OBJECT_SECRET_SET) == "x")))
   )
-' deploy/k8s/queqlite-checkpoint-job.yaml > "$manifest"
+' deploy/k8s/rhiza-checkpoint-job.yaml > "$manifest"
 
-if [ -n "${QUEQLITE_OBJECT_JOB_RENDER_ONLY:-}" ]; then
-  cp "$manifest" "$QUEQLITE_OBJECT_JOB_RENDER_ONLY"
+if [ -n "${RHIZA_OBJECT_JOB_RENDER_ONLY:-}" ]; then
+  cp "$manifest" "$RHIZA_OBJECT_JOB_RENDER_ONLY"
   exit 0
 fi
-if [ -n "${QUEQLITE_OBJECT_JOB_RESPONSE_FILE:-}" ]; then
-  emit_command_stdout "$QUEQLITE_OBJECT_JOB_RESPONSE_FILE"
+if [ -n "${RHIZA_OBJECT_JOB_RESPONSE_FILE:-}" ]; then
+  emit_command_stdout "$RHIZA_OBJECT_JOB_RESPONSE_FILE"
   exit
 fi
 

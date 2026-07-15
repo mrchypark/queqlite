@@ -5,29 +5,36 @@ set -euo pipefail
   echo "usage: $0 OLD_BUNDLE_JSON SUCCESSOR_DRAFT_JSON" >&2
   exit 64
 }
-if [ -n "${QUEQLITE_OBJECT_JOB_RESPONSE_FILE+x}" ] ||
-  [ -n "${QUEQLITE_OBJECT_JOB_RENDER_ONLY+x}" ] ||
-  [ -n "${QUEQLITE_ADMIN_JOB_RESPONSE_FILE+x}" ] ||
-  [ -n "${QUEQLITE_ADMIN_JOB_RENDER_ONLY+x}" ] ||
-  [ -n "${QUEQLITE_STATEFULSET_FIXTURE_DIR+x}" ]; then
+if [ -n "${RHIZA_OBJECT_JOB_RESPONSE_FILE+x}" ] ||
+  [ -n "${RHIZA_OBJECT_JOB_RENDER_ONLY+x}" ] ||
+  [ -n "${RHIZA_ADMIN_JOB_RESPONSE_FILE+x}" ] ||
+  [ -n "${RHIZA_ADMIN_JOB_RENDER_ONLY+x}" ] ||
+  [ -n "${RHIZA_STATEFULSET_FIXTURE_DIR+x}" ]; then
   echo "test-only Job response/render hooks are forbidden during configuration replacement" >&2
   exit 65
 fi
 old_bundle="$1"
 successor_draft="$2"
-namespace="${QUEQLITE_K8S_NAMESPACE:-queqlite-e2e}"
-context="${QUEQLITE_KUBE_CONTEXT:-}"
-work_dir="${QUEQLITE_RECONFIG_WORK_DIR:-target/queqlite-reconfigure}"
-status_path="${QUEQLITE_ADMIN_STATUS_PATH:-/v1/admin/membership/status}"
-stop_path="${QUEQLITE_ADMIN_STOP_PATH:-/v1/admin/membership/stop}"
-compact_path="${QUEQLITE_ADMIN_COMPACT_PATH:-/v1/admin/checkpoint/compact}"
-activate_path="${QUEQLITE_ADMIN_ACTIVATE_PATH:-/v1/admin/membership/activate}"
-cluster_id="${QUEQLITE_CLUSTER_ID:-queqlite-vind}"
-epoch="${QUEQLITE_EPOCH:-1}"
-generation="${QUEQLITE_RECOVERY_GENERATION:-1}"
-auth_secret="${QUEQLITE_AUTH_SECRET:-queqlite-auth}"
-object_secret="${QUEQLITE_OBJECT_SECRET-}"
-object_secret_set="${QUEQLITE_OBJECT_SECRET+x}"
+profile="${RHIZA_EXECUTION_PROFILE-}"
+namespace="${RHIZA_K8S_NAMESPACE:-rhiza-e2e}"
+context="${RHIZA_KUBE_CONTEXT:-}"
+work_dir="${RHIZA_RECONFIG_WORK_DIR:-target/rhiza-reconfigure-${profile}}"
+status_path="${RHIZA_ADMIN_STATUS_PATH:-/v1/admin/membership/status}"
+stop_path="${RHIZA_ADMIN_STOP_PATH:-/v1/admin/membership/stop}"
+compact_path="${RHIZA_ADMIN_COMPACT_PATH:-/v1/admin/checkpoint/compact}"
+activate_path="${RHIZA_ADMIN_ACTIVATE_PATH:-/v1/admin/membership/activate}"
+cluster_id="${RHIZA_CLUSTER_ID:-rhiza-vind}"
+effective_cluster_id="rhiza:${profile}:${cluster_id}"
+epoch="${RHIZA_EPOCH:-1}"
+generation="${RHIZA_RECOVERY_GENERATION:-1}"
+auth_secret="${RHIZA_AUTH_SECRET:-rhiza-auth}"
+object_secret="${RHIZA_OBJECT_SECRET-}"
+object_secret_set="${RHIZA_OBJECT_SECRET+x}"
+
+case "$profile" in
+  sql|graph|kv) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+esac
 
 for tool in kubectl jq yq openssl; do command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 127; }; done
 old_id="$(jq -er '.config_id' "$old_bundle")"
@@ -47,8 +54,8 @@ scripts/render-k8s-config.sh \
 scripts/render-k8s-config.sh \
   "$new_id" "$new_replicas" "$successor_draft" "$successor_preflight_yaml" successor
 
-old_name="queqlite-c${old_id}"
-new_name="queqlite-c${new_id}"
+old_name="rhiza-${profile}-c${old_id}"
+new_name="rhiza-${profile}-c${new_id}"
 mkdir -p "$work_dir"
 chmod 700 "$work_dir"
 stop_json="$work_dir/stop-c${old_id}.json"
@@ -70,7 +77,7 @@ k+=(-n "$namespace")
 
 validate_runtime_bundle() {
   local bundle="$1" expected_id="$2" label="$3"
-  if ! "${k[@]}" exec -i "${old_name}-0" -- queqlite validate-config-bundle --stdin \
+  if ! "${k[@]}" exec -i "${old_name}-0" -- rhiza validate-config-bundle --stdin \
     < "$bundle" > "$bundle_preflight_json"; then
     echo "runtime rejected the $label configuration bundle" >&2
     exit 65
@@ -135,7 +142,7 @@ if [ -s "$stop_json" ] && [ -s "$successor_bundle" ]; then
 fi
 
 admin() {
-  QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace" \
+  RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace" \
     scripts/k8s-admin-job.sh "$@"
 }
 
@@ -158,10 +165,10 @@ if ! "$durable_resume"; then
       echo "cannot verify live membership for ${old_name}-${ordinal}" >&2
       exit 65
     fi
-    jq -e --arg cluster "$cluster_id" --argjson epoch "$epoch" \
+    jq -e --arg cluster "$effective_cluster_id" --arg profile "$profile" --argjson epoch "$epoch" \
       --argjson generation "$generation" --argjson id "$old_id" \
       --argjson members "$expected_old_members" '
-      .cluster_id == $cluster and .epoch == $epoch and
+      .cluster_id == $cluster and .execution_profile == $profile and .epoch == $epoch and
       .recovery_generation == $generation and
       .node.active_config_id == $id and
       .node.configuration_state.config_id == $id and
@@ -172,7 +179,7 @@ if ! "$durable_resume"; then
     }
   done
   echo "preflighting checkpoint and object-store access"
-  QUEQLITE_RECOVERY_GENERATION="$generation" \
+  RHIZA_RECOVERY_GENERATION="$generation" \
     scripts/k8s-object-job.sh "$old_id" "$old_bundle" checkpoint inspect \
     > "$object_preflight_json"
   jq -e --argjson id "$old_id" '.identity.config_id == $id' \
@@ -305,7 +312,7 @@ compact_request="$(jq -cn \
 admin "$old_name" "${old_name}-0" POST "$compact_path" "$compact_request" \
   > "$compact_json"
 jq -e '.anchor.format_version == 2' "$compact_json" >/dev/null
-QUEQLITE_RECOVERY_GENERATION="$generation" \
+RHIZA_RECOVERY_GENERATION="$generation" \
   scripts/k8s-object-job.sh "$old_id" "$old_bundle" checkpoint inspect \
   > "$source_inspect_json"
 jq -e --argjson id "$old_id" \
@@ -343,7 +350,7 @@ jq -e --argjson id "$new_id" '.config_id == $id' "$bundle_preflight_json" >/dev/
 }
 
 echo "forking stopped checkpoint into configuration $new_id"
-QUEQLITE_RECOVERY_GENERATION="$generation" \
+RHIZA_RECOVERY_GENERATION="$generation" \
   scripts/k8s-object-job.sh "$new_id" "$successor_bundle" checkpoint fork-successor \
     --from-config-id "$old_id" \
     --from-generation "$generation" > "$forked_json"
@@ -361,11 +368,14 @@ jq -e --argjson id "$new_id" \
 
 echo "scaling stopped configuration $old_id to zero"
 "${k[@]}" scale statefulset "$old_name" --replicas=0 >/dev/null
-"${k[@]}" wait --for=delete pod -l "queqlite.dev/config-id=${old_id}" --timeout=180s >/dev/null
+"${k[@]}" wait --for=delete pod \
+  -l "rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${old_id}" \
+  --timeout=180s >/dev/null
 [ "$("${k[@]}" get statefulset "$old_name" -o jsonpath='{.spec.replicas}')" = 0 ]
-[ -z "$("${k[@]}" get pod -l "queqlite.dev/config-id=${old_id}" -o name)" ]
+[ -z "$("${k[@]}" get pod \
+  -l "rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${old_id}" -o name)" ]
 
-QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
+RHIZA_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   "$new_id" "$new_replicas" "$successor_bundle" "$successor_yaml" successor
 "${k[@]}" apply --dry-run=client --validate=false -f "$successor_yaml" >/dev/null
 "${k[@]}" apply -f "$successor_yaml" >/dev/null
@@ -412,7 +422,7 @@ for ((attempt=1; attempt<=60; attempt++)); do
   "$all_active" && break
   [ "$attempt" -lt 60 ] || { echo "not every successor node reached Active(S+1)" >&2; exit 1; }
 done
-QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAMESPACE="$namespace" \
+RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace" \
   scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"
 
 echo "configuration $new_id is Active; GC is now permitted"

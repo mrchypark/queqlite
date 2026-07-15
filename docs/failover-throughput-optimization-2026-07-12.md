@@ -1,9 +1,9 @@
-# Queqlite Failover and Throughput Verification
+# rhiza sql Failover and Throughput Verification
 
 Date: 2026-07-12
 
 Evidence status: the figures below are historical observations from unversioned
-local runs. Their `target/queqlite-bench/...` directories are not included in
+local runs. Their `target/rhiza-bench/...` directories are not included in
 this repository, so a checkout cannot independently audit them. Re-run the
 benchmark to produce versioned evidence before using the figures for a release
 or performance claim. New vind artifacts support such claims only when
@@ -13,7 +13,7 @@ and immutable benchmark binary and runtime container identities.
 
 ## Scope
 
-This change implements four related improvements without making Queqlite depend
+This change implements four related improvements without making rhiza sql depend
 on Kubernetes:
 
 1. Separate peer and client Services, preferred-first multi-endpoint client
@@ -78,7 +78,7 @@ pre-deletion window, with zero request errors. The fault command succeeded in
 separate after-recovery throughput window and does not isolate protocol cost
 from routing, restoration, or other system overhead.
 
-These measurements compare two Queqlite configurations and do **not** establish
+These measurements compare two rhiza sql configurations and do **not** establish
 Raft-equivalent performance. The paper-conformance and benchmark-comparability
 boundaries are documented in
 [`quepaxa-paper-conformance-2026-07-12.md`](quepaxa-paper-conformance-2026-07-12.md).
@@ -89,10 +89,10 @@ not independently auditable evidence or a general recovery-time claim.
 
 Original local run directories (not distributed with this repository):
 
-- Final preferred-first deletion run: `target/queqlite-bench/20260712-113825-51624`
-- Normal: `target/queqlite-bench/20260712-034534-80063`
-- Preferred deletion, final: `target/queqlite-bench/20260712-035609-39970`
-- Longer preferred deletion sample: `target/queqlite-bench/20260712-034903-7352`
+- Final preferred-first deletion run: `target/rhiza-bench/20260712-113825-51624`
+- Normal: `target/rhiza-bench/20260712-034534-80063`
+- Preferred deletion, final: `target/rhiza-bench/20260712-035609-39970`
+- Longer preferred deletion sample: `target/rhiza-bench/20260712-034903-7352`
 
 ## OSS usage and cost
 

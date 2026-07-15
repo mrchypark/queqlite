@@ -12,17 +12,17 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use queqlite_bench::{
+use reqwest::{blocking::Client, StatusCode};
+use rhiza_bench::{
     fault_window_durations, operation_is_write, parse_config, rate_decision, Config, FaultConfig,
     RateDecision, Stats, StatsOutput,
 };
-use reqwest::{blocking::Client, StatusCode};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-const BENCH_SEED_ID: &str = "queqlite-bench-seed";
+const BENCH_SEED_ID: &str = "rhiza-bench-seed";
 
-const VERSION_HEADER: &str = "x-queqlite-version";
+const VERSION_HEADER: &str = "x-rhiza-version";
 const PROTOCOL_VERSION: &str = "1";
 const BEFORE: u8 = 0;
 const DURING: u8 = 1;
@@ -1140,18 +1140,18 @@ impl FaultOutput {
 
 fn workload_name(config: &Config) -> &'static str {
     match config.workload {
-        queqlite_bench::Workload::Read => "read",
-        queqlite_bench::Workload::Write => "write",
-        queqlite_bench::Workload::Mixed => "mixed",
+        rhiza_bench::Workload::Read => "read",
+        rhiza_bench::Workload::Write => "write",
+        rhiza_bench::Workload::Mixed => "mixed",
     }
 }
 
 fn print_usage() {
     eprintln!(
         "Usage: cargo run --manifest-path bench/Cargo.toml -- [options]\n\
-         Required: --endpoint URL (repeatable, or QUEQLITE_BENCH_ENDPOINT) and --token TOKEN (or QUEQLITE_CLIENT_TOKEN)\n\
+         Required: --endpoint URL (repeatable, or RHIZA_BENCH_ENDPOINT) and --token TOKEN (or RHIZA_CLIENT_TOKEN)\n\
          Options: --duration 30s --warmup 5s --concurrency 1 --target-rate 100\n\
-                  --workload read|write|mixed --write-percent 50 --table queqlite_bench\n\
+                  --workload read|write|mixed --write-percent 50 --table rhiza_bench\n\
                   --request-timeout 10s --fault-timeout 5m --skip-setup\n\
                   --fault OFFSET TAG COMMAND"
     );
@@ -1172,8 +1172,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use queqlite_bench::{Config, FaultConfig, RateDecision, Workload};
     use reqwest::blocking::Client;
+    use rhiza_bench::{Config, FaultConfig, RateDecision, Workload};
 
     use super::{
         benchmark_failure, endpoint_candidates, run, run_phase, run_phase_with_startup_delay,
@@ -1191,7 +1191,7 @@ mod tests {
             target_rate: None,
             workload: Workload::Read,
             write_percent: 0,
-            table: "queqlite_bench".into(),
+            table: "rhiza_bench".into(),
             request_timeout: Duration::from_secs(1),
             fault_timeout: Duration::from_secs(1),
             skip_setup: false,
@@ -1269,7 +1269,7 @@ mod tests {
                 }
                 seed_seen |= is_seed;
                 let response = if is_seed {
-                    r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"queqlite-bench-seed"}]]}}]}"#
+                    r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"rhiza-bench-seed"}]]}}]}"#
                 } else {
                     r#"{"applied_index":1,"results":[{}]}"#
                 };
@@ -1313,7 +1313,7 @@ mod tests {
                     let mut stream = stream.unwrap();
                     let body = read_request_body(&mut stream);
                     let response = if body.contains("RETURNING request_id, value") {
-                        r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"queqlite-bench-seed"}]]}}]}"#
+                        r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"rhiza-bench-seed"}]]}}]}"#
                     } else {
                         r#"{"applied_index":1,"results":[{}]}"#
                     };
@@ -1362,7 +1362,7 @@ mod tests {
                 respond(
                     &mut stream,
                     "200 OK",
-                    r#"{"columns":[],"rows":[[{"type":"text","value":"queqlite-bench-seed"},{"type":"text","value":"value-queqlite-bench-seed"}]]}"#,
+                    r#"{"columns":[],"rows":[[{"type":"text","value":"rhiza-bench-seed"},{"type":"text","value":"value-rhiza-bench-seed"}]]}"#,
                 );
             }
         });
@@ -1381,10 +1381,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let marker = std::env::temp_dir().join(format!(
-            "queqlite-bench-offset-zero-start-{}",
-            process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("rhiza-bench-offset-zero-start-{}", process::id()));
         let _ = fs::remove_file(&marker);
         let call_started = Instant::now();
         let worker_startup_delay = Duration::from_millis(100);
@@ -1430,7 +1428,7 @@ mod tests {
     #[test]
     fn offset_zero_fault_waits_for_phase_release() {
         let marker =
-            std::env::temp_dir().join(format!("queqlite-bench-offset-zero-gate-{}", process::id()));
+            std::env::temp_dir().join(format!("rhiza-bench-offset-zero-gate-{}", process::id()));
         let _ = fs::remove_file(&marker);
         let phase_gate = Arc::new(PhaseGate::default());
         let handle = spawn_phase_fault_hook(
@@ -1582,7 +1580,7 @@ mod tests {
     #[test]
     fn timed_out_fault_kills_descendants_before_returning() {
         let marker =
-            std::env::temp_dir().join(format!("queqlite-bench-fault-descendant-{}", process::id()));
+            std::env::temp_dir().join(format!("rhiza-bench-fault-descendant-{}", process::id()));
         let _ = fs::remove_file(&marker);
         let start = Instant::now();
         let output = spawn_fault_hook(
@@ -1610,7 +1608,7 @@ mod tests {
     #[test]
     fn successful_fault_cleans_up_background_descendants() {
         let marker = std::env::temp_dir().join(format!(
-            "queqlite-bench-fault-success-descendant-{}",
+            "rhiza-bench-fault-success-descendant-{}",
             process::id()
         ));
         let _ = fs::remove_file(&marker);

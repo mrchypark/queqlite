@@ -1,22 +1,24 @@
 [workspace]
 members = [
-    "crates/queqlite",
-    "crates/queqlite-archive",
-    "crates/queqlite-cli",
-    "crates/queqlite-core",
-    "crates/queqlite-log",
-    "crates/queqlite-node",
-    "crates/queqlite-obj-store",
-    "crates/queqlite-quepaxa",
-    "crates/queqlite-sqlite",
-    "crates/queqlite-testkit",
+    "crates/rhiza",
+    "crates/rhiza-archive",
+    "crates/rhiza-cli",
+    "crates/rhiza-core",
+    "crates/rhiza-graph",
+    "crates/rhiza-kv",
+    "crates/rhiza-log",
+    "crates/rhiza-node",
+    "crates/rhiza-obj-store",
+    "crates/rhiza-quepaxa",
+    "crates/rhiza-sql",
+    "crates/rhiza-testkit",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/mrchypark/queqlite"
+repository = "https://github.com/mrchypark/rhiza"
 rust-version = "1.89"
 
 [workspace.dependencies]
@@ -25,6 +27,7 @@ bytes = "1"
 futures = "0.3"
 getrandom = "0.3"
 object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
+postcard = { version = "1", features = ["alloc"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
