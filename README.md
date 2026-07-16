@@ -155,12 +155,37 @@ only on that cluster-internal Service; it does not create an Ingress, NodePort,
 LoadBalancer, `hostPort`, or `hostNetwork` listener. Apply a namespace-level
 default-deny NetworkPolicy in environments that run untrusted workloads.
 
-The removed `tcp-tls-postcard` selector, TLS environment variables, and
-`recorder_tls_server_name` bundle field are rejected instead of acting as
-compatibility aliases. This transport remains a benchmark candidate, not the
-production default; promotion requires the documented multi-host durability,
-reconnect, rollback, and soak gates. Reintroduce an authenticated encrypted
-channel before any cross-cluster, externally reachable, or multi-tenant use.
+Set `RHIZA_RECORDER_TLS=on` to use the server-authenticated TLS 1.3 variant of
+the same framed Postcard protocol. TLS is off by default and does not fall back
+to plaintext when enabled. In addition to `RHIZA_RECORDER_TCP_LISTEN`, it
+requires readable certificate, private-key, and CA-bundle files:
+
+```bash
+export RHIZA_RECORDER_TRANSPORT=tcp-postcard
+export RHIZA_RECORDER_TLS=on
+export RHIZA_RECORDER_TCP_LISTEN=0.0.0.0:8082
+export RHIZA_RECORDER_TLS_CERT_FILE=/run/secrets/rhiza/recorder-tls/tls.crt
+export RHIZA_RECORDER_TLS_KEY_FILE=/run/secrets/rhiza/recorder-tls/tls.key
+export RHIZA_RECORDER_TLS_CA_FILE=/run/secrets/rhiza/recorder-tls/ca-bundle.pem
+```
+
+Every bundle member must also set `recorder_tls_server_name` to the DNS name in
+that member's certificate SAN. The Kubernetes renderer takes
+`RHIZA_RECORDER_TLS_SECRET`, mounts its `tls.crt`, `tls.key`, and
+`ca-bundle.pem` keys, and uses the exact ordinal headless-Service DNS names.
+Because all Pods in one StatefulSet mount the same Secret, its server
+certificate must cover every ordinal member name in that configuration.
+Set `RHIZA_RECORDER_TLS=off` (the default) for plaintext TCP/Postcard; TLS
+files, TLS server names, or a TLS Secret are rejected in that mode. TLS cannot
+be enabled with the HTTP transport, and the legacy `tcp-tls-postcard` transport
+value is rejected so conflicting settings fail closed.
+
+This is server-authenticated TLS, not mTLS. The encrypted HELLO exchange still
+authenticates callers with configured peer tokens. It protects RecorderRpc
+only; public APIs and log-fetch URLs keep their separately configured HTTP
+security contract. HTTP/JSON remains the production default, and promotion of
+either TCP variant still requires the documented multi-host durability,
+reconnect, rollback, and soak gates.
 
 ## rhiza sql API
 

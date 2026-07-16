@@ -22,17 +22,18 @@ use rhiza_node::{
     node_router_with_checkpoint_and_admin_tasks, recorder_router_for_generation,
     recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
     restore_checkpoint_to_fresh_data_dir_for_node, restore_successor_checkpoint_to_fresh_data_dir,
-    run_e2e, serve_recorder_tcp, validate_recorder_tcp_endpoint, AdminActivateRequest,
-    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
-    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    run_e2e, serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    AdminActivateRequest, AdminActivateResponse, AdminCompactRequest, AdminCompactResponse,
+    AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
     AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
     AdminTaskTracker, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
     HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
-    ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse, SqlQueryRequest,
-    SqlQueryResponse, StopInformation, TcpPostcardRecorderClient, WriteRequest, WriteResponse,
-    ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH,
-    ADMIN_STOP_PATH, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, READ_PATH, SQL_EXECUTE_PATH,
-    SQL_QUERY_PATH, VERSION_HEADER, WRITE_PATH,
+    ReadRequest, ReadResponse, RecorderTlsClientConfig, RecorderTlsServerConfig, SqlExecuteRequest,
+    SqlExecuteResponse, SqlQueryRequest, SqlQueryResponse, StopInformation,
+    TcpPostcardRecorderClient, WriteRequest, WriteResponse, ADMIN_ACTIVATE_PATH,
+    ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH,
+    LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, READ_PATH, SQL_EXECUTE_PATH, SQL_QUERY_PATH,
+    VERSION_HEADER, WRITE_PATH,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
@@ -344,12 +345,15 @@ struct MemberDocument {
     log_url: Option<String>,
     #[serde(default)]
     recorder_tcp_addr: Option<String>,
+    #[serde(default)]
+    recorder_tls_server_name: Option<String>,
     token: String,
 }
 
 #[derive(Clone, Debug)]
 struct RecorderTcpPeer {
     address: String,
+    tls_server_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -389,11 +393,20 @@ impl fmt::Debug for ConfigurationBundle {
 enum RecorderTransport {
     Http,
     TcpPostcard,
+    TcpTlsPostcard,
 }
 
 #[derive(Clone, Debug)]
 struct RecorderTcpConfig {
     listen: String,
+    tls: Option<RecorderTlsFiles>,
+}
+
+#[derive(Clone, Debug)]
+struct RecorderTlsFiles {
+    certificate: PathBuf,
+    private_key: PathBuf,
+    ca_bundle: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -603,25 +616,31 @@ impl ServeConfig {
         let client_listen = lookup("RHIZA_CLIENT_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
         let recorder_listen =
             lookup("RHIZA_RECORDER_LISTEN").unwrap_or_else(|| "0.0.0.0:8081".into());
-        let recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
+        let requested_recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
             None | Some("http") => RecorderTransport::Http,
             Some("tcp-postcard") => RecorderTransport::TcpPostcard,
             Some(_) => return Err("RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard".into()),
         };
-        for removed in [
-            "RHIZA_RECORDER_TLS_CERT_FILE",
-            "RHIZA_RECORDER_TLS_KEY_FILE",
-            "RHIZA_RECORDER_TLS_CA_FILE",
-        ] {
-            if lookup(removed).is_some() {
-                return Err(format!(
-                    "{removed} is no longer supported; tcp-postcard is plaintext and in-cluster only"
-                ));
-            }
+        let recorder_tls_enabled = match lookup("RHIZA_RECORDER_TLS").as_deref() {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err("RHIZA_RECORDER_TLS must be on|off".into()),
+        };
+        if recorder_tls_enabled && requested_recorder_transport == RecorderTransport::Http {
+            return Err(
+                "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard".into(),
+            );
         }
+        let recorder_transport = if recorder_tls_enabled {
+            RecorderTransport::TcpTlsPostcard
+        } else {
+            requested_recorder_transport
+        };
         let tcp_listen = optional_env(&mut lookup, "RHIZA_RECORDER_TCP_LISTEN")?;
-        let tcp_requested =
-            recorder_transport == RecorderTransport::TcpPostcard || tcp_listen.is_some();
+        let tcp_requested = matches!(
+            recorder_transport,
+            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard
+        ) || tcp_listen.is_some();
         let recorder_tcp = if tcp_requested {
             let listen = tcp_listen.ok_or_else(|| {
                 "RHIZA_RECORDER_TCP_LISTEN is required for recorder TCP".to_string()
@@ -629,14 +648,83 @@ impl ServeConfig {
             listen.parse::<std::net::SocketAddr>().map_err(|_| {
                 "RHIZA_RECORDER_TCP_LISTEN must be an IP socket address".to_string()
             })?;
-            Some(RecorderTcpConfig { listen })
+            let tls = if recorder_transport == RecorderTransport::TcpTlsPostcard {
+                Some(RecorderTlsFiles {
+                    certificate: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_CERT_FILE",
+                    )?),
+                    private_key: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_KEY_FILE",
+                    )?),
+                    ca_bundle: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_CA_FILE",
+                    )?),
+                })
+            } else {
+                for name in [
+                    "RHIZA_RECORDER_TLS_CERT_FILE",
+                    "RHIZA_RECORDER_TLS_KEY_FILE",
+                    "RHIZA_RECORDER_TLS_CA_FILE",
+                ] {
+                    if lookup(name).is_some() {
+                        return Err(format!("{name} is irrelevant unless RHIZA_RECORDER_TLS=on"));
+                    }
+                }
+                None
+            };
+            Some(RecorderTcpConfig { listen, tls })
         } else {
+            for name in [
+                "RHIZA_RECORDER_TLS_CERT_FILE",
+                "RHIZA_RECORDER_TLS_KEY_FILE",
+                "RHIZA_RECORDER_TLS_CA_FILE",
+            ] {
+                if lookup(name).is_some() {
+                    return Err(format!("{name} is irrelevant unless RHIZA_RECORDER_TLS=on"));
+                }
+            }
             None
         };
-        if recorder_transport == RecorderTransport::TcpPostcard
-            && bundle.recorder_tcp_peers.iter().any(Option::is_none)
-        {
-            return Err("tcp-postcard requires recorder_tcp_addr for every bundle member".into());
+        match recorder_transport {
+            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard
+                if bundle.recorder_tcp_peers.iter().any(Option::is_none) =>
+            {
+                return Err(format!(
+                    "{} requires recorder_tcp_addr for every bundle member",
+                    match recorder_transport {
+                        RecorderTransport::TcpPostcard => "tcp-postcard",
+                        RecorderTransport::TcpTlsPostcard => "tcp-tls-postcard",
+                        RecorderTransport::Http => unreachable!(),
+                    }
+                ));
+            }
+            RecorderTransport::TcpTlsPostcard
+                if bundle
+                    .recorder_tcp_peers
+                    .iter()
+                    .flatten()
+                    .any(|peer| peer.tls_server_name.is_none()) =>
+            {
+                return Err(
+                    "tcp-tls-postcard requires recorder_tls_server_name for every bundle member"
+                        .into(),
+                );
+            }
+            RecorderTransport::Http | RecorderTransport::TcpPostcard
+                if bundle
+                    .recorder_tcp_peers
+                    .iter()
+                    .flatten()
+                    .any(|peer| peer.tls_server_name.is_some()) =>
+            {
+                return Err(
+                    "recorder_tls_server_name is irrelevant unless RHIZA_RECORDER_TLS=on".into(),
+                );
+            }
+            _ => {}
         }
         let object_store_mode = lookup("RHIZA_OBJECT_STORE");
         let (recovery_generation, remote) = match object_store_mode {
@@ -1648,10 +1736,27 @@ fn parse_configuration_bundle(json: &str) -> Result<ConfigurationBundle, String>
         .into_iter()
         .map(|member| {
             let recorder_tcp = match member.recorder_tcp_addr {
-                None => None,
+                None => {
+                    if member.recorder_tls_server_name.is_some() {
+                        return Err(
+                            "recorder_tls_server_name requires recorder_tcp_addr".to_string()
+                        );
+                    }
+                    None
+                }
                 Some(address) => {
                     validate_recorder_tcp_endpoint(&address)?;
-                    Some(RecorderTcpPeer { address })
+                    if member
+                        .recorder_tls_server_name
+                        .as_ref()
+                        .is_some_and(|name| name.trim().is_empty())
+                    {
+                        return Err("recorder_tls_server_name must not be empty".into());
+                    }
+                    Some(RecorderTcpPeer {
+                        address,
+                        tls_server_name: member.recorder_tls_server_name,
+                    })
                 }
             };
             let log_url = member.log_url.unwrap_or_else(|| member.url.clone());
@@ -2266,7 +2371,7 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
 fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
     match config.recorder_transport {
         RecorderTransport::Http => Ok(&config.recorder_listen),
-        RecorderTransport::TcpPostcard => config
+        RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard => config
             .recorder_tcp
             .as_ref()
             .map(|tcp| tcp.listen.as_str())
@@ -2312,6 +2417,37 @@ async fn spawn_recorder_server(
                     recorder,
                     peers,
                     recovery_generation,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+            })))
+        }
+        RecorderTransport::TcpTlsPostcard => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let tls = tcp
+                .tls
+                .as_ref()
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            let certificate = fs::read(&tls.certificate)
+                .map_err(|error| format!("cannot read recorder TLS certificate: {error}"))?;
+            let private_key = fs::read(&tls.private_key)
+                .map_err(|error| format!("cannot read recorder TLS private key: {error}"))?;
+            let tls = RecorderTlsServerConfig::from_pem(&certificate, &private_key)?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
+            let peers = config.bundle.peers.clone();
+            let recovery_generation = config.recovery_generation;
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                serve_recorder_tcp_tls(
+                    listener,
+                    recorder,
+                    peers,
+                    recovery_generation,
+                    tls,
                     wait_for_shutdown(shutdown),
                 )
                 .await
@@ -2416,6 +2552,20 @@ fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String
 
 fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, String> {
     let local_token = config.local_peer_token()?.to_owned();
+    let tls_ca_bundle = match config.recorder_transport {
+        RecorderTransport::TcpTlsPostcard => {
+            let tls = config
+                .recorder_tcp
+                .as_ref()
+                .and_then(|tcp| tcp.tls.as_ref())
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            Some(
+                fs::read(&tls.ca_bundle)
+                    .map_err(|error| format!("cannot read recorder TLS CA bundle: {error}"))?,
+            )
+        }
+        RecorderTransport::Http | RecorderTransport::TcpPostcard => None,
+    };
     let recorders = config
         .bundle
         .peers
@@ -2444,6 +2594,28 @@ fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, Stri
                         config.node_id.clone(),
                         local_token.clone(),
                         config.recovery_generation,
+                    )?)
+                }
+                RecorderTransport::TcpTlsPostcard => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    let server_name = endpoint.tls_server_name.as_deref().ok_or_else(|| {
+                        format!("recorder TLS server name is missing for {}", peer.node_id())
+                    })?;
+                    let ca_bundle = tls_ca_bundle
+                        .as_deref()
+                        .ok_or_else(|| "recorder TLS CA bundle is missing".to_string())?;
+                    let tls = RecorderTlsClientConfig::from_ca_pem(ca_bundle, server_name)?;
+                    Box::new(TcpPostcardRecorderClient::new_tls(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                        tls,
                     )?)
                 }
             };
@@ -4288,30 +4460,121 @@ mod tests {
         assert_eq!(config.recorder_transport, RecorderTransport::TcpPostcard);
         assert_eq!(config.recorder_tcp.as_ref().unwrap().listen, "0.0.0.0:8082");
 
-        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/removed/ca.pem");
+        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/irrelevant/ca.pem");
         let error = parse_serve_env(&values).unwrap_err();
-        assert!(error.contains("no longer supported"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
         values.remove("RHIZA_RECORDER_TLS_CA_FILE");
-
-        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-tls-postcard");
-        let error = parse_serve_env(&values).unwrap_err();
-        assert!(error.contains("http|tcp-postcard"), "{error}");
     }
 
     #[test]
-    fn configuration_bundle_rejects_removed_tls_server_name() {
+    fn non_tls_transports_reject_bundle_tls_server_names() {
+        let bundle = serde_json::json!({
+            "version": 1,
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        let mut values = base_serve_env();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tls_server_name"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard");
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tls_server_name"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
+    }
+
+    #[test]
+    fn tcp_postcard_tls_on_requires_all_tls_files_and_server_names() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard");
+        values.insert("RHIZA_RECORDER_TLS", "on");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TCP_LISTEN"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TLS_CERT_FILE"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TLS_CERT_FILE", "/missing/tls.crt");
+        values.insert("RHIZA_RECORDER_TLS_KEY_FILE", "/missing/tls.key");
+        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/missing/ca-bundle.pem");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tcp_addr"), "{error}");
+
+        let bundle = serde_json::json!({
+            "version": 1,
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+        let config = parse_serve_env(&values).unwrap();
+        assert_eq!(config.recorder_transport, RecorderTransport::TcpTlsPostcard);
+        let tls = config.recorder_tcp.unwrap().tls.unwrap();
+        assert_eq!(tls.certificate, Path::new("/missing/tls.crt"));
+        assert_eq!(tls.private_key, Path::new("/missing/tls.key"));
+        assert_eq!(tls.ca_bundle, Path::new("/missing/ca-bundle.pem"));
+    }
+
+    #[test]
+    fn recorder_tls_switch_rejects_invalid_or_conflicting_configuration() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TLS", "sometimes");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("RHIZA_RECORDER_TLS must be on|off"),
+            "{error}"
+        );
+
+        values.insert("RHIZA_RECORDER_TLS", "on");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("requires RHIZA_RECORDER_TRANSPORT=tcp-postcard"),
+            "{error}"
+        );
+
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-tls-postcard");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn configuration_bundle_accepts_tls_server_name_for_each_member() {
         let json = serde_json::json!({
             "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"t1"},
-                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "token":"t2"},
-                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "token":"t3"}
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"t2"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"t3"}
             ]
         });
 
-        let error = parse_configuration_bundle(&json.to_string()).unwrap_err();
-        assert!(error.contains("unknown field"), "{error}");
+        let bundle = parse_configuration_bundle(&json.to_string()).unwrap();
+        assert_eq!(
+            bundle.recorder_tcp_peers[1]
+                .as_ref()
+                .unwrap()
+                .tls_server_name
+                .as_deref(),
+            Some("node-2")
+        );
     }
 
     #[test]
@@ -6166,6 +6429,7 @@ mod tests {
                     .map(|address| {
                         Some(RecorderTcpPeer {
                             address: address.clone(),
+                            tls_server_name: None,
                         })
                     })
                     .collect(),
@@ -6176,10 +6440,13 @@ mod tests {
             client_listen: client_addresses[index].clone(),
             recorder_listen: recorder_addresses[index].clone(),
             recorder_transport,
-            recorder_tcp: (recorder_transport == RecorderTransport::TcpPostcard).then(|| {
-                RecorderTcpConfig {
-                    listen: tcp_addresses[index].clone(),
-                }
+            recorder_tcp: matches!(
+                recorder_transport,
+                RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard
+            )
+            .then(|| RecorderTcpConfig {
+                listen: tcp_addresses[index].clone(),
+                tls: None,
             }),
             recovery_generation: 1,
             remote: None,
@@ -6191,12 +6458,15 @@ mod tests {
         }));
         let first_recorder_address = match recorder_transport {
             RecorderTransport::Http => &recorder_addresses[0],
-            RecorderTransport::TcpPostcard => &tcp_addresses[0],
+            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard => &tcp_addresses[0],
         };
         wait_for_tcp(first_recorder_address).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!first.is_finished());
-        if recorder_transport == RecorderTransport::TcpPostcard {
+        if matches!(
+            recorder_transport,
+            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard
+        ) {
             assert!(tokio::net::TcpStream::connect(&recorder_addresses[0])
                 .await
                 .is_err());

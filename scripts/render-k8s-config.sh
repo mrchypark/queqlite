@@ -14,6 +14,9 @@ output="$4"
 successor="${5:-}"
 profile="${RHIZA_EXECUTION_PROFILE-}"
 recorder_transport="${RHIZA_RECORDER_TRANSPORT:-http}"
+recorder_tls="${RHIZA_RECORDER_TLS:-off}"
+recorder_tls_secret="${RHIZA_RECORDER_TLS_SECRET-}"
+recorder_tls_secret_set="${RHIZA_RECORDER_TLS_SECRET+x}"
 
 case "$config_id" in ''|*[!0-9]*|0) usage;; esac
 case "$replicas" in 3|4|5|6|7) ;; *) usage;; esac
@@ -25,6 +28,14 @@ case "$recorder_transport" in
   http|tcp-postcard) ;;
   *) echo "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard" >&2; exit 65 ;;
 esac
+case "$recorder_tls" in
+  on|off) ;;
+  *) echo "RHIZA_RECORDER_TLS must be on|off" >&2; exit 65 ;;
+esac
+[ "$recorder_tls" != on ] || [ "$recorder_transport" = tcp-postcard ] || {
+  echo "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard" >&2
+  exit 65
+}
 [ -r "$bundle" ] || { echo "cannot read bundle: $bundle" >&2; exit 66; }
 
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
@@ -33,7 +44,7 @@ require sed
 require yq
 
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$profile" \
-  --arg recorder_transport "$recorder_transport" '
+  --arg recorder_transport "$recorder_transport" --arg recorder_tls "$recorder_tls" '
   ((keys | sort) == ["config_id", "members", "version"] or
    (keys | sort) == ["config_id", "members", "predecessor", "version"]) and
   .version == 1 and .config_id == $id and
@@ -41,8 +52,10 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
   all(.members[];
     (($recorder_transport == "http" and
       (keys | sort) == ["log_url", "node_id", "token", "url"]) or
-     ($recorder_transport == "tcp-postcard" and
-      (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "token", "url"]))) and
+     ($recorder_transport == "tcp-postcard" and $recorder_tls == "off" and
+      (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "token", "url"]) or
+     ($recorder_transport == "tcp-postcard" and $recorder_tls == "on" and
+      (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "recorder_tls_server_name", "token", "url"]))) and
   ((has("predecessor") | not) or .predecessor == null or
     (.predecessor |
       type == "object" and
@@ -65,6 +78,11 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
     ([.members | sort_by(.node_id)[] | {recorder_tcp_addr}] ==
       [range(0; $replicas) as $n | {
         recorder_tcp_addr: "rhiza-\($profile)-c\($id)-\($n).rhiza-\($profile)-c\($id):8082"
+      }])) and
+  ($recorder_tls != "on" or
+    ([.members | sort_by(.node_id)[] | {recorder_tls_server_name}] ==
+      [range(0; $replicas) as $n | {
+        recorder_tls_server_name: "rhiza-\($profile)-c\($id)-\($n).rhiza-\($profile)-c\($id)"
       }]))
 ' "$bundle" >/dev/null || { echo "invalid v1 bundle/config/replica identity" >&2; exit 65; }
 
@@ -148,6 +166,12 @@ validate_memory_quantity RHIZA_DATA_SIZE_LIMIT "$data_size_limit"
   die "RHIZA_S3_ENDPOINT must not be empty when set"
 [ -z "$object_secret_set" ] || [ -n "$object_secret" ] ||
   die "RHIZA_OBJECT_SECRET must not be empty when set"
+if [ "$recorder_tls" = on ]; then
+  [ -n "$recorder_tls_secret_set" ] && [ -n "$recorder_tls_secret" ] ||
+    die "RHIZA_RECORDER_TLS_SECRET is required when RHIZA_RECORDER_TLS=on"
+elif [ -n "$recorder_tls_secret_set" ]; then
+  die "RHIZA_RECORDER_TLS_SECRET is irrelevant unless RHIZA_RECORDER_TLS=on"
+fi
 validate_duration() {
   local name="$1" value="$2" amount maximum
   case "$value" in
@@ -240,12 +264,15 @@ yq eval --inplace '
       ] | map(select(strenv(OBJECT_SECRET_SET) == "x")))
     )
 ' "$output"
-export CONFIG_NAME="$name" RECORDER_TRANSPORT="$recorder_transport"
+export CONFIG_NAME="$name" RECORDER_TRANSPORT="$recorder_transport" RECORDER_TLS="$recorder_tls"
 yq eval --inplace '
   (select(.kind == "StatefulSet") |
     .spec.template.spec.containers[] | select(.name == "rhiza") | .env) |= (
-      map(select(.name != "RHIZA_RECORDER_TRANSPORT")) +
-      [{"name":"RHIZA_RECORDER_TRANSPORT", "value":strenv(RECORDER_TRANSPORT)}]
+      map(select(.name != "RHIZA_RECORDER_TRANSPORT" and .name != "RHIZA_RECORDER_TLS")) +
+      [
+        {"name":"RHIZA_RECORDER_TRANSPORT", "value":strenv(RECORDER_TRANSPORT)},
+        {"name":"RHIZA_RECORDER_TLS", "value":strenv(RECORDER_TLS)}
+      ]
     )
 ' "$output"
 if [ "$recorder_transport" = tcp-postcard ]; then
@@ -258,6 +285,32 @@ if [ "$recorder_transport" = tcp-postcard ]; then
     (select(.kind == "StatefulSet") |
       .spec.template.spec.containers[] | select(.name == "rhiza") | .env) +=
         [{"name":"RHIZA_RECORDER_TCP_LISTEN", "value":"0.0.0.0:8082"}]
+  ' "$output"
+fi
+if [ "$recorder_tls" = on ]; then
+  export RECORDER_TLS_SECRET="$recorder_tls_secret"
+  yq eval --inplace '
+    (select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[] | select(.name == "rhiza") | .env) += [
+        {"name":"RHIZA_RECORDER_TLS_CERT_FILE", "value":"/run/secrets/rhiza/recorder-tls/tls.crt"},
+        {"name":"RHIZA_RECORDER_TLS_KEY_FILE", "value":"/run/secrets/rhiza/recorder-tls/tls.key"},
+        {"name":"RHIZA_RECORDER_TLS_CA_FILE", "value":"/run/secrets/rhiza/recorder-tls/ca-bundle.pem"}
+      ] |
+    (select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[] | select(.name == "rhiza") | .volumeMounts) += [{
+        "name":"recorder-tls", "mountPath":"/run/secrets/rhiza/recorder-tls", "readOnly":true
+      }] |
+    (select(.kind == "StatefulSet") | .spec.template.spec.volumes) += [{
+      "name":"recorder-tls",
+      "secret":{
+        "secretName":strenv(RECORDER_TLS_SECRET),
+        "items":[
+          {"key":"tls.crt", "path":"tls.crt"},
+          {"key":"tls.key", "path":"tls.key"},
+          {"key":"ca-bundle.pem", "path":"ca-bundle.pem"}
+        ]
+      }
+    }]
   ' "$output"
 fi
 if grep -Eq '__[A-Z0-9_]+__' "$output"; then

@@ -3,22 +3,33 @@
 ## Decision
 
 Keep HTTP/JSON as the production default. `tcp-postcard` is available as an
-opt-in transport for a single trusted, isolated Kubernetes cluster. The latest
-Vind diagnostic showed materially higher throughput and better tail latency,
-but it was a dirty-source, single-host, single-pair run and is not sufficient to
-promote the default.
+opt-in transport for a single trusted, isolated Kubernetes cluster. Setting
+`RHIZA_RECORDER_TLS=on` adds TLS 1.3 server authentication to the same framed
+Postcard protocol so the two TCP modes can be compared without changing the
+RecorderRpc semantics. Neither TCP mode is promoted by the existing
+dirty-source, single-host diagnostics.
 
-Recorder TLS is not required by the current trust model and is not justified as
-a performance gate. The existing HTTP recorder is also plaintext. If the trust
-boundary later includes untrusted workloads, nodes, networks, or multiple
-clusters, evaluate a cluster-wide authenticated channel such as service-mesh
-mTLS or WireGuard instead of protecting only RecorderRpc.
+Recorder TLS is not required by the current trusted-cluster model and remains a
+comparison candidate rather than a performance gate. It protects RecorderRpc
+only: the public API and log-fetch paths retain their separately configured HTTP
+contract. If the trust boundary later includes untrusted workloads, nodes,
+networks, or multiple clusters, evaluate cluster-wide authentication such as
+service-mesh mTLS or WireGuard instead of treating server-only Recorder TLS as
+complete cluster security.
 
 ## Current transport contract
 
-- The only TCP selector is `tcp-postcard`. The removed `tcp-tls-postcard`
-  selector, TLS environment variables, and TLS bundle fields fail explicitly;
-  there is no compatibility alias.
+- `RHIZA_RECORDER_TRANSPORT=tcp-postcard` with `RHIZA_RECORDER_TLS=off` is
+  plaintext. Switching `RHIZA_RECORDER_TLS=on` requires a CA bundle, server
+  certificate, private key, and an exact `recorder_tls_server_name` for every
+  member. The modes never fall back to each other.
+- TLS accepts only `on|off`, cannot be enabled for HTTP, and rejects TLS files,
+  server names, or Secrets while off. The legacy `tcp-tls-postcard` transport
+  value is rejected so dual configuration cannot silently choose a mode.
+- TLS is restricted to TLS 1.3 with the `rhiza-recorder/1` ALPN and 0-RTT
+  disabled. It authenticates the server certificate and DNS name; callers are
+  authenticated by the encrypted HELLO peer-token exchange rather than a client
+  certificate.
 - Framed Postcard carries the seven typed `RecorderRpc` operations over bounded
   persistent connection pools. HELLO node/token/generation fields provide
   identity and fencing checks, not cryptographic authentication.
@@ -28,6 +39,9 @@ mTLS or WireGuard instead of protecting only RecorderRpc.
 - The shipped Kubernetes renderer uses exact headless-Service DNS names. The
   deployment check rejects Ingress, Gateway, NodePort, LoadBalancer, hostPort,
   hostNetwork, and externalIPs exposure.
+- The renderer mounts one Secret across the StatefulSet. Its certificate SAN
+  must therefore cover every ordinal headless-Service DNS name in the active
+  three-to-seven-node configuration.
 - The listener still binds to `0.0.0.0:8082`; isolation therefore depends on a
   trusted cluster plus CNI/NetworkPolicy enforcement. The repository manifests
   check exposure but do not create a default-deny NetworkPolicy.

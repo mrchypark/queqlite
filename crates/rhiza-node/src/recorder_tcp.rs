@@ -16,6 +16,7 @@ use rhiza_quepaxa::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     peer_credentials_authenticated, valid_recorder_command, valid_recorder_record, PeerConfig,
@@ -27,6 +28,103 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIONS_PER_LANE: usize = 2;
 const MAX_SERVER_CONNECTIONS: usize = DEFAULT_PEER_CONCURRENCY * 4;
+const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/1";
+
+#[derive(Clone)]
+pub struct RecorderTlsServerConfig {
+    inner: Arc<rustls::ServerConfig>,
+}
+
+impl fmt::Debug for RecorderTlsServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecorderTlsServerConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecorderTlsServerConfig {
+    pub fn from_pem(certificate_chain_pem: &[u8], private_key_pem: &[u8]) -> Result<Self, String> {
+        let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(certificate_chain_pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid recorder TLS certificate PEM".to_string())?;
+        if certificates.is_empty() {
+            return Err("recorder TLS certificate chain is empty".into());
+        }
+        let mut key_reader = std::io::Cursor::new(private_key_pem);
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|_| "invalid recorder TLS private key PEM".to_string())?
+            .ok_or_else(|| "recorder TLS private key is missing".to_string())?;
+        if rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|_| "invalid recorder TLS private key PEM".to_string())?
+            .is_some()
+        {
+            return Err("recorder TLS private key PEM contains multiple keys".into());
+        }
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| "recorder TLS crypto provider does not support TLS 1.3".to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| {
+            "recorder TLS certificate and private key are invalid or mismatched".to_string()
+        })?;
+        config.alpn_protocols = vec![RECORDER_TLS_ALPN.to_vec()];
+        config.max_early_data_size = 0;
+        Ok(Self {
+            inner: Arc::new(config),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct RecorderTlsClientConfig {
+    inner: Arc<rustls::ClientConfig>,
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+impl fmt::Debug for RecorderTlsClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecorderTlsClientConfig")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecorderTlsClientConfig {
+    pub fn from_ca_pem(ca_bundle_pem: &[u8], server_name: &str) -> Result<Self, String> {
+        let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_bundle_pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid recorder TLS CA bundle PEM".to_string())?;
+        if certificates.is_empty() {
+            return Err("recorder TLS CA bundle is empty".into());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in certificates {
+            roots.add(certificate).map_err(|_| {
+                "recorder TLS CA bundle contains an invalid certificate".to_string()
+            })?;
+        }
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|_| "invalid recorder TLS server name".to_string())?;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| "recorder TLS crypto provider does not support TLS 1.3".to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![RECORDER_TLS_ALPN.to_vec()];
+        config.enable_early_data = false;
+        Ok(Self {
+            inner: Arc::new(config),
+            server_name,
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Hello {
@@ -137,6 +235,52 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send,
 {
+    serve_recorder_tcp_inner(
+        listener,
+        recorder,
+        peers,
+        recovery_generation,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_recorder_tcp_tls<R, F>(
+    listener: tokio::net::TcpListener,
+    recorder: R,
+    peers: Vec<PeerConfig>,
+    recovery_generation: u64,
+    tls: RecorderTlsServerConfig,
+    shutdown: F,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
+    serve_recorder_tcp_inner(
+        listener,
+        recorder,
+        peers,
+        recovery_generation,
+        Some(tls.inner),
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_recorder_tcp_inner<R, F>(
+    listener: tokio::net::TcpListener,
+    recorder: R,
+    peers: Vec<PeerConfig>,
+    recovery_generation: u64,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    shutdown: F,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
     let reported_connection_error = Arc::new(AtomicBool::new(false));
@@ -155,12 +299,27 @@ where
                 let recorder = recorder.clone();
                 let peers = peers.clone();
                 let slots = slots.clone();
+                let tls = tls.clone();
                 let reported_connection_error = Arc::clone(&reported_connection_error);
                 tasks.spawn(async move {
                     let _connection = connection;
-                    if let Err(error) =
+                    let result = if let Some(config) = tls {
+                        let acceptor = TlsAcceptor::from(config);
+                        match tokio::time::timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                if tls_stream.get_ref().1.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
+                                    Err("recorder TLS ALPN negotiation failed".to_string())
+                                } else {
+                                    serve_connection(tls_stream, recorder, peers, recovery_generation, slots).await
+                                }
+                            }
+                            Ok(Err(_)) => Err("recorder TLS handshake failed".to_string()),
+                            Err(_) => Err("recorder TLS handshake timed out".to_string()),
+                        }
+                    } else {
                         serve_connection(stream, recorder, peers, recovery_generation, slots).await
-                    {
+                    };
+                    if let Err(error) = result {
                         if error != "connection closed"
                             && !reported_connection_error.swap(true, Ordering::Relaxed)
                         {
@@ -180,8 +339,8 @@ where
     Ok(())
 }
 
-async fn serve_connection<R>(
-    mut stream: tokio::net::TcpStream,
+async fn serve_connection<R, S>(
+    mut stream: S,
     recorder: R,
     peers: Vec<PeerConfig>,
     recovery_generation: u64,
@@ -189,6 +348,7 @@ async fn serve_connection<R>(
 ) -> Result<(), String>
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let hello_bytes = tokio::time::timeout(CALL_TIMEOUT, read_frame_async(&mut stream))
         .await
@@ -474,8 +634,53 @@ struct ConnectionPool {
 
 #[derive(Default)]
 struct PoolState {
-    idle: Vec<TcpStream>,
+    idle: Vec<RecorderClientStream>,
     open: usize,
+}
+
+enum RecorderClientStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl RecorderClientStream {
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Self::Plain(socket) => socket,
+            Self::Tls(stream) => &stream.sock,
+        }
+    }
+}
+
+impl Read for RecorderClientStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for RecorderClientStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ClientTransport {
+    Plain,
+    Tls(RecorderTlsClientConfig),
 }
 
 impl ConnectionPool {
@@ -493,6 +698,7 @@ pub struct TcpPostcardRecorderClient {
     local_node_id: String,
     peer_token: String,
     recovery_generation: u64,
+    transport: ClientTransport,
     consensus: ConnectionPool,
     control: ConnectionPool,
     next_request_id: AtomicU64,
@@ -507,6 +713,13 @@ impl fmt::Debug for TcpPostcardRecorderClient {
             .field("local_node_id", &self.local_node_id)
             .field("peer_token", &"[redacted]")
             .field("recovery_generation", &self.recovery_generation)
+            .field(
+                "transport",
+                &match self.transport {
+                    ClientTransport::Plain => "plain",
+                    ClientTransport::Tls(_) => "tls",
+                },
+            )
             .finish()
     }
 }
@@ -518,6 +731,42 @@ impl TcpPostcardRecorderClient {
         local_node_id: impl Into<String>,
         peer_token: impl Into<String>,
         recovery_generation: u64,
+    ) -> Result<Self, String> {
+        Self::new_with_transport(
+            address,
+            expected_recorder_id,
+            local_node_id,
+            peer_token,
+            recovery_generation,
+            ClientTransport::Plain,
+        )
+    }
+
+    pub fn new_tls(
+        address: impl ToString,
+        expected_recorder_id: impl Into<String>,
+        local_node_id: impl Into<String>,
+        peer_token: impl Into<String>,
+        recovery_generation: u64,
+        tls: RecorderTlsClientConfig,
+    ) -> Result<Self, String> {
+        Self::new_with_transport(
+            address,
+            expected_recorder_id,
+            local_node_id,
+            peer_token,
+            recovery_generation,
+            ClientTransport::Tls(tls),
+        )
+    }
+
+    fn new_with_transport(
+        address: impl ToString,
+        expected_recorder_id: impl Into<String>,
+        local_node_id: impl Into<String>,
+        peer_token: impl Into<String>,
+        recovery_generation: u64,
+        transport: ClientTransport,
     ) -> Result<Self, String> {
         let address = address.to_string();
         validate_recorder_tcp_endpoint(&address)?;
@@ -537,6 +786,7 @@ impl TcpPostcardRecorderClient {
             local_node_id,
             peer_token,
             recovery_generation,
+            transport,
             consensus: ConnectionPool::new(),
             control: ConnectionPool::new(),
             next_request_id: AtomicU64::new(1),
@@ -561,7 +811,7 @@ impl TcpPostcardRecorderClient {
         let remaining_deadline_ms = u32::try_from(remaining.as_millis())
             .unwrap_or(u32::MAX)
             .max(1);
-        if let Err(error) = set_timeouts(&stream, remaining) {
+        if let Err(error) = set_timeouts(stream.socket(), remaining) {
             self.discard(pool);
             return Err(error);
         }
@@ -598,7 +848,7 @@ impl TcpPostcardRecorderClient {
         &self,
         pool: &ConnectionPool,
         deadline: Instant,
-    ) -> rhiza_quepaxa::Result<TcpStream> {
+    ) -> rhiza_quepaxa::Result<RecorderClientStream> {
         loop {
             let mut state = pool
                 .state
@@ -633,7 +883,7 @@ impl TcpPostcardRecorderClient {
         }
     }
 
-    fn connect(&self, deadline: Instant) -> Result<TcpStream, String> {
+    fn connect(&self, deadline: Instant) -> Result<RecorderClientStream, String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let connect_timeout = CONNECT_TIMEOUT.min(remaining);
         if connect_timeout.is_zero() {
@@ -675,7 +925,30 @@ impl TcpPostcardRecorderClient {
             .map_err(|error| format!("cannot set recorder TCP_NODELAY: {error}"))?;
         set_timeouts(&socket, deadline.saturating_duration_since(Instant::now()))
             .map_err(|error| error.to_string())?;
-        let mut stream = socket;
+        let mut stream = match &self.transport {
+            ClientTransport::Plain => RecorderClientStream::Plain(socket),
+            ClientTransport::Tls(tls) => {
+                let connection =
+                    rustls::ClientConnection::new(Arc::clone(&tls.inner), tls.server_name.clone())
+                        .map_err(|_| "cannot initialize recorder TLS connection".to_string())?;
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                while stream.conn.is_handshaking() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("recorder TLS handshake timed out".into());
+                    }
+                    set_timeouts(&stream.sock, remaining).map_err(|error| error.to_string())?;
+                    stream
+                        .conn
+                        .complete_io(&mut stream.sock)
+                        .map_err(|_| "recorder TLS handshake failed".to_string())?;
+                }
+                if stream.conn.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
+                    return Err("recorder TLS ALPN negotiation failed".into());
+                }
+                RecorderClientStream::Tls(Box::new(stream))
+            }
+        };
         write_value_sync(
             &mut stream,
             &Hello {
@@ -696,7 +969,7 @@ impl TcpPostcardRecorderClient {
         }
     }
 
-    fn checkin(&self, pool: &ConnectionPool, stream: TcpStream) {
+    fn checkin(&self, pool: &ConnectionPool, stream: RecorderClientStream) {
         if let Ok(mut state) = pool.state.lock() {
             state.idle.push(stream);
             pool.available.notify_one();

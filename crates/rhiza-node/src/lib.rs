@@ -67,7 +67,8 @@ pub use graph::*;
 #[cfg(feature = "kv")]
 pub use kv::*;
 pub use recorder_tcp::{
-    serve_recorder_tcp, validate_recorder_tcp_endpoint, TcpPostcardRecorderClient,
+    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    RecorderTlsClientConfig, RecorderTlsServerConfig, TcpPostcardRecorderClient,
 };
 
 pub const MAX_FETCH_ENTRIES: u32 = 1_024;
