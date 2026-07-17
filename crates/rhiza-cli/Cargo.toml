@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["graph", "kv"]
+default = ["sql", "graph", "kv"]
+sql = ["dep:rhiza-sql", "rhiza-node/sql"]
 graph = ["rhiza-node/graph"]
 kv = ["rhiza-node/kv"]
+recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
 
 [dependencies]
 axum.workspace = true
@@ -18,7 +20,7 @@ rhiza-log = { path = "../rhiza-log" }
 rhiza-node = { path = "../rhiza-node", default-features = false }
 rhiza-obj-store = { path = "../rhiza-obj-store" }
 rhiza-quepaxa = { path = "../rhiza-quepaxa" }
-rhiza-sql = { path = "../rhiza-sql" }
+rhiza-sql = { path = "../rhiza-sql", optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

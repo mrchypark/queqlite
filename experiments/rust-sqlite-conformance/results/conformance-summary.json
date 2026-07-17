@@ -1,0 +1,245 @@
+{
+  "label": "NON-PRODUCTION conformance spike",
+  "production_ready": false,
+  "provenance": {
+    "graphitesql_crate": "0.1.3",
+    "graphitesql_sqlite_target": "3.53.2",
+    "graphitesql_reported_sqlite": "3.53.2",
+    "rusqlite_crate": "0.40.1",
+    "reference_sqlite": "3.53.2",
+    "target": "aarch64-apple-darwin",
+    "corpus_version": "v1",
+    "corpus_sha256": "e3252ab25165741e49b6e811fb6cbd2bacd33208133022a099087a1353ef33c8",
+    "git_head": "c9cf59024689fb3a30812dbf17ff018dc053fd28",
+    "git_dirty": true
+  },
+  "correctness": [
+    {
+      "name": "fixed_sql_corpus_and_returning",
+      "status": "PASS",
+      "detail": "corpus v1 (e3252ab25165741e49b6e811fb6cbd2bacd33208133022a099087a1353ef33c8) matched columns, storage types, values, row order, schema, triggers, transactions, UPSERT/REPLACE/multi-row, and RETURNING"
+    },
+    {
+      "name": "file_interoperability_both_directions",
+      "status": "PASS",
+      "detail": "candidate-created and reference-created files were each opened and mutated by the other engine with exact ordered rows/values preserved; both passed integrity_check"
+    },
+    {
+      "name": "wal_reopen_recovery",
+      "status": "PASS",
+      "detail": "read uncheckpointed reference WAL, reopened after recovery/checkpoint, and reopened candidate WAL database"
+    },
+    {
+      "name": "snapshot_and_backup_artifacts",
+      "status": "PASS",
+      "detail": "candidate serialize artifact (8192 bytes) passed reference integrity_check; reference online backup matched when opened by candidate"
+    },
+    {
+      "name": "session_changeset_normalize_cross_apply",
+      "status": "PASS",
+      "detail": "candidate generated 108 bytes; normalized 3 changes equal reference; candidate changeset applied to rusqlite and rusqlite changeset applied to candidate"
+    },
+    {
+      "name": "subprocess_hard_deadline_recovery",
+      "status": "PASS",
+      "detail": "candidate stayed process-confined; parent killed long-query child at 200 ms, explicitly deleted and verified absence of its DB/sidecars, and the next candidate case returned 42"
+    }
+  ],
+  "policy_and_cancellation": [
+    {
+      "name": "fine_grained_authorizer",
+      "status": "FAIL",
+      "detail": "only statement/table-level actions observed: [(21, \"\", \"\"), (20, \"t\", \"\")]"
+    },
+    {
+      "name": "deterministic_progress_handler",
+      "status": "BLOCKED_CAPABILITY",
+      "detail": "graphitesql 0.1.3 exports no progress-handler API; instruction-budget cancellation cannot be installed"
+    },
+    {
+      "name": "interrupt_handle",
+      "status": "BLOCKED_CAPABILITY",
+      "detail": "graphitesql 0.1.3 exports no interrupt handle API; hard deadlines require process termination"
+    },
+    {
+      "name": "complete_explain_opcode_policy",
+      "status": "FAIL",
+      "detail": "representative join EXPLAIN is incomplete: not yet implemented: EXPLAIN: VDBE join programs not yet listed"
+    },
+    {
+      "name": "trusted_schema",
+      "status": "FAIL",
+      "detail": "PRAGMA trusted_schema did not observably change after `PRAGMA trusted_schema=OFF`"
+    },
+    {
+      "name": "compile_options",
+      "status": "FAIL",
+      "detail": "PRAGMA compile_options returned no rows"
+    }
+  ],
+  "benchmark_methodology": {
+    "samples": 6,
+    "iterations_per_sample": 200,
+    "warmup_iterations": 20,
+    "engine_order": "alternating each sample; each engine runs first three times",
+    "observable_work": "equal SQL shape; query results fully materialized and checksummed; write affected-row counts checksummed",
+    "statistic": "median of six samples (mean of middle pair) with min/max spread"
+  },
+  "microbenchmark": [
+    {
+      "engine": "graphitesql",
+      "operation": "ordered_scan",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 91357,
+      "min_ns_per_operation": 81172,
+      "max_ns_per_operation": 96509,
+      "sample_ns_per_operation": [
+        81172,
+        89431,
+        90449,
+        92266,
+        93050,
+        96509
+      ],
+      "observable_checksum": 14896717532018910272
+    },
+    {
+      "engine": "graphitesql",
+      "operation": "point_insert",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 37911,
+      "min_ns_per_operation": 32929,
+      "max_ns_per_operation": 59193,
+      "sample_ns_per_operation": [
+        32929,
+        35773,
+        37003,
+        38819,
+        40211,
+        59193
+      ],
+      "observable_checksum": 200
+    },
+    {
+      "engine": "graphitesql",
+      "operation": "point_read",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 59145,
+      "min_ns_per_operation": 55014,
+      "max_ns_per_operation": 64051,
+      "sample_ns_per_operation": [
+        55014,
+        55053,
+        56830,
+        61461,
+        61630,
+        64051
+      ],
+      "observable_checksum": 5136169423140457912
+    },
+    {
+      "engine": "graphitesql",
+      "operation": "point_update",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 107327,
+      "min_ns_per_operation": 96732,
+      "max_ns_per_operation": 114311,
+      "sample_ns_per_operation": [
+        96732,
+        101813,
+        105112,
+        109543,
+        109867,
+        114311
+      ],
+      "observable_checksum": 200
+    },
+    {
+      "engine": "rusqlite",
+      "operation": "ordered_scan",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 36105,
+      "min_ns_per_operation": 33859,
+      "max_ns_per_operation": 37099,
+      "sample_ns_per_operation": [
+        33859,
+        34725,
+        35532,
+        36679,
+        36960,
+        37099
+      ],
+      "observable_checksum": 14896717532018910272
+    },
+    {
+      "engine": "rusqlite",
+      "operation": "point_insert",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 1412,
+      "min_ns_per_operation": 1277,
+      "max_ns_per_operation": 1990,
+      "sample_ns_per_operation": [
+        1277,
+        1397,
+        1408,
+        1417,
+        1440,
+        1990
+      ],
+      "observable_checksum": 200
+    },
+    {
+      "engine": "rusqlite",
+      "operation": "point_read",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 1351,
+      "min_ns_per_operation": 1248,
+      "max_ns_per_operation": 1445,
+      "sample_ns_per_operation": [
+        1248,
+        1307,
+        1312,
+        1390,
+        1433,
+        1445
+      ],
+      "observable_checksum": 5136169423140457912
+    },
+    {
+      "engine": "rusqlite",
+      "operation": "point_update",
+      "iterations_per_sample": 200,
+      "warmup_iterations": 20,
+      "samples": 6,
+      "median_ns_per_operation": 1617,
+      "min_ns_per_operation": 1458,
+      "max_ns_per_operation": 1643,
+      "sample_ns_per_operation": [
+        1458,
+        1488,
+        1605,
+        1629,
+        1635,
+        1643
+      ],
+      "observable_checksum": 200
+    }
+  ],
+  "benchmark_skipped_reason": null,
+  "hard_stop": true,
+  "hard_stop_criteria": "hard stop if any correctness or policy/cancellation check is not PASS; benchmark data never overrides correctness or missing controls"
+}

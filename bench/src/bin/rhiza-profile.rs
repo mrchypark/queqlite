@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    path::Path,
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,13 +12,21 @@ use std::{
 
 use rhiza::{
     effective_cluster_id, EmbeddedConfig, EmbeddedIdentity, ExecutionProfile, GraphCommandV1,
-    GraphParameterValue, GraphValueV1, ReadConsistency, RecorderRpc, Rhiza, RhizaHandle,
-    SqlCommand, SqlStatement, SqlValue,
+    GraphParameterValue, GraphValueV1, ReadConsistency, Rhiza, RhizaHandle, SqlCommand,
+    SqlStatement, SqlValue,
 };
-use rhiza_quepaxa::{Membership, RecorderFileStore};
+use rhiza_core::{Command as ConsensusCommand, CommandKind, EntryType, LogEntry, LogHash};
+use rhiza_graph::{encode_replicated_graph_command, LadybugStateMachine};
+use rhiza_kv::{encode_replicated_kv_command, KvCommandV1, RedbStateMachine};
+use rhiza_node::{NodeConfig, NodeRuntime};
+use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+use rhiza_sql::{encode_sql_command, SqliteStateMachine};
 use serde::Serialize;
 
 const KEYSPACE: u64 = 256;
+const RAW_RESULT_BYTES: usize = 1024 * 1024;
+const RAW_GRAPH_TIMEOUT_MS: u64 = 5_000;
+type RecorderSet = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -51,7 +60,68 @@ impl Profile {
 enum Workload {
     Write,
     Get,
+    DocumentGet,
     NativeRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum Layer {
+    Handle,
+    Runtime,
+    Raw,
+    Consensus,
+}
+
+impl Layer {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "handle" => Ok(Self::Handle),
+            "runtime" => Ok(Self::Runtime),
+            "raw" => Ok(Self::Raw),
+            "consensus" => Ok(Self::Consensus),
+            _ => Err("--layer must be handle, runtime, raw, or consensus".into()),
+        }
+    }
+
+    const fn scope(self) -> &'static str {
+        match self {
+            Self::Handle => "public RhizaHandle embedded API",
+            Self::Runtime => {
+                "NodeRuntime API with one blocking thread per benchmark worker; excludes RhizaHandle"
+            }
+            Self::Raw => {
+                "direct materializer reads; writes encode a command, construct LogEntry, and apply it"
+            }
+            Self::Consensus => {
+                "generic ThreeNodeConsensus::propose_at with deterministic payload; selected profile is not exercised; excludes qlog and materializer"
+            }
+        }
+    }
+
+    const fn consensus(self) -> &'static str {
+        match self {
+            Self::Handle | Self::Runtime => {
+                "in-process QuePaxa with three file-backed RecorderRpc voters"
+            }
+            Self::Raw => {
+                "excluded; writes include command encode, LogEntry construction, and materializer apply"
+            }
+            Self::Consensus => "in-process QuePaxa with three file-backed RecorderRpc voters",
+        }
+    }
+
+    const fn durability(self) -> &'static str {
+        match self {
+            Self::Handle | Self::Runtime => {
+                "RecorderFileStore local fsync plus local qlog/materializer"
+            }
+            Self::Raw => "materializer-native local commit only",
+            Self::Consensus => {
+                "three RecorderFileStore voter commits; excludes local qlog and materializer"
+            }
+        }
+    }
 }
 
 impl Workload {
@@ -59,16 +129,19 @@ impl Workload {
         match value {
             "write" => Ok(Self::Write),
             "get" => Ok(Self::Get),
+            "document-get" => Ok(Self::DocumentGet),
             "native-read" => Ok(Self::NativeRead),
-            _ => Err("--workload must be write, get, or native-read".into()),
+            _ => Err("--workload must be write, get, document-get, or native-read".into()),
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Config {
+    layer: Layer,
     profile: Profile,
     workload: Workload,
+    batch_size: usize,
     operations: u64,
     warmup: u64,
     concurrency: usize,
@@ -80,6 +153,8 @@ impl Config {
         let values: Vec<_> = args.into_iter().collect();
         let mut profile = None;
         let mut workload = None;
+        let mut layer = Layer::Handle;
+        let mut batch_size = 1;
         let mut operations = 1_000;
         let mut warmup = 100;
         let mut concurrency = 1;
@@ -93,8 +168,10 @@ impl Config {
                     .ok_or_else(|| format!("{flag} requires a value"))
             };
             match flag.as_str() {
+                "--layer" => layer = Layer::parse(next()?)?,
                 "--profile" => profile = Some(Profile::parse(next()?)?),
                 "--workload" => workload = Some(Workload::parse(next()?)?),
+                "--batch-size" => batch_size = parse_usize(next()?, flag)?,
                 "--operations" => operations = parse_u64(next()?, flag)?,
                 "--warmup" => warmup = parse_u64_allow_zero(next()?, flag)?,
                 "--concurrency" => concurrency = parse_usize(next()?, flag)?,
@@ -107,9 +184,31 @@ impl Config {
         if !(16..=4_096).contains(&value_bytes) {
             return Err("--value-bytes must be between 16 and 4096".into());
         }
+        if matches!(layer, Layer::Raw | Layer::Consensus) && concurrency != 1 {
+            return Err(format!("--layer {layer:?} requires --concurrency 1").to_lowercase());
+        }
+        let profile = profile.ok_or_else(|| "--profile is required".to_string())?;
+        let workload = workload.ok_or_else(|| "--workload is required".to_string())?;
+        if workload == Workload::DocumentGet && profile != Profile::Graph {
+            return Err("--workload document-get requires --profile graph".into());
+        }
+        if layer == Layer::Consensus && workload != Workload::Write {
+            return Err("--layer consensus supports only --workload write".into());
+        }
+        if !matches!(batch_size, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+            return Err("--batch-size must be 1, 2, 4, 8, 16, 32, or 64".into());
+        }
+        if batch_size != 1 && workload != Workload::Write {
+            return Err("--batch-size greater than 1 requires --workload write".into());
+        }
+        if batch_size != 1 && !matches!(layer, Layer::Handle | Layer::Runtime) {
+            return Err("--batch-size greater than 1 requires --layer handle or runtime".into());
+        }
         Ok(Self {
-            profile: profile.ok_or_else(|| "--profile is required".to_string())?,
-            workload: workload.ok_or_else(|| "--workload is required".to_string())?,
+            layer,
+            profile,
+            workload,
+            batch_size,
             operations,
             warmup,
             concurrency,
@@ -147,8 +246,9 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: rhiza-profile --profile sql|graph|kv --workload write|get|native-read \
-     [--operations N] [--warmup N] [--concurrency N] [--value-bytes N]"
+    "usage: rhiza-profile --profile sql|graph|kv --workload write|get|document-get|native-read \
+     [--layer handle|runtime|raw|consensus] [--operations N] [--warmup N] [--concurrency N] \
+     [--batch-size 1|2|4|8|16|32|64] [--value-bytes N]"
         .into()
 }
 
@@ -208,7 +308,7 @@ impl Samples {
         })
     }
 
-    fn metrics(&self, elapsed: Duration) -> Metrics {
+    fn metrics(&self, elapsed: Duration, qlog_entries: Option<u64>) -> Metrics {
         Metrics {
             attempts: self.successes + self.errors,
             successes: self.successes,
@@ -219,6 +319,7 @@ impl Samples {
             } else {
                 self.successes as f64 / elapsed.as_secs_f64()
             },
+            qlog_entries,
             latency_us: Latencies {
                 p50: self.percentile(500),
                 p95: self.percentile(950),
@@ -262,8 +363,12 @@ struct System {
 
 #[derive(Debug, Serialize)]
 struct ReportConfig {
+    layer: Layer,
+    measurement_scope: &'static str,
     profile: Profile,
     workload: Workload,
+    batch_size: usize,
+    logical_operations: u64,
     operations: u64,
     warmup_operations: u64,
     concurrency: usize,
@@ -281,6 +386,8 @@ struct Metrics {
     errors: u64,
     elapsed_seconds: f64,
     operations_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qlog_entries: Option<u64>,
     latency_us: Latencies,
     error_classes: BTreeMap<String, u64>,
 }
@@ -324,26 +431,32 @@ async fn run(config: Config) -> Result<Report, String> {
     // change the source provenance reported for this run.
     let provenance = provenance();
     let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let rhiza = Rhiza::open(embedded_config(root.path(), config.profile)?)
-        .await
-        .map_err(|error| error.to_string())?;
-    let handle = rhiza.handle();
-    let measured = async {
-        setup(&handle, &config).await?;
-        if config.warmup > 0 {
-            let (warmup, _) = run_phase(handle.clone(), &config, config.warmup, "warmup").await;
-            if warmup.errors > 0 {
-                return Err(format!("warmup failed with {} errors", warmup.errors));
-            }
+    let (samples, elapsed, qlog_entries) = match config.layer {
+        Layer::Handle => {
+            let rhiza = Rhiza::open(embedded_config(root.path(), config.profile)?)
+                .await
+                .map_err(|error| error.to_string())?;
+            let measured = measure_target(Target::Handle(rhiza.handle()), &config).await;
+            let shutdown = rhiza.shutdown().await.map_err(|error| error.to_string());
+            let measured = measured?;
+            shutdown?;
+            measured
         }
-        let (samples, elapsed) =
-            run_phase(handle.clone(), &config, config.operations, "measure").await;
-        Ok((samples, elapsed))
-    }
-    .await;
-    let shutdown = rhiza.shutdown().await.map_err(|error| error.to_string());
-    let (samples, elapsed) = measured?;
-    shutdown?;
+        Layer::Runtime => {
+            let runtime = runtime(root.path(), config.profile)?;
+            measure_target(Target::Runtime(runtime), &config).await?
+        }
+        Layer::Raw => {
+            let (samples, elapsed) =
+                measure_raw(RawTarget::open(root.path(), config.profile)?, &config)?;
+            (samples, elapsed, None)
+        }
+        Layer::Consensus => {
+            let (samples, elapsed) =
+                measure_consensus(ConsensusTarget::open(root.path())?, &config)?;
+            (samples, elapsed, None)
+        }
+    };
 
     Ok(Report {
         schema_version: 1,
@@ -355,18 +468,22 @@ async fn run(config: Config) -> Result<Report, String> {
         provenance,
         system: system(),
         configuration: ReportConfig {
+            layer: config.layer,
+            measurement_scope: config.layer.scope(),
             profile: config.profile,
             workload: config.workload,
+            batch_size: config.batch_size,
+            logical_operations: config.operations,
             operations: config.operations,
             warmup_operations: config.warmup,
             concurrency: config.concurrency,
             keyspace: KEYSPACE,
             value_bytes: config.value_bytes,
             read_consistency: "local",
-            consensus: "in-process QuePaxa with three file-backed RecorderRpc voters",
-            durability: "RecorderFileStore local fsync plus local qlog/materializer",
+            consensus: config.layer.consensus(),
+            durability: config.layer.durability(),
         },
-        measurement: samples.metrics(elapsed),
+        measurement: samples.metrics(elapsed, qlog_entries),
         limitations: vec![
             "single process on one host",
             "excludes HTTP serialization and transport",
@@ -383,22 +500,7 @@ fn embedded_config(root: &std::path::Path, profile: Profile) -> Result<EmbeddedC
         Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
     let cluster_id = effective_cluster_id(execution_profile, "profile-bench")
         .map_err(|error| error.to_string())?;
-    let recorders = membership
-        .members()
-        .iter()
-        .map(|id| {
-            RecorderFileStore::new_with_membership(
-                root.join("recorders").join(id),
-                id.clone(),
-                &cluster_id,
-                1,
-                1,
-                membership.clone(),
-            )
-            .map(|recorder| (id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>))
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let recorders = recorders(root, &membership, &cluster_id)?;
     Ok(EmbeddedConfig::new(
         EmbeddedIdentity::new("profile-bench", "node-1", 1, 1),
         root.join("node"),
@@ -410,23 +512,116 @@ fn embedded_config(root: &std::path::Path, profile: Profile) -> Result<EmbeddedC
     ))
 }
 
-async fn setup(handle: &RhizaHandle, config: &Config) -> Result<(), String> {
+fn recorders(
+    root: &Path,
+    membership: &Membership,
+    cluster_id: &str,
+) -> Result<RecorderSet, String> {
+    membership
+        .members()
+        .iter()
+        .map(|id| {
+            RecorderFileStore::new_with_membership(
+                root.join("recorders").join(id),
+                id.clone(),
+                cluster_id,
+                1,
+                1,
+                membership.clone(),
+            )
+            .map(|recorder| (id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>))
+            .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn runtime(root: &Path, profile: Profile) -> Result<Arc<NodeRuntime>, String> {
+    let execution_profile = profile.execution_profile();
+    let membership =
+        Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
+    let node_config = NodeConfig::new_embedded(
+        "profile-bench",
+        "node-1",
+        root.join("node"),
+        1,
+        1,
+        membership.members().to_vec(),
+    )
+    .map_err(|error| error.to_string())?
+    .with_execution_profile(execution_profile)
+    .map_err(|error| error.to_string())?;
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            node_config.cluster_id().to_owned(),
+            "node-1",
+            1,
+            1,
+            recorders(root, &membership, node_config.cluster_id())?,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    if node_config.membership() != consensus.membership() {
+        return Err("runtime benchmark membership mismatch".into());
+    }
+    NodeRuntime::open(node_config, consensus, &[])
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone)]
+enum Target {
+    Handle(RhizaHandle),
+    Runtime(Arc<NodeRuntime>),
+}
+
+async fn measure_target(
+    target: Target,
+    config: &Config,
+) -> Result<(Samples, Duration, Option<u64>), String> {
+    setup(&target, config).await?;
+    if config.warmup > 0 {
+        let (warmup, _) = run_phase(target.clone(), config, config.warmup, "warmup").await;
+        if warmup.errors > 0 {
+            return Err(format!("warmup failed with {} errors", warmup.errors));
+        }
+    }
+    let qlog_before = match &target {
+        Target::Handle(_) => None,
+        Target::Runtime(runtime) => {
+            Some(runtime.applied_index().map_err(|error| error.to_string())?)
+        }
+    };
+    let measured = run_phase(target.clone(), config, config.operations, "measure").await;
+    let qlog_entries = match (&target, qlog_before) {
+        (Target::Runtime(runtime), Some(before)) => Some(
+            runtime
+                .applied_index()
+                .map_err(|error| error.to_string())?
+                .saturating_sub(before),
+        ),
+        _ => None,
+    };
+    Ok((measured.0, measured.1, qlog_entries))
+}
+
+async fn setup(target: &Target, config: &Config) -> Result<(), String> {
     if config.profile == Profile::Sql {
-        handle
-            .execute_sql(SqlCommand {
+        execute_sql(
+            target,
+            SqlCommand {
                 request_id: "profile-bench-schema".into(),
                 statements: vec![SqlStatement {
                     sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                         .into(),
                     parameters: vec![],
                 }],
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+            },
+        )
+        .await?;
     }
     for index in 0..KEYSPACE {
         write_one(
-            handle,
+            target,
             config.profile,
             index,
             &format!("setup-{index:016x}"),
@@ -438,6 +633,18 @@ async fn setup(handle: &RhizaHandle, config: &Config) -> Result<(), String> {
 }
 
 async fn run_phase(
+    target: Target,
+    config: &Config,
+    operations: u64,
+    phase: &'static str,
+) -> (Samples, Duration) {
+    match target {
+        Target::Handle(handle) => run_phase_handle(handle, config, operations, phase).await,
+        Target::Runtime(runtime) => run_phase_runtime(runtime, config, operations, phase).await,
+    }
+}
+
+async fn run_phase_handle(
     handle: RhizaHandle,
     config: &Config,
     operations: u64,
@@ -447,21 +654,34 @@ async fn run_phase(
     let start = Instant::now() + Duration::from_millis(20);
     let mut workers = Vec::with_capacity(config.concurrency);
     for _ in 0..config.concurrency {
-        let handle = handle.clone();
+        let target = Target::Handle(handle.clone());
         let counter = counter.clone();
         let config = config.clone();
         workers.push(tokio::spawn(async move {
             tokio::time::sleep_until(start.into()).await;
             let mut samples = Samples::default();
             loop {
-                let sequence = counter.fetch_add(1, Ordering::Relaxed);
+                let claim = if config.workload == Workload::Write {
+                    config.batch_size as u64
+                } else {
+                    1
+                };
+                let sequence = counter.fetch_add(claim, Ordering::Relaxed);
                 if sequence >= operations {
                     break;
                 }
-                let request_id = format!("{phase}-{sequence:016x}");
+                let count = claim.min(operations - sequence) as usize;
                 let began = Instant::now();
-                let result = operate(&handle, &config, sequence, &request_id).await;
-                samples.record(began.elapsed(), result);
+                let results = if config.workload == Workload::Write {
+                    write_batch(&target, &config, sequence, count, phase).await
+                } else {
+                    let request_id = format!("{phase}-{sequence:016x}");
+                    vec![operate(&target, &config, sequence, &request_id).await]
+                };
+                let elapsed = began.elapsed();
+                for result in results {
+                    samples.record(elapsed, result);
+                }
             }
             samples
         }));
@@ -481,8 +701,266 @@ async fn run_phase(
     (combined, start.elapsed())
 }
 
+async fn run_phase_runtime(
+    runtime: Arc<NodeRuntime>,
+    config: &Config,
+    operations: u64,
+    phase: &'static str,
+) -> (Samples, Duration) {
+    let counter = Arc::new(AtomicU64::new(0));
+    let start = Instant::now() + Duration::from_millis(20);
+    let mut workers = Vec::with_capacity(config.concurrency);
+    for _ in 0..config.concurrency {
+        let runtime = Arc::clone(&runtime);
+        let counter = Arc::clone(&counter);
+        let config = config.clone();
+        workers.push(tokio::task::spawn_blocking(move || {
+            std::thread::sleep(start.saturating_duration_since(Instant::now()));
+            let mut samples = Samples::default();
+            loop {
+                let claim = if config.workload == Workload::Write {
+                    config.batch_size as u64
+                } else {
+                    1
+                };
+                let sequence = counter.fetch_add(claim, Ordering::Relaxed);
+                if sequence >= operations {
+                    break;
+                }
+                let count = claim.min(operations - sequence) as usize;
+                let began = Instant::now();
+                let results = if config.workload == Workload::Write {
+                    write_batch_runtime(&runtime, &config, sequence, count, phase)
+                } else {
+                    let request_id = format!("{phase}-{sequence:016x}");
+                    vec![operate_runtime(&runtime, &config, sequence, &request_id)]
+                };
+                let elapsed = began.elapsed();
+                for result in results {
+                    samples.record(elapsed, result);
+                }
+            }
+            samples
+        }));
+    }
+    let mut combined = Samples::default();
+    for worker in workers {
+        match worker.await {
+            Ok(samples) => combined.merge(samples),
+            Err(error) => {
+                combined.errors += 1;
+                combined
+                    .error_classes
+                    .insert(format!("runtime worker join: {error}"), 1);
+            }
+        }
+    }
+    (combined, start.elapsed())
+}
+
+fn operate_runtime(
+    runtime: &NodeRuntime,
+    config: &Config,
+    sequence: u64,
+    request_id: &str,
+) -> Result<(), String> {
+    let key_index = sequence % KEYSPACE;
+    match config.workload {
+        Workload::Write => write_one_runtime(
+            runtime,
+            config.profile,
+            key_index,
+            request_id,
+            config.value_bytes,
+        ),
+        Workload::Get => get_one_runtime(runtime, config.profile, key_index),
+        Workload::DocumentGet => get_graph_document_runtime(runtime, config.profile, key_index),
+        Workload::NativeRead => native_read_runtime(runtime, config.profile),
+    }
+}
+
+fn write_one_runtime(
+    runtime: &NodeRuntime,
+    profile: Profile,
+    key_index: u64,
+    request_id: &str,
+    value_bytes: usize,
+) -> Result<(), String> {
+    let key = key(key_index);
+    let value = value(key_index, request_id, value_bytes);
+    match profile {
+        Profile::Sql => runtime
+            .execute_sql(SqlCommand {
+                request_id: request_id.into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
+                          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                        .into(),
+                    parameters: vec![SqlValue::Text(key), SqlValue::Text(value)],
+                }],
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Profile::Graph => runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(request_id, key, GraphValueV1::String(value))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Profile::Kv => runtime
+            .mutate_kv(
+                KvCommandV1::put(request_id, key.into_bytes(), value.into_bytes())
+                    .map_err(|error| error.to_string())?,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn write_batch_runtime(
+    runtime: &NodeRuntime,
+    config: &Config,
+    first_sequence: u64,
+    count: usize,
+    phase: &str,
+) -> Vec<Result<(), String>> {
+    match config.profile {
+        Profile::Sql => logical_batch_results(
+            count,
+            runtime.execute_sql_batch(
+                (0..count)
+                    .map(|offset| {
+                        sql_write_command(first_sequence + offset as u64, phase, config.value_bytes)
+                    })
+                    .collect(),
+            ),
+        ),
+        Profile::Graph => match (0..count)
+            .map(|offset| {
+                graph_write_command(first_sequence + offset as u64, phase, config.value_bytes)
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(commands) => logical_batch_results(count, runtime.mutate_graph_batch(commands)),
+            Err(error) => repeated_batch_error(count, error),
+        },
+        Profile::Kv => match (0..count)
+            .map(|offset| {
+                kv_write_command(first_sequence + offset as u64, phase, config.value_bytes)
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(commands) => logical_batch_results(count, runtime.mutate_kv_batch(commands)),
+            Err(error) => repeated_batch_error(count, error),
+        },
+    }
+}
+
+fn get_one_runtime(runtime: &NodeRuntime, profile: Profile, key_index: u64) -> Result<(), String> {
+    let key = key(key_index);
+    let present = match profile {
+        Profile::Sql => {
+            runtime
+                .query_sql(
+                    &SqlStatement {
+                        sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
+                        parameters: vec![SqlValue::Text(key)],
+                    },
+                    ReadConsistency::Local,
+                    1,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len()
+                == 1
+        }
+        Profile::Graph => {
+            runtime
+                .query_graph(
+                    "MATCH (d:RhizaDocument) WHERE d.id = $id \
+                 RETURN d.string_value AS value LIMIT 1",
+                    &BTreeMap::from([("id".into(), GraphParameterValue::String(key))]),
+                    ReadConsistency::Local,
+                    1,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len()
+                == 1
+        }
+        Profile::Kv => runtime
+            .get_kv(key.as_bytes(), ReadConsistency::Local)
+            .map_err(|error| error.to_string())?
+            .value
+            .is_some(),
+    };
+    if present {
+        Ok(())
+    } else {
+        Err("runtime get returned no row".into())
+    }
+}
+
+fn get_graph_document_runtime(
+    runtime: &NodeRuntime,
+    profile: Profile,
+    key_index: u64,
+) -> Result<(), String> {
+    if profile != Profile::Graph {
+        return Err("document get requires graph profile".into());
+    }
+    if runtime
+        .get_graph_document(&key(key_index), ReadConsistency::Local)
+        .map_err(|error| error.to_string())?
+        .value
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err("runtime document get returned no value".into())
+    }
+}
+
+fn native_read_runtime(runtime: &NodeRuntime, profile: Profile) -> Result<(), String> {
+    let rows = match profile {
+        Profile::Sql => runtime
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
+                    parameters: vec![],
+                },
+                ReadConsistency::Local,
+                16,
+            )
+            .map_err(|error| error.to_string())?
+            .rows
+            .len(),
+        Profile::Graph => runtime
+            .query_graph(
+                "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
+                &BTreeMap::new(),
+                ReadConsistency::Local,
+                16,
+            )
+            .map_err(|error| error.to_string())?
+            .rows
+            .len(),
+        Profile::Kv => runtime
+            .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
+            .map_err(|error| error.to_string())?
+            .rows()
+            .len(),
+    };
+    if rows == 0 {
+        Err("runtime native read returned no rows".into())
+    } else {
+        Ok(())
+    }
+}
+
 async fn operate(
-    handle: &RhizaHandle,
+    target: &Target,
     config: &Config,
     sequence: u64,
     request_id: &str,
@@ -491,7 +969,7 @@ async fn operate(
     match config.workload {
         Workload::Write => {
             write_one(
-                handle,
+                target,
                 config.profile,
                 key_index,
                 request_id,
@@ -499,13 +977,14 @@ async fn operate(
             )
             .await
         }
-        Workload::Get => get_one(handle, config.profile, key_index).await,
-        Workload::NativeRead => native_read(handle, config.profile).await,
+        Workload::Get => get_one(target, config.profile, key_index).await,
+        Workload::DocumentGet => get_graph_document(target, config.profile, key_index).await,
+        Workload::NativeRead => native_read(target, config.profile).await,
     }
 }
 
 async fn write_one(
-    handle: &RhizaHandle,
+    target: &Target,
     profile: Profile,
     key_index: u64,
     request_id: &str,
@@ -515,8 +994,9 @@ async fn write_one(
     let value = value(key_index, request_id, value_bytes);
     match profile {
         Profile::Sql => {
-            handle
-                .execute_sql(SqlCommand {
+            execute_sql(
+                target,
+                SqlCommand {
                     request_id: request_id.into(),
                     statements: vec![SqlStatement {
                         sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
@@ -524,69 +1004,284 @@ async fn write_one(
                             .into(),
                         parameters: vec![SqlValue::Text(key), SqlValue::Text(value)],
                     }],
-                })
-                .await
-                .map_err(|error| error.to_string())?;
+                },
+            )
+            .await?;
         }
         Profile::Graph => {
             let command =
                 GraphCommandV1::put_document(request_id, key, GraphValueV1::String(value))
                     .map_err(|error| error.to_string())?;
-            handle
-                .mutate_graph(command)
-                .await
-                .map_err(|error| error.to_string())?;
+            match target {
+                Target::Handle(handle) => {
+                    handle
+                        .mutate_graph(command)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime.mutate_graph(command).map(|_| ())
+                    })
+                    .await?;
+                }
+            }
         }
-        Profile::Kv => {
-            handle
-                .put_kv(request_id, key.into_bytes(), value.into_bytes())
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        Profile::Kv => match target {
+            Target::Handle(handle) => {
+                handle
+                    .put_kv(request_id, key.into_bytes(), value.into_bytes())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Target::Runtime(runtime) => {
+                let command = KvCommandV1::put(request_id, key.into_bytes(), value.into_bytes())
+                    .map_err(|error| error.to_string())?;
+                runtime_call(runtime, move |runtime| {
+                    runtime.mutate_kv(command).map(|_| ())
+                })
+                .await?;
+            }
+        },
     }
     Ok(())
 }
 
-async fn get_one(handle: &RhizaHandle, profile: Profile, key_index: u64) -> Result<(), String> {
+async fn write_batch(
+    target: &Target,
+    config: &Config,
+    first_sequence: u64,
+    count: usize,
+    phase: &'static str,
+) -> Vec<Result<(), String>> {
+    match (target, config.profile) {
+        (Target::Handle(handle), Profile::Sql) => logical_batch_results(
+            count,
+            handle
+                .execute_sql_batch(
+                    (0..count)
+                        .map(|offset| {
+                            sql_write_command(
+                                first_sequence + offset as u64,
+                                phase,
+                                config.value_bytes,
+                            )
+                        })
+                        .collect(),
+                )
+                .await,
+        ),
+        (Target::Handle(handle), Profile::Graph) => {
+            let commands = (0..count)
+                .map(|offset| {
+                    graph_write_command(first_sequence + offset as u64, phase, config.value_bytes)
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match commands {
+                Ok(commands) => {
+                    logical_batch_results(count, handle.mutate_graph_batch(commands).await)
+                }
+                Err(error) => repeated_batch_error(count, error),
+            }
+        }
+        (Target::Handle(handle), Profile::Kv) => {
+            let commands = (0..count)
+                .map(|offset| {
+                    kv_write_command(first_sequence + offset as u64, phase, config.value_bytes)
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match commands {
+                Ok(commands) => {
+                    logical_batch_results(count, handle.mutate_kv_batch(commands).await)
+                }
+                Err(error) => repeated_batch_error(count, error),
+            }
+        }
+        (Target::Runtime(runtime), _) => {
+            let runtime = Arc::clone(runtime);
+            let config = config.clone();
+            match tokio::task::spawn_blocking(move || {
+                write_batch_runtime(&runtime, &config, first_sequence, count, phase)
+            })
+            .await
+            {
+                Ok(results) => results,
+                Err(error) => repeated_batch_error(count, format!("runtime worker join: {error}")),
+            }
+        }
+    }
+}
+
+fn sql_write_command(sequence: u64, phase: &str, value_bytes: usize) -> SqlCommand {
+    let request_id = format!("{phase}-{sequence:016x}");
+    let key = key(sequence % KEYSPACE);
+    let value = value(sequence % KEYSPACE, &request_id, value_bytes);
+    SqlCommand {
+        request_id,
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                .into(),
+            parameters: vec![SqlValue::Text(key), SqlValue::Text(value)],
+        }],
+    }
+}
+
+fn graph_write_command(
+    sequence: u64,
+    phase: &str,
+    value_bytes: usize,
+) -> Result<GraphCommandV1, String> {
+    let request_id = format!("{phase}-{sequence:016x}");
+    let key_index = sequence % KEYSPACE;
+    GraphCommandV1::put_document(
+        request_id.clone(),
+        key(key_index),
+        GraphValueV1::String(value(key_index, &request_id, value_bytes)),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn kv_write_command(sequence: u64, phase: &str, value_bytes: usize) -> Result<KvCommandV1, String> {
+    let request_id = format!("{phase}-{sequence:016x}");
+    let key_index = sequence % KEYSPACE;
+    KvCommandV1::put(
+        request_id.clone(),
+        key(key_index).into_bytes(),
+        value(key_index, &request_id, value_bytes).into_bytes(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn logical_batch_results<T, ItemError, BatchError>(
+    count: usize,
+    result: Result<Vec<Result<T, ItemError>>, BatchError>,
+) -> Vec<Result<(), String>>
+where
+    ItemError: ToString,
+    BatchError: ToString,
+{
+    match result {
+        Ok(results) if results.len() == count => results
+            .into_iter()
+            .map(|result| result.map(|_| ()).map_err(|error| error.to_string()))
+            .collect(),
+        Ok(results) => repeated_batch_error(
+            count,
+            format!(
+                "batch returned {} results for {count} operations",
+                results.len()
+            ),
+        ),
+        Err(error) => repeated_batch_error(count, error.to_string()),
+    }
+}
+
+fn repeated_batch_error(count: usize, error: impl Into<String>) -> Vec<Result<(), String>> {
+    let error = error.into();
+    (0..count).map(|_| Err(error.clone())).collect()
+}
+
+async fn execute_sql(target: &Target, command: SqlCommand) -> Result<(), String> {
+    match target {
+        Target::Handle(handle) => handle
+            .execute_sql(command)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Target::Runtime(runtime) => {
+            runtime_call(runtime, move |runtime| {
+                runtime.execute_sql(command).map(|_| ())
+            })
+            .await
+        }
+    }
+}
+
+async fn runtime_call<T, E, F>(runtime: &Arc<NodeRuntime>, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    E: ToString + Send + 'static,
+    F: FnOnce(Arc<NodeRuntime>) -> Result<T, E> + Send + 'static,
+{
+    let runtime = Arc::clone(runtime);
+    tokio::task::spawn_blocking(move || operation(runtime))
+        .await
+        .map_err(|error| format!("runtime worker join: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<(), String> {
     let key = key(key_index);
     match profile {
         Profile::Sql => {
-            let result = handle
-                .query(
-                    SqlStatement {
-                        sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
-                        parameters: vec![SqlValue::Text(key)],
-                    },
-                    ReadConsistency::Local,
-                    1,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            if result.rows.len() != 1 {
+            let statement = SqlStatement {
+                sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
+                parameters: vec![SqlValue::Text(key)],
+            };
+            let rows = match target {
+                Target::Handle(handle) => handle
+                    .query(statement, ReadConsistency::Local, 1)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .rows
+                    .len(),
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime
+                            .query_sql(&statement, ReadConsistency::Local, 1)
+                            .map(|result| result.rows.len())
+                    })
+                    .await?
+                }
+            };
+            if rows != 1 {
                 return Err("sql get returned no row".into());
             }
         }
         Profile::Graph => {
-            let result = handle
-                .query_graph(
-                    "MATCH (d:RhizaDocument) WHERE d.id = $id \
-                     RETURN d.string_value AS value LIMIT 1",
-                    BTreeMap::from([("id".into(), GraphParameterValue::String(key))]),
-                    ReadConsistency::Local,
-                    1,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            if result.rows.len() != 1 {
+            let statement = "MATCH (d:RhizaDocument) WHERE d.id = $id \
+                             RETURN d.string_value AS value LIMIT 1";
+            let parameters = BTreeMap::from([("id".into(), GraphParameterValue::String(key))]);
+            let rows = match target {
+                Target::Handle(handle) => handle
+                    .query_graph(statement, parameters, ReadConsistency::Local, 1)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .rows
+                    .len(),
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime
+                            .query_graph(statement, &parameters, ReadConsistency::Local, 1)
+                            .map(|result| result.rows.len())
+                    })
+                    .await?
+                }
+            };
+            if rows != 1 {
                 return Err("graph get returned no row".into());
             }
         }
         Profile::Kv => {
-            let result = handle
-                .get_kv(key.as_bytes(), ReadConsistency::Local)
-                .await
-                .map_err(|error| error.to_string())?;
-            if result.value.is_none() {
+            let present = match target {
+                Target::Handle(handle) => handle
+                    .get_kv(key.as_bytes(), ReadConsistency::Local)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .value
+                    .is_some(),
+                Target::Runtime(runtime) => {
+                    let key = key.into_bytes();
+                    runtime_call(runtime, move |runtime| {
+                        runtime
+                            .get_kv(&key, ReadConsistency::Local)
+                            .map(|result| result.value.is_some())
+                    })
+                    .await?
+                }
+            };
+            if !present {
                 return Err("kv get returned no value".into());
             }
         }
@@ -594,44 +1289,464 @@ async fn get_one(handle: &RhizaHandle, profile: Profile, key_index: u64) -> Resu
     Ok(())
 }
 
-async fn native_read(handle: &RhizaHandle, profile: Profile) -> Result<(), String> {
+async fn get_graph_document(
+    target: &Target,
+    profile: Profile,
+    key_index: u64,
+) -> Result<(), String> {
+    if profile != Profile::Graph {
+        return Err("document get requires graph profile".into());
+    }
+    let id = key(key_index);
+    let present = match target {
+        Target::Handle(handle) => handle
+            .get_graph_document(id, ReadConsistency::Local)
+            .await
+            .map_err(|error| error.to_string())?
+            .value
+            .is_some(),
+        Target::Runtime(runtime) => {
+            runtime_call(runtime, move |runtime| {
+                runtime
+                    .get_graph_document(&id, ReadConsistency::Local)
+                    .map(|result| result.value.is_some())
+            })
+            .await?
+        }
+    };
+    if present {
+        Ok(())
+    } else {
+        Err("document get returned no value".into())
+    }
+}
+
+async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
     let rows = match profile {
-        Profile::Sql => handle
-            .query(
-                SqlStatement {
-                    sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
-                    parameters: vec![],
-                },
-                ReadConsistency::Local,
-                16,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .rows
-            .len(),
-        Profile::Graph => handle
-            .query_graph(
-                "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
-                BTreeMap::new(),
-                ReadConsistency::Local,
-                16,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .rows
-            .len(),
-        Profile::Kv => handle
-            .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
-            .await
-            .map_err(|error| error.to_string())?
-            .rows()
-            .len(),
+        Profile::Sql => {
+            let statement = SqlStatement {
+                sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
+                parameters: vec![],
+            };
+            match target {
+                Target::Handle(handle) => handle
+                    .query(statement, ReadConsistency::Local, 16)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .rows
+                    .len(),
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime
+                            .query_sql(&statement, ReadConsistency::Local, 16)
+                            .map(|result| result.rows.len())
+                    })
+                    .await?
+                }
+            }
+        }
+        Profile::Graph => {
+            let statement = "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16";
+            let parameters = BTreeMap::new();
+            match target {
+                Target::Handle(handle) => handle
+                    .query_graph(statement, parameters, ReadConsistency::Local, 16)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .rows
+                    .len(),
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime
+                            .query_graph(statement, &parameters, ReadConsistency::Local, 16)
+                            .map(|result| result.rows.len())
+                    })
+                    .await?
+                }
+            }
+        }
+        Profile::Kv => match target {
+            Target::Handle(handle) => handle
+                .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
+                .await
+                .map_err(|error| error.to_string())?
+                .rows()
+                .len(),
+            Target::Runtime(runtime) => {
+                runtime_call(runtime, move |runtime| {
+                    runtime
+                        .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
+                        .map(|result| result.rows().len())
+                })
+                .await?
+            }
+        },
     };
     if rows == 0 {
         Err("native read returned no rows".into())
     } else {
         Ok(())
     }
+}
+
+enum RawState {
+    Sql(SqliteStateMachine),
+    Graph(LadybugStateMachine),
+    Kv(RedbStateMachine),
+}
+
+struct RawTarget {
+    cluster_id: String,
+    next_index: u64,
+    previous_hash: LogHash,
+    state: RawState,
+}
+
+impl RawTarget {
+    fn open(root: &Path, profile: Profile) -> Result<Self, String> {
+        let cluster_id = effective_cluster_id(profile.execution_profile(), "profile-bench")
+            .map_err(|error| error.to_string())?;
+        let state = match profile {
+            Profile::Sql => {
+                SqliteStateMachine::open(root.join("raw/sql.db"), &cluster_id, "node-1", 1, 1)
+                    .map(RawState::Sql)
+                    .map_err(|error| error.to_string())?
+            }
+            Profile::Graph => {
+                LadybugStateMachine::open(root.join("raw/graph.lbug"), &cluster_id, "node-1", 1, 1)
+                    .map(RawState::Graph)
+                    .map_err(|error| error.to_string())?
+            }
+            Profile::Kv => {
+                RedbStateMachine::open(root.join("raw/kv.redb"), &cluster_id, "node-1", 1, 1)
+                    .map(RawState::Kv)
+                    .map_err(|error| error.to_string())?
+            }
+        };
+        Ok(Self {
+            cluster_id,
+            next_index: 1,
+            previous_hash: LogHash::ZERO,
+            state,
+        })
+    }
+
+    fn apply(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        let hash = LogEntry::calculate_hash(
+            &self.cluster_id,
+            self.next_index,
+            1,
+            1,
+            EntryType::Command,
+            self.previous_hash,
+            &payload,
+        );
+        let entry = LogEntry {
+            cluster_id: self.cluster_id.clone(),
+            epoch: 1,
+            config_id: 1,
+            index: self.next_index,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: self.previous_hash,
+            hash,
+        };
+        match &self.state {
+            RawState::Sql(state) => state
+                .apply_entry(&entry)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            RawState::Graph(state) => state
+                .apply_entry(&entry)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            RawState::Kv(state) => state
+                .apply_entry(&entry)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        }?;
+        self.next_index += 1;
+        self.previous_hash = hash;
+        Ok(())
+    }
+
+    fn write_one(
+        &mut self,
+        profile: Profile,
+        key_index: u64,
+        request_id: &str,
+        value_bytes: usize,
+    ) -> Result<(), String> {
+        let key = key(key_index);
+        let value = value(key_index, request_id, value_bytes);
+        let payload = match profile {
+            Profile::Sql => encode_sql_command(&SqlCommand {
+                request_id: request_id.into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
+                          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                        .into(),
+                    parameters: vec![SqlValue::Text(key), SqlValue::Text(value)],
+                }],
+            })
+            .map_err(|error| error.to_string())?,
+            Profile::Graph => encode_replicated_graph_command(
+                &GraphCommandV1::put_document(request_id, key, GraphValueV1::String(value))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+            Profile::Kv => encode_replicated_kv_command(
+                &KvCommandV1::put(request_id, key.into_bytes(), value.into_bytes())
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+        };
+        self.apply(payload)
+    }
+
+    fn operate(&mut self, config: &Config, sequence: u64, request_id: &str) -> Result<(), String> {
+        let key_index = sequence % KEYSPACE;
+        match config.workload {
+            Workload::Write => {
+                self.write_one(config.profile, key_index, request_id, config.value_bytes)
+            }
+            Workload::Get => self.get_one(config.profile, key_index),
+            Workload::DocumentGet => self.get_graph_document(config.profile, key_index),
+            Workload::NativeRead => self.native_read(config.profile),
+        }
+    }
+
+    fn get_one(&self, profile: Profile, key_index: u64) -> Result<(), String> {
+        let key = key(key_index);
+        let rows = match (&self.state, profile) {
+            (RawState::Sql(state), Profile::Sql) => state
+                .query_sql(
+                    &SqlStatement {
+                        sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
+                        parameters: vec![SqlValue::Text(key)],
+                    },
+                    1,
+                    RAW_RESULT_BYTES,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len(),
+            (RawState::Graph(state), Profile::Graph) => state
+                .query_read_only(
+                    "MATCH (d:RhizaDocument) WHERE d.id = $id \
+                     RETURN d.string_value AS value LIMIT 1",
+                    &BTreeMap::from([("id".into(), GraphParameterValue::String(key))]),
+                    1,
+                    RAW_RESULT_BYTES,
+                    RAW_GRAPH_TIMEOUT_MS,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len(),
+            (RawState::Kv(state), Profile::Kv) => usize::from(
+                state
+                    .get_with_tip(key.as_bytes())
+                    .map_err(|error| error.to_string())?
+                    .value()
+                    .is_some(),
+            ),
+            _ => return Err("raw benchmark profile/state mismatch".into()),
+        };
+        if rows == 1 {
+            Ok(())
+        } else {
+            Err("raw get returned no row".into())
+        }
+    }
+
+    fn get_graph_document(&self, profile: Profile, key_index: u64) -> Result<(), String> {
+        if profile != Profile::Graph {
+            return Err("document get requires graph profile".into());
+        }
+        let RawState::Graph(state) = &self.state else {
+            return Err("raw benchmark profile/state mismatch".into());
+        };
+        if state
+            .get_document_with_tip(&key(key_index))
+            .map_err(|error| error.to_string())?
+            .0
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err("raw document get returned no value".into())
+        }
+    }
+
+    fn native_read(&self, profile: Profile) -> Result<(), String> {
+        let rows = match (&self.state, profile) {
+            (RawState::Sql(state), Profile::Sql) => state
+                .query_sql(
+                    &SqlStatement {
+                        sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
+                        parameters: vec![],
+                    },
+                    16,
+                    RAW_RESULT_BYTES,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len(),
+            (RawState::Graph(state), Profile::Graph) => state
+                .query_read_only(
+                    "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
+                    &BTreeMap::new(),
+                    16,
+                    RAW_RESULT_BYTES,
+                    RAW_GRAPH_TIMEOUT_MS,
+                )
+                .map_err(|error| error.to_string())?
+                .rows
+                .len(),
+            (RawState::Kv(state), Profile::Kv) => state
+                .scan_prefix(b"bench-key-", 16, None)
+                .map_err(|error| error.to_string())?
+                .rows()
+                .len(),
+            _ => return Err("raw benchmark profile/state mismatch".into()),
+        };
+        if rows == 0 {
+            Err("raw native read returned no rows".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn measure_raw(mut target: RawTarget, config: &Config) -> Result<(Samples, Duration), String> {
+    if config.profile == Profile::Sql {
+        let payload = encode_sql_command(&SqlCommand {
+            request_id: "profile-bench-schema".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        })
+        .map_err(|error| error.to_string())?;
+        target.apply(payload)?;
+    }
+    for index in 0..KEYSPACE {
+        target.write_one(
+            config.profile,
+            index,
+            &format!("setup-{index:016x}"),
+            config.value_bytes,
+        )?;
+    }
+    if config.warmup > 0 {
+        let (warmup, _) = run_phase_raw(&mut target, config, config.warmup, "warmup");
+        if warmup.errors > 0 {
+            return Err(format!("warmup failed with {} errors", warmup.errors));
+        }
+    }
+    Ok(run_phase_raw(
+        &mut target,
+        config,
+        config.operations,
+        "measure",
+    ))
+}
+
+fn run_phase_raw(
+    target: &mut RawTarget,
+    config: &Config,
+    operations: u64,
+    phase: &'static str,
+) -> (Samples, Duration) {
+    let start = Instant::now();
+    let mut samples = Samples::default();
+    for sequence in 0..operations {
+        let request_id = format!("{phase}-{sequence:016x}");
+        let began = Instant::now();
+        let result = target.operate(config, sequence, &request_id);
+        samples.record(began.elapsed(), result);
+    }
+    (samples, start.elapsed())
+}
+
+struct ConsensusTarget {
+    consensus: ThreeNodeConsensus,
+    next_index: u64,
+    previous_hash: LogHash,
+}
+
+impl ConsensusTarget {
+    fn open(root: &Path) -> Result<Self, String> {
+        let cluster_id = "profile-bench-consensus";
+        let membership =
+            Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            cluster_id,
+            "node-1",
+            1,
+            1,
+            recorders(root, &membership, cluster_id)?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            consensus,
+            next_index: 1,
+            previous_hash: LogHash::ZERO,
+        })
+    }
+
+    fn write(&mut self, sequence: u64, request_id: &str, bytes: usize) -> Result<(), String> {
+        let payload = value(sequence, request_id, bytes).into_bytes();
+        let entry = self
+            .consensus
+            .propose_at(
+                self.next_index,
+                self.previous_hash,
+                ConsensusCommand::new(CommandKind::Deterministic, payload),
+            )
+            .map_err(|error| error.to_string())?;
+        self.next_index = entry
+            .index
+            .checked_add(1)
+            .ok_or_else(|| "consensus benchmark index exhausted".to_string())?;
+        self.previous_hash = entry.hash;
+        Ok(())
+    }
+}
+
+fn measure_consensus(
+    mut target: ConsensusTarget,
+    config: &Config,
+) -> Result<(Samples, Duration), String> {
+    if config.warmup > 0 {
+        let (warmup, _) = run_phase_consensus(&mut target, config, config.warmup, "warmup");
+        if warmup.errors > 0 {
+            return Err(format!("warmup failed with {} errors", warmup.errors));
+        }
+    }
+    Ok(run_phase_consensus(
+        &mut target,
+        config,
+        config.operations,
+        "measure",
+    ))
+}
+
+fn run_phase_consensus(
+    target: &mut ConsensusTarget,
+    config: &Config,
+    operations: u64,
+    phase: &'static str,
+) -> (Samples, Duration) {
+    let start = Instant::now();
+    let mut samples = Samples::default();
+    for sequence in 0..operations {
+        let request_id = format!("{phase}-{sequence:016x}");
+        let began = Instant::now();
+        let result = target.write(sequence, &request_id, config.value_bytes);
+        samples.record(began.elapsed(), result);
+    }
+    (samples, start.elapsed())
 }
 
 fn key(index: u64) -> String {
@@ -720,14 +1835,117 @@ mod tests {
         assert_eq!(
             config,
             Config {
+                layer: Layer::Handle,
                 profile: Profile::Graph,
                 workload: Workload::NativeRead,
+                batch_size: 1,
                 operations: 20,
                 warmup: 0,
                 concurrency: 4,
                 value_bytes: 64,
             }
         );
+    }
+
+    #[test]
+    fn config_selects_runtime_and_rejects_concurrent_raw_measurement() {
+        let runtime = Config::parse(
+            ["--profile", "kv", "--workload", "get", "--layer", "runtime"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(runtime.layer, Layer::Runtime);
+
+        assert!(Config::parse(
+            [
+                "--profile",
+                "kv",
+                "--workload",
+                "get",
+                "--layer",
+                "raw",
+                "--concurrency",
+                "2",
+            ]
+            .map(str::to_owned),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn consensus_layer_accepts_only_single_worker_writes() {
+        let consensus = Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "consensus",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(consensus.layer, Layer::Consensus);
+
+        for invalid in [
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "get",
+                "--layer",
+                "consensus",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "consensus",
+                "--concurrency",
+                "2",
+            ],
+        ] {
+            assert!(Config::parse(invalid.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn document_get_accepts_only_graph_profile() {
+        for layer in ["handle", "runtime", "raw"] {
+            let config = Config::parse(
+                [
+                    "--profile",
+                    "graph",
+                    "--workload",
+                    "document-get",
+                    "--layer",
+                    layer,
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(config.workload, Workload::DocumentGet);
+        }
+
+        for profile in ["sql", "kv"] {
+            assert!(Config::parse(
+                ["--profile", profile, "--workload", "document-get"].map(str::to_owned)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn raw_document_get_reads_seeded_graph_document() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = RawTarget::open(root.path(), Profile::Graph).unwrap();
+        target
+            .write_one(Profile::Graph, 7, "setup-graph-document", 64)
+            .unwrap();
+
+        target.get_graph_document(Profile::Graph, 7).unwrap();
     }
 
     #[test]
@@ -751,6 +1969,48 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_size_accepts_powers_of_two_and_rejects_other_workloads() {
+        for batch_size in [1, 2, 4, 8, 16, 32, 64] {
+            let config = Config::parse(
+                [
+                    "--profile",
+                    "kv",
+                    "--workload",
+                    "write",
+                    "--batch-size",
+                    &batch_size.to_string(),
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(config.batch_size, batch_size);
+        }
+        for args in [
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--batch-size",
+                "3",
+            ],
+            vec!["--profile", "sql", "--workload", "get", "--batch-size", "2"],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "raw",
+                "--batch-size",
+                "2",
+            ],
+        ] {
+            assert!(Config::parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn percentiles_use_nearest_rank_and_merge_worker_histograms() {
         let mut left = Samples::default();
         left.record(Duration::from_micros(10), Ok(()));
@@ -766,7 +2026,8 @@ mod tests {
         assert_eq!(left.percentile(500), Some(20));
         assert_eq!(left.percentile(950), Some(40));
         assert_eq!(
-            left.metrics(Duration::from_secs(2)).operations_per_second,
+            left.metrics(Duration::from_secs(2), None)
+                .operations_per_second,
             2.0
         );
     }

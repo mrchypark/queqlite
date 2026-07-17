@@ -1117,6 +1117,31 @@ impl SqliteStateMachine {
         meta_hash(&self.conn, MetaKey::AppliedHash)
     }
 
+    pub fn applied_tip_value(&self) -> Result<(LogIndex, LogHash)> {
+        let (applied_index, applied_hash) = self
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT value FROM __rhiza_meta WHERE key = ?1),
+                    (SELECT value FROM __rhiza_meta WHERE key = ?2)",
+                params![
+                    MetaKey::AppliedIndex.as_str(),
+                    MetaKey::AppliedHash.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .map_err(sqlite_error)?;
+        Ok((
+            decode_meta_u64(MetaKey::AppliedIndex, applied_index)?,
+            decode_meta_hash(MetaKey::AppliedHash, applied_hash)?,
+        ))
+    }
+
     pub fn configuration_state_value(&self) -> Result<ConfigurationState> {
         meta_configuration_state(&self.conn)
     }
@@ -2980,20 +3005,31 @@ fn read_state_hash(bytes: &[u8], offset: usize) -> Result<LogHash> {
 }
 
 fn meta_string(conn: &Connection, key: MetaKey) -> Result<String> {
-    let value = get_meta(conn, key)?
-        .ok_or_else(|| Error::Sqlite(format!("missing meta key {}", key.as_str())))?;
+    decode_meta_string(key, get_meta(conn, key)?)
+}
+
+fn decode_meta_string(key: MetaKey, value: Option<Vec<u8>>) -> Result<String> {
+    let value = value.ok_or_else(|| Error::Sqlite(format!("missing meta key {}", key.as_str())))?;
     String::from_utf8(value)
         .map_err(|err| Error::Sqlite(format!("invalid {} utf8: {err}", key.as_str())))
 }
 
 fn meta_u64(conn: &Connection, key: MetaKey) -> Result<u64> {
-    meta_string(conn, key)?
+    decode_meta_u64(key, get_meta(conn, key)?)
+}
+
+fn decode_meta_u64(key: MetaKey, value: Option<Vec<u8>>) -> Result<u64> {
+    decode_meta_string(key, value)?
         .parse()
         .map_err(|err| Error::Sqlite(format!("invalid {} integer value: {err}", key.as_str())))
 }
 
 fn meta_hash(conn: &Connection, key: MetaKey) -> Result<LogHash> {
-    let value = meta_string(conn, key)?;
+    decode_meta_hash(key, get_meta(conn, key)?)
+}
+
+fn decode_meta_hash(key: MetaKey, value: Option<Vec<u8>>) -> Result<LogHash> {
+    let value = decode_meta_string(key, value)?;
     LogHash::from_hex(&value)
         .ok_or_else(|| Error::Sqlite(format!("invalid {} hash value", key.as_str())))
 }
@@ -3037,6 +3073,38 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod query_policy_tests {
     use super::*;
+
+    #[test]
+    fn applied_tip_returns_index_and_hash_from_the_same_database_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let database =
+            SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+                .unwrap();
+        let payload = b"put\trequest-1\tkey-1\tvalue-1";
+        let hash = LogEntry::calculate_hash(
+            "cluster-a",
+            1,
+            1,
+            1,
+            EntryType::Command,
+            LogHash::ZERO,
+            payload,
+        );
+        database
+            .apply_entry(&LogEntry {
+                cluster_id: "cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                index: 1,
+                entry_type: EntryType::Command,
+                payload: payload.to_vec(),
+                prev_hash: LogHash::ZERO,
+                hash,
+            })
+            .unwrap();
+
+        assert_eq!(database.applied_tip_value().unwrap(), (1, hash));
+    }
 
     #[test]
     fn read_query_timeout_interrupts_work_and_releases_the_connection() {

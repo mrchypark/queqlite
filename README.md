@@ -51,8 +51,38 @@ One cluster runs exactly one profile. `RHIZA_CLUSTER_ID` is the logical name;
 the runtime binds consensus and checkpoint identity to the selected profile so
 SQL, graph, and KV nodes cannot accidentally join one another.
 
-The production Docker image is built with all workspace features. The same
-image serves any profile selected by `RHIZA_EXECUTION_PROFILE`.
+The supported container image variants are built from the same `rhiza` binary
+with different Cargo feature sets:
+
+| Artifact | Docker build argument | Cargo feature selection |
+| --- | --- | --- |
+| `rhiza-sql` | `RHIZA_PROFILE=sql` | `--no-default-features --features sql` |
+| `rhiza-graph` | `RHIZA_PROFILE=graph` | `--no-default-features --features graph` |
+| `rhiza-kv` | `RHIZA_PROFILE=kv` | `--no-default-features --features kv` |
+| `rhiza-all` | `RHIZA_PROFILE=all` | `--all-features` |
+
+`rhiza-sql`, `rhiza-graph`, and `rhiza-kv` are the default release and
+deployment matrix. `rhiza-all` is a convenience artifact for environments
+that deliberately need one combined image; it does not change the one-profile
+per-cluster contract or remove the explicit `RHIZA_EXECUTION_PROFILE`
+requirement.
+
+CI builds and validates all four variants without registry credentials. Image
+publication and registry tags remain a separate release operation.
+
+One parameterized Dockerfile builds all four artifacts:
+
+```bash
+docker build --build-arg RHIZA_PROFILE=sql -t rhiza-sql:dev .
+docker build --build-arg RHIZA_PROFILE=graph -t rhiza-graph:dev .
+docker build --build-arg RHIZA_PROFILE=kv -t rhiza-kv:dev .
+docker build --build-arg RHIZA_PROFILE=all -t rhiza-all:dev .
+```
+
+Plain `docker build -t rhiza-all:dev .` defaults to the combined `all` build.
+For normal deployment, select the scoped image matching the required profile;
+for example, use `RHIZA_IMAGE=rhiza-sql:dev` together with
+`RHIZA_EXECUTION_PROFILE=sql`.
 
 ## Embedded Rust API
 
@@ -468,7 +498,10 @@ kubectl -n rhiza create secret generic rhiza-sql-c1-bundle \
 kubectl -n rhiza create -f target/rhiza-sql-c1.yaml
 ```
 
-Set `RHIZA_IMAGE`, `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`,
+The renderer derives the local image default from the required profile (for
+example, `RHIZA_EXECUTION_PROFILE=sql` defaults to `rhiza-sql:dev`). Set
+`RHIZA_IMAGE` to override it with a registry-qualified artifact and tag. Also
+set `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`,
 `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`, and Secret-name overrides as
 needed. `RHIZA_EXECUTION_PROFILE` is required and must be `sql`, `graph`, or
 `kv`. The renderer scopes resource names, labels, data/config paths, and bundle
@@ -578,6 +611,25 @@ targets only a `rhiza sql` pod; it does not inject RustFS failures.
 
 The implemented fast-path, microbatch, failover, and OSS cost results are in
 [docs/failover-throughput-optimization-2026-07-12.md](docs/failover-throughput-optimization-2026-07-12.md).
+The current Recorder durability, typed-batch, and production-adapter transport
+evidence is in
+[docs/performance-optimization-2026-07-17.md](docs/performance-optimization-2026-07-17.md).
+Its Linux WAL syscall comparison is reproducible with
+[`bench/run-recorder-sync-linux.py`](bench/run-recorder-sync-linux.py) and
+[`bench/support/fdatasync-as-fsync.c`](bench/support/fdatasync-as-fsync.c); the
+auditable 12-pair artifacts are tracked as
+[`raw.jsonl`](docs/benchmarks/recorder-sync-linux-20260717/raw.jsonl) and
+[`summary.json`](docs/benchmarks/recorder-sync-linux-20260717/summary.json).
+The 24-row raw artifact is about 48.6 KiB and the summary is about 9.4 KiB. That
+run used a dirty worktree and Docker Desktop's virtual filesystem, so the
+summary sets `production_valid=false`. Native `fdatasync` had 1.561x aggregate
+median throughput and lower aggregate p50/p95/p99. However, the paired
+`fsync/native` median was 0.928 and the win split was 6/12 each, so paired
+performance remains inconclusive. Linux `sync_data` remains a
+correctness-preserving candidate for the smaller durability syscall, not a
+production speedup claim. Production adoption requires clean physical
+crash/reopen and throughput/latency validation on the target
+ext4/XFS/Kubernetes CSI stack.
 The primary-source protocol conformance and performance-comparability limits are
 in [docs/quepaxa-paper-conformance-2026-07-12.md](docs/quepaxa-paper-conformance-2026-07-12.md).
 

@@ -1,0 +1,257 @@
+{
+  "aggregate": {
+    "candidates": {
+      "fsync-preload": {
+        "errors_total": 0,
+        "median_latency_p50_ns": 398624.5,
+        "median_latency_p95_ns": 1239624.5,
+        "median_latency_p99_ns": 2123125.0,
+        "median_ops_per_second": 1911.5215089204817,
+        "runs": 12
+      },
+      "native-fdatasync": {
+        "errors_total": 0,
+        "median_latency_p50_ns": 240437.5,
+        "median_latency_p95_ns": 793479.0,
+        "median_latency_p99_ns": 1603021.0,
+        "median_ops_per_second": 2983.9011487711614,
+        "runs": 12
+      }
+    },
+    "median_fsync_preload_over_native_throughput": 0.9278500671968066,
+    "paired_ratios": [
+      {
+        "fsync_preload_over_native_throughput": 1.4984371519028112,
+        "pair_id": "pair-001"
+      },
+      {
+        "fsync_preload_over_native_throughput": 1.1590103309217636,
+        "pair_id": "pair-002"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.8156242319402751,
+        "pair_id": "pair-003"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.8416696691380331,
+        "pair_id": "pair-004"
+      },
+      {
+        "fsync_preload_over_native_throughput": 1.01403046525558,
+        "pair_id": "pair-005"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.7247556357852813,
+        "pair_id": "pair-006"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.7888932252503345,
+        "pair_id": "pair-007"
+      },
+      {
+        "fsync_preload_over_native_throughput": 1.0702474561699893,
+        "pair_id": "pair-008"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.6582997093488836,
+        "pair_id": "pair-009"
+      },
+      {
+        "fsync_preload_over_native_throughput": 1.0198804884578816,
+        "pair_id": "pair-010"
+      },
+      {
+        "fsync_preload_over_native_throughput": 0.29988585478340135,
+        "pair_id": "pair-011"
+      },
+      {
+        "fsync_preload_over_native_throughput": 1.0408020455228535,
+        "pair_id": "pair-012"
+      }
+    ]
+  },
+  "conditions": {
+    "balanced_order": [
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ],
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ],
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ],
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ],
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ],
+      [
+        "native-fdatasync",
+        "fsync-preload"
+      ],
+      [
+        "fsync-preload",
+        "native-fdatasync"
+      ]
+    ],
+    "operations": 800,
+    "pairs": 12,
+    "payload_bytes": 128,
+    "platform": "linux/arm64",
+    "runtime_image": "debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+    "warmup": 100
+  },
+  "production_valid": false,
+  "provenance": {
+    "commands": {
+      "build": {
+        "argv": [
+          "docker",
+          "run",
+          "--rm",
+          "--platform",
+          "linux/arm64",
+          "-v",
+          "/Users/cypark/Documents/project/rhiza:/work:ro",
+          "-v",
+          "/Users/cypark/Documents/project/rhiza/target/recorder-sync-linux-build-final-v3-20260717:/artifacts",
+          "-w",
+          "/work",
+          "rust:1.89.0-bookworm",
+          "sh",
+          "-ec",
+          "CARGO_TARGET_DIR=/artifacts/target cargo build --locked --release -p rhiza-quepaxa --example recorder_sync_bench && cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -o /artifacts/fdatasync-as-fsync.so /work/bench/support/fdatasync-as-fsync.c"
+        ],
+        "shell": "docker run --rm --platform linux/arm64 -v /Users/cypark/Documents/project/rhiza:/work:ro -v /Users/cypark/Documents/project/rhiza/target/recorder-sync-linux-build-final-v3-20260717:/artifacts -w /work rust:1.89.0-bookworm sh -ec 'CARGO_TARGET_DIR=/artifacts/target cargo build --locked --release -p rhiza-quepaxa --example recorder_sync_bench && cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -o /artifacts/fdatasync-as-fsync.so /work/bench/support/fdatasync-as-fsync.c'"
+      },
+      "pull": {
+        "argv": [
+          "docker",
+          "pull",
+          "--platform",
+          "linux/arm64",
+          "rust:1.89.0-bookworm"
+        ],
+        "shell": "docker pull --platform linux/arm64 rust:1.89.0-bookworm"
+      },
+      "runtime_pull": {
+        "argv": [
+          "docker",
+          "pull",
+          "--platform",
+          "linux/arm64",
+          "debian:bookworm-slim"
+        ],
+        "shell": "docker pull --platform linux/arm64 debian:bookworm-slim"
+      }
+    },
+    "docker": {
+      "docker_driver": "overlayfs",
+      "docker_name": "dory-engine",
+      "docker_operating_system": "Alpine Linux v3.24 (containerized)",
+      "host_platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+      "image_id": "sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff",
+      "image_repo_digests": [
+        "rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff"
+      ],
+      "image_tag": "rust:1.89.0-bookworm"
+    },
+    "git": {
+      "dirty": true,
+      "head": "c9cf59024689fb3a30812dbf17ff018dc053fd28",
+      "tracked_diff_bytes": 426374,
+      "tracked_diff_sha256": "96326c93f1043f7211f42d893b03e70431343bc419edc8e432b027669151b2ef",
+      "untracked_generated_count": 1,
+      "untracked_relevant_source_count": 28,
+      "untracked_relevant_source_paths": [
+        "bench/run-recorder-sync-linux.py",
+        "bench/run-recorder-transport.py",
+        "bench/run-rpc-codec.py",
+        "bench/run-rpc-framework.py",
+        "bench/src/bin/rhiza-recorder-transport.rs",
+        "bench/support/fdatasync-as-fsync.c",
+        "crates/rhiza-node/src/recorder_tcp/postcard_rpc.rs",
+        "crates/rhiza-node/tests/execution_profile_features.rs",
+        "crates/rhiza-node/tests/recorder_postcard_rpc.rs",
+        "crates/rhiza-quepaxa/examples/recorder_sync_bench.rs",
+        "docs/performance-optimization-2026-07-17.md",
+        "docs/protobuf-postcard-benchmark-2026-07-17.md",
+        "experiments/rust-sqlite-conformance/Cargo.lock",
+        "experiments/rust-sqlite-conformance/Cargo.toml",
+        "experiments/rust-sqlite-conformance/README.md",
+        "experiments/rust-sqlite-conformance/build.rs",
+        "experiments/rust-sqlite-conformance/src/lib.rs",
+        "experiments/rust-sqlite-conformance/src/main.rs",
+        "experiments/rust-sqlite-conformance/tests/conformance.rs",
+        "experiments/turso-size-perf/Cargo.lock",
+        "experiments/turso-size-perf/Cargo.toml",
+        "experiments/turso-size-perf/README.md",
+        "experiments/turso-size-perf/run.py",
+        "experiments/turso-size-perf/src/bin/rusqlite.rs",
+        "experiments/turso-size-perf/src/bin/turso.rs",
+        "experiments/turso-size-perf/src/common.rs",
+        "experiments/turso-size-perf/src/lib.rs",
+        "experiments/turso-size-perf/tests/test_run.py"
+      ],
+      "untracked_relevant_source_paths_omitted": 0,
+      "untracked_relevant_source_sha256": "e23913c15d8d59107cc1a0ff1bc9e5fc373fe9884a6a6b370c224c0e8be1b80d",
+      "untracked_total_count": 37
+    },
+    "hashes": {
+      "benchmark_binary_sha256": "7bc075b29e7d49524ea51555b5cc95a0f6d1eea4b9eccff7d634caa27893459d",
+      "cargo_lock_sha256": "bbaf97c7d3e4e7d7be54a0bf048cdbb2ab2ed07f2c8e4e5a557a245afeee2891",
+      "recorder_sync_bench_source_sha256": "6a8db3387e9dc2922fd7cac9e42af1f9cb770e30a69dc9addb1797cb25ebcace",
+      "rhiza_core_cargo_toml_sha256": "590595b1ad63b5cc62d7b41ee6741f6609e2a8607038d9db7d9b13fb132acecd",
+      "rhiza_core_lib_source_sha256": "1211daa309ce35c7480b285e45303b0f0bb5082504ab5a8b7467aa4970263379",
+      "rhiza_quepaxa_cargo_toml_sha256": "fd92f6a0dcbab0c5410dd152a5492b17e4ea0d1224409045f130f2749172fad5",
+      "rhiza_quepaxa_lib_source_sha256": "54ca511bd8be35e1b2deeb50a1f8f9ced66bb336194e4d7ba07c4473a9d60c1d",
+      "runner_source_sha256": "bbe7d010c56fae73cc2d65d252093e2e547b4c191a8e14c9ccd7aa7454ed0b7d",
+      "shim_binary_sha256": "0b77516b8ab16587ee80bcb93d9e8e3d909578c368fe1d0cc272d32100284580",
+      "shim_source_sha256": "4516efff7c30acef65648e9875c05b7af8da632a989d247012912e23badbc251",
+      "workspace_cargo_toml_sha256": "f26aa837a4d2e87700ff57a9c6a04c6ae4564a1a22f07443a55986773b6ced8e"
+    },
+    "reused_build_artifacts": "/Users/cypark/Documents/project/rhiza/target/recorder-sync-linux-build-final-v3-20260717",
+    "runtime_docker": {
+      "docker_driver": "overlayfs",
+      "docker_name": "dory-engine",
+      "docker_operating_system": "Alpine Linux v3.24 (containerized)",
+      "host_platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+      "image_id": "sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+      "image_repo_digests": [
+        "debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
+      ],
+      "image_tag": "debian:bookworm-slim"
+    }
+  },
+  "provenance_sha256": "f1f12c8e3144435e765e9c9f290790d5b139fddad2e10d49354ce0314d6e2caf",
+  "raw_jsonl": "/Users/cypark/Documents/project/rhiza/docs/benchmarks/recorder-sync-linux-20260717/raw.jsonl",
+  "schema_version": 1,
+  "scope": "Docker virtual-filesystem syscall diagnostic; not physical durability evidence"
+}

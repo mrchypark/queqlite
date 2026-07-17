@@ -196,7 +196,7 @@ fn version_one_head_requires_the_breaking_manifest_upgrade() {
         store(dir.path(), membership),
         Err(Error::MigrationRequired {
             format: "recorder durable head",
-            version: 2
+            version: 3
         })
     ));
 }
@@ -210,11 +210,10 @@ fn reopen_fails_closed_when_an_acknowledged_slot_loses_its_command() {
     let value =
         AcceptedValue::from_command(CLUSTER_ID, 8, EPOCH, CONFIG_ID, LogHash::ZERO, &command);
     recorder
-        .record_proposal(record(
-            8,
-            proposal("writer", 1, 1, value),
-            Some(command.clone()),
-        ))
+        .store_command(command.hash(), command.clone())
+        .unwrap();
+    recorder
+        .record_proposal(record(8, proposal("writer", 1, 1, value), None))
         .unwrap();
     drop(recorder);
     fs::remove_file(
@@ -230,11 +229,8 @@ fn reopen_fails_closed_when_an_acknowledged_slot_loses_its_command() {
 }
 
 #[test]
-fn interrupted_normal_record_rolls_slot_and_head_forward_together() {
-    for fault in [
-        SealFaultPoint::AfterRecordManifest,
-        SealFaultPoint::AfterRecordCache,
-    ] {
+fn interrupted_wal_record_replays_a_complete_unacknowledged_frame() {
+    for fault in [SealFaultPoint::AfterWalWrite, SealFaultPoint::AfterWalSync] {
         let dir = tempfile::tempdir().unwrap();
         let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
         let recorder = store(dir.path(), membership.clone()).unwrap();
@@ -266,12 +262,12 @@ fn interrupted_normal_record_rolls_slot_and_head_forward_together() {
             reopened.fetch_command(command.hash()).unwrap(),
             Some(command)
         );
-        assert!(!dir.path().join("slot-head.intent").exists());
+        assert!(dir.path().join("recorder.wal").exists());
     }
 }
 
 #[test]
-fn interrupted_record_before_manifest_does_not_publish_a_promise() {
+fn interrupted_record_before_wal_sync_never_acknowledges() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(dir.path(), membership.clone()).unwrap();
@@ -279,7 +275,7 @@ fn interrupted_record_before_manifest_does_not_publish_a_promise() {
     let value =
         AcceptedValue::from_command(CLUSTER_ID, 8, EPOCH, CONFIG_ID, LogHash::ZERO, &command);
     recorder
-        .set_seal_fault(Some(SealFaultPoint::BeforeRecordManifest))
+        .set_seal_fault(Some(SealFaultPoint::AfterWalWrite))
         .unwrap();
 
     assert!(matches!(
@@ -288,23 +284,40 @@ fn interrupted_record_before_manifest_does_not_publish_a_promise() {
             proposal("writer", 1, 1, value),
             Some(command),
         )),
-        Err(Error::Io(message)) if message.contains("BeforeRecordManifest")
+        Err(Error::Io(message)) if message.contains("AfterWalWrite")
     ));
-    drop(recorder);
-
-    let reopened = store(dir.path(), membership).unwrap();
     assert_eq!(
-        reopened
+        recorder
             .configuration_state()
             .unwrap()
             .max_accepted_or_decided_slot(),
         None
     );
-    assert_eq!(reopened.load(8).unwrap().isr().first_current(), None);
+    assert_eq!(recorder.load(8).unwrap().isr().first_current(), None);
+    assert!(matches!(
+        recorder.record_proposal(record(
+            8,
+            proposal(
+                "writer",
+                2,
+                1,
+                AcceptedValue::from_command(
+                    CLUSTER_ID,
+                    8,
+                    EPOCH,
+                    CONFIG_ID,
+                    LogHash::ZERO,
+                    &StoredCommand::new(EntryType::Command, b"retry".to_vec()),
+                ),
+            ),
+            Some(StoredCommand::new(EntryType::Command, b"retry".to_vec())),
+        )),
+        Err(Error::Io(_))
+    ));
 }
 
 #[test]
-fn manifest_recovers_the_two_most_recent_slot_caches() {
+fn wal_replays_recent_slots_before_cache_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
     let recorder = store(dir.path(), membership.clone()).unwrap();
@@ -328,9 +341,9 @@ fn manifest_recovers_the_two_most_recent_slot_caches() {
     }
     drop(recorder);
 
-    for (slot, _) in &proposals {
-        fs::remove_file(dir.path().join(format!("slot-{slot:020}.rec"))).unwrap();
-    }
+    assert!(proposals
+        .iter()
+        .all(|(slot, _)| !dir.path().join(format!("slot-{slot:020}.rec")).exists()));
 
     let reopened = store(dir.path(), membership).unwrap();
     for (slot, proposal) in proposals {

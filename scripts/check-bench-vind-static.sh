@@ -6,7 +6,7 @@ cd "$repo_root"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-grep -Fq 'http|tcp-postcard)' scripts/bench-vind.sh
+grep -Fq 'http|tcp-postcard|tcp-postcard-rpc)' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS=on' scripts/bench-vind.sh
 grep -Fq 'RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls' scripts/bench-vind.sh
 grep -Fq 'recorder_tls_server_name:' scripts/bench-vind.sh
@@ -888,6 +888,17 @@ if yq eval -e 'select(.kind == "StatefulSet") |
   exit 1
 fi
 
+RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tcp.json" "$tmp/cluster-postcard-rpc.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TRANSPORT") |
+  .value == "tcp-postcard-rpc"' "$tmp/cluster-postcard-rpc.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .ports[] | select(.name == "recorder-tcp") | .containerPort == 8082' \
+  "$tmp/cluster-postcard-rpc.yaml" >/dev/null
+
 jq '.members |= (to_entries | map(.value + {
   recorder_tcp_addr:("rhiza-sql-c1-" + (.key | tostring) + ".rhiza-sql-c1:8082"),
   recorder_tls_server_name:("rhiza-sql-c1-" + (.key | tostring) + ".rhiza-sql-c1")
@@ -939,6 +950,20 @@ yq eval -e 'select(.kind == "StatefulSet") |
   .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
   .secret.secretName == "rhiza-sql-c1-recorder-tls"' \
   "$tmp/cluster-tls.yaml" >/dev/null
+
+RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+RHIZA_RECORDER_TLS=on \
+RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tls.json" \
+    "$tmp/cluster-postcard-rpc-tls.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TRANSPORT") |
+  .value == "tcp-postcard-rpc"' "$tmp/cluster-postcard-rpc-tls.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TLS") |
+  .value == "on"' "$tmp/cluster-postcard-rpc-tls.yaml" >/dev/null
 tls_secret_keys="$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
   .secret.items[].key' "$tmp/cluster-tls.yaml" | sed '/^$/d; /^---$/d' | sort | paste -sd, -)"

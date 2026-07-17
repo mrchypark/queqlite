@@ -94,8 +94,8 @@ usage() {
     'Set RHIZA_BENCH_MULTI_ENDPOINT=1 to route retries across all three nodes.' \
     'Durability defaults to sync. Set RHIZA_DURABILITY_MODE=bounded with' \
     'RHIZA_DURABILITY_MAX_LAG, or periodic with RHIZA_DURABILITY_INTERVAL.' \
-    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard to benchmark TCP/Postcard.' \
-    'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for TCP/Postcard.' \
+    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc to benchmark a TCP transport.' \
+    'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for either TCP transport.' \
     '' \
     'It creates a vind cluster, deploys RustFS plus a three-node rhiza cluster,' \
     'runs bench/rhiza-bench through a local port-forward, and emits artifacts.json.' >&2
@@ -775,15 +775,15 @@ case "$object_metering" in 0|1) ;; *) die "RHIZA_BENCH_OBJECT_USAGE_METERING mus
 case "$resource_sampling" in 0|1) ;; *) die "RHIZA_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
 case "$multi_endpoint" in 0|1) ;; *) die "RHIZA_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
 case "$recorder_transport" in
-  http|tcp-postcard) ;;
-  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard" ;;
+  http|tcp-postcard|tcp-postcard-rpc) ;;
+  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc" ;;
 esac
 case "$recorder_tls" in
   on|off) ;;
   *) die "RHIZA_RECORDER_TLS must be on|off" ;;
 esac
-[ "$recorder_tls" != on ] || [ "$recorder_transport" = tcp-postcard ] ||
-  die "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard"
+[ "$recorder_tls" != on ] || [ "$recorder_transport" != http ] ||
+  die "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc"
 case "$sample_interval" in ''|*[!0-9]*) die "--sample-interval must be a positive integer";; esac
 [ "$sample_interval" -gt 0 ] || die "--sample-interval must be a positive integer"
 for tool in cargo curl docker jq kubectl openssl rustc sed timeout vcluster yq; do require "$tool"; done
@@ -1180,7 +1180,7 @@ jq -n --argjson tokens "$peer_tokens" --arg recorder_transport "$recorder_transp
     node_id:("node-" + ($n + 1 | tostring)),
     url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8081"),
     log_url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8080"), token:$tokens[$n]
-  } + (if $recorder_transport == "tcp-postcard" then {
+  } + (if $recorder_transport != "http" then {
     recorder_tcp_addr:("rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8082")
   } else {} end) + (if $recorder_tls == "on" then {
     recorder_tls_server_name:("rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1")

@@ -872,6 +872,8 @@ pub enum SealFaultPoint {
     AfterHeadIntent,
     AfterHeadConfiguration,
     AfterHead,
+    AfterWalWrite,
+    AfterWalSync,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1081,13 +1083,76 @@ pub struct RecorderFileStore {
     configuration: Arc<Mutex<ConfigurationState>>,
     recorded_head: Arc<Mutex<RecordedHeadProvenance>>,
     recent_slots: Arc<Mutex<Vec<DurableSlotSnapshot>>>,
+    wal: Arc<Mutex<RecorderWal>>,
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
     _root_lock: Arc<fs::File>,
     sync: Arc<Mutex<()>>,
 }
 
 const RECORDED_HEAD_MAGIC: &[u8; 4] = b"QRHD";
-const RECORDED_HEAD_VERSION: u16 = 2;
+const RECORDED_HEAD_VERSION: u16 = 3;
+const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";
+const RECORDER_WAL_VERSION: u16 = 1;
+const RECORDER_WAL_SOFT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
+#[cfg(not(test))]
+const RECORDER_WAL_HARD_FRAME_LIMIT: u64 = 1_024;
+#[cfg(test)]
+const RECORDER_WAL_HARD_FRAME_LIMIT: u64 = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WalCheckpoint {
+    generation: u64,
+    through_sequence: u64,
+}
+
+impl Default for WalCheckpoint {
+    fn default() -> Self {
+        Self {
+            generation: 1,
+            through_sequence: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecorderWal {
+    checkpoint: WalCheckpoint,
+    next_sequence: u64,
+    last_digest: LogHash,
+    frame_count: u64,
+    byte_count: u64,
+    slots: BTreeMap<Slot, Vec<u8>>,
+    commands: Vec<(LogHash, StoredCommand)>,
+    failed: bool,
+}
+
+impl Default for RecorderWal {
+    fn default() -> Self {
+        Self {
+            checkpoint: WalCheckpoint::default(),
+            next_sequence: 1,
+            last_digest: LogHash::ZERO,
+            frame_count: 0,
+            byte_count: 0,
+            slots: BTreeMap::new(),
+            commands: Vec::new(),
+            failed: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WalFrame {
+    generation: u64,
+    sequence: u64,
+    prev_digest: LogHash,
+    digest: LogHash,
+    slot: Slot,
+    slot_bytes: Vec<u8>,
+    configuration_bytes: Vec<u8>,
+    head: RecordedHeadProvenance,
+    command: Option<(LogHash, StoredCommand)>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DurableSlotSnapshot {
@@ -1227,6 +1292,7 @@ impl RecorderFileStore {
         let (store, existing_format) =
             Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
         store.open_or_initialize_recorded_head(existing_format)?;
+        store.open_or_replay_wal()?;
         Ok(store)
     }
 
@@ -1288,6 +1354,7 @@ impl RecorderFileStore {
                 ))),
                 recorded_head: Arc::new(Mutex::new(RecordedHeadProvenance::Empty)),
                 recent_slots: Arc::new(Mutex::new(Vec::new())),
+                wal: Arc::new(Mutex::new(RecorderWal::default())),
                 seal_fault: Arc::new(Mutex::new(None)),
                 _root_lock: Arc::new(root_lock),
                 sync: Arc::new(Mutex::new(())),
@@ -1316,7 +1383,7 @@ impl RecorderFileStore {
             if existing_format {
                 return Err(Error::MigrationRequired {
                     format: "recorder durable head",
-                    version: RECORDED_HEAD_VERSION,
+                    version: 2,
                 });
             }
             let configured =
@@ -1337,6 +1404,7 @@ impl RecorderFileStore {
         store.configuration = Arc::new(Mutex::new(configured));
         store.recover_intent()?;
         store.open_or_initialize_recorded_head(existing_format)?;
+        store.open_or_replay_wal()?;
         Ok(store)
     }
 
@@ -1448,6 +1516,7 @@ impl RecorderFileStore {
         {
             return Err(Error::Rejected(RejectReason::InvalidTransition));
         }
+        self.checkpoint_wal_unlocked()?;
         self.store_command_unlocked(expected_stop.command_hash, &stop_command)?;
         let installed = ConfigurationState {
             config_id: next_config_id,
@@ -1516,6 +1585,7 @@ impl RecorderFileStore {
             recovered_tip,
             recovered_hash,
         };
+        self.checkpoint_wal_unlocked()?;
         self.commit_configuration_head_unlocked(&recovered, &head)?;
         *self
             .configuration
@@ -1678,21 +1748,16 @@ impl RecorderFileStore {
             .lock()
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.recover_intent()?;
-        if let Some(command) = &request.command {
-            self.stage_command_unlocked(value.command_hash, command)?;
-        }
         let configuration = self.configuration_state()?;
-        let change = self.change_for_value_unlocked(value)?;
+        let change =
+            self.change_for_value_with_command_unlocked(value, request.command.as_ref())?;
         if !configuration.activated && change.is_none() {
             return Err(Error::Rejected(RejectReason::ActivationRequired));
         }
         self.validate_slot_gate(&configuration, request.slot, change.as_ref())?;
-        self.validate_value_unlocked(request.slot, value)?;
+        self.validate_value_with_command_unlocked(request.slot, value, request.command.as_ref())?;
         let state = self.load_unlocked(request.slot, request.config_digest)?;
         if let Some(proof) = state.decision_proof() {
-            if request.command.is_some() {
-                self.sync_root()?;
-            }
             return Ok(record_summary(
                 &self.recorder_id,
                 &state,
@@ -1706,7 +1771,15 @@ impl RecorderFileStore {
         next.accepted = None;
         let next_configuration =
             self.transition_after_apply(&configuration, &next, change.as_ref(), Some(value))?;
-        self.persist_state_transition_unlocked(&next, &configuration, &next_configuration)?;
+        self.persist_state_transition_with_command_unlocked(
+            &next,
+            &configuration,
+            &next_configuration,
+            request
+                .command
+                .as_ref()
+                .map(|command| (value.command_hash, command)),
+        )?;
         Ok(record_summary(&self.recorder_id, &next, None))
     }
 
@@ -1862,6 +1935,24 @@ impl RecorderFileStore {
     }
 
     fn load_unlocked(&self, slot: Slot, config_digest: LogHash) -> Result<RecorderSlotState> {
+        if let Some(bytes) = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
+            .slots
+            .get(&slot)
+            .cloned()
+        {
+            let state = decode_recorder_state(&bytes)?;
+            if state.cluster_id != self.cluster_id
+                || state.epoch != self.epoch
+                || state.config_id != self.current_config_id()
+                || (config_digest != LogHash::ZERO && state.config_digest != config_digest)
+            {
+                return Err(Error::Decode("recorder WAL state identity mismatch".into()));
+            }
+            return Ok(state);
+        }
         let path = self.path(slot);
         if !path.exists() {
             return Ok(RecorderSlotState::new_with_digest(
@@ -1887,7 +1978,7 @@ impl RecorderFileStore {
 
     fn open_or_initialize_recorded_head(&self, existing_format: bool) -> Result<()> {
         let configuration = self.configuration_state()?;
-        let (head, recent_slots) = if self.recorded_head_path().exists() {
+        let (head, recent_slots, wal_checkpoint) = if self.recorded_head_path().exists() {
             decode_recorded_head(
                 &fs::read(self.recorded_head_path()).map_err(|err| Error::Io(err.to_string()))?,
                 &self.cluster_id,
@@ -1898,17 +1989,163 @@ impl RecorderFileStore {
             if existing_format {
                 return Err(Error::MigrationRequired {
                     format: "recorder durable head",
-                    version: RECORDED_HEAD_VERSION,
+                    version: 2,
                 });
             }
             let head = RecordedHeadProvenance::Empty;
+            let wal_checkpoint = WalCheckpoint::default();
             atomic_write(
                 &self.recorded_head_path(),
-                &encode_recorded_head(&self.cluster_id, self.epoch, &configuration, &head, &[])?,
+                &encode_recorded_head(
+                    &self.cluster_id,
+                    self.epoch,
+                    &configuration,
+                    &head,
+                    &[],
+                    wal_checkpoint,
+                )?,
             )?;
-            (head, Vec::new())
+            (head, Vec::new(), wal_checkpoint)
         };
-        self.install_recorded_head(&configuration, head, recent_slots)
+        self.install_recorded_head(&configuration, head, recent_slots, wal_checkpoint)
+    }
+
+    fn open_or_replay_wal(&self) -> Result<()> {
+        let path = self.wal_path();
+        let created = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(Error::Io(error.to_string())),
+        };
+        if created {
+            self.sync_root()?;
+        }
+        let bytes = fs::read(&path).map_err(|error| Error::Io(error.to_string()))?;
+        let checkpoint = self.wal_checkpoint()?;
+        let mut replayed = RecorderWal {
+            checkpoint,
+            next_sequence: checkpoint
+                .through_sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Decode("recorder WAL sequence exhausted".into()))?,
+            ..RecorderWal::default()
+        };
+        let mut configuration = self.configuration_state()?;
+        let mut head = self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
+            .clone();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let Some((frame, end)) = decode_wal_frame(&bytes, offset)? else {
+                break;
+            };
+            if frame.generation < checkpoint.generation {
+                offset = end;
+                continue;
+            }
+            if frame.generation != checkpoint.generation
+                || frame.sequence != replayed.next_sequence
+                || frame.prev_digest != replayed.last_digest
+            {
+                return Err(Error::Decode(
+                    "recorder WAL sequence or digest chain mismatch".into(),
+                ));
+            }
+            let state = decode_recorder_state(&frame.slot_bytes)?;
+            let next_configuration = decode_configuration_state(&frame.configuration_bytes)?;
+            if state.slot() != frame.slot
+                || state.cluster_id != self.cluster_id
+                || state.epoch != self.epoch
+                || state.config_id != next_configuration.config_id
+                || state.config_digest != next_configuration.config_digest
+                || configuration_structure_changed(&configuration, &next_configuration)
+            {
+                return Err(Error::Decode("recorder WAL state identity mismatch".into()));
+            }
+            if let Some((hash, command)) = &frame.command {
+                if command.hash() != *hash {
+                    return Err(Error::Decode(
+                        "recorder WAL inline command hash mismatch".into(),
+                    ));
+                }
+                upsert_wal_command(&mut replayed.commands, *hash, command.clone())?;
+            }
+            for value in recorder_state_values(&state) {
+                let command = replayed
+                    .commands
+                    .iter()
+                    .rev()
+                    .find(|(hash, _)| *hash == value.command_hash)
+                    .map(|(_, command)| command.clone())
+                    .or_else(|| {
+                        self.fetch_command_cache_unlocked(value.command_hash)
+                            .ok()
+                            .flatten()
+                    })
+                    .ok_or(Error::CommandUnavailable)?;
+                if AcceptedValue::from_command(
+                    &self.cluster_id,
+                    frame.slot,
+                    self.epoch,
+                    next_configuration.config_id,
+                    value.prev_hash,
+                    &command,
+                ) != *value
+                {
+                    return Err(Error::Decode("recorder WAL value mismatch".into()));
+                }
+            }
+            let expected_head = if next_configuration.max_accepted_or_decided_slot
+                == Some(frame.slot)
+                && recorder_state_values(&state).next().is_some()
+            {
+                RecordedHeadProvenance::SlotBacked { slot: frame.slot }
+            } else {
+                head.clone()
+            };
+            if frame.head != expected_head {
+                return Err(Error::Decode("recorder WAL head mismatch".into()));
+            }
+            replayed.slots.insert(frame.slot, frame.slot_bytes);
+            replayed.next_sequence = replayed
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Decode("recorder WAL sequence exhausted".into()))?;
+            replayed.last_digest = frame.digest;
+            replayed.frame_count += 1;
+            configuration = next_configuration;
+            head = frame.head;
+            offset = end;
+        }
+        if offset != bytes.len() {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|error| Error::Io(error.to_string()))?;
+            file.set_len(offset as u64)
+                .and_then(|_| sync_wal_metadata(&file))
+                .map_err(|error| Error::Io(error.to_string()))?;
+        }
+        replayed.byte_count = offset as u64;
+        *self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))? = replayed;
+        *self
+            .configuration
+            .lock()
+            .map_err(|_| Error::Io("configuration lock poisoned".into()))? = configuration;
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        Ok(())
     }
 
     fn install_recorded_head(
@@ -1916,6 +2153,7 @@ impl RecorderFileStore {
         configuration: &ConfigurationState,
         head: RecordedHeadProvenance,
         recent_slots: Vec<DurableSlotSnapshot>,
+        wal_checkpoint: WalCheckpoint,
     ) -> Result<()> {
         let mut recovered_cache = false;
         for snapshot in &recent_slots {
@@ -1992,10 +2230,35 @@ impl RecorderFileStore {
             .recent_slots
             .lock()
             .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))? = recent_slots;
+        let mut wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        wal.checkpoint = wal_checkpoint;
+        wal.next_sequence = wal_checkpoint
+            .through_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Decode("recorder WAL sequence exhausted".into()))?;
         Ok(())
     }
 
     fn fetch_command_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
+        if let Some(command) = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
+            .commands
+            .iter()
+            .rev()
+            .find(|(hash, _)| *hash == command_hash)
+            .map(|(_, command)| command.clone())
+        {
+            return Ok(Some(command));
+        }
+        self.fetch_command_cache_unlocked(command_hash)
+    }
+
+    fn fetch_command_cache_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
         let path = self.command_path(command_hash);
         if !path.exists() {
             return Ok(None);
@@ -2009,9 +2272,16 @@ impl RecorderFileStore {
     }
 
     fn validate_value_unlocked(&self, slot: Slot, value: &AcceptedValue) -> Result<()> {
-        let command = self
-            .fetch_command_unlocked(value.command_hash)?
-            .ok_or(Error::CommandUnavailable)?;
+        self.validate_value_with_command_unlocked(slot, value, None)
+    }
+
+    fn validate_value_with_command_unlocked(
+        &self,
+        slot: Slot,
+        value: &AcceptedValue,
+        inline: Option<&StoredCommand>,
+    ) -> Result<()> {
+        let command = self.command_for_value_unlocked(value, inline)?;
         let expected = AcceptedValue::from_command(
             &self.cluster_id,
             slot,
@@ -2027,15 +2297,43 @@ impl RecorderFileStore {
     }
 
     fn change_for_value_unlocked(&self, value: &AcceptedValue) -> Result<Option<ConfigChange>> {
-        let command = self
-            .fetch_command_unlocked(value.command_hash)?
-            .ok_or(Error::CommandUnavailable)?;
+        self.change_for_value_with_command_unlocked(value, None)
+    }
+
+    fn change_for_value_with_command_unlocked(
+        &self,
+        value: &AcceptedValue,
+        inline: Option<&StoredCommand>,
+    ) -> Result<Option<ConfigChange>> {
+        let command = self.command_for_value_unlocked(value, inline)?;
         if command.entry_type != EntryType::ConfigChange {
             return Ok(None);
         }
         ConfigChange::recognize(&command)
             .map_err(|_| Error::Rejected(RejectReason::InvalidRequest))
             .map(Some)
+    }
+
+    fn command_for_value_unlocked<'a>(
+        &self,
+        value: &AcceptedValue,
+        inline: Option<&'a StoredCommand>,
+    ) -> Result<std::borrow::Cow<'a, StoredCommand>> {
+        if let Some(command) = inline {
+            if command.hash() != value.command_hash {
+                return Err(Error::CommandHashMismatch);
+            }
+            if self
+                .fetch_command_unlocked(value.command_hash)?
+                .is_some_and(|existing| existing != *command)
+            {
+                return Err(Error::CommandHashMismatch);
+            }
+            return Ok(std::borrow::Cow::Borrowed(command));
+        }
+        self.fetch_command_unlocked(value.command_hash)?
+            .map(std::borrow::Cow::Owned)
+            .ok_or(Error::CommandUnavailable)
     }
 
     fn validate_slot_gate(
@@ -2227,6 +2525,10 @@ impl RecorderFileStore {
         self.root.join("recorded-head.rec")
     }
 
+    fn wal_path(&self) -> PathBuf {
+        self.root.join("recorder.wal")
+    }
+
     fn head_after_slot_state(
         &self,
         configuration: &ConfigurationState,
@@ -2263,7 +2565,14 @@ impl RecorderFileStore {
         atomic_write(&self.configuration_path(), &configuration_bytes)?;
         atomic_write(
             &self.recorded_head_path(),
-            &encode_recorded_head(&self.cluster_id, self.epoch, &configuration, &head, &[])?,
+            &encode_recorded_head(
+                &self.cluster_id,
+                self.epoch,
+                &configuration,
+                &head,
+                &[],
+                self.wal_checkpoint()?,
+            )?,
         )?;
         fs::remove_file(path).map_err(|err| Error::Io(err.to_string()))?;
         fs::File::open(&self.root)
@@ -2303,8 +2612,14 @@ impl RecorderFileStore {
         head: &RecordedHeadProvenance,
     ) -> Result<()> {
         let configuration_bytes = encode_configuration_state(configuration)?;
-        let head_bytes =
-            encode_recorded_head(&self.cluster_id, self.epoch, configuration, head, &[])?;
+        let head_bytes = encode_recorded_head(
+            &self.cluster_id,
+            self.epoch,
+            configuration,
+            head,
+            &[],
+            self.wal_checkpoint()?,
+        )?;
         atomic_write(
             &self.configuration_head_intent_path(),
             &encode_configuration_head_intent(&configuration_bytes, &head_bytes),
@@ -2325,33 +2640,25 @@ impl RecorderFileStore {
         previous: &ConfigurationState,
         next: &ConfigurationState,
     ) -> Result<()> {
+        self.persist_state_transition_with_command_unlocked(slot_state, previous, next, None)
+    }
+
+    fn persist_state_transition_with_command_unlocked(
+        &self,
+        slot_state: &RecorderSlotState,
+        previous: &ConfigurationState,
+        next: &ConfigurationState,
+        command: Option<(LogHash, &StoredCommand)>,
+    ) -> Result<()> {
         if configuration_structure_changed(previous, next) {
+            self.checkpoint_wal_unlocked()?;
+            if let Some((hash, command)) = command {
+                self.store_command_unlocked(hash, command)?;
+            }
             return self.commit_transition_unlocked(slot_state, next);
         }
-        let slot_bytes = encode_recorder_state(slot_state)?;
         let head = self.head_after_slot_state(next, slot_state)?;
-        let mut recent_slots = self
-            .recent_slots
-            .lock()
-            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
-            .clone();
-        recent_slots.retain(|snapshot| snapshot.slot != slot_state.slot());
-        recent_slots.push(DurableSlotSnapshot {
-            slot: slot_state.slot(),
-            bytes: slot_bytes.clone(),
-        });
-        if recent_slots.len() > 2 {
-            recent_slots.drain(..recent_slots.len() - 2);
-        }
-        let head_bytes =
-            encode_recorded_head(&self.cluster_id, self.epoch, next, &head, &recent_slots)?;
-        // The manifest is authoritative. Its directory barrier also makes the previous
-        // transaction's slot cache durable before that snapshot ages out on the next write.
-        self.fail_seal_at(SealFaultPoint::BeforeRecordManifest)?;
-        atomic_write(&self.recorded_head_path(), &head_bytes)?;
-        self.fail_seal_at(SealFaultPoint::AfterRecordManifest)?;
-        atomic_replace(&self.path(slot_state.slot()), &slot_bytes)?;
-        self.fail_seal_at(SealFaultPoint::AfterRecordCache)?;
+        self.append_wal_unlocked(slot_state, next, &head, command)?;
         *self
             .configuration
             .lock()
@@ -2360,10 +2667,184 @@ impl RecorderFileStore {
             .recorded_head
             .lock()
             .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
-        *self
-            .recent_slots
+        self.recent_slots
             .lock()
-            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))? = recent_slots;
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
+        Ok(())
+    }
+
+    fn append_wal_unlocked(
+        &self,
+        slot_state: &RecorderSlotState,
+        configuration: &ConfigurationState,
+        head: &RecordedHeadProvenance,
+        command: Option<(LogHash, &StoredCommand)>,
+    ) -> Result<()> {
+        let should_checkpoint = {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            if wal.failed {
+                return Err(Error::Io(
+                    "recorder WAL is unavailable after an I/O failure".into(),
+                ));
+            }
+            wal.frame_count >= RECORDER_WAL_HARD_FRAME_LIMIT
+                || wal.byte_count >= RECORDER_WAL_SOFT_BYTE_LIMIT
+        };
+        if should_checkpoint {
+            self.checkpoint_wal_unlocked()?;
+        }
+        let (generation, sequence, prev_digest) = {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            (
+                wal.checkpoint.generation,
+                wal.next_sequence,
+                wal.last_digest,
+            )
+        };
+        let (frame, digest) = encode_wal_frame(
+            generation,
+            sequence,
+            prev_digest,
+            slot_state,
+            configuration,
+            head,
+            command,
+        )?;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(self.wal_path())
+            .map_err(|error| Error::Io(error.to_string()))?;
+        if let Err(error) = file.write_all(&frame) {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.failed = true;
+            }
+            return Err(Error::Io(error.to_string()));
+        }
+        if let Err(error) = self.fail_seal_at(SealFaultPoint::AfterWalWrite) {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.failed = true;
+            }
+            return Err(error);
+        }
+        if let Err(error) = sync_wal_append(&file) {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.failed = true;
+            }
+            return Err(Error::Io(error.to_string()));
+        }
+        if let Err(error) = self.fail_seal_at(SealFaultPoint::AfterWalSync) {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.failed = true;
+            }
+            return Err(error);
+        }
+        let slot_bytes = encode_recorder_state(slot_state)?;
+        let mut wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        wal.slots.insert(slot_state.slot(), slot_bytes);
+        if let Some((hash, command)) = command {
+            upsert_wal_command(&mut wal.commands, hash, command.clone())?;
+        }
+        wal.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Io("recorder WAL sequence exhausted".into()))?;
+        wal.last_digest = digest;
+        wal.frame_count += 1;
+        wal.byte_count = wal
+            .byte_count
+            .checked_add(frame.len() as u64)
+            .ok_or_else(|| Error::Io("recorder WAL byte count overflow".into()))?;
+        Ok(())
+    }
+
+    fn checkpoint_wal_unlocked(&self) -> Result<()> {
+        let (checkpoint, next_sequence, slots, commands) = {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            if wal.failed {
+                return Err(Error::Io(
+                    "recorder WAL is unavailable after an I/O failure".into(),
+                ));
+            }
+            if wal.frame_count == 0 {
+                return Ok(());
+            }
+            (
+                wal.checkpoint,
+                wal.next_sequence,
+                wal.slots.clone(),
+                wal.commands.clone(),
+            )
+        };
+        let next_checkpoint = WalCheckpoint {
+            generation: checkpoint
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::Io("recorder WAL generation exhausted".into()))?,
+            through_sequence: next_sequence - 1,
+        };
+        for (hash, command) in &commands {
+            atomic_replace(&self.command_path(*hash), &encode_stored_command(command))?;
+        }
+        for (slot, bytes) in &slots {
+            atomic_replace(&self.path(*slot), bytes)?;
+        }
+        let configuration = self.configuration_state()?;
+        let head = self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
+            .clone();
+        atomic_replace(
+            &self.configuration_path(),
+            &encode_configuration_state(&configuration)?,
+        )?;
+        atomic_write(
+            &self.recorded_head_path(),
+            &encode_recorded_head(
+                &self.cluster_id,
+                self.epoch,
+                &configuration,
+                &head,
+                &[],
+                next_checkpoint,
+            )?,
+        )?;
+        let truncate_result = fs::OpenOptions::new()
+            .write(true)
+            .open(self.wal_path())
+            .and_then(|file| file.set_len(0).and_then(|_| sync_wal_metadata(&file)));
+        if let Err(error) = truncate_result {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.failed = true;
+            }
+            return Err(Error::Io(error.to_string()));
+        }
+        let mut wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        wal.checkpoint = next_checkpoint;
+        wal.last_digest = LogHash::ZERO;
+        wal.frame_count = 0;
+        wal.byte_count = 0;
+        wal.slots.clear();
+        wal.commands.clear();
+        self.recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
         Ok(())
     }
 
@@ -2384,8 +2865,14 @@ impl RecorderFileStore {
         let slot_bytes = encode_recorder_state(slot_state)?;
         let configuration_bytes = encode_configuration_state(configuration)?;
         let head = self.head_after_slot_state(configuration, slot_state)?;
-        let head_bytes =
-            encode_recorded_head(&self.cluster_id, self.epoch, configuration, &head, &[])?;
+        let head_bytes = encode_recorded_head(
+            &self.cluster_id,
+            self.epoch,
+            configuration,
+            &head,
+            &[],
+            self.wal_checkpoint()?,
+        )?;
         atomic_write(
             &self.intent_path(),
             &encode_transition_intent(slot_state.slot(), &slot_bytes, &configuration_bytes)?,
@@ -2439,6 +2926,27 @@ impl RecorderFileStore {
             .lock()
             .map(|state| state.config_id)
             .unwrap_or(self.config_id)
+    }
+
+    fn wal_checkpoint(&self) -> Result<WalCheckpoint> {
+        self.wal
+            .lock()
+            .map(|wal| wal.checkpoint)
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))
+    }
+
+    #[cfg(test)]
+    fn wal_stats(&self) -> Result<(u64, u64, u64)> {
+        self.wal
+            .lock()
+            .map(|wal| {
+                (
+                    wal.checkpoint.generation,
+                    wal.checkpoint.through_sequence,
+                    wal.frame_count,
+                )
+            })
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))
     }
 }
 
@@ -2555,15 +3063,21 @@ impl RecordWorker {
     fn dispatch(&self, job: RecordJob) {
         self.pending.fetch_add(1, Ordering::Relaxed);
         let failed = match &self.sender {
-            Some(sender) => sender.try_send(job).err().map(|error| match error {
-                std::sync::mpsc::TrySendError::Full(job)
-                | std::sync::mpsc::TrySendError::Disconnected(job) => job,
-            }),
-            None => Some(job),
+            Some(sender) => match sender.try_send(job) {
+                Ok(()) => None,
+                Err(std::sync::mpsc::TrySendError::Full(job)) => Some((
+                    job,
+                    Error::Io("recorder worker queue is temporarily full".into()),
+                )),
+                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                    Some((job, Error::ProposeFailed))
+                }
+            },
+            None => Some((job, Error::ProposeFailed)),
         };
-        if let Some(job) = failed {
+        if let Some((job, error)) = failed {
             self.pending.fetch_sub(1, Ordering::Relaxed);
-            let _ = job.result.send((job.index, Err(Error::ProposeFailed)));
+            let _ = job.result.send((job.index, Err(error)));
         }
     }
 
@@ -4024,7 +4538,13 @@ impl RecorderRpc for RecorderFileStore {
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.recover_intent()?;
         let configuration = self.configuration_state()?;
-        if !self.path(slot).exists() {
+        let exists_in_wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
+            .slots
+            .contains_key(&slot);
+        if !exists_in_wal && !self.path(slot).exists() {
             return Ok(None);
         }
         let state = self.load_unlocked(slot, configuration.config_digest)?;
@@ -4809,6 +5329,43 @@ std::thread_local! {
     static SYNC_COUNTS: std::cell::Cell<(usize, usize)> = const {
         std::cell::Cell::new((0, 0))
     };
+    static LAST_FILE_SYNC_KIND: std::cell::Cell<Option<FileSyncKind>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileSyncKind {
+    #[cfg(target_os = "linux")]
+    Data,
+    All,
+}
+
+#[cfg(target_os = "linux")]
+fn sync_wal_append(file: &fs::File) -> io::Result<()> {
+    // Linux fdatasync (File::sync_data) also flushes metadata required for later data retrieval,
+    // including the file size extended by this append, so a complete WAL frame remains replayable.
+    file.sync_data()?;
+    #[cfg(test)]
+    record_file_sync_kind(FileSyncKind::Data);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_wal_append(file: &fs::File) -> io::Result<()> {
+    // Keep non-Linux durability conservative because sync_data semantics vary by platform.
+    file.sync_all()?;
+    #[cfg(test)]
+    record_file_sync_kind(FileSyncKind::All);
+    Ok(())
+}
+
+fn sync_wal_metadata(file: &fs::File) -> io::Result<()> {
+    file.sync_all()?;
+    #[cfg(test)]
+    record_file_sync_kind(FileSyncKind::All);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4817,6 +5374,12 @@ fn record_file_sync() {
         let (file, directory) = counts.get();
         counts.set((file + 1, directory));
     });
+}
+
+#[cfg(test)]
+fn record_file_sync_kind(kind: FileSyncKind) {
+    record_file_sync();
+    LAST_FILE_SYNC_KIND.with(|last| last.set(Some(kind)));
 }
 
 #[cfg(test)]
@@ -4830,11 +5393,17 @@ fn record_directory_sync() {
 #[cfg(test)]
 fn reset_sync_counts() {
     SYNC_COUNTS.with(|counts| counts.set((0, 0)));
+    LAST_FILE_SYNC_KIND.with(|last| last.set(None));
 }
 
 #[cfg(test)]
 fn sync_counts() -> (usize, usize) {
     SYNC_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn last_file_sync_kind() -> Option<FileSyncKind> {
+    LAST_FILE_SYNC_KIND.with(std::cell::Cell::get)
 }
 
 const CONFIGURATION_HEAD_INTENT_MAGIC: &[u8; 4] = b"QCHI";
@@ -4888,12 +5457,181 @@ fn decode_configuration_head_intent(bytes: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((configuration, head))
 }
 
+fn encode_wal_frame(
+    generation: u64,
+    sequence: u64,
+    prev_digest: LogHash,
+    slot_state: &RecorderSlotState,
+    configuration: &ConfigurationState,
+    head: &RecordedHeadProvenance,
+    command: Option<(LogHash, &StoredCommand)>,
+) -> Result<(Vec<u8>, LogHash)> {
+    let slot_bytes = encode_recorder_state(slot_state)?;
+    let configuration_bytes = encode_configuration_state(configuration)?;
+    let mut payload = Vec::new();
+    put_u64(&mut payload, generation);
+    put_u64(&mut payload, sequence);
+    payload.extend_from_slice(prev_digest.as_bytes());
+    put_u64(&mut payload, slot_state.slot());
+    put_blob(&mut payload, &slot_bytes)?;
+    put_blob(&mut payload, &configuration_bytes)?;
+    encode_head_provenance(&mut payload, head);
+    match command {
+        Some((hash, command)) => {
+            payload.push(1);
+            payload.extend_from_slice(hash.as_bytes());
+            put_blob(&mut payload, &encode_stored_command(command))?;
+        }
+        None => payload.push(0),
+    }
+    let total_len = 4usize
+        .checked_add(2)
+        .and_then(|len| len.checked_add(8))
+        .and_then(|len| len.checked_add(payload.len()))
+        .and_then(|len| len.checked_add(32))
+        .ok_or_else(|| Error::Io("recorder WAL frame length overflow".into()))?;
+    let mut frame = Vec::with_capacity(total_len);
+    frame.extend_from_slice(RECORDER_WAL_MAGIC);
+    put_u16(&mut frame, RECORDER_WAL_VERSION);
+    put_u64(&mut frame, total_len as u64);
+    frame.extend_from_slice(&payload);
+    let digest = LogHash::digest(&[&frame]);
+    frame.extend_from_slice(digest.as_bytes());
+    Ok((frame, digest))
+}
+
+fn decode_wal_frame(bytes: &[u8], offset: usize) -> Result<Option<(WalFrame, usize)>> {
+    const PREFIX_LEN: usize = 4 + 2 + 8;
+    let remaining = bytes
+        .get(offset..)
+        .ok_or_else(|| Error::Decode("recorder WAL offset overflow".into()))?;
+    if remaining.len() < PREFIX_LEN {
+        return Ok(None);
+    }
+    if remaining.get(..4) != Some(RECORDER_WAL_MAGIC) {
+        return Err(Error::Decode("recorder WAL frame magic mismatch".into()));
+    }
+    let mut cursor = offset + 4;
+    if read_u16(bytes, &mut cursor)? != RECORDER_WAL_VERSION {
+        return Err(Error::Decode("recorder WAL frame version mismatch".into()));
+    }
+    let frame_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| Error::Decode("recorder WAL frame length overflow".into()))?;
+    if frame_len < PREFIX_LEN + 32 {
+        return Err(Error::Decode("recorder WAL frame length is invalid".into()));
+    }
+    let end = offset
+        .checked_add(frame_len)
+        .ok_or_else(|| Error::Decode("recorder WAL frame length overflow".into()))?;
+    if end > bytes.len() {
+        return Ok(None);
+    }
+    let digest_offset = end - 32;
+    let digest = read_hash(bytes, &mut { digest_offset })?;
+    let expected = LogHash::digest(&[&bytes[offset..digest_offset]]);
+    if digest != expected {
+        return Err(Error::Decode("recorder WAL frame checksum mismatch".into()));
+    }
+    let generation = read_u64(bytes, &mut cursor)?;
+    let sequence = read_u64(bytes, &mut cursor)?;
+    let prev_digest = read_hash(bytes, &mut cursor)?;
+    let slot = read_u64(bytes, &mut cursor)?;
+    let slot_bytes = read_blob(bytes, &mut cursor)?;
+    let configuration_bytes = read_blob(bytes, &mut cursor)?;
+    let head = decode_head_provenance(bytes, &mut cursor)?;
+    let command = match read_u8(bytes, &mut cursor)? {
+        0 => None,
+        1 => {
+            let hash = read_hash(bytes, &mut cursor)?;
+            let command = decode_stored_command(&read_blob(bytes, &mut cursor)?)?;
+            Some((hash, command))
+        }
+        _ => return Err(Error::Decode("recorder WAL command flag is invalid".into())),
+    };
+    if cursor != digest_offset {
+        return Err(Error::Decode(
+            "recorder WAL frame has trailing bytes".into(),
+        ));
+    }
+    Ok(Some((
+        WalFrame {
+            generation,
+            sequence,
+            prev_digest,
+            digest,
+            slot,
+            slot_bytes,
+            configuration_bytes,
+            head,
+            command,
+        },
+        end,
+    )))
+}
+
+fn encode_head_provenance(out: &mut Vec<u8>, head: &RecordedHeadProvenance) {
+    match head {
+        RecordedHeadProvenance::Empty => out.push(0),
+        RecordedHeadProvenance::SlotBacked { slot } => {
+            out.push(1);
+            put_u64(out, *slot);
+        }
+        RecordedHeadProvenance::CheckpointBacked {
+            stop_slot,
+            prefix_hash,
+            recovered_tip,
+            recovered_hash,
+        } => {
+            out.push(2);
+            put_u64(out, *stop_slot);
+            out.extend_from_slice(prefix_hash.as_bytes());
+            put_u64(out, *recovered_tip);
+            out.extend_from_slice(recovered_hash.as_bytes());
+        }
+    }
+}
+
+fn decode_head_provenance(bytes: &[u8], cursor: &mut usize) -> Result<RecordedHeadProvenance> {
+    match read_u8(bytes, cursor)? {
+        0 => Ok(RecordedHeadProvenance::Empty),
+        1 => Ok(RecordedHeadProvenance::SlotBacked {
+            slot: read_u64(bytes, cursor)?,
+        }),
+        2 => Ok(RecordedHeadProvenance::CheckpointBacked {
+            stop_slot: read_u64(bytes, cursor)?,
+            prefix_hash: read_hash(bytes, cursor)?,
+            recovered_tip: read_u64(bytes, cursor)?,
+            recovered_hash: read_hash(bytes, cursor)?,
+        }),
+        _ => Err(Error::Decode(
+            "recorder WAL head provenance is invalid".into(),
+        )),
+    }
+}
+
+fn upsert_wal_command(
+    commands: &mut Vec<(LogHash, StoredCommand)>,
+    hash: LogHash,
+    command: StoredCommand,
+) -> Result<()> {
+    if let Some((_, existing)) = commands.iter().find(|(existing, _)| *existing == hash) {
+        return if *existing == command {
+            Ok(())
+        } else {
+            Err(Error::CommandHashMismatch)
+        };
+    }
+    commands.push((hash, command));
+    Ok(())
+}
+
 fn encode_recorded_head(
     cluster_id: &str,
     epoch: Epoch,
     configuration: &ConfigurationState,
     provenance: &RecordedHeadProvenance,
     recent_slots: &[DurableSlotSnapshot],
+    wal_checkpoint: WalCheckpoint,
 ) -> Result<Vec<u8>> {
     if recent_slots.len() > 2 {
         return Err(Error::Io(
@@ -4926,6 +5664,8 @@ fn encode_recorded_head(
             encoded.extend_from_slice(recovered_hash.as_bytes());
         }
     }
+    put_u64(&mut encoded, wal_checkpoint.generation);
+    put_u64(&mut encoded, wal_checkpoint.through_sequence);
     put_u16(&mut encoded, recent_slots.len() as u16);
     for snapshot in recent_slots {
         put_u64(&mut encoded, snapshot.slot);
@@ -4941,7 +5681,11 @@ fn decode_recorded_head(
     expected_cluster_id: &str,
     expected_epoch: Epoch,
     configuration: &ConfigurationState,
-) -> Result<(RecordedHeadProvenance, Vec<DurableSlotSnapshot>)> {
+) -> Result<(
+    RecordedHeadProvenance,
+    Vec<DurableSlotSnapshot>,
+    WalCheckpoint,
+)> {
     if bytes.get(..RECORDED_HEAD_MAGIC.len()) != Some(RECORDED_HEAD_MAGIC) {
         return Err(Error::Decode("invalid recorder durable head magic".into()));
     }
@@ -4995,6 +5739,15 @@ fn decode_recorded_head(
             )))
         }
     };
+    let wal_checkpoint = WalCheckpoint {
+        generation: read_u64(body, &mut cursor)?,
+        through_sequence: read_u64(body, &mut cursor)?,
+    };
+    if wal_checkpoint.generation == 0 {
+        return Err(Error::Decode(
+            "recorder durable head has zero WAL generation".into(),
+        ));
+    }
     let recent_count = usize::from(read_u16(body, &mut cursor)?);
     if recent_count > 2 {
         return Err(Error::Decode(
@@ -5020,7 +5773,7 @@ fn decode_recorded_head(
     if cursor != body.len() {
         return Err(Error::Decode("trailing recorder durable head bytes".into()));
     }
-    Ok((provenance, recent_slots))
+    Ok((provenance, recent_slots, wal_checkpoint))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -5094,6 +5847,14 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn put_blob(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u64::try_from(value.len())
+        .map_err(|_| Error::Decode("recorder blob is too long".into()))?;
+    put_u64(out, len);
+    out.extend_from_slice(value);
+    Ok(())
+}
+
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
     let value = *bytes
         .get(*cursor)
@@ -5160,6 +5921,20 @@ fn read_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
     Ok(slice.to_vec())
 }
 
+fn read_blob(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+    let len = usize::try_from(read_u64(bytes, cursor)?)
+        .map_err(|_| Error::Decode("recorder blob length overflow".into()))?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| Error::Decode("recorder blob length overflow".into()))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| Error::Decode("short recorder blob".into()))?
+        .to_vec();
+    *cursor = end;
+    Ok(value)
+}
+
 #[derive(Debug)]
 pub struct SingleNodeConsensus {
     cluster_id: String,
@@ -5221,11 +5996,13 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        reset_sync_counts, sync_counts, AcceptedValue, ConfigChange, ConfigurationState, Consensus,
-        Error, Membership, Proposal, ProposalPriority, ProposerProgress, RecordRequest,
-        RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderRpc, RejectReason,
-        SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        decode_wal_frame, encode_wal_frame, last_file_sync_kind, reset_sync_counts, sync_counts,
+        sync_wal_append, sync_wal_metadata, AcceptedValue, ConfigChange, ConfigurationState,
+        Consensus, Error, FileSyncKind, Membership, Proposal, ProposalPriority, ProposerProgress,
+        RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderRpc,
+        RecorderSlotState, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
+    use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
         collections::HashSet,
@@ -5330,6 +6107,14 @@ mod tests {
         }
     }
 
+    struct AlwaysIoRecorder;
+
+    impl RecorderRpc for AlwaysIoRecorder {
+        fn record(&self, _request: RecordRequest) -> super::Result<RecordSummary> {
+            Err(Error::Io("injected recorder unavailable".into()))
+        }
+    }
+
     #[test]
     fn single_node_consensus_commits_contiguous_hash_chain() {
         let consensus = SingleNodeConsensus::new("cluster-a", 1, 1);
@@ -5349,7 +6134,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_record_uses_one_directory_barrier() {
+    fn normal_record_uses_one_file_sync_and_no_directory_barrier() {
         let root = tempfile::tempdir().unwrap();
         let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
         let store = RecorderFileStore::new_with_membership(
@@ -5381,7 +6166,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(sync_counts(), (2, 1));
+        assert_eq!(sync_counts(), (1, 0));
         assert!(!root.path().join("slot-head.intent").exists());
 
         let inline = StoredCommand::new(EntryType::Command, b"inline-command".to_vec());
@@ -5400,7 +6185,363 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(sync_counts(), (3, 1));
+        assert_eq!(sync_counts(), (1, 0));
+    }
+
+    #[test]
+    fn wal_append_uses_the_platform_safe_file_sync() {
+        let file = tempfile::tempfile().unwrap();
+        reset_sync_counts();
+
+        sync_wal_append(&file).unwrap();
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(last_file_sync_kind(), Some(FileSyncKind::Data));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(last_file_sync_kind(), Some(FileSyncKind::All));
+    }
+
+    #[test]
+    fn wal_metadata_changes_keep_full_file_sync() {
+        let file = tempfile::tempfile().unwrap();
+        reset_sync_counts();
+
+        sync_wal_metadata(&file).unwrap();
+
+        assert_eq!(last_file_sync_kind(), Some(FileSyncKind::All));
+    }
+
+    #[test]
+    fn wal_replays_acknowledged_records_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"wal-reopen".to_vec());
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 8,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                    command: Some(command.clone()),
+                })
+                .unwrap();
+        }
+
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(
+            reopened.fetch_command(command.hash()).unwrap(),
+            Some(command)
+        );
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 4);
+    }
+
+    #[test]
+    fn wal_sync_fault_never_acknowledges_before_the_durable_frame_is_replayable() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"wal-sync-fault".to_vec());
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            store
+                .set_seal_fault(Some(SealFaultPoint::AfterWalSync))
+                .unwrap();
+            assert!(matches!(
+                store.record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 8,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                    command: Some(command.clone()),
+                }),
+                Err(Error::Io(message)) if message.contains("AfterWalSync")
+            ));
+            assert_eq!(
+                store
+                    .configuration_state()
+                    .unwrap()
+                    .max_accepted_or_decided_slot(),
+                None
+            );
+            assert_eq!(store.load(8).unwrap().isr.step(), 0);
+        }
+
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(
+            reopened.fetch_command(command.hash()).unwrap(),
+            Some(command)
+        );
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 4);
+    }
+
+    #[test]
+    fn wal_ignores_a_torn_final_frame_but_replays_the_committed_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let first = StoredCommand::new(EntryType::Command, b"wal-first".to_vec());
+        let second = StoredCommand::new(EntryType::Command, b"wal-second".to_vec());
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            for (slot, command) in [(8, first.clone()), (9, second.clone())] {
+                let value =
+                    AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command);
+                store
+                    .record_proposal(RecordRequest {
+                        cluster_id: "cluster".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: membership.digest(),
+                        slot,
+                        step: 4,
+                        proposal: Proposal::new(ProposalPriority::MAX, "writer", slot, value),
+                        command: Some(command),
+                    })
+                    .unwrap();
+            }
+        }
+        let wal = root.path().join("recorder.wal");
+        let len = std::fs::metadata(&wal).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(len - 7)
+            .unwrap();
+
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(reopened.fetch_command(first.hash()).unwrap(), Some(first));
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 4);
+        assert_eq!(reopened.fetch_command(second.hash()).unwrap(), None);
+        assert_eq!(reopened.load(9).unwrap().isr.step(), 0);
+    }
+
+    #[test]
+    fn wal_fails_closed_on_interior_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            for slot in [8, 9] {
+                let command = StoredCommand::new(
+                    EntryType::Command,
+                    format!("wal-corrupt-{slot}").into_bytes(),
+                );
+                let value =
+                    AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command);
+                store
+                    .record_proposal(RecordRequest {
+                        cluster_id: "cluster".into(),
+                        epoch: 1,
+                        config_id: 1,
+                        config_digest: membership.digest(),
+                        slot,
+                        step: 4,
+                        proposal: Proposal::new(ProposalPriority::MAX, "writer", slot, value),
+                        command: Some(command),
+                    })
+                    .unwrap();
+            }
+        }
+        let wal = root.path().join("recorder.wal");
+        let mut bytes = std::fs::read(&wal).unwrap();
+        bytes[100] ^= 0x80;
+        std::fs::write(&wal, bytes).unwrap();
+
+        assert!(matches!(
+            RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership,
+            ),
+            Err(Error::Decode(message)) if message.contains("WAL")
+        ));
+    }
+
+    #[test]
+    fn wal_fails_closed_on_full_length_final_frame_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            let command = StoredCommand::new(EntryType::Command, b"wal-final-corrupt".to_vec());
+            let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 8,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                    command: Some(command),
+                })
+                .unwrap();
+        }
+        let wal = root.path().join("recorder.wal");
+        let mut bytes = std::fs::read(&wal).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        std::fs::write(&wal, bytes).unwrap();
+
+        assert!(matches!(
+            RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership,
+            ),
+            Err(Error::Decode(message)) if message.contains("WAL frame checksum")
+        ));
+    }
+
+    #[test]
+    fn wal_rotation_checkpoints_before_reusing_the_stable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        for slot in 1..=super::RECORDER_WAL_HARD_FRAME_LIMIT + 1 {
+            let command = StoredCommand::new(
+                EntryType::Command,
+                format!("wal-rotate-{slot}").into_bytes(),
+            );
+            let value = AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command);
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", slot, value),
+                    command: Some(command),
+                })
+                .unwrap();
+        }
+        let (generation, through_sequence, frames) = store.wal_stats().unwrap();
+        assert!(generation > 1);
+        assert!(through_sequence >= super::RECORDER_WAL_HARD_FRAME_LIMIT);
+        assert_eq!(frames, 1);
+        drop(store);
+
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(
+            reopened
+                .load(super::RECORDER_WAL_HARD_FRAME_LIMIT + 1)
+                .unwrap()
+                .isr
+                .step(),
+            4
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn wal_frame_round_trips_arbitrary_inline_commands(
+            sequence in 1u64..u64::MAX,
+            payload in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+            let configuration = ConfigurationState::initial(
+                1,
+                membership.digest(),
+                Some(membership),
+            );
+            let state = RecorderSlotState::new_with_digest(
+                8,
+                "cluster",
+                1,
+                1,
+                configuration.config_digest(),
+            );
+            let command = StoredCommand::new(EntryType::Command, payload);
+            let (encoded, digest) = encode_wal_frame(
+                3,
+                sequence,
+                LogHash::ZERO,
+                &state,
+                &configuration,
+                &RecordedHeadProvenance::Empty,
+                Some((command.hash(), &command)),
+            ).unwrap();
+            let (decoded, end) = decode_wal_frame(&encoded, 0).unwrap().unwrap();
+            prop_assert_eq!(end, encoded.len());
+            prop_assert_eq!(decoded.generation, 3);
+            prop_assert_eq!(decoded.sequence, sequence);
+            prop_assert_eq!(decoded.digest, digest);
+            prop_assert_eq!(decoded.command, Some((command.hash(), command)));
+        }
     }
 
     #[test]
@@ -5617,6 +6758,95 @@ mod tests {
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
         second.join().unwrap();
         third.join().unwrap();
+    }
+
+    #[test]
+    fn full_record_worker_queue_is_transient_unavailable_not_fatal() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n1",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(AlwaysIoRecorder) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(AlwaysIoRecorder) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert!(consensus
+            .record_broadcast(record_requests(&consensus, 1))
+            .unwrap()
+            .is_empty());
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+
+        assert!(consensus
+            .record_broadcast(record_requests(&consensus, 2))
+            .unwrap()
+            .is_empty());
+
+        let third = consensus.record_broadcast(record_requests(&consensus, 3));
+        assert!(
+            matches!(third, Ok(ref replies) if replies.is_empty()),
+            "a full worker queue must remain retryable, got {third:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+    }
+
+    #[test]
+    fn disconnected_record_worker_is_fatal() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let proposal = Proposal::new(
+            ProposalPriority::MAX,
+            "n1",
+            1,
+            AcceptedValue {
+                command_hash: LogHash::ZERO,
+                prev_hash: LogHash::ZERO,
+                entry_hash: LogHash::ZERO,
+            },
+        );
+        let request = RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 4,
+            proposal,
+            command: None,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel(1);
+        drop(job_rx);
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = super::RecordWorker {
+            sender: Some(job_tx),
+            handle: None,
+            pending: Arc::clone(&pending),
+        };
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+        worker.dispatch(super::RecordJob {
+            index: 0,
+            request,
+            result: result_tx,
+        });
+
+        assert_eq!(result_rx.recv().unwrap().1, Err(Error::ProposeFailed));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]

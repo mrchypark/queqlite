@@ -550,6 +550,10 @@ impl KvGetResult {
     pub const fn tip(&self) -> KvReadTip {
         self.tip
     }
+
+    pub fn into_parts(self) -> (Option<Vec<u8>>, KvReadTip) {
+        (self.value, self.tip)
+    }
 }
 
 /// One copied row from a deterministic byte-ordered scan.
@@ -1780,6 +1784,11 @@ mod snapshot_tests {
         assert_eq!(result.tip().applied_index(), 41);
         assert_eq!(result.tip().applied_hash(), hash);
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+
+        let (value, tip) = result.into_parts();
+        assert_eq!(value, Some(b"value".to_vec()));
+        assert_eq!(tip.applied_index(), 41);
+        assert_eq!(tip.applied_hash(), hash);
     }
 
     #[test]

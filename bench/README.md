@@ -194,18 +194,30 @@ cargo test --manifest-path bench/Cargo.toml
 
 ## Direct SQL, graph, and KV profile benchmark
 
-`rhiza-profile` compares the production embedded APIs without HTTP. Every run
-opens one profile with a local QuePaxa instance backed by three file-based
-Recorder voters, preloads the same 256 bounded keys, and measures a fixed number
-of point operations. Writes include Recorder fsync and local qlog/materializer
-work. Gets use local consistency, so they deliberately exclude a consensus read
-barrier. The stable JSON report records these boundaries, the exact Git state,
+`rhiza-profile` compares the public embedded API (`--layer handle`), direct
+`NodeRuntime` calls (`--layer runtime`), and the materializer (`--layer raw`)
+without HTTP. Every run preloads the same 256 bounded keys and measures a fixed
+number of operations. Handle and runtime writes use a local QuePaxa instance
+backed by three file-based Recorder voters; raw excludes consensus. Reads use
+local consistency, so they deliberately exclude a consensus read barrier. The
+stable JSON report records these boundaries, the exact Git state,
 host/toolchain provenance, errors, throughput, and p50/p95/p99/p99.9/max latency
 in microseconds.
 
 Build once, then run each profile under the same operation count, payload, and
 concurrency. `native-read` is a supplemental bounded ordered query for SQL and
 graph, and a bounded prefix scan for KV; compare `get` for point-read parity.
+For graph, `get` measures generic Cypher while `document-get` measures the fixed
+document projection without parsing a caller-supplied query.
+
+For `write`, `--batch-size 1|2|4|8|16|32|64` exercises the typed embedded batch
+API on the handle or runtime layer. `operations`, attempts, successes, errors,
+and throughput remain logical-command counts rather than batch-call counts.
+Successful commands in one non-atomic batch may share a QuePaxa log entry;
+runtime-layer JSON also reports `qlog_entries` for the measured phase so the
+coalescing ratio is visible. Per-command latency is the enclosing batch response
+latency. Retry an indeterminate batch as the whole unchanged vector with the
+same request IDs.
 
 ```sh
 cargo build --release --locked --manifest-path bench/Cargo.toml \
@@ -222,6 +234,20 @@ for profile in sql graph kv; do
     --operations 10000 --warmup 1000 --concurrency 8 --value-bytes 128 \
     > "target/rhiza-bench/profile/${profile}-get.json"
 done
+
+for layer in handle runtime raw; do
+  bench/target/release/rhiza-profile \
+    --profile graph --workload document-get --layer "$layer" \
+    --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+    > "target/rhiza-bench/profile/graph-document-get-${layer}.json"
+done
+
+for batch_size in 1 2 4 8 16 32 64; do
+  bench/target/release/rhiza-profile \
+    --profile kv --workload write --layer runtime --batch-size "$batch_size" \
+    --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+    > "target/rhiza-bench/profile/kv-write-batch-${batch_size}.json"
+done
 ```
 
 Run on an otherwise idle machine. Each invocation uses a fresh temporary data
@@ -236,9 +262,13 @@ multi-host behavior; use the vind runner for those costs.
 
 `rhiza-transport` compares the private node-RPC building blocks on loopback. It
 runs plaintext HTTP and HTTPS with JSON, Postcard, and Prost bodies, plaintext
-and rustls-protected persistent TCP/Postcard, Quinn with one stream per RPC, and
-Quinn with one persistent lane per worker. HTTPS, TLS/TCP, and Quinn trust the
-same generated certificate, so their steady-state TLS costs are comparable.
+and rustls-protected persistent TCP with Postcard and Prost, Quinn with one
+stream per RPC, Quinn with one persistent lane per worker, and a plaintext
+`postcard-rpc` framework candidate. HTTPS, TLS/TCP, and Quinn trust the same
+generated certificate, so their steady-state TLS costs are comparable. TCP
+candidates use the same four-byte big-endian length prefix, one warmed
+connection or session per worker, `TCP_NODELAY`, frame limit, validation, and
+timeout paths.
 
 ```sh
 cargo run --release --locked --manifest-path bench/Cargo.toml \
@@ -278,9 +308,110 @@ Use `python3 bench/run-rpc-tls.py --self-test` for the embedded aggregation
 fixture. The summary includes binary SHA-256, Git and host provenance, and the
 effective order of every run.
 
-The runner writes each completed process's stdout before validation. If the
+For an isolated Postcard-versus-Prost comparison over otherwise identical
+plaintext and TLS/TCP stacks, run:
+
+```sh
+cargo build --release --locked --manifest-path bench/Cargo.toml \
+  --bin rhiza-transport
+python3 bench/run-rpc-codec.py --output-dir bench/rpc-codec-results
+```
+
+`run-rpc-codec.py` runs `tcp-postcard`, `tcp-prost`, `tcp-tls-postcard`, and
+`tcp-tls-prost` four times, rotating every candidate through every order
+position. Its defaults cover 128- and 4096-byte payloads at concurrency 1, 8,
+and 64. It preserves raw JSON,
+validates framing metadata, response/error counts, topology, codec identity,
+and TLS handshake/ALPN telemetry, then emits four-run per-cell medians and worst
+maximum latency. Use `python3 bench/run-rpc-codec.py --self-test` to test its
+aggregation fixture without running the Rust benchmark.
+
+The schema-version-2 codec summary keeps the flat absolute medians and declares
+exactly two comparisons: plaintext `tcp-postcard` to `tcp-prost`, and TLS
+`tcp-tls-postcard` to `tcp-tls-prost`. It first pairs Prost and Postcard within
+each run and payload/concurrency cell, then reports Prost/Postcard throughput
+and p50/p95/p99/p99.9 ratios with per-run values, median, minimum, maximum, and
+median percent delta. An equal-cell-weight geometric mean is included only as
+an auxiliary summary, so a reversal in a cell such as 4096 bytes at concurrency
+64 remains visible rather than being pooled away.
+
+`comparison_valid` means diagnostics and clean, consistent provenance passed
+and both declared within-security comparison groups are valid. It never makes
+the four candidates one comparison and does not validate a plaintext-versus-TLS
+claim; `cross_security_comparison_valid` is always false.
+
+For the local framework A/B, compare the hand-written `tcp-postcard` framing to
+`tcp-postcard-rpc` while keeping the request and acknowledgement schema, payload,
+four-byte big-endian length prefix, frame limit, timeout, concurrency, plaintext
+security stratum, and one warmed session per worker fixed:
+
+```sh
+cargo build --release --locked --manifest-path bench/Cargo.toml \
+  --bin rhiza-transport
+python3 bench/run-rpc-framework.py \
+  --output-dir bench/rpc-framework-results
+```
+
+The framework candidate is pinned to `postcard-rpc` 0.12.1 with `use-std`. It
+uses the real `HostClient`, custom TCP `WireRx`/`WireTx`, `Server`, and generated
+endpoint dispatcher. Requests alternate between `rhiza/record` and
+`rhiza/record/replicate`; both paths use the identical `WireRequest`/`WireAck`
+schema so dispatch is exercised without changing payload work. At concurrency
+greater than one, two cloned client lanes can have requests outstanding on the
+same worker session, while a shared semaphore keeps total in-flight work at the
+configured concurrency.
+
+After warmup negotiates the dispatcher's one-byte key, each measured
+postcard-rpc frame has a six-byte header (one-byte discriminant, one-byte key,
+four-byte sequence) plus the common four-byte length prefix. Raw JSON reports
+both components separately and includes them in encoded request/response sizes.
+
+`run-rpc-framework.py` defaults to three alternating A/B pairs (six runs), so
+each candidate occupies each order position three times. It preserves raw JSON,
+validates schema, framing overhead, endpoint paths, topology, errors, and
+provenance, then reports paired `tcp-postcard-rpc / tcp-postcard` ratios per
+payload/concurrency cell plus an equal-cell-weight geometric mean. Use
+`python3 bench/run-rpc-framework.py --self-test` for its aggregation fixture.
+A dirty or inconsistent Git tree remains diagnostically useful locally but sets
+both `comparison_valid` and `publishable` to false.
+
+The preceding `rhiza-transport` Postcard comparison is **framework-only**. Do
+not aggregate it with production Recorder adapter measurements. For the actual
+adapter A/B, `rhiza-recorder-transport` starts the public production legacy and
+`postcard-rpc` servers and calls them through their public production clients.
+That preserves the real HELLO exchange, opaque Postcard envelope, manual
+seven-endpoint dispatcher, sync bridges, deadlines, connection pools, and
+candidate overload behavior. It measures `record` on the consensus lane and
+`inspect_record_summary` on the control lane against identical deterministic
+in-memory `RecorderRpc` fixtures.
+
+```sh
+cargo build --release --locked --manifest-path bench/Cargo.toml \
+  --bin rhiza-recorder-transport
+python3 bench/run-recorder-transport.py \
+  --output-dir target/rhiza-bench/recorder-transport-results
+```
+
+The runner defaults to three balanced plaintext A/B pairs at concurrency 1, 4,
+and 32. Add `--security plaintext,tls` to run the TLS 1.3 pair as a separate
+stratum; plaintext and TLS results are never combined. Every candidate has one
+shared production client object reused by all threads and cells. Both lanes are
+warmed before every metric. The candidate's real bridge depth and in-flight
+limit are intentionally not widened: `try_send` overloads remain classified
+errors, attempt throughput includes them, success throughput excludes them, and
+latency percentiles contain successful calls only. The report records the
+production Key8/Seq4 13-byte `postcard-rpc` header and the separate four-byte
+frame length prefix. Use `python3 bench/run-recorder-transport.py --self-test`
+to test validation, balancing, and aggregation without running Rust.
+
+Raw runs from a dirty tree remain useful for local diagnosis, but the runner
+sets `comparison_valid` and `publishable` false. It also requires the Git commit
+and dirty state to remain identical across all runs and binds the summary to the
+release binary's SHA-256.
+
+The codec runner writes each completed process's stdout before validation. If the
 benchmark process fails or emits invalid JSON, it exits nonzero immediately;
-there may therefore be fewer than three raw files and no `summary.json`. This
+there may therefore be fewer than four raw files and no `summary.json`. This
 failure-artifact behavior is intentional and callers must preserve the output
 directory and check the runner exit status.
 
@@ -293,8 +424,9 @@ materialization. The JSON report repeats these limitations, records the order
 offset plus effective order, and validates every response including its request
 ID. Each call has a two-second timeout. Raw reports distinguish
 `diagnostic_valid` from `comparison_valid`: warmup or measurement errors fail
-the diagnostic, while a dirty tree, fewer than three runs, mixed security, or
-unverified TLS negotiation prevents comparison validity. HTTPS and TLS/TCP
+the diagnostic, while a dirty tree, fewer than four codec runs, or unverified
+TLS negotiation prevents the declared codec-pair comparisons from being valid.
+HTTPS and TLS/TCP
 observe negotiated TLS version and ALPN from rustls; Quinn observes ALPN and
 relies on QUIC's TLS 1.3 invariant while using an explicitly TLS 1.3-only
 configuration.

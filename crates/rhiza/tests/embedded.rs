@@ -8,9 +8,9 @@ use std::{
 #[cfg(feature = "kv")]
 use rhiza::KvCommandResultV1;
 use rhiza::{
-    effective_cluster_id, CheckpointCoordinator, DurabilityHealth, DurabilityMode, EmbeddedConfig,
-    EmbeddedIdentity, Error, ExecutionProfile, ReadConsistency, RecorderRpc, Rhiza, SqlCommand,
-    SqlStatement, SqlValue,
+    effective_cluster_id, BatchWriteError, CheckpointCoordinator, DurabilityHealth, DurabilityMode,
+    EmbeddedConfig, EmbeddedIdentity, Error, ExecutionProfile, NodeError, ReadConsistency,
+    RecorderRpc, Rhiza, SqlCommand, SqlStatement, SqlValue,
 };
 #[cfg(feature = "graph")]
 use rhiza::{
@@ -74,6 +74,81 @@ async fn executes_and_queries_sql_with_in_process_recorders() {
     rhiza.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_sql_batch_coalesces_in_order_and_retries_unchanged_vector() {
+    let root = tempfile::tempdir().unwrap();
+    let rhiza = Rhiza::open(config(root.path())).await.unwrap();
+    let handle = rhiza.handle();
+    handle
+        .execute_sql(SqlCommand {
+            request_id: "batch-schema".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE batch_items(id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+    let commands = (1..=3)
+        .map(|id| SqlCommand {
+            request_id: format!("batch-insert-{id}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO batch_items(id, name) VALUES (?1, ?2) RETURNING id".into(),
+                parameters: vec![SqlValue::Integer(id), SqlValue::Text(format!("name-{id}"))],
+            }],
+        })
+        .collect::<Vec<_>>();
+
+    let first = handle.execute_sql_batch(commands.clone()).await.unwrap();
+    let replay = handle.execute_sql_batch(commands).await.unwrap();
+
+    assert_eq!(first, replay);
+    assert!(first.iter().all(Result::is_ok));
+    assert!(first
+        .iter()
+        .map(|result| result.as_ref().unwrap().applied_index)
+        .all(|index| index == 2));
+    rhiza.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_sql_batch_preflight_failure_is_not_attempted() {
+    let root = tempfile::tempdir().unwrap();
+    let rhiza = Rhiza::open(config(root.path())).await.unwrap();
+    let handle = rhiza.handle();
+    let statement = SqlStatement {
+        sql: "CREATE TABLE batch_preflight(id INTEGER PRIMARY KEY)".into(),
+        parameters: vec![],
+    };
+
+    let error = handle
+        .execute_sql_batch(vec![
+            SqlCommand {
+                request_id: "would-be-valid".into(),
+                statements: vec![statement.clone()],
+            },
+            SqlCommand {
+                request_id: String::new(),
+                statements: vec![statement.clone()],
+            },
+        ])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BatchWriteError::NotAttempted(Error::Node(NodeError::InvalidRequest(_)))
+    ));
+    handle
+        .execute_sql(SqlCommand {
+            request_id: "after-preflight".into(),
+            statements: vec![statement],
+        })
+        .await
+        .unwrap();
+    rhiza.shutdown().await.unwrap();
+}
+
 #[cfg(feature = "graph")]
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_profile_executes_semantic_writes_and_read_only_queries_in_process() {
@@ -127,6 +202,24 @@ async fn graph_profile_executes_semantic_writes_and_read_only_queries_in_process
             expected: ExecutionProfile::Sqlite,
             actual: ExecutionProfile::Graph,
         })
+    ));
+
+    assert!(matches!(
+        handle
+            .execute_sql_batch(vec![SqlCommand {
+                request_id: "wrong-profile-batch".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE forbidden_batch(id INTEGER)".into(),
+                    parameters: vec![],
+                }],
+            }])
+            .await,
+        Err(BatchWriteError::NotAttempted(
+            Error::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual: ExecutionProfile::Graph,
+            }
+        ))
     ));
 
     rhiza.shutdown().await.unwrap();

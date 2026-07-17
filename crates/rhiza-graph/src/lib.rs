@@ -935,8 +935,8 @@ impl LadybugStateMachine {
         document(&connection, id)
     }
 
-    /// Reads one fixed document projection and the materialized log tip while
-    /// holding one shared database boundary that excludes materializer writes.
+    /// Reads one fixed document projection and the materialized log tip from
+    /// one Ladybug query snapshot, rechecking misses in an explicit read transaction.
     pub fn get_document_with_tip(
         &self,
         id: &str,
@@ -945,11 +945,16 @@ impl LadybugStateMachine {
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
+        if let Some((value, applied_index, applied_hash)) = document_with_tip(&connection, id)? {
+            return Ok((Some(value), applied_index, applied_hash));
+        }
         read_transaction(&connection, || {
-            let value = document(&connection, id)?;
-            let applied_index = meta_u64(&connection, "applied_index")?;
-            let hash = meta_hash(&connection, "applied_hash")?;
-            Ok((value, applied_index, hash))
+            if let Some((value, applied_index, applied_hash)) = document_with_tip(&connection, id)?
+            {
+                return Ok((Some(value), applied_index, applied_hash));
+            }
+            let (applied_index, applied_hash) = materialized_tip(&connection)?;
+            Ok((None, applied_index, applied_hash))
         })
     }
 
@@ -1034,8 +1039,7 @@ impl LadybugStateMachine {
                     .collect::<Result<Vec<_>>>()?;
                 rows.push(row);
             }
-            let applied_index = meta_u64(&connection, "applied_index")?;
-            let hash = meta_hash(&connection, "applied_hash")?;
+            let (applied_index, hash) = materialized_tip(&connection)?;
             Ok(GraphQueryResult {
                 columns,
                 rows,
@@ -3518,6 +3522,58 @@ fn document(connection: &Connection<'_>, id: &str) -> Result<Option<GraphValueV1
     let Some(row) = one_or_none(rows, "document lookup")? else {
         return Ok(None);
     };
+    Ok(Some(decode_document(&row)?))
+}
+
+fn document_with_tip(
+    connection: &Connection<'_>,
+    id: &str,
+) -> Result<Option<(GraphValueV1, LogIndex, LogHash)>> {
+    let rows = execute(
+        connection,
+        "MATCH (d:RhizaDocument), (m:__RhizaMeta) WHERE d.id = $id AND m.key IN ['applied_index', 'applied_hash'] RETURN d.kind, d.bool_value, d.i64_value, d.u64_value, d.f64_value, d.string_value, d.bytes_value, m.key, m.value",
+        vec![("id", Value::String(id.into()))],
+    )?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 2 || rows.iter().any(|row| row.len() != 9) {
+        return Err(Error::Ladybug(
+            "document and tip lookup returned wrong shape".into(),
+        ));
+    }
+    let value = decode_document(&rows[0][..7])?;
+    let mut applied_index = None;
+    let mut applied_hash = None;
+    for row in rows {
+        if decode_document(&row[..7])? != value {
+            return Err(Error::Ladybug(
+                "document and tip lookup returned inconsistent documents".into(),
+            ));
+        }
+        let key = expect_string(&row[7], "metadata key")?;
+        let metadata_value = expect_string(&row[8], "metadata value")?;
+        match key.as_str() {
+            "applied_index" => applied_index = Some(metadata_value),
+            "applied_hash" => applied_hash = Some(metadata_value),
+            _ => {
+                return Err(Error::Ladybug(
+                    "document and tip lookup returned an unexpected key".into(),
+                ))
+            }
+        }
+    }
+    let applied_index = applied_index
+        .ok_or_else(|| Error::IdentityMismatch("missing applied_index".into()))?
+        .parse()
+        .map_err(|_| Error::IdentityMismatch("applied_index".into()))?;
+    let applied_hash = parse_hash(
+        &applied_hash.ok_or_else(|| Error::IdentityMismatch("missing applied_hash".into()))?,
+    )?;
+    Ok(Some((value, applied_index, applied_hash)))
+}
+
+fn decode_document(row: &[Value]) -> Result<GraphValueV1> {
     if row.len() != 7 {
         return Err(Error::Ladybug(
             "document lookup returned wrong shape".into(),
@@ -3541,7 +3597,7 @@ fn document(connection: &Connection<'_>, id: &str) -> Result<Option<GraphValueV1
             )))
         }
     };
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn record_request(
@@ -3662,6 +3718,30 @@ fn meta_hash(connection: &Connection<'_>, key: &str) -> Result<LogHash> {
     )
 }
 
+fn materialized_tip(connection: &Connection<'_>) -> Result<(LogIndex, LogHash)> {
+    let rows = execute(
+        connection,
+        "MATCH (i:__RhizaMeta), (h:__RhizaMeta) WHERE i.key = 'applied_index' AND h.key = 'applied_hash' RETURN i.value, h.value",
+        vec![],
+    )?;
+    let row = one_or_none(rows, "materialized tip lookup")?
+        .ok_or_else(|| Error::IdentityMismatch("missing materialized tip".into()))?;
+    decode_materialized_tip(&row)
+}
+
+fn decode_materialized_tip(row: &[Value]) -> Result<(LogIndex, LogHash)> {
+    if row.len() != 2 {
+        return Err(Error::Ladybug(
+            "materialized tip lookup returned wrong shape".into(),
+        ));
+    }
+    let applied_index = expect_string(&row[0], "applied_index")?
+        .parse()
+        .map_err(|_| Error::IdentityMismatch("applied_index".into()))?;
+    let applied_hash = parse_hash(&expect_string(&row[1], "applied_hash")?)?;
+    Ok((applied_index, applied_hash))
+}
+
 fn parse_hash(value: &str) -> Result<LogHash> {
     LogHash::from_hex(value).ok_or_else(|| Error::Ladybug("stored log hash is invalid".into()))
 }
@@ -3671,13 +3751,13 @@ fn execute(
     query: &str,
     parameters: Vec<(&str, Value)>,
 ) -> Result<Vec<Vec<Value>>> {
-    let mut statement = connection.prepare(query).map_err(ladybug_error)?;
     if parameters.is_empty() {
         return connection
             .query(query)
             .map(|result| result.collect())
             .map_err(ladybug_error);
     }
+    let mut statement = connection.prepare(query).map_err(ladybug_error)?;
     connection
         .execute(&mut statement, parameters)
         .map(|result| result.collect())
@@ -3984,6 +4064,39 @@ mod snapshot_tests {
 mod query_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn document_read_returns_the_tip_when_the_document_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        assert_eq!(
+            state.get_document_with_tip("missing").unwrap(),
+            (None, 0, LogHash::ZERO)
+        );
+    }
+
+    #[test]
+    fn execute_returns_rows_with_and_without_parameters() {
+        let database = Database::in_memory(SystemConfig::default()).unwrap();
+        let connection = Connection::new(&database).unwrap();
+
+        assert_eq!(
+            execute(&connection, "RETURN 1", vec![]).unwrap(),
+            vec![vec![Value::Int64(1)]]
+        );
+        assert_eq!(
+            execute(
+                &connection,
+                "RETURN $value",
+                vec![("value", Value::String("rhiza".into()))],
+            )
+            .unwrap(),
+            vec![vec![Value::String("rhiza".into())]]
+        );
+    }
 
     #[test]
     fn database_lifecycle_lock_allows_concurrent_readers() {

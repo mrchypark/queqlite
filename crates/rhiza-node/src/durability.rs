@@ -32,6 +32,7 @@ use rhiza_kv::{
     restore_snapshot_file as restore_kv_snapshot_file,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
+#[cfg(feature = "sql")]
 use rhiza_sql::{restore_recovery_snapshot_file, sql_executor_fingerprint};
 use serde::Serialize;
 
@@ -644,6 +645,9 @@ fn create_runtime_checkpoint_snapshot(
         .lock_materializer()
         .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
     match &*materializer {
+        #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+        Materializer::Unavailable => unreachable!("no execution profiles are compiled in"),
+        #[cfg(feature = "sql")]
         Materializer::Sql(state) => {
             let snapshot = state
                 .create_recovery_snapshot(runtime.config().recovery_generation())
@@ -918,22 +922,30 @@ fn install_profile_snapshot(
 ) -> Result<(), DurabilityError> {
     match snapshot_profile(identity.cluster_id())? {
         ExecutionProfile::Sqlite => {
-            validate_anchor_fingerprint(
-                snapshot.anchor(),
-                sql_executor_fingerprint()
-                    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?,
-            )?;
-            let path = staging.join("sqlite/db.sqlite");
-            match target_node_id {
-                Some(node_id) => restore_recovery_snapshot_file(
-                    path,
-                    snapshot.bytes(),
+            #[cfg(feature = "sql")]
+            {
+                validate_anchor_fingerprint(
                     snapshot.anchor(),
-                    node_id,
-                )
-                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string())),
-                None => install_snapshot_bytes(&path, snapshot.bytes()),
+                    sql_executor_fingerprint().map_err(|error| {
+                        DurabilityError::SnapshotVerification(error.to_string())
+                    })?,
+                )?;
+                let path = staging.join("sqlite/db.sqlite");
+                match target_node_id {
+                    Some(node_id) => restore_recovery_snapshot_file(
+                        path,
+                        snapshot.bytes(),
+                        snapshot.anchor(),
+                        node_id,
+                    )
+                    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string())),
+                    None => install_snapshot_bytes(&path, snapshot.bytes()),
+                }
             }
+            #[cfg(not(feature = "sql"))]
+            Err(DurabilityError::SnapshotVerification(
+                "sql execution profile is not compiled in".into(),
+            ))
         }
         ExecutionProfile::Graph => {
             #[cfg(feature = "graph")]
@@ -1128,6 +1140,7 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
     })
 }
 
+#[cfg(feature = "sql")]
 fn install_snapshot_bytes(path: &Path, bytes: &[u8]) -> Result<(), DurabilityError> {
     let parent = path.parent().expect("SQLite restore path has a parent");
     fs::create_dir_all(parent)?;

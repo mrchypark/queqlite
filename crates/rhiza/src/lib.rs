@@ -11,7 +11,7 @@ use std::{
 };
 
 use rhiza_node::{
-    confirm_write_durability, ConfigError, NodeConfig, NodeError, NodeRuntime, NodeService,
+    confirm_write_durability, run_read_operation, ConfigError, NodeConfig, NodeRuntime, NodeService,
 };
 use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
@@ -30,8 +30,8 @@ pub use rhiza_graph::{
 pub use rhiza_kv::{KvCommandResultV1, KvCommandV1, KvReadTip, KvScanResult, KvScanRow};
 pub use rhiza_node::{
     effective_cluster_id, CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
-    LogPeer, NodeStatus, ReadConsistency, ReadResponse, SqlExecuteResponse, SqlQueryResponse,
-    SqlStatementResult, WriteRequest, WriteResponse,
+    LogPeer, NodeError, NodeStatus, ReadConsistency, ReadResponse, SqlExecuteResponse,
+    SqlQueryResponse, SqlStatementResult, WriteRequest, WriteResponse,
 };
 #[cfg(feature = "graph")]
 pub use rhiza_node::{GraphMutationOutcome, GraphReadResponse};
@@ -147,6 +147,35 @@ impl std::error::Error for Error {
             Self::Durability(error) => Some(error),
             Self::PendingConsensusRpcs => None,
             Self::Worker(error) => Some(error),
+        }
+    }
+}
+
+/// An outer failure from an embedded typed batch write.
+///
+/// `NotAttempted` means the complete vector failed validation or admission before any command was
+/// attempted. `Indeterminate` means execution may have committed commands but their durability
+/// could not be confirmed. After `Indeterminate`, retry the entire unchanged vector with the same
+/// request IDs; per-command idempotency makes that retry safe.
+#[derive(Debug)]
+pub enum BatchWriteError {
+    NotAttempted(Error),
+    Indeterminate(Error),
+}
+
+impl fmt::Display for BatchWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAttempted(error) => write!(f, "batch was not attempted: {error}"),
+            Self::Indeterminate(error) => write!(f, "batch outcome is indeterminate: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BatchWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotAttempted(error) | Self::Indeterminate(error) => Some(error),
         }
     }
 }
@@ -326,6 +355,23 @@ impl RhizaHandle {
         Ok(inner.service.execute_sql(command).await?)
     }
 
+    /// Executes an ordered, non-atomic SQL batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
+    pub async fn execute_sql_batch(
+        &self,
+        commands: Vec<SqlCommand>,
+    ) -> Result<Vec<Result<SqlExecuteResponse, NodeError>>, BatchWriteError> {
+        self.execute_typed_batch(
+            ExecutionProfile::Sqlite,
+            move |runtime| runtime.execute_sql_batch(commands),
+            |response| response.applied_index,
+        )
+        .await
+    }
+
     pub async fn read(
         &self,
         key: &str,
@@ -366,6 +412,24 @@ impl RhizaHandle {
         Ok(outcome)
     }
 
+    /// Executes an ordered, non-atomic graph batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
+    #[cfg(feature = "graph")]
+    pub async fn mutate_graph_batch(
+        &self,
+        commands: Vec<GraphCommandV1>,
+    ) -> Result<Vec<Result<GraphMutationOutcome, NodeError>>, BatchWriteError> {
+        self.execute_typed_batch(
+            ExecutionProfile::Graph,
+            move |runtime| runtime.mutate_graph_batch(commands),
+            GraphMutationOutcome::applied_index,
+        )
+        .await
+    }
+
     #[cfg(feature = "graph")]
     pub async fn query_graph(
         &self,
@@ -384,6 +448,22 @@ impl RhizaHandle {
         .await
         .map_err(Error::Worker)?
         .map_err(Error::Node)
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn get_graph_document(
+        &self,
+        id: impl Into<String>,
+        consistency: ReadConsistency,
+    ) -> Result<GraphReadResponse, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        let runtime = inner.runtime.clone();
+        let id = id.into();
+        tokio::task::spawn_blocking(move || runtime.get_graph_document(&id, consistency))
+            .await
+            .map_err(Error::Worker)?
+            .map_err(Error::Node)
     }
 
     #[cfg(feature = "kv")]
@@ -422,6 +502,24 @@ impl RhizaHandle {
         Ok(outcome)
     }
 
+    /// Executes an ordered, non-atomic KV batch that may coalesce commands into fewer log entries.
+    ///
+    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
+    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
+    /// vector with the same request IDs.
+    #[cfg(feature = "kv")]
+    pub async fn mutate_kv_batch(
+        &self,
+        commands: Vec<KvCommandV1>,
+    ) -> Result<Vec<Result<KvMutationOutcome, NodeError>>, BatchWriteError> {
+        self.execute_typed_batch(
+            ExecutionProfile::Kv,
+            move |runtime| runtime.mutate_kv_batch(commands),
+            KvMutationOutcome::applied_index,
+        )
+        .await
+    }
+
     #[cfg(feature = "kv")]
     pub async fn get_kv(
         &self,
@@ -432,7 +530,7 @@ impl RhizaHandle {
         require_profile(&inner, ExecutionProfile::Kv)?;
         let runtime = inner.runtime.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || runtime.get_kv(&key, consistency))
+        run_read_operation(consistency, move || runtime.get_kv(&key, consistency))
             .await
             .map_err(Error::Worker)?
             .map_err(Error::Node)
@@ -512,6 +610,42 @@ impl RhizaHandle {
         }
         Ok((inner, operation))
     }
+
+    async fn execute_typed_batch<T, F, I>(
+        &self,
+        profile: ExecutionProfile,
+        execute: F,
+        applied_index: I,
+    ) -> Result<Vec<Result<T, NodeError>>, BatchWriteError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<NodeRuntime>) -> Result<Vec<Result<T, NodeError>>, NodeError>
+            + Send
+            + 'static,
+        I: Fn(&T) -> rhiza_core::LogIndex,
+    {
+        let (inner, _operation) = self
+            .begin_operation()
+            .await
+            .map_err(BatchWriteError::NotAttempted)?;
+        require_profile(&inner, profile).map_err(BatchWriteError::NotAttempted)?;
+        embedded_write_allowed(&inner).map_err(BatchWriteError::NotAttempted)?;
+        let runtime = inner.runtime.clone();
+        let results = tokio::task::spawn_blocking(move || execute(runtime))
+            .await
+            .map_err(|error| BatchWriteError::Indeterminate(Error::Worker(error)))?
+            .map_err(|error| BatchWriteError::NotAttempted(Error::Node(error)))?;
+        if let Some(index) = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(&applied_index))
+            .max()
+        {
+            confirm_embedded_write(&inner, index)
+                .await
+                .map_err(BatchWriteError::Indeterminate)?;
+        }
+        Ok(results)
+    }
 }
 
 fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Error> {
@@ -525,7 +659,6 @@ fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Erro
     }
 }
 
-#[cfg(any(feature = "graph", feature = "kv"))]
 fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     if let Some(coordinator) = &inner.coordinator {
         coordinator.write_allowed()?;
@@ -533,7 +666,6 @@ fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(any(feature = "graph", feature = "kv"))]
 async fn confirm_embedded_write(
     inner: &Inner,
     applied_index: rhiza_core::LogIndex,

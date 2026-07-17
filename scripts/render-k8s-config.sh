@@ -25,15 +25,15 @@ case "$profile" in
   *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
 case "$recorder_transport" in
-  http|tcp-postcard) ;;
-  *) echo "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard" >&2; exit 65 ;;
+  http|tcp-postcard|tcp-postcard-rpc) ;;
+  *) echo "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc" >&2; exit 65 ;;
 esac
 case "$recorder_tls" in
   on|off) ;;
   *) echo "RHIZA_RECORDER_TLS must be on|off" >&2; exit 65 ;;
 esac
-[ "$recorder_tls" != on ] || [ "$recorder_transport" = tcp-postcard ] || {
-  echo "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard" >&2
+[ "$recorder_tls" != on ] || [ "$recorder_transport" != http ] || {
+  echo "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc" >&2
   exit 65
 }
 [ -r "$bundle" ] || { echo "cannot read bundle: $bundle" >&2; exit 66; }
@@ -52,9 +52,11 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
   all(.members[];
     (($recorder_transport == "http" and
       (keys | sort) == ["log_url", "node_id", "token", "url"]) or
-     ($recorder_transport == "tcp-postcard" and $recorder_tls == "off" and
+     (($recorder_transport == "tcp-postcard" or $recorder_transport == "tcp-postcard-rpc") and
+      $recorder_tls == "off" and
       (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "token", "url"]) or
-     ($recorder_transport == "tcp-postcard" and $recorder_tls == "on" and
+     (($recorder_transport == "tcp-postcard" or $recorder_transport == "tcp-postcard-rpc") and
+      $recorder_tls == "on" and
       (keys | sort) == ["log_url", "node_id", "recorder_tcp_addr", "recorder_tls_server_name", "token", "url"]))) and
   ((has("predecessor") | not) or .predecessor == null or
     (.predecessor |
@@ -74,7 +76,7 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
       url: "http://rhiza-\($profile)-c\($id)-\($n).rhiza-\($profile)-c\($id):8081",
       log_url: "http://rhiza-\($profile)-c\($id)-\($n).rhiza-\($profile)-c\($id):8080"
     }]) and
-  ($recorder_transport != "tcp-postcard" or
+  ($recorder_transport == "http" or
     ([.members | sort_by(.node_id)[] | {recorder_tcp_addr}] ==
       [range(0; $replicas) as $n | {
         recorder_tcp_addr: "rhiza-\($profile)-c\($id)-\($n).rhiza-\($profile)-c\($id):8082"
@@ -87,7 +89,7 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" --arg profile "$p
 ' "$bundle" >/dev/null || { echo "invalid v1 bundle/config/replica identity" >&2; exit 65; }
 
 name="rhiza-${profile}-c${config_id}"
-image="${RHIZA_IMAGE:-rhiza:dev}"
+image="${RHIZA_IMAGE:-rhiza-${profile}:dev}"
 cluster_id="${RHIZA_CLUSTER_ID:-rhiza-vind}"
 epoch="${RHIZA_EPOCH:-1}"
 generation="${RHIZA_RECOVERY_GENERATION:-1}"
@@ -275,7 +277,7 @@ yq eval --inplace '
       ]
     )
 ' "$output"
-if [ "$recorder_transport" = tcp-postcard ]; then
+if [ "$recorder_transport" != http ]; then
   yq eval --inplace '
     (select(.kind == "Service" and .metadata.name == strenv(CONFIG_NAME)) |
       .spec.ports) += [{"name":"recorder-tcp", "port":8082, "targetPort":"recorder-tcp"}] |
