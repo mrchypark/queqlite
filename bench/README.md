@@ -192,6 +192,46 @@ replacement to become Ready; it does not inject RustFS failures.
 cargo test --manifest-path bench/Cargo.toml
 ```
 
+## Direct SQL, graph, and KV profile benchmark
+
+`rhiza-profile` compares the production embedded APIs without HTTP. Every run
+opens one profile with a local QuePaxa instance backed by three file-based
+Recorder voters, preloads the same 256 bounded keys, and measures a fixed number
+of point operations. Writes include Recorder fsync and local qlog/materializer
+work. Gets use local consistency, so they deliberately exclude a consensus read
+barrier. The stable JSON report records these boundaries, the exact Git state,
+host/toolchain provenance, errors, throughput, and p50/p95/p99/p99.9/max latency
+in microseconds.
+
+Build once, then run each profile under the same operation count, payload, and
+concurrency. `native-read` is a supplemental bounded ordered query for SQL and
+graph, and a bounded prefix scan for KV; compare `get` for point-read parity.
+
+```sh
+cargo build --release --locked --manifest-path bench/Cargo.toml \
+  --bin rhiza-profile
+
+mkdir -p target/rhiza-bench/profile
+for profile in sql graph kv; do
+  bench/target/release/rhiza-profile \
+    --profile "$profile" --workload write \
+    --operations 10000 --warmup 1000 --concurrency 8 --value-bytes 128 \
+    > "target/rhiza-bench/profile/${profile}-write.json"
+  bench/target/release/rhiza-profile \
+    --profile "$profile" --workload get \
+    --operations 10000 --warmup 1000 --concurrency 8 --value-bytes 128 \
+    > "target/rhiza-bench/profile/${profile}-get.json"
+done
+```
+
+Run on an otherwise idle machine. Each invocation uses a fresh temporary data
+directory, and reports from a dirty worktree remain useful locally but should
+not be published as release evidence. The example writes reports under the
+repository's ignored `target/` directory so shell redirection itself does not
+make a clean checkout appear dirty. This direct benchmark excludes HTTP,
+serialization, node-to-node network latency, remote checkpoints, and
+multi-host behavior; use the vind runner for those costs.
+
 ## Node transport microbenchmark
 
 `rhiza-transport` compares the private node-RPC building blocks on loopback. It

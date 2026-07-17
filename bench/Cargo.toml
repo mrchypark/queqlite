@@ -18,9 +18,12 @@ prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rhiza = { path = "../crates/rhiza", features = ["graph", "kv"] }
+rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
