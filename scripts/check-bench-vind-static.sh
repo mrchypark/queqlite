@@ -6,12 +6,12 @@ cd "$repo_root"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-if grep -Eq 'tcp-tls-postcard|RHIZA_RECORDER_TLS_SECRET|recorder_tls_server_name|recorder-tls|tls\.(crt|key)|ca-bundle' \
-  scripts/bench-vind.sh; then
-  echo "vind benchmark still contains Recorder TLS setup" >&2
-  exit 1
-fi
-grep -Fq 'http|tcp-postcard' scripts/bench-vind.sh
+grep -Fq 'http|tcp-postcard|tcp-postcard-rpc)' scripts/bench-vind.sh
+grep -Fq 'RHIZA_RECORDER_TLS=on' scripts/bench-vind.sh
+grep -Fq 'RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls' scripts/bench-vind.sh
+grep -Fq 'recorder_tls_server_name:' scripts/bench-vind.sh
+# shellcheck disable=SC2016 # Literal source check.
+grep -Fq -- '--from-file=tls.key="$recorder_tls_dir/tls.key"' scripts/bench-vind.sh
 grep -Fq 'recorder_tcp_addr:' scripts/bench-vind.sh
 grep -Fq '":1F92[[:space:]]+[0-9A-F]+:[0-9A-F]+[[:space:]]+0A"' scripts/bench-vind.sh
 grep -Fq '! grep -Eqi ":1F91' scripts/bench-vind.sh
@@ -866,8 +866,110 @@ yq eval -e 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c1") |
   .spec.ports[] |
   select(.name == "recorder-tcp" and .port == 8082 and .targetPort == "recorder-tcp")' \
   "$tmp/cluster-tcp.yaml" >/dev/null
-if grep -Eqi 'recorder.*(tls|certificate|ca-bundle)' "$tmp/cluster-tcp.yaml"; then
-  echo "plaintext Recorder manifest contains TLS configuration" >&2
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TLS") | .value == "off"' \
+  "$tmp/cluster-tcp.yaml" >/dev/null
+for tls_env_name in RHIZA_RECORDER_TLS_CERT_FILE RHIZA_RECORDER_TLS_KEY_FILE \
+  RHIZA_RECORDER_TLS_CA_FILE; do
+  if TLS_ENV_NAME="$tls_env_name" yq eval -e 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[] | select(.name == "rhiza") |
+    .env[] | select(.name == strenv(TLS_ENV_NAME))' "$tmp/cluster-tcp.yaml" \
+      >/dev/null 2>&1; then
+    echo "plaintext Recorder manifest contains $tls_env_name" >&2
+    exit 1
+  fi
+done
+if yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .volumeMounts[] | select(.name == "recorder-tls")' "$tmp/cluster-tcp.yaml" \
+    >/dev/null 2>&1; then
+  echo "plaintext Recorder manifest contains a TLS volume mount" >&2
+  exit 1
+fi
+
+RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tcp.json" "$tmp/cluster-postcard-rpc.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TRANSPORT") |
+  .value == "tcp-postcard-rpc"' "$tmp/cluster-postcard-rpc.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .ports[] | select(.name == "recorder-tcp") | .containerPort == 8082' \
+  "$tmp/cluster-postcard-rpc.yaml" >/dev/null
+
+jq '.members |= (to_entries | map(.value + {
+  recorder_tcp_addr:("rhiza-sql-c1-" + (.key | tostring) + ".rhiza-sql-c1:8082"),
+  recorder_tls_server_name:("rhiza-sql-c1-" + (.key | tostring) + ".rhiza-sql-c1")
+}))' "$tmp/config.json" > "$tmp/config-tls.json"
+tls_names=(
+  rhiza-sql-c1-0.rhiza-sql-c1
+  rhiza-sql-c1-1.rhiza-sql-c1
+  rhiza-sql-c1-2.rhiza-sql-c1
+)
+tls_dir="$tmp/recorder-tls"
+generate_recorder_tls_material "$tls_dir" "${tls_names[@]}"
+openssl verify -CAfile "$tls_dir/ca-bundle.pem" "$tls_dir/tls.crt" >/dev/null
+for dns_name in "${tls_names[@]}"; do
+  openssl x509 -in "$tls_dir/tls.crt" -noout -checkhost "$dns_name" >/dev/null
+done
+expected_sans="$(printf '%s\n' "${tls_names[@]}" | sort)"
+actual_sans="$(openssl x509 -in "$tls_dir/tls.crt" -noout -text |
+  grep -o 'DNS:[^, ]*' | cut -c5- | sort)"
+[ "$actual_sans" = "$expected_sans" ]
+[ "$(find "$tls_dir" -type f | wc -l | tr -d ' ')" = 3 ]
+
+RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+RHIZA_RECORDER_TLS=on \
+RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tls.json" "$tmp/cluster-tls.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TRANSPORT") |
+  .value == "tcp-postcard"' "$tmp/cluster-tls.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TLS") |
+  .value == "on"' "$tmp/cluster-tls.yaml" >/dev/null
+for tls_env in \
+  RHIZA_RECORDER_TLS_CERT_FILE=/run/secrets/rhiza/recorder-tls/tls.crt \
+  RHIZA_RECORDER_TLS_KEY_FILE=/run/secrets/rhiza/recorder-tls/tls.key \
+  RHIZA_RECORDER_TLS_CA_FILE=/run/secrets/rhiza/recorder-tls/ca-bundle.pem; do
+  TLS_ENV_NAME="${tls_env%%=*}" TLS_ENV_VALUE="${tls_env#*=}" \
+    yq eval -e 'select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[] | select(.name == "rhiza") |
+      .env[] | select(.name == strenv(TLS_ENV_NAME)) |
+      .value == strenv(TLS_ENV_VALUE)' "$tmp/cluster-tls.yaml" >/dev/null
+done
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .volumeMounts[] |
+  select(.name == "recorder-tls" and .readOnly == true)' \
+  "$tmp/cluster-tls.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
+  .secret.secretName == "rhiza-sql-c1-recorder-tls"' \
+  "$tmp/cluster-tls.yaml" >/dev/null
+
+RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+RHIZA_RECORDER_TLS=on \
+RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls \
+  scripts/render-k8s-config.sh 1 3 "$tmp/config-tls.json" \
+    "$tmp/cluster-postcard-rpc-tls.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TRANSPORT") |
+  .value == "tcp-postcard-rpc"' "$tmp/cluster-postcard-rpc-tls.yaml" >/dev/null
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") |
+  .env[] | select(.name == "RHIZA_RECORDER_TLS") |
+  .value == "on"' "$tmp/cluster-postcard-rpc-tls.yaml" >/dev/null
+tls_secret_keys="$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
+  .secret.items[].key' "$tmp/cluster-tls.yaml" | sed '/^$/d; /^---$/d' | sort | paste -sd, -)"
+[ "$tls_secret_keys" = ca-bundle.pem,tls.crt,tls.key ]
+if grep -Eq 'BEGIN (CERTIFICATE|.*PRIVATE KEY)|^[[:space:]]*data:' "$tmp/cluster-tls.yaml"; then
+  echo "Recorder TLS manifest contains certificate or key material" >&2
   exit 1
 fi
 

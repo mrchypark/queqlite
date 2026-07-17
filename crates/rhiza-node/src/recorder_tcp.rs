@@ -16,6 +16,7 @@ use rhiza_quepaxa::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     peer_credentials_authenticated, valid_recorder_command, valid_recorder_record, PeerConfig,
@@ -27,6 +28,112 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIONS_PER_LANE: usize = 2;
 const MAX_SERVER_CONNECTIONS: usize = DEFAULT_PEER_CONCURRENCY * 4;
+const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/1";
+
+#[cfg(feature = "recorder-postcard-rpc")]
+mod postcard_rpc;
+#[cfg(feature = "recorder-postcard-rpc")]
+pub use postcard_rpc::{
+    serve_recorder_postcard_rpc, serve_recorder_postcard_rpc_tls,
+    RecorderPostcardRpcTlsClientConfig, RecorderPostcardRpcTlsServerConfig,
+    TcpPostcardRpcRecorderClient,
+};
+
+#[derive(Clone)]
+pub struct RecorderTlsServerConfig {
+    inner: Arc<rustls::ServerConfig>,
+}
+
+impl fmt::Debug for RecorderTlsServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecorderTlsServerConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecorderTlsServerConfig {
+    pub fn from_pem(certificate_chain_pem: &[u8], private_key_pem: &[u8]) -> Result<Self, String> {
+        let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(certificate_chain_pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid recorder TLS certificate PEM".to_string())?;
+        if certificates.is_empty() {
+            return Err("recorder TLS certificate chain is empty".into());
+        }
+        let mut key_reader = std::io::Cursor::new(private_key_pem);
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|_| "invalid recorder TLS private key PEM".to_string())?
+            .ok_or_else(|| "recorder TLS private key is missing".to_string())?;
+        if rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|_| "invalid recorder TLS private key PEM".to_string())?
+            .is_some()
+        {
+            return Err("recorder TLS private key PEM contains multiple keys".into());
+        }
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| "recorder TLS crypto provider does not support TLS 1.3".to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| {
+            "recorder TLS certificate and private key are invalid or mismatched".to_string()
+        })?;
+        config.alpn_protocols = vec![RECORDER_TLS_ALPN.to_vec()];
+        config.max_early_data_size = 0;
+        Ok(Self {
+            inner: Arc::new(config),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct RecorderTlsClientConfig {
+    inner: Arc<rustls::ClientConfig>,
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+impl fmt::Debug for RecorderTlsClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecorderTlsClientConfig")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecorderTlsClientConfig {
+    pub fn from_ca_pem(ca_bundle_pem: &[u8], server_name: &str) -> Result<Self, String> {
+        let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_bundle_pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid recorder TLS CA bundle PEM".to_string())?;
+        if certificates.is_empty() {
+            return Err("recorder TLS CA bundle is empty".into());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in certificates {
+            roots.add(certificate).map_err(|_| {
+                "recorder TLS CA bundle contains an invalid certificate".to_string()
+            })?;
+        }
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|_| "invalid recorder TLS server name".to_string())?;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| "recorder TLS crypto provider does not support TLS 1.3".to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![RECORDER_TLS_ALPN.to_vec()];
+        config.enable_early_data = false;
+        Ok(Self {
+            inner: Arc::new(config),
+            server_name,
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Hello {
@@ -137,6 +244,52 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send,
 {
+    serve_recorder_tcp_inner(
+        listener,
+        recorder,
+        peers,
+        recovery_generation,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_recorder_tcp_tls<R, F>(
+    listener: tokio::net::TcpListener,
+    recorder: R,
+    peers: Vec<PeerConfig>,
+    recovery_generation: u64,
+    tls: RecorderTlsServerConfig,
+    shutdown: F,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
+    serve_recorder_tcp_inner(
+        listener,
+        recorder,
+        peers,
+        recovery_generation,
+        Some(tls.inner),
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_recorder_tcp_inner<R, F>(
+    listener: tokio::net::TcpListener,
+    recorder: R,
+    peers: Vec<PeerConfig>,
+    recovery_generation: u64,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    shutdown: F,
+) -> Result<(), String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
     let reported_connection_error = Arc::new(AtomicBool::new(false));
@@ -155,12 +308,27 @@ where
                 let recorder = recorder.clone();
                 let peers = peers.clone();
                 let slots = slots.clone();
+                let tls = tls.clone();
                 let reported_connection_error = Arc::clone(&reported_connection_error);
                 tasks.spawn(async move {
                     let _connection = connection;
-                    if let Err(error) =
+                    let result = if let Some(config) = tls {
+                        let acceptor = TlsAcceptor::from(config);
+                        match tokio::time::timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                if tls_stream.get_ref().1.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
+                                    Err("recorder TLS ALPN negotiation failed".to_string())
+                                } else {
+                                    serve_connection(tls_stream, recorder, peers, recovery_generation, slots).await
+                                }
+                            }
+                            Ok(Err(_)) => Err("recorder TLS handshake failed".to_string()),
+                            Err(_) => Err("recorder TLS handshake timed out".to_string()),
+                        }
+                    } else {
                         serve_connection(stream, recorder, peers, recovery_generation, slots).await
-                    {
+                    };
+                    if let Err(error) = result {
                         if error != "connection closed"
                             && !reported_connection_error.swap(true, Ordering::Relaxed)
                         {
@@ -180,8 +348,8 @@ where
     Ok(())
 }
 
-async fn serve_connection<R>(
-    mut stream: tokio::net::TcpStream,
+async fn serve_connection<R, S>(
+    mut stream: S,
     recorder: R,
     peers: Vec<PeerConfig>,
     recovery_generation: u64,
@@ -189,6 +357,7 @@ async fn serve_connection<R>(
 ) -> Result<(), String>
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let hello_bytes = tokio::time::timeout(CALL_TIMEOUT, read_frame_async(&mut stream))
         .await
@@ -229,6 +398,8 @@ where
         }
         let request_id = request.request_id;
         let operation = response_operation(&request.body);
+        let dispatch_deadline = Instant::now()
+            + Duration::from_millis(u64::from(request.remaining_deadline_ms)).min(CALL_TIMEOUT);
         let permit = match slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -245,16 +416,14 @@ where
                 continue;
             }
         };
-        let call_recorder = recorder.clone();
-        let body = match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            dispatch(call_recorder, request.body)
-        })
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => error_response(operation, error.to_string()),
-        };
+        let body = dispatch_with_deadline(
+            recorder.clone(),
+            request.body,
+            operation,
+            permit,
+            dispatch_deadline,
+        )
+        .await;
         write_value_async_with_timeout(
             &mut stream,
             &ResponseFrame {
@@ -268,13 +437,37 @@ where
     }
 }
 
+async fn dispatch_with_deadline<R>(
+    recorder: R,
+    body: RecorderRequestBody,
+    operation: Operation,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    deadline: Instant,
+) -> RecorderResponseBody
+where
+    R: RecorderRpc + Send + Sync + 'static,
+{
+    if deadline <= Instant::now() {
+        return error_response(operation, "recorder RPC deadline exceeded".into());
+    }
+    let dispatched = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        dispatch(recorder, body)
+    });
+    match tokio::time::timeout_at(deadline.into(), dispatched).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => error_response(operation, error.to_string()),
+        Err(_) => error_response(operation, "recorder RPC deadline exceeded".into()),
+    }
+}
+
 fn hello_authenticated(hello: &Hello, peers: &[PeerConfig], recovery_generation: u64) -> bool {
     hello.version == WIRE_VERSION
         && hello.recovery_generation == recovery_generation
         && peer_credentials_authenticated(&hello.node_id, &hello.token, peers)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Operation {
     Identity,
     StoreCommand,
@@ -474,8 +667,150 @@ struct ConnectionPool {
 
 #[derive(Default)]
 struct PoolState {
-    idle: Vec<TcpStream>,
+    idle: Vec<RecorderClientStream>,
     open: usize,
+}
+
+trait DeadlineClock {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Clone, Copy)]
+struct SystemClock;
+
+impl DeadlineClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+trait SocketTimeouts {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl SocketTimeouts for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+struct DeadlineStream<S, C = SystemClock> {
+    inner: S,
+    deadline: Instant,
+    clock: C,
+}
+
+impl<S> DeadlineStream<S> {
+    fn new(inner: S, deadline: Instant) -> Self {
+        Self::new_with_clock(inner, deadline, SystemClock)
+    }
+}
+
+impl<S, C> DeadlineStream<S, C> {
+    fn new_with_clock(inner: S, deadline: Instant, clock: C) -> Self {
+        Self {
+            inner,
+            deadline,
+            clock,
+        }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+}
+
+impl<S, C: DeadlineClock> DeadlineStream<S, C> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(self.clock.now());
+        if remaining.is_zero() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "recorder RPC deadline exceeded",
+            ))
+        } else {
+            Ok(remaining)
+        }
+    }
+}
+
+impl<S: Read + SocketTimeouts, C: DeadlineClock> Read for DeadlineStream<S, C> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.set_read_timeout(Some(self.remaining()?))?;
+        self.inner.read(buffer)
+    }
+}
+
+impl<S: Write + SocketTimeouts, C: DeadlineClock> Write for DeadlineStream<S, C> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.flush()
+    }
+}
+
+enum RecorderClientStream {
+    Plain(DeadlineStream<TcpStream>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, DeadlineStream<TcpStream>>>),
+}
+
+impl RecorderClientStream {
+    fn set_deadline(&mut self, deadline: Instant) {
+        match self {
+            Self::Plain(stream) => stream.set_deadline(deadline),
+            Self::Tls(stream) => stream.sock.set_deadline(deadline),
+        }
+    }
+
+    fn ensure_deadline(&self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.remaining().map(|_| ()),
+            Self::Tls(stream) => stream.sock.remaining().map(|_| ()),
+        }
+    }
+}
+
+impl Read for RecorderClientStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.ensure_deadline()?;
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for RecorderClientStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.ensure_deadline()?;
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.ensure_deadline()?;
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ClientTransport {
+    Plain,
+    Tls(RecorderTlsClientConfig),
 }
 
 impl ConnectionPool {
@@ -493,6 +828,8 @@ pub struct TcpPostcardRecorderClient {
     local_node_id: String,
     peer_token: String,
     recovery_generation: u64,
+    transport: ClientTransport,
+    call_timeout: Duration,
     consensus: ConnectionPool,
     control: ConnectionPool,
     next_request_id: AtomicU64,
@@ -507,6 +844,14 @@ impl fmt::Debug for TcpPostcardRecorderClient {
             .field("local_node_id", &self.local_node_id)
             .field("peer_token", &"[redacted]")
             .field("recovery_generation", &self.recovery_generation)
+            .field("call_timeout", &self.call_timeout)
+            .field(
+                "transport",
+                &match self.transport {
+                    ClientTransport::Plain => "plain",
+                    ClientTransport::Tls(_) => "tls",
+                },
+            )
             .finish()
     }
 }
@@ -519,6 +864,62 @@ impl TcpPostcardRecorderClient {
         peer_token: impl Into<String>,
         recovery_generation: u64,
     ) -> Result<Self, String> {
+        Self::new_with_transport(
+            address,
+            expected_recorder_id,
+            local_node_id,
+            peer_token,
+            recovery_generation,
+            ClientTransport::Plain,
+        )
+    }
+
+    pub fn new_tls(
+        address: impl ToString,
+        expected_recorder_id: impl Into<String>,
+        local_node_id: impl Into<String>,
+        peer_token: impl Into<String>,
+        recovery_generation: u64,
+        tls: RecorderTlsClientConfig,
+    ) -> Result<Self, String> {
+        Self::new_with_transport(
+            address,
+            expected_recorder_id,
+            local_node_id,
+            peer_token,
+            recovery_generation,
+            ClientTransport::Tls(tls),
+        )
+    }
+
+    fn new_with_transport(
+        address: impl ToString,
+        expected_recorder_id: impl Into<String>,
+        local_node_id: impl Into<String>,
+        peer_token: impl Into<String>,
+        recovery_generation: u64,
+        transport: ClientTransport,
+    ) -> Result<Self, String> {
+        Self::new_with_transport_and_timeout(
+            address,
+            expected_recorder_id,
+            local_node_id,
+            peer_token,
+            recovery_generation,
+            transport,
+            CALL_TIMEOUT,
+        )
+    }
+
+    fn new_with_transport_and_timeout(
+        address: impl ToString,
+        expected_recorder_id: impl Into<String>,
+        local_node_id: impl Into<String>,
+        peer_token: impl Into<String>,
+        recovery_generation: u64,
+        transport: ClientTransport,
+        call_timeout: Duration,
+    ) -> Result<Self, String> {
         let address = address.to_string();
         validate_recorder_tcp_endpoint(&address)?;
         let expected_recorder_id = expected_recorder_id.into();
@@ -528,6 +929,7 @@ impl TcpPostcardRecorderClient {
             || local_node_id.trim().is_empty()
             || peer_token.trim().is_empty()
             || recovery_generation == 0
+            || call_timeout.is_zero()
         {
             return Err("invalid recorder TCP client identity".into());
         }
@@ -537,6 +939,8 @@ impl TcpPostcardRecorderClient {
             local_node_id,
             peer_token,
             recovery_generation,
+            transport,
+            call_timeout,
             consensus: ConnectionPool::new(),
             control: ConnectionPool::new(),
             next_request_id: AtomicU64::new(1),
@@ -548,7 +952,7 @@ impl TcpPostcardRecorderClient {
         request: RecorderRequestBody,
         consensus: bool,
     ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
-        let deadline = Instant::now() + CALL_TIMEOUT;
+        let deadline = Instant::now() + self.call_timeout;
         let pool = if consensus {
             &self.consensus
         } else {
@@ -557,14 +961,14 @@ impl TcpPostcardRecorderClient {
         let mut stream = self.checkout(pool, deadline)?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let operation = response_operation(&request);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let remaining_deadline_ms = u32::try_from(remaining.as_millis())
-            .unwrap_or(u32::MAX)
-            .max(1);
-        if let Err(error) = set_timeouts(&stream, remaining) {
-            self.discard(pool);
-            return Err(error);
-        }
+        stream.set_deadline(deadline);
+        let remaining_deadline_ms = match advertised_remaining_deadline_ms(deadline) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                self.discard(pool);
+                return Err(error);
+            }
+        };
         let frame = RequestFrame {
             version: WIRE_VERSION,
             request_id,
@@ -598,7 +1002,7 @@ impl TcpPostcardRecorderClient {
         &self,
         pool: &ConnectionPool,
         deadline: Instant,
-    ) -> rhiza_quepaxa::Result<TcpStream> {
+    ) -> rhiza_quepaxa::Result<RecorderClientStream> {
         loop {
             let mut state = pool
                 .state
@@ -633,7 +1037,7 @@ impl TcpPostcardRecorderClient {
         }
     }
 
-    fn connect(&self, deadline: Instant) -> Result<TcpStream, String> {
+    fn connect(&self, deadline: Instant) -> Result<RecorderClientStream, String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let connect_timeout = CONNECT_TIMEOUT.min(remaining);
         if connect_timeout.is_zero() {
@@ -673,9 +1077,30 @@ impl TcpPostcardRecorderClient {
         socket
             .set_nodelay(true)
             .map_err(|error| format!("cannot set recorder TCP_NODELAY: {error}"))?;
-        set_timeouts(&socket, deadline.saturating_duration_since(Instant::now()))
-            .map_err(|error| error.to_string())?;
-        let mut stream = socket;
+        let socket = DeadlineStream::new(socket, deadline);
+        let mut stream = match &self.transport {
+            ClientTransport::Plain => RecorderClientStream::Plain(socket),
+            ClientTransport::Tls(tls) => {
+                let connection =
+                    rustls::ClientConnection::new(Arc::clone(&tls.inner), tls.server_name.clone())
+                        .map_err(|_| "cannot initialize recorder TLS connection".to_string())?;
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                while stream.conn.is_handshaking() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("recorder TLS handshake timed out".into());
+                    }
+                    stream
+                        .conn
+                        .complete_io(&mut stream.sock)
+                        .map_err(|_| "recorder TLS handshake failed".to_string())?;
+                }
+                if stream.conn.alpn_protocol() != Some(RECORDER_TLS_ALPN) {
+                    return Err("recorder TLS ALPN negotiation failed".into());
+                }
+                RecorderClientStream::Tls(Box::new(stream))
+            }
+        };
         write_value_sync(
             &mut stream,
             &Hello {
@@ -696,7 +1121,7 @@ impl TcpPostcardRecorderClient {
         }
     }
 
-    fn checkin(&self, pool: &ConnectionPool, stream: TcpStream) {
+    fn checkin(&self, pool: &ConnectionPool, stream: RecorderClientStream) {
         if let Ok(mut state) = pool.state.lock() {
             state.idle.push(stream);
             pool.available.notify_one();
@@ -848,14 +1273,14 @@ impl RecorderRpc for TcpPostcardRecorderClient {
     }
 }
 
-fn set_timeouts(socket: &TcpStream, timeout: Duration) -> rhiza_quepaxa::Result<()> {
-    if timeout.is_zero() {
+fn advertised_remaining_deadline_ms(deadline: Instant) -> rhiza_quepaxa::Result<u32> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
         return Err(Error::Io("recorder RPC deadline exceeded".into()));
     }
-    socket
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| socket.set_write_timeout(Some(timeout)))
-        .map_err(|error| Error::Io(error.to_string()))
+    Ok(u32::try_from(remaining.as_millis())
+        .unwrap_or(u32::MAX)
+        .max(1))
 }
 
 fn read_frame_sync(reader: &mut impl Read) -> Result<Vec<u8>, String> {
@@ -889,6 +1314,456 @@ fn write_value_sync(writer: &mut impl Write, value: &impl Serialize) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        net::TcpListener,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+    };
+
+    #[derive(Clone)]
+    struct FakeClock {
+        origin: Instant,
+        elapsed: Rc<Cell<Duration>>,
+    }
+
+    impl DeadlineClock for FakeClock {
+        fn now(&self) -> Instant {
+            self.origin + self.elapsed.get()
+        }
+    }
+
+    struct SlowPartialIo {
+        clock: FakeClock,
+        step: Duration,
+        input: VecDeque<u8>,
+        read_timeout: Cell<Option<Duration>>,
+        write_timeout: Cell<Option<Duration>>,
+        read_timeouts: Rc<RefCell<Vec<Duration>>>,
+        write_timeouts: Rc<RefCell<Vec<Duration>>>,
+    }
+
+    type SlowPartialFixture = (
+        SlowPartialIo,
+        FakeClock,
+        Rc<RefCell<Vec<Duration>>>,
+        Rc<RefCell<Vec<Duration>>>,
+    );
+
+    impl SlowPartialIo {
+        fn spend(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            let timeout = timeout.expect("deadline stream must configure a timeout");
+            if self.step > timeout {
+                self.clock.elapsed.set(self.clock.elapsed.get() + timeout);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted operation reached its timeout",
+                ));
+            }
+            self.clock.elapsed.set(self.clock.elapsed.get() + self.step);
+            Ok(())
+        }
+    }
+
+    impl SocketTimeouts for SlowPartialIo {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.read_timeout.set(timeout);
+            self.read_timeouts
+                .borrow_mut()
+                .push(timeout.expect("read timeout must be bounded"));
+            Ok(())
+        }
+
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.write_timeout.set(timeout);
+            self.write_timeouts
+                .borrow_mut()
+                .push(timeout.expect("write timeout must be bounded"));
+            Ok(())
+        }
+    }
+
+    impl Read for SlowPartialIo {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.spend(self.read_timeout.get())?;
+            let Some(byte) = self.input.pop_front() else {
+                return Ok(0);
+            };
+            buffer[0] = byte;
+            Ok(1)
+        }
+    }
+
+    impl Write for SlowPartialIo {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            self.spend(self.write_timeout.get())?;
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.spend(self.write_timeout.get())
+        }
+    }
+
+    fn slow_partial_io(input: Vec<u8>) -> SlowPartialFixture {
+        let clock = FakeClock {
+            origin: Instant::now(),
+            elapsed: Rc::new(Cell::new(Duration::ZERO)),
+        };
+        let read_timeouts = Rc::new(RefCell::new(Vec::new()));
+        let write_timeouts = Rc::new(RefCell::new(Vec::new()));
+        (
+            SlowPartialIo {
+                clock: clock.clone(),
+                step: Duration::from_millis(30),
+                input: input.into(),
+                read_timeout: Cell::new(None),
+                write_timeout: Cell::new(None),
+                read_timeouts: Rc::clone(&read_timeouts),
+                write_timeouts: Rc::clone(&write_timeouts),
+            },
+            clock,
+            read_timeouts,
+            write_timeouts,
+        )
+    }
+
+    #[test]
+    fn sync_frame_read_refreshes_timeout_against_one_absolute_deadline() {
+        let mut input = 1_u32.to_be_bytes().to_vec();
+        input.push(42);
+        let (io, clock, read_timeouts, _) = slow_partial_io(input);
+        let deadline = clock.now() + Duration::from_millis(100);
+        let mut stream = DeadlineStream::new_with_clock(io, deadline, clock.clone());
+
+        assert!(read_frame_sync(&mut stream).is_err());
+
+        assert_eq!(clock.elapsed.get(), Duration::from_millis(100));
+        assert_eq!(
+            *read_timeouts.borrow(),
+            [100, 70, 40, 10].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn sync_frame_write_refreshes_timeout_against_one_absolute_deadline() {
+        let (io, clock, _, write_timeouts) = slow_partial_io(Vec::new());
+        let deadline = clock.now() + Duration::from_millis(100);
+        let mut stream = DeadlineStream::new_with_clock(io, deadline, clock.clone());
+
+        assert!(write_value_sync(&mut stream, &42_u64).is_err());
+
+        assert_eq!(clock.elapsed.get(), Duration::from_millis(100));
+        assert_eq!(
+            *write_timeouts.borrow(),
+            [100, 70, 40, 10].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn legacy_client_bounds_partial_response_drip_by_sender_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (advertised_tx, advertised_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello: Hello = decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+            assert_eq!(hello.version, WIRE_VERSION);
+            thread::sleep(Duration::from_millis(80));
+            write_value_sync(
+                &mut stream,
+                &HelloReply::Accepted {
+                    version: WIRE_VERSION,
+                    recorder_id: "node-1".into(),
+                },
+            )
+            .unwrap();
+            let request: RequestFrame =
+                decode_exact(&read_frame_sync(&mut stream).unwrap()).unwrap();
+            advertised_tx.send(request.remaining_deadline_ms).unwrap();
+            for byte in [0_u8, 0, 0, 1, 0] {
+                thread::sleep(Duration::from_millis(120));
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_millis(400),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        assert!(client.recorder_id().is_err());
+        let elapsed = started.elapsed();
+
+        let advertised = advertised_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            advertised > 0 && advertised <= 350,
+            "advertised {advertised}ms"
+        );
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "partial response exceeded the sender-owned deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[derive(Clone)]
+    struct BlockingMutation {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct CountingMutation {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecorderRpc for CountingMutation {
+        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+
+        fn store_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl RecorderRpc for BlockingMutation {
+        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+            Ok("node-1".into())
+        }
+
+        fn store_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.started.send(()).unwrap();
+            let (released, ready) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn peers() -> Vec<PeerConfig> {
+        (1..=3)
+            .map(|index| {
+                PeerConfig::new(
+                    format!("node-{index}"),
+                    format!("http://node-{index}:8081"),
+                    format!("peer-token-{index}"),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn request_expired_before_dispatch_never_reaches_recorder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let command = StoredCommand::new(rhiza_core::EntryType::Command, b"expired".to_vec());
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = dispatch_with_deadline(
+            CountingMutation {
+                calls: Arc::clone(&calls),
+            },
+            RecorderRequestBody::StoreCommand {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                command_hash: command.hash(),
+                command,
+            },
+            Operation::StoreCommand,
+            permit,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            response,
+            RecorderResponseBody::StoreCommand(RpcResult::Error(message))
+                if message.contains("deadline")
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_server_returns_overload_without_calling_recorder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_connection(
+            server_stream,
+            CountingMutation {
+                calls: Arc::clone(&calls),
+            },
+            peers(),
+            7,
+            slots,
+        ));
+        write_value_async(
+            &mut client,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut client).await.unwrap()).unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        let command = StoredCommand::new(rhiza_core::EntryType::Command, b"overloaded".to_vec());
+        write_value_async(
+            &mut client,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 1,
+                remaining_deadline_ms: 1_000,
+                body: RecorderRequestBody::StoreCommand {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: LogHash::ZERO,
+                    command_hash: command.hash(),
+                    command,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let response: ResponseFrame =
+            decode_exact(&read_frame_async(&mut client).await.unwrap()).unwrap();
+        assert!(matches!(
+            response.body,
+            RecorderResponseBody::StoreCommand(RpcResult::Overloaded)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(client);
+        drop(held);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_deadline_returns_while_admitted_mutation_finishes_and_shutdown_drains_it() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_recorder_tcp(
+            listener,
+            BlockingMutation {
+                started: started_tx,
+                release: Arc::clone(&release),
+                completed: Arc::clone(&completed),
+            },
+            peers(),
+            7,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        write_value_async(
+            &mut stream,
+            &Hello {
+                version: WIRE_VERSION,
+                node_id: "node-2".into(),
+                recovery_generation: 7,
+                token: "peer-token-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decode_exact::<HelloReply>(&read_frame_async(&mut stream).await.unwrap()).unwrap(),
+            HelloReply::Accepted { .. }
+        ));
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let command = StoredCommand::new(rhiza_core::EntryType::Command, b"slow".to_vec());
+        write_value_async(
+            &mut stream,
+            &RequestFrame {
+                version: WIRE_VERSION,
+                request_id: 1,
+                remaining_deadline_ms: 50,
+                body: RecorderRequestBody::StoreCommand {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    command_hash: command.hash(),
+                    command,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_millis(300), read_frame_async(&mut stream)).await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!server.is_finished());
+        let (released, ready) = &*release;
+        *released.lock().unwrap() = true;
+        ready.notify_all();
+        server.await.unwrap().unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        let response = response
+            .expect("server must answer the advertised deadline")
+            .unwrap();
+        assert!(matches!(
+            decode_exact::<ResponseFrame>(&response).unwrap().body,
+            RecorderResponseBody::StoreCommand(RpcResult::Error(message))
+                if message.contains("deadline")
+        ));
+    }
 
     #[test]
     fn postcard_decoder_rejects_trailing_bytes_and_wrong_hello_version() {

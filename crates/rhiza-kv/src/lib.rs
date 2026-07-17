@@ -3,9 +3,11 @@
 //! The replicated surface is deliberately semantic: callers may submit only
 //! versioned put/delete commands. Arbitrary redb transactions are not exposed.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::ops::Bound;
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
@@ -15,12 +17,15 @@ use rhiza_core::{
 use tempfile::NamedTempFile;
 
 const COMMAND_MAGIC: &[u8; 6] = b"RHKV\0\x01";
+const BATCH_COMMAND_MAGIC: &[u8; 6] = b"RHKB\0\x01";
 const RECEIPT_MAGIC: &[u8; 6] = b"RHKR\0\x01";
 const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-kv-snapshot-v1\0";
 const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"RHKS";
 const SNAPSHOT_WIRE_VERSION: u16 = 1;
 const MATERIALIZER_DOMAIN: &[u8] = b"rhiza-kv-materializer-v1\0";
 const COMMAND_VERSION: u16 = 1;
+const BATCH_COMMAND_VERSION: u16 = 2;
+const BATCH_REQUEST_ID: &str = "__rhiza_kv_batch_v1";
 
 const DATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__rhiza_kv_data_v1");
 const REQUEST_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__rhiza_kv_requests_v1");
@@ -40,6 +45,13 @@ pub const MAX_REQUEST_ID_BYTES: usize = 256;
 pub const MAX_KV_KEY_BYTES: usize = 4 * 1024;
 /// Maximum accepted value size in bytes.
 pub const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
+/// Maximum commands carried by one replicated KV batch.
+pub const MAX_KV_BATCH_MEMBERS: usize = 64;
+/// Maximum rows returned by one ordered scan.
+pub const MAX_KV_SCAN_ROWS: usize = 1024;
+/// Maximum combined key and value bytes returned by one ordered scan.
+pub const MAX_KV_SCAN_RESULT_BYTES: usize = 1024 * 1024;
+const _: () = assert!(MAX_KV_SCAN_RESULT_BYTES >= MAX_KV_KEY_BYTES + MAX_KV_VALUE_BYTES);
 
 /// Stable compatibility identity for redb bytes and deterministic KV semantics.
 pub fn kv_materializer_fingerprint() -> LogHash {
@@ -49,6 +61,8 @@ pub fn kv_materializer_fingerprint() -> LogHash {
         b"schema=1",
         COMMAND_MAGIC,
         &COMMAND_VERSION.to_be_bytes(),
+        BATCH_COMMAND_MAGIC,
+        &BATCH_COMMAND_VERSION.to_be_bytes(),
     ])
 }
 
@@ -57,9 +71,11 @@ pub fn kv_materializer_fingerprint() -> LogHash {
 pub enum Error {
     Codec(String),
     InvalidCommand(String),
+    InvalidQuery(String),
     InvalidEntry(String),
     PartialInitialization,
     RequestConflict { request_id: String },
+    ResourceExhausted(String),
     Database(String),
     Io(String),
     InvalidSnapshot(String),
@@ -70,6 +86,7 @@ impl fmt::Display for Error {
         match self {
             Self::Codec(message) => write!(formatter, "KV codec error: {message}"),
             Self::InvalidCommand(message) => write!(formatter, "invalid KV command: {message}"),
+            Self::InvalidQuery(message) => write!(formatter, "invalid KV query: {message}"),
             Self::InvalidEntry(message) => write!(formatter, "invalid log entry: {message}"),
             Self::PartialInitialization => {
                 formatter.write_str("partial or corrupt KV initialization")
@@ -79,6 +96,9 @@ impl fmt::Display for Error {
                     formatter,
                     "request id {request_id:?} was reused with another command"
                 )
+            }
+            Self::ResourceExhausted(message) => {
+                write!(formatter, "KV query resources exhausted: {message}")
             }
             Self::Database(message) => write!(formatter, "redb error: {message}"),
             Self::Io(message) => write!(formatter, "KV snapshot I/O failed: {message}"),
@@ -235,6 +255,33 @@ fn validate_key(key: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_scan_bound(name: &str, value: &[u8]) -> Result<(), Error> {
+    if value.len() > MAX_KV_KEY_BYTES {
+        return Err(Error::InvalidQuery(format!(
+            "{name} exceeds {MAX_KV_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_scan_cursor(cursor: Option<&[u8]>) -> Result<(), Error> {
+    let Some(cursor) = cursor else {
+        return Ok(());
+    };
+    if cursor.is_empty() {
+        return Err(Error::InvalidQuery("scan cursor must not be empty".into()));
+    }
+    validate_scan_bound("scan cursor", cursor)
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    let index = successor.iter().rposition(|byte| *byte != u8::MAX)?;
+    successor[index] += 1;
+    successor.truncate(index + 1);
+    Some(successor)
+}
+
 /// Encodes a command inside the shared `QCMD` envelope for the KV profile.
 pub fn encode_replicated_kv_command(command: &KvCommandV1) -> Result<Vec<u8>, Error> {
     command.validate()?;
@@ -243,6 +290,42 @@ pub fn encode_replicated_kv_command(command: &KvCommandV1) -> Result<Vec<u8>, Er
         COMMAND_VERSION,
         command.request_id(),
         command.encode(),
+    )
+    .and_then(|envelope| envelope.encode())
+    .map_err(|error| Error::Codec(error.to_string()))
+}
+
+/// Encodes ordered individual KV commands as one canonical replicated batch.
+pub fn encode_replicated_kv_batch(commands: &[KvCommandV1]) -> Result<Vec<u8>, Error> {
+    if commands.is_empty() || commands.len() > MAX_KV_BATCH_MEMBERS {
+        return Err(Error::InvalidCommand(format!(
+            "KV batch must contain 1..={MAX_KV_BATCH_MEMBERS} commands"
+        )));
+    }
+    let mut request_ids = BTreeSet::new();
+    let mut body = Vec::from(BATCH_COMMAND_MAGIC.as_slice());
+    body.extend_from_slice(&(commands.len() as u16).to_be_bytes());
+    for command in commands {
+        command.validate()?;
+        if !request_ids.insert(command.request_id()) {
+            return Err(Error::InvalidCommand(format!(
+                "KV batch repeats request id {:?}",
+                command.request_id()
+            )));
+        }
+        let encoded = command.encode();
+        body.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .map_err(|_| Error::Codec("KV batch member is too large".into()))?
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&encoded);
+    }
+    ReplicatedCommandEnvelope::new(
+        ExecutionProfile::Kv,
+        BATCH_COMMAND_VERSION,
+        BATCH_REQUEST_ID,
+        body,
     )
     .and_then(|envelope| envelope.encode())
     .map_err(|error| Error::Codec(error.to_string()))
@@ -270,6 +353,82 @@ fn decode_replicated_kv_command(payload: &[u8]) -> Result<KvCommandV1, Error> {
         ));
     }
     Ok(command)
+}
+
+struct DecodedKvCommand {
+    command: KvCommandV1,
+    individual_payload: Vec<u8>,
+}
+
+fn decode_replicated_kv_commands(payload: &[u8]) -> Result<Vec<DecodedKvCommand>, Error> {
+    let envelope = ReplicatedCommandEnvelope::decode(payload)
+        .map_err(|error| Error::Codec(error.to_string()))?;
+    if envelope.profile() != ExecutionProfile::Kv {
+        return Err(Error::InvalidCommand(format!(
+            "expected kv profile, got {}",
+            envelope.profile()
+        )));
+    }
+    match envelope.command_version() {
+        COMMAND_VERSION => {
+            let command = decode_replicated_kv_command(payload)?;
+            Ok(vec![DecodedKvCommand {
+                command,
+                individual_payload: payload.to_vec(),
+            }])
+        }
+        BATCH_COMMAND_VERSION => {
+            if envelope.request_id() != BATCH_REQUEST_ID {
+                return Err(Error::InvalidCommand(
+                    "KV batch envelope request id is invalid".into(),
+                ));
+            }
+            let mut decoder = Decoder::new(envelope.body());
+            if decoder.take(BATCH_COMMAND_MAGIC.len())? != BATCH_COMMAND_MAGIC {
+                return Err(Error::Codec("invalid KV batch magic or version".into()));
+            }
+            let count = usize::from(decoder.u16()?);
+            if count == 0 || count > MAX_KV_BATCH_MEMBERS {
+                return Err(Error::InvalidCommand(format!(
+                    "KV batch must contain 1..={MAX_KV_BATCH_MEMBERS} commands"
+                )));
+            }
+            let mut request_ids = BTreeSet::new();
+            let mut commands = Vec::with_capacity(count);
+            for _ in 0..count {
+                let length = usize::try_from(decoder.u32()?)
+                    .map_err(|_| Error::Codec("KV batch member length overflow".into()))?;
+                let encoded = decoder.take(length)?;
+                let command = KvCommandV1::decode(encoded)?;
+                if command.encode() != encoded {
+                    return Err(Error::Codec("noncanonical KV batch member".into()));
+                }
+                if !request_ids.insert(command.request_id().to_owned()) {
+                    return Err(Error::InvalidCommand(format!(
+                        "KV batch repeats request id {:?}",
+                        command.request_id()
+                    )));
+                }
+                let individual_payload = encode_replicated_kv_command(&command)?;
+                commands.push(DecodedKvCommand {
+                    command,
+                    individual_payload,
+                });
+            }
+            decoder.finish()?;
+            let canonical = commands
+                .iter()
+                .map(|member| member.command.clone())
+                .collect::<Vec<_>>();
+            if encode_replicated_kv_batch(&canonical)? != payload {
+                return Err(Error::Codec("noncanonical KV batch command".into()));
+            }
+            Ok(commands)
+        }
+        version => Err(Error::InvalidCommand(format!(
+            "unsupported command version {version}"
+        ))),
+    }
 }
 
 /// Observable result of a semantic KV command.
@@ -357,6 +516,87 @@ pub struct ApplyOutcome {
     applied_index: u64,
     applied_hash: LogHash,
     result: Option<KvCommandResultV1>,
+}
+
+/// Applied qlog tip observed by a point read or scan snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvReadTip {
+    applied_index: u64,
+    applied_hash: LogHash,
+}
+
+impl KvReadTip {
+    pub const fn applied_index(self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn applied_hash(self) -> LogHash {
+        self.applied_hash
+    }
+}
+
+/// Exact-key result and the applied tip from the same redb read transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvGetResult {
+    value: Option<Vec<u8>>,
+    tip: KvReadTip,
+}
+
+impl KvGetResult {
+    pub fn value(&self) -> Option<&[u8]> {
+        self.value.as_deref()
+    }
+
+    pub const fn tip(&self) -> KvReadTip {
+        self.tip
+    }
+
+    pub fn into_parts(self) -> (Option<Vec<u8>>, KvReadTip) {
+        (self.value, self.tip)
+    }
+}
+
+/// One copied row from a deterministic byte-ordered scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvScanRow {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl KvScanRow {
+    pub fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+/// Bounded ordered rows and the applied tip from one redb read transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvScanResult {
+    rows: Vec<KvScanRow>,
+    next_cursor: Option<Vec<u8>>,
+    tip: KvReadTip,
+}
+
+impl KvScanResult {
+    pub fn rows(&self) -> &[KvScanRow] {
+        &self.rows
+    }
+
+    pub fn next_cursor(&self) -> Option<&[u8]> {
+        self.next_cursor.as_deref()
+    }
+
+    pub const fn tip(&self) -> KvReadTip {
+        self.tip
+    }
 }
 
 /// A self-verifying point-in-time image of the authoritative redb materializer.
@@ -615,13 +855,125 @@ impl RedbStateMachine {
 
     /// Returns a copied value. No raw transaction or iterator is exposed.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.get_with_tip(key)?.value)
+    }
+
+    /// Returns a copied value and applied tip from exactly one redb read transaction.
+    pub fn get_with_tip(&self, key: &[u8]) -> Result<KvGetResult, Error> {
         validate_key(key)?;
         let read = self.database.begin_read().map_err(database_error)?;
-        let table = read.open_table(DATA_TABLE).map_err(database_error)?;
-        Ok(table
+        let data = read.open_table(DATA_TABLE).map_err(database_error)?;
+        let progress = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        let value = data
             .get(key)
             .map_err(database_error)?
-            .map(|value| value.value().to_vec()))
+            .map(|value| value.value().to_vec());
+        let tip = read_tip(&progress)?;
+        Ok(KvGetResult { value, tip })
+    }
+
+    /// Scans keys from an inclusive start to an optional exclusive end.
+    ///
+    /// A cursor is the last key returned by the preceding page and is excluded
+    /// from this page. Limits must be within `1..=MAX_KV_SCAN_ROWS`.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+    ) -> Result<KvScanResult, Error> {
+        validate_scan_bound("range start", start)?;
+        if let Some(end) = end {
+            validate_scan_bound("range end", end)?;
+        }
+        validate_scan_cursor(cursor)?;
+        if cursor.is_some_and(|cursor| cursor < start || end.is_some_and(|end| cursor >= end)) {
+            return Err(Error::InvalidQuery(
+                "cursor is outside the requested range".into(),
+            ));
+        }
+        self.scan_snapshot(start, end, limit, cursor)
+    }
+
+    /// Scans all keys with a byte prefix in deterministic ascending order.
+    pub fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+    ) -> Result<KvScanResult, Error> {
+        validate_scan_bound("prefix", prefix)?;
+        validate_scan_cursor(cursor)?;
+        if cursor.is_some_and(|cursor| !cursor.starts_with(prefix)) {
+            return Err(Error::InvalidQuery(
+                "cursor does not belong to the requested prefix".into(),
+            ));
+        }
+        let end = prefix_successor(prefix);
+        self.scan_snapshot(prefix, end.as_deref(), limit, cursor)
+    }
+
+    fn scan_snapshot(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+    ) -> Result<KvScanResult, Error> {
+        if !(1..=MAX_KV_SCAN_ROWS).contains(&limit) {
+            return Err(Error::InvalidQuery(format!(
+                "scan limit must be within 1..={MAX_KV_SCAN_ROWS}"
+            )));
+        }
+        let row_limit = limit;
+        let read = self.database.begin_read().map_err(database_error)?;
+        let data = read.open_table(DATA_TABLE).map_err(database_error)?;
+        let progress = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        let tip = read_tip(&progress)?;
+        if end.is_some_and(|end| start >= end) {
+            return Ok(KvScanResult {
+                rows: Vec::new(),
+                next_cursor: None,
+                tip,
+            });
+        }
+        let lower = cursor.map_or(Bound::Included(start), Bound::Excluded);
+        let upper = end.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut rows = Vec::with_capacity(row_limit);
+        let mut result_bytes = 0_usize;
+        let mut has_more = false;
+        for row in data
+            .range::<&[u8]>((lower, upper))
+            .map_err(database_error)?
+        {
+            let (key, value) = row.map_err(database_error)?;
+            let row_bytes = key
+                .value()
+                .len()
+                .checked_add(value.value().len())
+                .ok_or_else(|| Error::ResourceExhausted("KV scan row size overflow".into()))?;
+            let next_result_bytes = result_bytes
+                .checked_add(row_bytes)
+                .ok_or_else(|| Error::ResourceExhausted("KV scan result size overflow".into()))?;
+            if rows.len() == row_limit || next_result_bytes > MAX_KV_SCAN_RESULT_BYTES {
+                has_more = true;
+                break;
+            }
+            result_bytes = next_result_bytes;
+            rows.push(KvScanRow::new(key.value().to_vec(), value.value().to_vec()));
+        }
+        if has_more && rows.is_empty() {
+            return Err(Error::ResourceExhausted(
+                "KV row exceeds the maximum scan result size".into(),
+            ));
+        }
+        let next_cursor = has_more.then(|| rows.last().expect("non-empty page").key.clone());
+        Ok(KvScanResult {
+            rows,
+            next_cursor,
+            tip,
+        })
     }
 
     pub fn applied_index(&self) -> Result<u64, Error> {
@@ -747,6 +1099,9 @@ impl RedbStateMachine {
                 "entry hash does not match content".into(),
             ));
         }
+        let decoded_commands = (entry.entry_type == EntryType::Command)
+            .then(|| decode_replicated_kv_commands(&entry.payload))
+            .transpose()?;
 
         let write = self.database.begin_write().map_err(database_error)?;
         let mut progress = write.open_table(PROGRESS_TABLE).map_err(database_error)?;
@@ -759,18 +1114,24 @@ impl RedbStateMachine {
                     "replayed index has a different hash".into(),
                 ));
             }
-            let result = if entry.entry_type == EntryType::Command {
-                let command = decode_replicated_kv_command(&entry.payload)?;
+            let result = if let Some(commands) = decoded_commands.as_ref() {
                 let requests = write.open_table(REQUEST_TABLE).map_err(database_error)?;
-                let record = read_request(&requests, command.request_id())?.ok_or_else(|| {
-                    Error::InvalidEntry("replayed command has no durable receipt".into())
-                })?;
-                if record.payload_hash != LogHash::digest(&[&entry.payload]) {
-                    return Err(Error::RequestConflict {
-                        request_id: command.request_id().into(),
-                    });
+                let mut result = None;
+                for member in commands {
+                    let record =
+                        read_request(&requests, member.command.request_id())?.ok_or_else(|| {
+                            Error::InvalidEntry("replayed command has no durable receipt".into())
+                        })?;
+                    if record.payload_hash != LogHash::digest(&[&member.individual_payload]) {
+                        return Err(Error::RequestConflict {
+                            request_id: member.command.request_id().into(),
+                        });
+                    }
+                    if commands.len() == 1 {
+                        result = Some(record.result);
+                    }
                 }
-                Some(record.result)
+                result
             } else {
                 None
             };
@@ -798,46 +1159,62 @@ impl RedbStateMachine {
 
         let result = match entry.entry_type {
             EntryType::Command => {
-                let command = decode_replicated_kv_command(&entry.payload)?;
-                let payload_hash = LogHash::digest(&[&entry.payload]);
-                let mut requests = write.open_table(REQUEST_TABLE).map_err(database_error)?;
-                if let Some(record) = read_request(&requests, command.request_id())? {
-                    if record.payload_hash != payload_hash {
-                        return Err(Error::RequestConflict {
-                            request_id: command.request_id().into(),
-                        });
-                    }
-                    Some(record.result)
-                } else {
+                let commands = decoded_commands
+                    .as_ref()
+                    .expect("command entries were decoded before opening the transaction");
+                let mut single_result = None;
+                {
+                    let mut requests = write.open_table(REQUEST_TABLE).map_err(database_error)?;
                     let mut data = write.open_table(DATA_TABLE).map_err(database_error)?;
-                    let command_result = match &command.operation {
-                        KvOperationV1::Put { key, value } => {
-                            let replaced =
-                                data.get(key.as_slice()).map_err(database_error)?.is_some();
-                            data.insert(key.as_slice(), value.as_slice())
+                    for member in commands {
+                        let payload_hash = LogHash::digest(&[&member.individual_payload]);
+                        let command_result = if let Some(record) =
+                            read_request(&requests, member.command.request_id())?
+                        {
+                            if record.payload_hash != payload_hash {
+                                return Err(Error::RequestConflict {
+                                    request_id: member.command.request_id().into(),
+                                });
+                            }
+                            record.result
+                        } else {
+                            let command_result = match &member.command.operation {
+                                KvOperationV1::Put { key, value } => {
+                                    let replaced =
+                                        data.get(key.as_slice()).map_err(database_error)?.is_some();
+                                    data.insert(key.as_slice(), value.as_slice())
+                                        .map_err(database_error)?;
+                                    KvCommandResultV1::Put { replaced }
+                                }
+                                KvOperationV1::Delete { key } => {
+                                    let existed = data
+                                        .remove(key.as_slice())
+                                        .map_err(database_error)?
+                                        .is_some();
+                                    KvCommandResultV1::Delete { existed }
+                                }
+                            };
+                            let record = KvRequestRecord {
+                                payload_hash,
+                                original_log_index: entry.index,
+                                original_log_hash: entry.hash,
+                                result: command_result.clone(),
+                            };
+                            let encoded_record = record.encode();
+                            requests
+                                .insert(
+                                    member.command.request_id().as_bytes(),
+                                    encoded_record.as_slice(),
+                                )
                                 .map_err(database_error)?;
-                            KvCommandResultV1::Put { replaced }
+                            command_result
+                        };
+                        if commands.len() == 1 {
+                            single_result = Some(command_result);
                         }
-                        KvOperationV1::Delete { key } => {
-                            let existed = data
-                                .remove(key.as_slice())
-                                .map_err(database_error)?
-                                .is_some();
-                            KvCommandResultV1::Delete { existed }
-                        }
-                    };
-                    let record = KvRequestRecord {
-                        payload_hash,
-                        original_log_index: entry.index,
-                        original_log_hash: entry.hash,
-                        result: command_result.clone(),
-                    };
-                    let encoded_record = record.encode();
-                    requests
-                        .insert(command.request_id().as_bytes(), encoded_record.as_slice())
-                        .map_err(database_error)?;
-                    Some(command_result)
+                    }
                 }
+                single_result
             }
             EntryType::Noop => {
                 if !entry.payload.is_empty() {
@@ -1241,6 +1618,13 @@ fn read_hash_meta(
     Ok(LogHash::from_bytes(bytes))
 }
 
+fn read_tip(table: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<KvReadTip, Error> {
+    Ok(KvReadTip {
+        applied_index: read_u64_meta(table, META_APPLIED_INDEX)?,
+        applied_hash: read_hash_meta(table, META_APPLIED_HASH)?,
+    })
+}
+
 fn read_request(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     request_id: &str,
@@ -1356,6 +1740,205 @@ mod snapshot_tests {
             .unwrap();
         let snapshot = source.create_snapshot(1).unwrap();
         (dir, snapshot)
+    }
+
+    fn seed_rows(
+        state: &RedbStateMachine,
+        rows: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        applied_index: u64,
+        applied_hash: LogHash,
+    ) {
+        let write = state.database.begin_write().unwrap();
+        {
+            let mut data = write.open_table(DATA_TABLE).unwrap();
+            for (key, value) in rows {
+                data.insert(key.as_slice(), value.as_slice()).unwrap();
+            }
+        }
+        {
+            let mut progress = write.open_table(PROGRESS_TABLE).unwrap();
+            progress
+                .insert(META_APPLIED_INDEX, applied_index.to_be_bytes().as_slice())
+                .unwrap();
+            progress
+                .insert(META_APPLIED_HASH, applied_hash.as_bytes().as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn exact_get_returns_value_and_applied_tip_from_one_snapshot_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("get.redb");
+        let hash = LogHash::digest(&[b"get-tip"]);
+        {
+            let state = RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+            seed_rows(&state, [(b"key".to_vec(), b"value".to_vec())], 41, hash);
+        }
+
+        let reopened = RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let result = reopened.get_with_tip(b"key").unwrap();
+
+        assert_eq!(result.value(), Some(b"value".as_slice()));
+        assert_eq!(result.tip().applied_index(), 41);
+        assert_eq!(result.tip().applied_hash(), hash);
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+
+        let (value, tip) = result.into_parts();
+        assert_eq!(value, Some(b"value".to_vec()));
+        assert_eq!(tip.applied_index(), 41);
+        assert_eq!(tip.applied_hash(), hash);
+    }
+
+    #[test]
+    fn range_scan_is_byte_ordered_end_exclusive_and_cursor_paged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            RedbStateMachine::open(dir.path().join("range.redb"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        let hash = LogHash::digest(&[b"range-tip"]);
+        seed_rows(
+            &state,
+            [
+                (b"b".to_vec(), b"4".to_vec()),
+                (b"aa".to_vec(), b"2".to_vec()),
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"ab".to_vec(), b"3".to_vec()),
+            ],
+            9,
+            hash,
+        );
+
+        let first = state.scan_range(b"a", Some(b"b"), 2, None).unwrap();
+        assert_eq!(
+            first.rows(),
+            &[
+                KvScanRow::new(b"a".to_vec(), b"1".to_vec()),
+                KvScanRow::new(b"aa".to_vec(), b"2".to_vec()),
+            ]
+        );
+        assert_eq!(first.next_cursor(), Some(b"aa".as_slice()));
+        assert_eq!(first.tip().applied_index(), 9);
+        assert_eq!(first.tip().applied_hash(), hash);
+
+        let second = state
+            .scan_range(b"a", Some(b"b"), 2, first.next_cursor())
+            .unwrap();
+        assert_eq!(
+            second.rows(),
+            &[KvScanRow::new(b"ab".to_vec(), b"3".to_vec())]
+        );
+        assert_eq!(second.next_cursor(), None);
+    }
+
+    #[test]
+    fn prefix_scan_handles_empty_and_all_ff_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            RedbStateMachine::open(dir.path().join("prefix.redb"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        seed_rows(
+            &state,
+            [
+                (vec![0xfe], b"before".to_vec()),
+                (vec![0xff], b"root".to_vec()),
+                (vec![0xff, 0x00], b"zero".to_vec()),
+                (vec![0xff, 0xff], b"max".to_vec()),
+            ],
+            4,
+            LogHash::digest(&[b"prefix-tip"]),
+        );
+
+        let all = state.scan_prefix(b"", 10, None).unwrap();
+        assert_eq!(all.rows().len(), 4);
+        assert_eq!(all.rows()[0].key(), &[0xfe]);
+        assert_eq!(all.rows()[3].key(), &[0xff, 0xff]);
+
+        let ff = state.scan_prefix(&[0xff], 10, None).unwrap();
+        assert_eq!(
+            ff.rows().iter().map(KvScanRow::key).collect::<Vec<_>>(),
+            vec![&[0xff][..], &[0xff, 0x00][..], &[0xff, 0xff][..]]
+        );
+        assert_eq!(ff.next_cursor(), None);
+    }
+
+    #[test]
+    fn scan_rejects_invalid_row_limits_caps_bytes_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caps.redb");
+        let hash = LogHash::digest(&[b"caps-tip"]);
+        {
+            let state = RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+            let rows = (0..MAX_KV_SCAN_ROWS + 2).map(|index| {
+                (
+                    format!("small-{index:05}").into_bytes(),
+                    vec![u8::try_from(index % 251).unwrap()],
+                )
+            });
+            seed_rows(&state, rows, 17, hash);
+
+            assert!(matches!(
+                state.scan_prefix(b"small-", 0, None),
+                Err(Error::InvalidQuery(_))
+            ));
+            assert!(matches!(
+                state.scan_prefix(b"small-", MAX_KV_SCAN_ROWS + 1, None),
+                Err(Error::InvalidQuery(_))
+            ));
+            let capped = state
+                .scan_prefix(b"small-", MAX_KV_SCAN_ROWS, None)
+                .unwrap();
+            assert_eq!(capped.rows().len(), MAX_KV_SCAN_ROWS);
+            assert!(capped.next_cursor().is_some());
+        }
+
+        let reopened = RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let large_rows = (0..5).map(|index| {
+            (
+                format!("wide-{index}").into_bytes(),
+                vec![u8::try_from(index).unwrap(); MAX_KV_VALUE_BYTES],
+            )
+        });
+        seed_rows(&reopened, large_rows, 18, hash);
+        let capped = reopened.scan_prefix(b"wide-", 5, None).unwrap();
+        assert!(capped.rows().len() < 5);
+        assert!(
+            capped
+                .rows()
+                .iter()
+                .map(|row| row.key().len() + row.value().len())
+                .sum::<usize>()
+                <= MAX_KV_SCAN_RESULT_BYTES
+        );
+        assert!(capped.next_cursor().is_some());
+        assert_eq!(capped.tip().applied_index(), 18);
+    }
+
+    #[test]
+    fn scan_returns_one_largest_valid_record_without_exhausting_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RedbStateMachine::open(
+            dir.path().join("largest-record.redb"),
+            "cluster-1",
+            "node-1",
+            7,
+            3,
+        )
+        .unwrap();
+        let key = vec![b'k'; MAX_KV_KEY_BYTES];
+        let value = vec![b'v'; MAX_KV_VALUE_BYTES];
+        seed_rows(
+            &state,
+            [(key.clone(), value.clone())],
+            1,
+            LogHash::digest(&[b"largest-record"]),
+        );
+
+        let result = state.scan_prefix(b"", 1, None).unwrap();
+
+        assert_eq!(result.rows(), &[KvScanRow::new(key, value)]);
+        assert_eq!(result.next_cursor(), None);
     }
 
     #[test]

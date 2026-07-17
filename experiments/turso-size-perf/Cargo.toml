@@ -1,0 +1,33 @@
+[package]
+name = "turso-size-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+turso-backend = ["dep:turso", "dep:tokio"]
+rusqlite-backend = ["dep:rusqlite", "dep:tokio"]
+
+[dependencies]
+rusqlite = { version = "=0.40.1", features = ["bundled"], optional = true }
+tokio = { version = "=1.48.0", features = ["rt-multi-thread", "sync"], optional = true }
+turso = { version = "=0.7.0", default-features = false, optional = true }
+
+[[bin]]
+name = "turso-size-perf"
+path = "src/bin/turso.rs"
+required-features = ["turso-backend"]
+
+[[bin]]
+name = "rusqlite-size-perf"
+path = "src/bin/rusqlite.rs"
+required-features = ["rusqlite-backend"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = false

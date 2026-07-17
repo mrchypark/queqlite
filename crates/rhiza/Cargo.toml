@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+graph = ["dep:rhiza-graph", "rhiza-node/graph"]
+kv = ["dep:rhiza-kv", "rhiza-node/kv"]
+
 [dependencies]
 rhiza-core = { path = "../rhiza-core" }
-rhiza-node = { path = "../rhiza-node" }
+rhiza-graph = { path = "../rhiza-graph", optional = true }
+rhiza-kv = { path = "../rhiza-kv", optional = true }
+rhiza-node = { path = "../rhiza-node", default-features = false }
 rhiza-quepaxa = { path = "../rhiza-quepaxa" }
 rhiza-sql = { path = "../rhiza-sql" }
 tokio.workspace = true

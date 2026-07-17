@@ -80,32 +80,37 @@ fn config_change_commands_are_versioned_opaque_and_strictly_recognized() {
 
 #[test]
 fn stop_seal_is_durable_before_ack_and_blocks_later_old_slots() {
-    let dir = tempfile::tempdir().unwrap();
-    let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
-    let recorder = store(&dir, "r1", 4, membership);
-    let stop = ConfigChange::stop(4, recorder.configuration_state().unwrap().config_digest())
-        .to_stored_command();
-    let value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
-    recorder.store_command(stop.hash(), stop).unwrap();
-    recorder
-        .set_seal_fault(Some(SealFaultPoint::AfterIntent))
-        .unwrap();
+    for fault in [
+        SealFaultPoint::AfterIntent,
+        SealFaultPoint::AfterSlot,
+        SealFaultPoint::AfterConfiguration,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
+        let recorder = store(&dir, "r1", 4, membership);
+        let stop = ConfigChange::stop(4, recorder.configuration_state().unwrap().config_digest())
+            .to_stored_command();
+        let value = AcceptedValue::from_command("cluster-a", 7, 2, 4, LogHash::ZERO, &stop);
+        recorder.store_command(stop.hash(), stop).unwrap();
+        recorder.set_seal_fault(Some(fault)).unwrap();
 
-    assert!(matches!(
-        record(&recorder, 7, 4, proposal("writer", 1, 1, value.clone())),
-        Err(Error::Io(message)) if message.contains("AfterIntent")
-    ));
-    drop(recorder);
+        assert!(matches!(
+            record(&recorder, 7, 4, proposal("writer", 1, 1, value.clone())),
+            Err(Error::Io(message)) if message.contains(&format!("{fault:?}"))
+        ));
+        drop(recorder);
 
-    let recorder = store(&dir, "r1", 4, Membership::new(["r1", "r2", "r3"]).unwrap());
-    let state = recorder.configuration_state().unwrap();
-    assert_eq!(state.seal().unwrap().stop_slot, 7);
-    assert_eq!(
-        record(&recorder, 8, 4, proposal("writer", 1, 1, value)),
-        Err(Error::Rejected(RejectReason::ConfigurationSealed {
-            stop_slot: 7
-        }))
-    );
+        let recorder = store(&dir, "r1", 4, Membership::new(["r1", "r2", "r3"]).unwrap());
+        let state = recorder.configuration_state().unwrap();
+        assert_eq!(state.seal().unwrap().stop_slot, 7);
+        assert_eq!(state.max_accepted_or_decided_slot(), Some(7));
+        assert_eq!(
+            record(&recorder, 8, 4, proposal("writer", 1, 1, value)),
+            Err(Error::Rejected(RejectReason::ConfigurationSealed {
+                stop_slot: 7
+            }))
+        );
+    }
 }
 
 #[test]
@@ -404,15 +409,31 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
     let proof = old.inspect_decision_proof_at(7).unwrap().unwrap();
     drop(old);
 
+    let checkpoint_hash = LogHash::digest(&[b"checkpoint-tip"]);
     for recorder in &stores {
         recorder
             .install_successor_from_proof(membership.clone(), &proof)
             .unwrap();
         let recovered = recorder
-            .recover_successor_activation_from_checkpoint(7, stop.hash, 9)
+            .recover_successor_activation_from_checkpoint(7, stop.hash, 9, checkpoint_hash)
             .unwrap();
         assert!(recovered.is_activated());
         assert_eq!(recovered.max_accepted_or_decided_slot(), Some(9));
+    }
+    drop(stores);
+    let stores = [
+        store(&dir, "r1", 5, membership.clone()),
+        store(&dir, "r2", 5, membership.clone()),
+        store(&dir, "r3", 5, membership.clone()),
+    ];
+    for recorder in &stores {
+        assert_eq!(
+            recorder
+                .configuration_state()
+                .unwrap()
+                .max_accepted_or_decided_slot(),
+            Some(9)
+        );
     }
 
     let recovered = ThreeNodeConsensus::from_recorders_with_ids(
@@ -427,7 +448,6 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
             .collect(),
     )
     .unwrap();
-    let checkpoint_hash = LogHash::digest(&[b"checkpoint-tip"]);
     assert_eq!(
         recovered
             .propose_at(
@@ -439,6 +459,63 @@ fn verified_checkpoint_recovery_reactivates_fresh_successor_recorders() {
             .prev_hash,
         checkpoint_hash
     );
+}
+
+#[test]
+fn checkpoint_head_intent_recovers_every_config_and_head_fault_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
+    let stores = [
+        store(&dir, "r1", 4, membership.clone()),
+        store(&dir, "r2", 4, membership.clone()),
+        store(&dir, "r3", 4, membership.clone()),
+    ];
+    let old = ThreeNodeConsensus::from_recorders_with_ids(
+        "cluster-a",
+        "writer",
+        2,
+        4,
+        stores
+            .iter()
+            .zip(["r1", "r2", "r3"])
+            .map(|(store, id)| (id.into(), Box::new(store.clone()) as _))
+            .collect(),
+    )
+    .unwrap();
+    let stop = old
+        .propose_stop_for_successor_at(7, LogHash::ZERO, &membership)
+        .unwrap();
+    let proof = old.inspect_decision_proof_at(7).unwrap().unwrap();
+    drop(old);
+    let checkpoint_hash = LogHash::digest(&[b"checkpoint-fault-tip"]);
+
+    for (recorder, fault) in stores.iter().zip([
+        SealFaultPoint::AfterHeadIntent,
+        SealFaultPoint::AfterHeadConfiguration,
+        SealFaultPoint::AfterHead,
+    ]) {
+        recorder
+            .install_successor_from_proof(membership.clone(), &proof)
+            .unwrap();
+        recorder.set_seal_fault(Some(fault)).unwrap();
+        assert!(matches!(
+            recorder.recover_successor_activation_from_checkpoint(
+                7,
+                stop.hash,
+                9,
+                checkpoint_hash,
+            ),
+            Err(Error::Io(message)) if message.contains(&format!("{fault:?}"))
+        ));
+    }
+    drop(stores);
+
+    for id in ["r1", "r2", "r3"] {
+        let reopened = store(&dir, id, 5, membership.clone());
+        let state = reopened.configuration_state().unwrap();
+        assert!(state.is_activated());
+        assert_eq!(state.max_accepted_or_decided_slot(), Some(9));
+    }
 }
 
 #[test]

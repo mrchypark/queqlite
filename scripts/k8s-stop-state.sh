@@ -23,7 +23,9 @@ case "${1-}" in
     case "$old_id:$new_id" in
       *[!0-9:]*|:*|*:) die "configuration ids must be positive integers" ;;
     esac
-    [ "$old_id" -gt 0 ] && [ "$new_id" -gt 0 ] || die "configuration ids must be positive integers"
+    if [ "$old_id" -le 0 ] || [ "$new_id" -le 0 ]; then
+      die "configuration ids must be positive integers"
+    fi
     [ -n "$candidate" ] || die "candidate Stop operation id must not be empty"
     jq -e --argjson new "$new_id" '
       (keys | sort) == ["config_id", "digest", "members"] and

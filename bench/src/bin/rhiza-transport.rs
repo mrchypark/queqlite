@@ -20,8 +20,18 @@ use axum::{
     routing::post,
     Router,
 };
+use postcard_rpc::postcard_schema::Schema;
+use postcard_rpc::{
+    header::{VarHeader, VarKey, VarKeyKind, VarSeq, VarSeqKind},
+    host_client::{
+        HostClient, WireRx as HostWireRx, WireSpawn as HostWireSpawn, WireTx as HostWireTx,
+    },
+    server::{WireRx as ServerWireRx, WireRxErrorKind, WireTx as ServerWireTx, WireTxErrorKind},
+    standard_icd::{WireError, ERROR_PATH},
+    Endpoint,
+};
 use prost::Message;
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint as QuinnEndpoint};
 use rcgen::CertifiedKey;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
@@ -147,8 +157,8 @@ where
     }
 }
 
-#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
-struct WireRequest {
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize, Schema)]
+pub struct WireRequest {
     #[prost(string, tag = "1")]
     request_id: String,
     #[prost(uint64, tag = "2")]
@@ -159,8 +169,8 @@ struct WireRequest {
     payload: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
-struct WireAck {
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize, Schema)]
+pub struct WireAck {
     #[prost(uint64, tag = "1")]
     slot: u64,
     #[prost(bool, tag = "2")]
@@ -169,6 +179,31 @@ struct WireAck {
     hash: Vec<u8>,
     #[prost(string, tag = "4")]
     request_id: String,
+}
+
+postcard_rpc::endpoints! {
+    list = RPC_ENDPOINTS;
+    omit_std = true;
+    | EndpointTy        | RequestTy   | ResponseTy | Path                    |
+    | ----------        | ---------   | ---------- | ----                    |
+    | RecordEndpoint    | WireRequest | WireAck    | "rhiza/record"          |
+    | ReplicateEndpoint | WireRequest | WireAck    | "rhiza/record/replicate" |
+}
+
+postcard_rpc::topics! {
+    list = RPC_TOPICS_IN;
+    direction = postcard_rpc::TopicDirection::ToServer;
+    omit_std = true;
+    | TopicTy | MessageTy | Path |
+    | ------- | --------- | ---- |
+}
+
+postcard_rpc::topics! {
+    list = RPC_TOPICS_OUT;
+    direction = postcard_rpc::TopicDirection::ToClient;
+    omit_std = true;
+    | TopicTy | MessageTy | Path |
+    | ------- | --------- | ---- |
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,13 +264,16 @@ enum Candidate {
     HttpsPostcard,
     HttpsProst,
     TcpPostcard,
+    TcpPostcardRpc,
+    TcpProst,
     TcpTlsPostcard,
+    TcpTlsProst,
     QuinnRpcStream,
     QuinnLane,
 }
 
 impl Candidate {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 13] = [
         Self::HttpJson,
         Self::HttpPostcard,
         Self::HttpProst,
@@ -243,7 +281,10 @@ impl Candidate {
         Self::HttpsPostcard,
         Self::HttpsProst,
         Self::TcpPostcard,
+        Self::TcpPostcardRpc,
+        Self::TcpProst,
         Self::TcpTlsPostcard,
+        Self::TcpTlsProst,
         Self::QuinnRpcStream,
         Self::QuinnLane,
     ];
@@ -257,7 +298,10 @@ impl Candidate {
             Self::HttpsPostcard => "https-postcard",
             Self::HttpsProst => "https-prost",
             Self::TcpPostcard => "tcp-postcard",
+            Self::TcpPostcardRpc => "tcp-postcard-rpc",
+            Self::TcpProst => "tcp-prost",
             Self::TcpTlsPostcard => "tcp-tls-postcard",
+            Self::TcpTlsProst => "tcp-tls-prost",
             Self::QuinnRpcStream => "quinn-rpc-stream",
             Self::QuinnLane => "quinn-lane",
         }
@@ -266,7 +310,10 @@ impl Candidate {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "tcp-postcard-persistent-worker" => Some(Self::TcpPostcard),
+            "tcp-postcard-rpc-persistent-worker" => Some(Self::TcpPostcardRpc),
+            "tcp-prost-persistent-worker" => Some(Self::TcpProst),
             "tcp-tls-postcard-persistent-worker" => Some(Self::TcpTlsPostcard),
+            "tcp-tls-prost-persistent-worker" => Some(Self::TcpTlsProst),
             "quinn-lane-persistent-worker" => Some(Self::QuinnLane),
             _ => Self::ALL
                 .into_iter()
@@ -277,7 +324,7 @@ impl Candidate {
     fn codec(self) -> Codec {
         match self {
             Self::HttpJson | Self::HttpsJson => Codec::Json,
-            Self::HttpProst | Self::HttpsProst => Codec::Prost,
+            Self::HttpProst | Self::HttpsProst | Self::TcpProst | Self::TcpTlsProst => Codec::Prost,
             _ => Codec::Postcard,
         }
     }
@@ -286,7 +333,11 @@ impl Candidate {
         match self {
             Self::HttpJson | Self::HttpPostcard | Self::HttpProst => "HTTP/1.1 over TCP",
             Self::HttpsJson | Self::HttpsPostcard | Self::HttpsProst => "HTTP/1.1 over TLS/TCP",
-            Self::TcpPostcard | Self::TcpTlsPostcard => "length-prefixed TCP",
+            Self::TcpPostcard
+            | Self::TcpPostcardRpc
+            | Self::TcpProst
+            | Self::TcpTlsPostcard
+            | Self::TcpTlsProst => "length-prefixed TCP",
             Self::QuinnRpcStream | Self::QuinnLane => "QUIC",
         }
     }
@@ -297,16 +348,27 @@ impl Candidate {
             | Self::HttpsPostcard
             | Self::HttpsProst
             | Self::TcpTlsPostcard
+            | Self::TcpTlsProst
             | Self::QuinnRpcStream
             | Self::QuinnLane => "TLS server authentication; shared benchmark certificate",
-            Self::HttpJson | Self::HttpPostcard | Self::HttpProst | Self::TcpPostcard => "none",
+            Self::HttpJson
+            | Self::HttpPostcard
+            | Self::HttpProst
+            | Self::TcpPostcard
+            | Self::TcpPostcardRpc
+            | Self::TcpProst => "none",
         }
     }
 
     fn is_tls(self) -> bool {
         !matches!(
             self,
-            Self::HttpJson | Self::HttpPostcard | Self::HttpProst | Self::TcpPostcard
+            Self::HttpJson
+                | Self::HttpPostcard
+                | Self::HttpProst
+                | Self::TcpPostcard
+                | Self::TcpPostcardRpc
+                | Self::TcpProst
         )
     }
 
@@ -318,8 +380,11 @@ impl Candidate {
             | Self::HttpsJson
             | Self::HttpsPostcard
             | Self::HttpsProst => "shared reqwest pool; blocking worker per concurrency slot",
-            Self::TcpPostcard | Self::TcpTlsPostcard => {
+            Self::TcpPostcard | Self::TcpProst | Self::TcpTlsPostcard | Self::TcpTlsProst => {
                 "one warmed persistent connection per worker"
+            }
+            Self::TcpPostcardRpc => {
+                "one warmed postcard-rpc session per worker; up to two concurrent requests multiplexed per session within configured concurrency"
             }
             Self::QuinnRpcStream => "one QUIC connection; one bidirectional stream per RPC",
             Self::QuinnLane => "one QUIC connection; one persistent stream per worker",
@@ -440,7 +505,7 @@ fn print_usage() {
          [--payloads N,N] [--concurrency N,N] [--candidates NAME,NAME]\n\
          [--candidate-order-offset N]\n\
          Candidates: http-json,http-postcard,http-prost,https-json,https-postcard,https-prost,\n\
-         tcp-postcard,tcp-tls-postcard,quinn-rpc-stream,quinn-lane"
+         tcp-postcard,tcp-postcard-rpc,tcp-prost,tcp-tls-postcard,tcp-tls-prost,quinn-rpc-stream,quinn-lane"
     );
 }
 
@@ -481,6 +546,8 @@ struct Conditions {
     candidate_order: &'static str,
     server_reuse: &'static str,
     call_timeout_seconds: u64,
+    postcard_rpc_version: &'static str,
+    postcard_rpc_endpoint_paths: [&'static str; 2],
     tls: TlsConditions,
 }
 
@@ -506,6 +573,9 @@ struct Metric {
     payload_bytes: usize,
     encoded_request_bytes: usize,
     encoded_response_bytes: usize,
+    postcard_rpc_request_header_bytes: Option<usize>,
+    postcard_rpc_response_header_bytes: Option<usize>,
+    length_prefix_bytes_per_frame: usize,
     concurrency: usize,
     warmup_attempts: usize,
     warmup_errors: usize,
@@ -557,13 +627,13 @@ struct TcpTlsClient {
 }
 
 struct QuinnClient {
-    _endpoint: Endpoint,
+    _endpoint: QuinnEndpoint,
     connection: Connection,
     telemetry: Arc<TlsTelemetry>,
 }
 
 struct QuinnServer {
-    _endpoint: Endpoint,
+    _endpoint: QuinnEndpoint,
     addr: SocketAddr,
     telemetry: Arc<TlsTelemetry>,
 }
@@ -597,6 +667,7 @@ impl Metric {
             && negotiation_verified;
         let (encoded_request_bytes, encoded_response_bytes) =
             encoded_sizes(candidate, payload_bytes);
+        let (rpc_request_header, rpc_response_header, length_prefix) = protocol_overhead(candidate);
         Self {
             candidate: candidate.name(),
             codec: candidate.codec().content_type(),
@@ -606,6 +677,9 @@ impl Metric {
             payload_bytes,
             encoded_request_bytes,
             encoded_response_bytes,
+            postcard_rpc_request_header_bytes: rpc_request_header,
+            postcard_rpc_response_header_bytes: rpc_response_header,
+            length_prefix_bytes_per_frame: length_prefix,
             concurrency,
             warmup_attempts: phase.warmup_attempts,
             warmup_errors: phase.warmup_errors,
@@ -669,11 +743,21 @@ async fn main() {
         eprintln!("HTTPS setup error: {error}");
         process::exit(1);
     });
-    let tcp_addr = start_tcp().await;
-    let (tcp_tls_addr, tcp_tls_telemetry) = start_tcp_tls(&tls).await.unwrap_or_else(|error| {
-        eprintln!("TLS/TCP setup error: {error}");
-        process::exit(1);
-    });
+    let tcp_postcard_addr = start_tcp(Codec::Postcard).await;
+    let tcp_postcard_rpc_addr = start_tcp_postcard_rpc().await;
+    let tcp_prost_addr = start_tcp(Codec::Prost).await;
+    let (tcp_tls_postcard_addr, tcp_tls_postcard_telemetry) = start_tcp_tls(&tls, Codec::Postcard)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("TLS/TCP Postcard setup error: {error}");
+            process::exit(1);
+        });
+    let (tcp_tls_prost_addr, tcp_tls_prost_telemetry) = start_tcp_tls(&tls, Codec::Prost)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("TLS/TCP Prost setup error: {error}");
+            process::exit(1);
+        });
     let quic_server = start_quic_server(&tls).await.unwrap_or_else(|error| {
         eprintln!("QUIC setup error: {error}");
         process::exit(1);
@@ -742,13 +826,52 @@ async fn main() {
                         .await
                     }
                     Candidate::TcpPostcard => {
-                        bench_tcp(tcp_addr, candidate, payload_bytes, concurrency, &config).await
+                        bench_tcp(
+                            tcp_postcard_addr,
+                            candidate,
+                            payload_bytes,
+                            concurrency,
+                            &config,
+                        )
+                        .await
+                    }
+                    Candidate::TcpPostcardRpc => {
+                        bench_tcp_postcard_rpc(
+                            tcp_postcard_rpc_addr,
+                            candidate,
+                            payload_bytes,
+                            concurrency,
+                            &config,
+                        )
+                        .await
+                    }
+                    Candidate::TcpProst => {
+                        bench_tcp(
+                            tcp_prost_addr,
+                            candidate,
+                            payload_bytes,
+                            concurrency,
+                            &config,
+                        )
+                        .await
                     }
                     Candidate::TcpTlsPostcard => {
                         bench_tcp_tls(
-                            tcp_tls_addr,
+                            tcp_tls_postcard_addr,
                             &tls,
-                            tcp_tls_telemetry.clone(),
+                            tcp_tls_postcard_telemetry.clone(),
+                            candidate,
+                            payload_bytes,
+                            concurrency,
+                            &config,
+                        )
+                        .await
+                    }
+                    Candidate::TcpTlsProst => {
+                        bench_tcp_tls(
+                            tcp_tls_prost_addr,
+                            &tls,
+                            tcp_tls_prost_telemetry.clone(),
                             candidate,
                             payload_bytes,
                             concurrency,
@@ -814,6 +937,8 @@ async fn main() {
             candidate_order: "the CLI/default order is rotated left by candidate_order_offset; candidates records the effective order",
             server_reuse: "servers are reused; HTTPS and TLS/TCP use per-worker connections and Quinn creates one fresh client endpoint/connection per metric cell; all are warmed before measurement",
             call_timeout_seconds: CALL_TIMEOUT.as_secs(),
+            postcard_rpc_version: "0.12.1 (use-std)",
+            postcard_rpc_endpoint_paths: [RecordEndpoint::PATH, ReplicateEndpoint::PATH],
             tls: TlsConditions {
                 certificate_sha256: certificate_sha256(&tls),
                 trust_roots: "generated benchmark certificate only; platform roots disabled",
@@ -874,14 +999,62 @@ fn encoded_sizes(candidate: Candidate, payload_bytes: usize) -> (usize, usize) {
     if matches!(
         candidate,
         Candidate::TcpPostcard
+            | Candidate::TcpPostcardRpc
+            | Candidate::TcpProst
             | Candidate::TcpTlsPostcard
+            | Candidate::TcpTlsProst
             | Candidate::QuinnRpcStream
             | Candidate::QuinnLane
     ) {
         request_bytes += 4;
         response_bytes += 4;
     }
+    if candidate == Candidate::TcpPostcardRpc {
+        let (request_header, response_header) = rpc_header_sizes();
+        request_bytes += request_header;
+        response_bytes += response_header;
+    }
     (request_bytes, response_bytes)
+}
+
+fn protocol_overhead(candidate: Candidate) -> (Option<usize>, Option<usize>, usize) {
+    let length_prefix = usize::from(matches!(
+        candidate,
+        Candidate::TcpPostcard
+            | Candidate::TcpPostcardRpc
+            | Candidate::TcpProst
+            | Candidate::TcpTlsPostcard
+            | Candidate::TcpTlsProst
+            | Candidate::QuinnRpcStream
+            | Candidate::QuinnLane
+    )) * 4;
+    if candidate == Candidate::TcpPostcardRpc {
+        let (request, response) = rpc_header_sizes();
+        (Some(request), Some(response), length_prefix)
+    } else {
+        (None, None, length_prefix)
+    }
+}
+
+fn rpc_header_sizes() -> (usize, usize) {
+    fn header_len(key: postcard_rpc::Key, key_kind: VarKeyKind) -> usize {
+        let mut key = VarKey::Key8(key);
+        key.shrink_to(key_kind);
+        VarHeader {
+            key,
+            seq_no: VarSeq::Seq4(2_000_000),
+        }
+        .write_to_vec()
+        .len()
+    }
+
+    let dispatcher = RpcDispatcher::new(RpcContext, TokioSpawner);
+    let key_kind = postcard_rpc::server::Dispatch::min_key_len(&dispatcher);
+    let request = header_len(RecordEndpoint::REQ_KEY, key_kind)
+        .max(header_len(ReplicateEndpoint::REQ_KEY, key_kind));
+    let response = header_len(RecordEndpoint::RESP_KEY, key_kind)
+        .max(header_len(ReplicateEndpoint::RESP_KEY, key_kind));
+    (request, response)
 }
 
 fn representative_sequence(candidate: Candidate) -> u64 {
@@ -892,7 +1065,11 @@ fn representative_sequence(candidate: Candidate) -> u64 {
         | Candidate::HttpsJson
         | Candidate::HttpsPostcard
         | Candidate::HttpsProst => 1_000_000,
-        Candidate::TcpPostcard | Candidate::TcpTlsPostcard => 2_000_000,
+        Candidate::TcpPostcard
+        | Candidate::TcpPostcardRpc
+        | Candidate::TcpProst
+        | Candidate::TcpTlsPostcard
+        | Candidate::TcpTlsProst => 2_000_000,
         Candidate::QuinnRpcStream | Candidate::QuinnLane => 3_000_000,
     }
 }
@@ -1157,7 +1334,224 @@ fn http_exchange(
         .is_some_and(|ack| valid_ack(&ack, sequence, payload))
 }
 
-async fn start_tcp() -> SocketAddr {
+#[derive(Clone)]
+pub struct RpcServerWireTx {
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+}
+
+impl ServerWireTx for RpcServerWireTx {
+    type Error = WireTxErrorKind;
+
+    async fn send<T: Serialize + ?Sized>(
+        &self,
+        header: VarHeader,
+        message: &T,
+    ) -> Result<(), Self::Error> {
+        let mut frame = header.write_to_vec();
+        frame.extend_from_slice(
+            &postcard::to_allocvec(message).map_err(|_| WireTxErrorKind::Other)?,
+        );
+        self.send_raw(&frame).await
+    }
+
+    async fn send_raw(&self, frame: &[u8]) -> Result<(), Self::Error> {
+        let mut writer = self.writer.lock().await;
+        tokio::time::timeout(CALL_TIMEOUT, write_tcp_frame(&mut *writer, frame))
+            .await
+            .map_err(|_| WireTxErrorKind::Timeout)?
+            .map_err(|_| WireTxErrorKind::ConnectionClosed)
+    }
+
+    async fn send_log_str(&self, _key_kind: VarKeyKind, _message: &str) -> Result<(), Self::Error> {
+        Err(WireTxErrorKind::Other)
+    }
+
+    async fn send_log_fmt<'a>(
+        &self,
+        _key_kind: VarKeyKind,
+        _message: std::fmt::Arguments<'a>,
+    ) -> Result<(), Self::Error> {
+        Err(WireTxErrorKind::Other)
+    }
+}
+
+struct RpcServerWireRx {
+    reader: tokio::net::tcp::OwnedReadHalf,
+}
+
+impl ServerWireRx for RpcServerWireRx {
+    type Error = WireRxErrorKind;
+
+    async fn receive<'a>(&mut self, buffer: &'a mut [u8]) -> Result<&'a mut [u8], Self::Error> {
+        let frame = tokio::time::timeout(CALL_TIMEOUT, read_tcp_frame(&mut self.reader))
+            .await
+            .map_err(|_| WireRxErrorKind::Other)?
+            .map_err(|_| WireRxErrorKind::ConnectionClosed)?
+            .ok_or(WireRxErrorKind::ConnectionClosed)?;
+        if frame.len() > buffer.len() {
+            return Err(WireRxErrorKind::ReceivedMessageTooLarge);
+        }
+        buffer[..frame.len()].copy_from_slice(&frame);
+        Ok(&mut buffer[..frame.len()])
+    }
+}
+
+struct RpcHostWireTx {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl HostWireTx for RpcHostWireTx {
+    type Error = io::Error;
+
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), Self::Error> {
+        tokio::time::timeout(CALL_TIMEOUT, write_tcp_frame(&mut self.writer, &frame))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "postcard-rpc write timeout"))?
+            .map_err(io::Error::other)
+    }
+}
+
+struct RpcHostWireRx {
+    reader: tokio::net::tcp::OwnedReadHalf,
+}
+
+impl HostWireRx for RpcHostWireRx {
+    type Error = io::Error;
+
+    async fn receive(&mut self) -> Result<Vec<u8>, Self::Error> {
+        tokio::time::timeout(CALL_TIMEOUT, read_tcp_frame(&mut self.reader))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "postcard-rpc read timeout"))?
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "postcard-rpc EOF"))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TokioSpawner;
+
+impl HostWireSpawn for TokioSpawner {
+    fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+        tokio::spawn(future);
+    }
+}
+
+impl postcard_rpc::server::WireSpawn for TokioSpawner {
+    type Error = std::convert::Infallible;
+    type Info = ();
+
+    fn info(&self) -> &Self::Info {
+        &()
+    }
+}
+
+pub fn rpc_spawn(
+    _info: &(),
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), std::convert::Infallible> {
+    tokio::spawn(future);
+    Ok(())
+}
+
+pub struct RpcContext;
+
+fn rpc_record_handler(
+    _context: &mut RpcContext,
+    _header: VarHeader,
+    request: WireRequest,
+) -> WireAck {
+    rpc_ack(request)
+}
+
+fn rpc_replicate_handler(
+    _context: &mut RpcContext,
+    _header: VarHeader,
+    request: WireRequest,
+) -> WireAck {
+    rpc_ack(request)
+}
+
+fn rpc_ack(request: WireRequest) -> WireAck {
+    handle_request(request.clone()).unwrap_or(WireAck {
+        slot: request.slot,
+        accepted: false,
+        hash: Vec::new(),
+        request_id: request.request_id,
+    })
+}
+
+postcard_rpc::define_dispatch! {
+    app: RpcDispatcher;
+    spawn_fn: rpc_spawn;
+    tx_impl: RpcServerWireTx;
+    spawn_impl: TokioSpawner;
+    context: RpcContext;
+
+    endpoints: {
+        list: RPC_ENDPOINTS;
+
+        | EndpointTy        | kind     | handler               |
+        | ----------        | ----     | -------               |
+        | RecordEndpoint    | blocking | rpc_record_handler    |
+        | ReplicateEndpoint | blocking | rpc_replicate_handler |
+    };
+    topics_in: {
+        list: RPC_TOPICS_IN;
+
+        | TopicTy | kind | handler |
+        | ------- | ---- | ------- |
+    };
+    topics_out: {
+        list: RPC_TOPICS_OUT;
+    };
+}
+
+async fn start_tcp_postcard_rpc() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            let (reader, writer) = stream.into_split();
+            let tx = RpcServerWireTx {
+                writer: Arc::new(tokio::sync::Mutex::new(writer)),
+            };
+            let rx = RpcServerWireRx { reader };
+            let dispatcher = RpcDispatcher::new(RpcContext, TokioSpawner);
+            let key_kind = postcard_rpc::server::Dispatch::min_key_len(&dispatcher);
+            let mut server = postcard_rpc::server::Server::new(
+                tx,
+                rx,
+                vec![0_u8; MAX_FRAME].into_boxed_slice(),
+                dispatcher,
+                key_kind,
+            );
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+        }
+    });
+    addr
+}
+
+async fn connect_tcp_postcard_rpc(addr: SocketAddr) -> Option<HostClient<WireError>> {
+    let stream = tokio::time::timeout(CALL_TIMEOUT, tokio::net::TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    stream.set_nodelay(true).ok()?;
+    let (reader, writer) = stream.into_split();
+    Some(HostClient::new_with_wire(
+        RpcHostWireTx { writer },
+        RpcHostWireRx { reader },
+        TokioSpawner,
+        VarSeqKind::Seq4,
+        ERROR_PATH,
+        8,
+    ))
+}
+
+async fn start_tcp(codec: Codec) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1165,13 +1559,17 @@ async fn start_tcp() -> SocketAddr {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(serve_tcp_stream(stream));
+            let _ = stream.set_nodelay(true);
+            tokio::spawn(serve_tcp_stream(stream, codec));
         }
     });
     addr
 }
 
-async fn start_tcp_tls(tls: &TlsMaterial) -> Result<(SocketAddr, Arc<TlsTelemetry>), String> {
+async fn start_tcp_tls(
+    tls: &TlsMaterial,
+    codec: Codec,
+) -> Result<(SocketAddr, Arc<TlsTelemetry>), String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| error.to_string())?;
@@ -1194,7 +1592,7 @@ async fn start_tcp_tls(tls: &TlsMaterial) -> Result<(SocketAddr, Arc<TlsTelemetr
                         session.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3)
                             && session.alpn_protocol() == Some(RPC_ALPN),
                     );
-                    serve_tcp_stream(stream).await;
+                    serve_tcp_stream(stream, codec).await;
                 }
             });
         }
@@ -1202,7 +1600,7 @@ async fn start_tcp_tls(tls: &TlsMaterial) -> Result<(SocketAddr, Arc<TlsTelemetr
     Ok((addr, telemetry))
 }
 
-async fn serve_tcp_stream<S>(mut stream: S)
+async fn serve_tcp_stream<S>(mut stream: S, codec: Codec)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1210,10 +1608,10 @@ where
         let Ok(Some(frame)) = read_tcp_frame(&mut stream).await else {
             break;
         };
-        let result = Codec::Postcard
+        let result = codec
             .decode_request(&frame)
             .and_then(handle_request)
-            .and_then(|ack| Codec::Postcard.encode_ack(&ack));
+            .and_then(|ack| codec.encode_ack(&ack));
         let Ok(response) = result else { break };
         if write_tcp_frame(&mut stream, &response).await.is_err() {
             break;
@@ -1231,14 +1629,130 @@ async fn bench_tcp(
     let payload = Arc::new(vec![0xa5; payload_bytes]);
     let phase = tcp_phase(
         addr,
+        candidate.codec(),
         payload,
         concurrency,
         config.warmup,
         config.operations,
-        2_000_000,
     )
     .await;
     Metric::from_samples(candidate, payload_bytes, concurrency, phase)
+}
+
+async fn bench_tcp_postcard_rpc(
+    addr: SocketAddr,
+    candidate: Candidate,
+    payload_bytes: usize,
+    concurrency: usize,
+    config: &Config,
+) -> Metric {
+    let payload = Arc::new(vec![0xa5; payload_bytes]);
+    let phase =
+        tcp_postcard_rpc_phase(addr, payload, concurrency, config.warmup, config.operations).await;
+    Metric::from_samples(candidate, payload_bytes, concurrency, phase)
+}
+
+async fn tcp_postcard_rpc_phase(
+    addr: SocketAddr,
+    payload: Arc<Vec<u8>>,
+    concurrency: usize,
+    warmup: usize,
+    operations: usize,
+) -> PhaseResult {
+    let lanes_per_session = if concurrency > 1 { 2 } else { 1 };
+    let lane_count = concurrency * lanes_per_session;
+    let warmup_start = Arc::new(tokio::sync::Barrier::new(lane_count + 1));
+    let measurement_ready = Arc::new(tokio::sync::Barrier::new(lane_count + 1));
+    let measurement_start = Arc::new(tokio::sync::Barrier::new(lane_count + 1));
+    let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut sessions = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        sessions.push(connect_tcp_postcard_rpc(addr).await);
+    }
+    let mut lanes = Vec::with_capacity(lane_count);
+    for (worker, session) in sessions.iter().enumerate() {
+        for worker_lane in 0..lanes_per_session {
+            let lane = worker * lanes_per_session + worker_lane;
+            let client = session.clone();
+            let payload = payload.clone();
+            let warmup_start = warmup_start.clone();
+            let measurement_ready = measurement_ready.clone();
+            let measurement_start = measurement_start.clone();
+            let permits = permits.clone();
+            let warmup_count = if worker_lane == 0 {
+                worker_count(warmup, concurrency, worker)
+            } else {
+                0
+            };
+            let count = worker_count(operations, lane_count, lane);
+            lanes.push(tokio::spawn(async move {
+                let mut samples = Vec::with_capacity(count);
+                let mut errors = 0;
+                warmup_start.wait().await;
+                for local in 0..warmup_count {
+                    let sequence = sequence(concurrency, worker, local) as u64;
+                    let permit = permits.acquire().await.unwrap();
+                    let ok = match client.as_ref() {
+                        Some(client) => rpc_exchange(client, sequence, &payload).await,
+                        None => false,
+                    };
+                    drop(permit);
+                    errors += usize::from(!ok);
+                }
+                let warmup_errors = errors;
+                errors = 0;
+                measurement_ready.wait().await;
+                measurement_start.wait().await;
+                for local in 0..count {
+                    let sequence = 2_000_000 + sequence(lane_count, lane, local) as u64;
+                    let permit = permits.acquire().await.unwrap();
+                    let started = Instant::now();
+                    let ok = match client.as_ref() {
+                        Some(client) => rpc_exchange(client, sequence, &payload).await,
+                        None => false,
+                    };
+                    samples.push(started.elapsed().as_nanos() as u64);
+                    drop(permit);
+                    errors += usize::from(!ok);
+                }
+                (samples, errors, warmup_count, warmup_errors)
+            }));
+        }
+    }
+    warmup_start.wait().await;
+    measurement_ready.wait().await;
+    let started = Instant::now();
+    measurement_start.wait().await;
+    let (samples, errors, warmup_attempts, warmup_errors, wall) =
+        collect_phase_tasks(lanes, operations, started).await;
+    for client in sessions.into_iter().flatten() {
+        client.close();
+    }
+    PhaseResult {
+        samples,
+        errors,
+        wall,
+        warmup_attempts,
+        warmup_errors,
+        tls_before: None,
+        tls_after: None,
+    }
+}
+
+async fn rpc_exchange(client: &HostClient<WireError>, sequence: u64, payload: &[u8]) -> bool {
+    let request = request(sequence, payload);
+    let response = tokio::time::timeout(CALL_TIMEOUT, async {
+        if sequence.is_multiple_of(2) {
+            client.send_resp::<RecordEndpoint>(&request).await
+        } else {
+            client.send_resp::<ReplicateEndpoint>(&request).await
+        }
+    })
+    .await;
+    response
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|ack| valid_ack(&ack, sequence, payload))
 }
 
 async fn bench_tcp_tls(
@@ -1259,11 +1773,11 @@ async fn bench_tcp_tls(
             connector,
             telemetry,
         },
+        candidate.codec(),
         payload,
         concurrency,
         config.warmup,
         config.operations,
-        2_000_000,
     )
     .await;
     Metric::from_samples(candidate, payload_bytes, concurrency, phase)
@@ -1272,11 +1786,11 @@ async fn bench_tcp_tls(
 async fn tcp_tls_phase(
     addr: SocketAddr,
     client: TcpTlsClient,
+    codec: Codec,
     payload: Arc<Vec<u8>>,
     concurrency: usize,
     warmup: usize,
     operations: usize,
-    offset: u64,
 ) -> PhaseResult {
     let warmup_start = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
     let measurement_ready = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
@@ -1316,7 +1830,7 @@ async fn tcp_tls_phase(
             if let Some(stream) = stream.as_mut() {
                 for local in 0..warmup_count {
                     let sequence = sequence(concurrency, worker, local) as u64;
-                    errors += usize::from(!tcp_exchange(stream, sequence, &payload).await);
+                    errors += usize::from(!tcp_exchange(stream, codec, sequence, &payload).await);
                 }
             } else {
                 errors += warmup_count;
@@ -1326,10 +1840,10 @@ async fn tcp_tls_phase(
             measurement_ready.wait().await;
             measurement_start.wait().await;
             for local in 0..count {
-                let sequence = offset + sequence(concurrency, worker, local) as u64;
+                let sequence = 2_000_000 + sequence(concurrency, worker, local) as u64;
                 let started = Instant::now();
                 let ok = match stream.as_mut() {
-                    Some(stream) => tcp_exchange(stream, sequence, &payload).await,
+                    Some(stream) => tcp_exchange(stream, codec, sequence, &payload).await,
                     None => false,
                 };
                 samples.push(started.elapsed().as_nanos() as u64);
@@ -1359,11 +1873,11 @@ async fn tcp_tls_phase(
 
 async fn tcp_phase(
     addr: SocketAddr,
+    codec: Codec,
     payload: Arc<Vec<u8>>,
     concurrency: usize,
     warmup: usize,
     operations: usize,
-    offset: u64,
 ) -> PhaseResult {
     let warmup_start = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
     let measurement_ready = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
@@ -1390,7 +1904,7 @@ async fn tcp_phase(
             if let Some(stream) = stream.as_mut() {
                 for local in 0..warmup_count {
                     let sequence = sequence(concurrency, worker, local) as u64;
-                    errors += usize::from(!tcp_exchange(stream, sequence, &payload).await);
+                    errors += usize::from(!tcp_exchange(stream, codec, sequence, &payload).await);
                 }
             } else {
                 errors += warmup_count;
@@ -1400,10 +1914,10 @@ async fn tcp_phase(
             measurement_ready.wait().await;
             measurement_start.wait().await;
             for local in 0..count {
-                let sequence = offset + sequence(concurrency, worker, local) as u64;
+                let sequence = 2_000_000 + sequence(concurrency, worker, local) as u64;
                 let started = Instant::now();
                 let ok = match stream.as_mut() {
-                    Some(stream) => tcp_exchange(stream, sequence, &payload).await,
+                    Some(stream) => tcp_exchange(stream, codec, sequence, &payload).await,
                     None => false,
                 };
                 samples.push(started.elapsed().as_nanos() as u64);
@@ -1429,17 +1943,15 @@ async fn tcp_phase(
     }
 }
 
-async fn tcp_exchange<S>(stream: &mut S, sequence: u64, payload: &[u8]) -> bool
+async fn tcp_exchange<S>(stream: &mut S, codec: Codec, sequence: u64, payload: &[u8]) -> bool
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let encoded = Codec::Postcard
-        .encode_request(&request(sequence, payload))
-        .unwrap();
+    let encoded = codec.encode_request(&request(sequence, payload)).unwrap();
     tokio::time::timeout(CALL_TIMEOUT, async {
         write_tcp_frame(stream, &encoded).await.ok()?;
         let response = read_tcp_frame(stream).await.ok()??;
-        let ack = Codec::Postcard.decode_ack(&response).ok()?;
+        let ack = codec.decode_ack(&response).ok()?;
         Some(valid_ack(&ack, sequence, payload))
     })
     .await
@@ -1487,7 +1999,7 @@ async fn start_quic_server(tls: &TlsMaterial) -> Result<QuinnServer, String> {
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         .max_concurrent_bidi_streams(1_024_u32.into());
-    let server = Endpoint::server(
+    let server = QuinnEndpoint::server(
         server_config,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     )
@@ -1527,7 +2039,7 @@ async fn connect_quic(server: &QuinnServer, tls: &TlsMaterial) -> Result<QuinnCl
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .map_err(|error| error.to_string())?,
     ));
-    let mut client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+    let mut client = QuinnEndpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
         .map_err(|error| error.to_string())?;
     client.set_default_client_config(client_config);
     let connection = client
@@ -1838,26 +2350,80 @@ mod tests {
             Candidate::parse("tcp-tls-postcard"),
             Some(Candidate::TcpTlsPostcard)
         );
+        assert_eq!(
+            Candidate::parse("tcp-postcard-rpc"),
+            Some(Candidate::TcpPostcardRpc)
+        );
+        assert_eq!(Candidate::parse("tcp-prost"), Some(Candidate::TcpProst));
+        assert_eq!(
+            Candidate::parse("tcp-tls-prost"),
+            Some(Candidate::TcpTlsProst)
+        );
         assert_eq!(Candidate::parse("quinn-lane"), Some(Candidate::QuinnLane));
     }
 
     #[test]
-    fn plaintext_tcp_candidate_is_canonical_and_isolates_tls_overhead() {
+    fn tcp_codec_pairs_are_canonical_and_isolate_tls_overhead() {
         assert_eq!(Candidate::TcpPostcard.name(), "tcp-postcard");
-        assert_eq!(
-            Candidate::TcpPostcard.codec(),
-            Candidate::TcpTlsPostcard.codec()
+        assert_eq!(Candidate::TcpProst.name(), "tcp-prost");
+        assert_eq!(Candidate::TcpTlsPostcard.name(), "tcp-tls-postcard");
+        assert_eq!(Candidate::TcpTlsProst.name(), "tcp-tls-prost");
+        for (plaintext, tls, codec) in [
+            (
+                Candidate::TcpPostcard,
+                Candidate::TcpTlsPostcard,
+                Codec::Postcard,
+            ),
+            (Candidate::TcpProst, Candidate::TcpTlsProst, Codec::Prost),
+        ] {
+            assert_eq!(plaintext.codec(), codec);
+            assert_eq!(tls.codec(), codec);
+            assert_eq!(plaintext.transport(), tls.transport());
+            assert_eq!(plaintext.topology(), tls.topology());
+            assert_eq!(plaintext.tls(), "none");
+            assert!(!plaintext.is_tls());
+            assert!(tls.is_tls());
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_server_exchanges_postcard_and_prost_with_identical_framing() {
+        for codec in [Codec::Postcard, Codec::Prost] {
+            let addr = start_tcp(codec).await;
+            let mut stream =
+                tokio::time::timeout(CALL_TIMEOUT, tokio::net::TcpStream::connect(addr))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            stream.set_nodelay(true).unwrap();
+            assert!(tcp_exchange(&mut stream, codec, 42, &[0xa5; 128]).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn postcard_rpc_multiplexes_both_endpoint_paths_on_one_session() {
+        let addr = start_tcp_postcard_rpc().await;
+        let client = connect_tcp_postcard_rpc(addr).await.unwrap();
+        let payload = [0xa5; 128];
+        let (record, replicate) = tokio::join!(
+            rpc_exchange(&client, 42, &payload),
+            rpc_exchange(&client, 43, &payload),
         );
+        assert!(record);
+        assert!(replicate);
+        client.close();
+    }
+
+    #[test]
+    fn postcard_rpc_reports_real_header_and_length_prefix_overhead() {
+        assert_eq!(rpc_header_sizes(), (6, 6));
         assert_eq!(
-            Candidate::TcpPostcard.transport(),
-            Candidate::TcpTlsPostcard.transport()
+            protocol_overhead(Candidate::TcpPostcardRpc),
+            (Some(6), Some(6), 4)
         );
-        assert_eq!(
-            Candidate::TcpPostcard.topology(),
-            Candidate::TcpTlsPostcard.topology()
-        );
-        assert_eq!(Candidate::TcpPostcard.tls(), "none");
-        assert!(Candidate::TcpTlsPostcard.is_tls());
+        let postcard = encoded_sizes(Candidate::TcpPostcard, 128);
+        let rpc = encoded_sizes(Candidate::TcpPostcardRpc, 128);
+        assert_eq!(rpc, (postcard.0 + 6, postcard.1 + 6));
     }
 
     #[test]
@@ -1926,6 +2492,7 @@ mod tests {
             Candidate::HttpsPostcard,
             Candidate::HttpsProst,
             Candidate::TcpTlsPostcard,
+            Candidate::TcpTlsProst,
             Candidate::QuinnRpcStream,
             Candidate::QuinnLane,
         ] {
@@ -1939,6 +2506,8 @@ mod tests {
             Candidate::HttpPostcard,
             Candidate::HttpProst,
             Candidate::TcpPostcard,
+            Candidate::TcpPostcardRpc,
+            Candidate::TcpProst,
         ] {
             assert_eq!(candidate.tls(), "none");
         }
@@ -1957,7 +2526,11 @@ mod tests {
                     | Candidate::HttpsJson
                     | Candidate::HttpsPostcard
                     | Candidate::HttpsProst => 1_000_000,
-                    Candidate::TcpPostcard | Candidate::TcpTlsPostcard => 2_000_000,
+                    Candidate::TcpPostcard
+                    | Candidate::TcpPostcardRpc
+                    | Candidate::TcpProst
+                    | Candidate::TcpTlsPostcard
+                    | Candidate::TcpTlsProst => 2_000_000,
                     Candidate::QuinnRpcStream | Candidate::QuinnLane => 3_000_000,
                 }
             );
@@ -1967,15 +2540,23 @@ mod tests {
             let framing = usize::from(matches!(
                 candidate,
                 Candidate::TcpPostcard
+                    | Candidate::TcpPostcardRpc
+                    | Candidate::TcpProst
                     | Candidate::TcpTlsPostcard
+                    | Candidate::TcpTlsProst
                     | Candidate::QuinnRpcStream
                     | Candidate::QuinnLane
             )) * 4;
+            let rpc_headers = if candidate == Candidate::TcpPostcardRpc {
+                rpc_header_sizes()
+            } else {
+                (0, 0)
+            };
             assert_eq!(
                 encoded_sizes(candidate, 128),
                 (
-                    codec.encode_request(&request).unwrap().len() + framing,
-                    codec.encode_ack(&ack).unwrap().len() + framing,
+                    codec.encode_request(&request).unwrap().len() + framing + rpc_headers.0,
+                    codec.encode_ack(&ack).unwrap().len() + framing + rpc_headers.1,
                 )
             );
         }

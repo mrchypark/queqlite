@@ -874,15 +874,20 @@ fn node_admin_error(error: NodeError) -> Response {
 
 fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
     match error {
-        NodeError::InvalidRequest(_) | NodeError::InvalidSqlStatement { .. } => {
+        NodeError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, AdminErrorCode::InvalidRequest),
+        #[cfg(feature = "sql")]
+        NodeError::InvalidSqlStatement { .. } => {
             (StatusCode::BAD_REQUEST, AdminErrorCode::InvalidRequest)
         }
-        NodeError::PreconditionFailed(_)
-        | NodeError::ConfigurationTransition { .. }
-        | NodeError::RequestConflict(_) => {
+        NodeError::PreconditionFailed(_) | NodeError::ConfigurationTransition { .. } => {
             (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
         }
-        NodeError::Unavailable(_) | NodeError::Contention(_) | NodeError::WinnerLimitExceeded => {
+        #[cfg(feature = "sql")]
+        NodeError::RequestConflict(_) => (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed),
+        NodeError::Unavailable(_)
+        | NodeError::ResourceExhausted(_)
+        | NodeError::Contention(_)
+        | NodeError::WinnerLimitExceeded => {
             (StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable)
         }
         NodeError::UnsupportedAckMode(_)

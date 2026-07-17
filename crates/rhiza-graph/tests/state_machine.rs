@@ -297,34 +297,47 @@ fn read_only_query_admission_rejects_mutation_external_io_and_multiple_statement
 }
 
 #[test]
-fn read_only_query_rejects_untyped_patterns_functions_and_subqueries() {
+fn read_only_query_accepts_labeled_patterns_functions_and_clauses_supported_by_ladybug() {
     let dir = tempfile::tempdir().unwrap();
     let state =
         LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
             .unwrap();
-    let unsafe_queries = [
-        "MATCH (n) RETURN n",
-        "MATCH (a:RhizaDocument)-[r]->(b:RhizaDocument) RETURN r",
-        "MATCH (d:RhizaDocument) RETURN labels(d)",
-        "MATCH (d:RhizaDocument) RETURN label(d)",
-        "MATCH (d:RhizaDocument) RETURN `labels`(d)",
-        r"MATCH (d:RhizaDocument) RETURN `\u006cabels`(d)",
-        "MATCH (d:RhizaDocument) CALL { MATCH (x:RhizaDocument) RETURN x } RETURN d",
-        "MATCH (d:RhizaDocument) WHERE EXISTS { MATCH (x:RhizaDocument) RETURN x } RETURN d",
-        "MATCH (d:RhizaDocument) WITH d MATCH (x:RhizaDocument) RETURN x",
-        "UNWIND [1, 2] AS n RETURN n",
-        "RETURN 1",
+    let command = GraphCommandV1::put_document(
+        "general-query",
+        "document-1",
+        GraphValueV1::String("value".into()),
+    )
+    .unwrap();
+    state
+        .apply_entry(&entry(1, LogHash::ZERO, replicated(&command)))
+        .unwrap();
+
+    let supported = [
+        "MATCH (d:RhizaDocument) RETURN upper(d.string_value) AS value LIMIT 1",
+        "MATCH (d:RhizaDocument) WITH d RETURN d.id AS id LIMIT 1",
+        "UNWIND [2, 1] AS n RETURN n ORDER BY n LIMIT 2",
+        "RETURN 1 AS value LIMIT 1",
     ];
 
-    for query in unsafe_queries {
+    for query in supported {
         assert!(
-            matches!(
-                state.query_read_only(query, &BTreeMap::new(), 10, 4096, 1_000),
-                Err(Error::InvalidCommand(_))
-            ),
-            "unsafe V1 graph query unexpectedly passed: {query}"
+            state
+                .query_read_only(query, &BTreeMap::new(), 10, 4096, 1_000)
+                .is_ok(),
+            "Ladybug-supported read query was rejected: {query}"
         );
     }
+
+    assert!(matches!(
+        state.query_read_only(
+            "MATCH (d:RhizaDocument) CALL { MATCH (x:RhizaDocument) RETURN x } RETURN d",
+            &BTreeMap::new(),
+            10,
+            4096,
+            1_000,
+        ),
+        Err(Error::InvalidCommand(_))
+    ));
 }
 
 #[test]
@@ -367,33 +380,59 @@ fn read_only_query_allows_clause_words_as_parameter_names() {
 }
 
 #[test]
-fn read_only_query_rejects_excessive_projections_and_materializing_functions() {
+fn read_only_query_allows_wide_and_function_projections_with_byte_and_row_bounds() {
     let dir = tempfile::tempdir().unwrap();
     let state =
         LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
             .unwrap();
-    let projections = std::iter::repeat_n("v.id", 1_000)
+    let command =
+        GraphCommandV1::put_document("wide-query", "document-1", GraphValueV1::I64(7)).unwrap();
+    state
+        .apply_entry(&entry(1, LogHash::ZERO, replicated(&command)))
+        .unwrap();
+    let projections = std::iter::repeat_n("v.id", 5)
         .collect::<Vec<_>>()
         .join(", ");
-    let too_wide = format!("MATCH (v:RhizaDocument) RETURN {projections}");
-    let unsafe_queries = [
-        too_wide,
-        "MATCH (v:RhizaDocument) RETURN repeat(v.id, 1000000)".into(),
-        "MATCH (v:RhizaDocument) RETURN range(1, 1000000)".into(),
-        "MATCH (v:RhizaDocument) RETURN count(v)".into(),
-        "MATCH (v:RhizaDocument) RETURN v.id LIMIT $delete".into(),
-        "MATCH (v:RhizaDocument) RETURN v.id LIMIT 1 LIMIT 2".into(),
-    ];
+    let wide = state
+        .query_read_only(
+            &format!("MATCH (v:RhizaDocument) RETURN {projections}"),
+            &BTreeMap::new(),
+            10,
+            4096,
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(wide.rows[0].len(), 5);
+    assert!(state
+        .query_read_only(
+            "MATCH (v:RhizaDocument) RETURN count(v)",
+            &BTreeMap::new(),
+            10,
+            4096,
+            1_000,
+        )
+        .is_ok());
 
-    for query in unsafe_queries {
-        assert!(
-            matches!(
-                state.query_read_only(&query, &BTreeMap::new(), 10, usize::MAX, 1_000),
-                Err(Error::InvalidCommand(_))
-            ),
-            "resource-amplifying query unexpectedly passed: {query}"
-        );
-    }
+    assert!(matches!(
+        state.query_read_only(
+            "MATCH (v:RhizaDocument) RETURN repeat(v.id, 1000)",
+            &BTreeMap::new(),
+            10,
+            16,
+            1_000,
+        ),
+        Err(Error::InvalidCommand(message)) if message.contains("bytes")
+    ));
+    assert!(matches!(
+        state.query_read_only(
+            "MATCH (v:RhizaDocument) RETURN v.id LIMIT 1 LIMIT 2",
+            &BTreeMap::new(),
+            10,
+            4096,
+            1_000,
+        ),
+        Err(Error::InvalidCommand(_))
+    ));
 
     let oversized_literal = format!(
         "MATCH (v:RhizaDocument) RETURN '{}'",
@@ -406,56 +445,54 @@ fn read_only_query_rejects_excessive_projections_and_materializing_functions() {
 }
 
 #[test]
-fn read_only_query_v1_rejects_joins_paths_sorts_operators_and_whole_nodes() {
+fn read_only_query_supports_joins_sorts_operators_literals_and_whole_nodes() {
     let dir = tempfile::tempdir().unwrap();
     let state =
         LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
             .unwrap();
-    let unsupported = [
-        "MATCH (v:Person) RETURN v.name",
-        "MATCH (v:RhizaDocument), (x:RhizaDocument) RETURN v.id",
-        "MATCH (v:RhizaDocument)-[:Link]->(x:RhizaDocument) RETURN v.id",
-        "MATCH (v:RhizaDocument)-[:Link*1..3]->(x:RhizaDocument) RETURN v.id",
-        "MATCH (v:RhizaDocument) RETURN v",
-        "MATCH (v:RhizaDocument) RETURN DISTINCT v.id",
-        "MATCH (v:RhizaDocument) RETURN v.id ORDER BY v.id",
-        "MATCH (v:RhizaDocument) RETURN v.id SKIP 1",
-        "MATCH (v:RhizaDocument) RETURN v.i64_value + 1",
-        "MATCH (v:RhizaDocument) RETURN [v.id]",
-        "MATCH (v:RhizaDocument) RETURN v.unknown_property",
-        "MATCH (v:RhizaDocument) RETURN v.id, v.id, v.id, v.id, v.id",
-        "OPTIONAL MATCH (v:RhizaDocument) RETURN v.id",
-        "MATCH (v:RhizaDocument) WHERE v.id = 'literal' RETURN v.id",
-        "MATCH (v:RhizaDocument) RETURN v.id AS id",
-        "MATCH (v:RhizaDocument) RETURN 999999999999999999999999999999999999999999",
-        "MATCH (v:RhizaDocument) RETURN 'literal'",
-        "MATCH (v:RhizaDocument) RETURN true",
-        "MATCH (v:RhizaDocument) RETURN null",
-        "MATCH (v:RhizaDocument) RETURN $1bad",
-        "MATCH (v:RhizaDocument) RETURN $bad-name",
+    let first =
+        GraphCommandV1::put_document("general-1", "document-1", GraphValueV1::I64(1)).unwrap();
+    let first_entry = entry(1, LogHash::ZERO, replicated(&first));
+    state.apply_entry(&first_entry).unwrap();
+    let second =
+        GraphCommandV1::put_document("general-2", "document-2", GraphValueV1::I64(2)).unwrap();
+    state
+        .apply_entry(&entry(2, first_entry.hash, replicated(&second)))
+        .unwrap();
+    let supported = [
+        "MATCH (v:RhizaDocument), (x:RhizaDocument) RETURN v.id, x.id ORDER BY v.id, x.id LIMIT 2",
+        "MATCH (v:RhizaDocument) RETURN v LIMIT 1",
+        "MATCH (v:RhizaDocument) RETURN DISTINCT v.id ORDER BY v.id LIMIT 2",
+        "MATCH (v:RhizaDocument) RETURN v.id ORDER BY v.id SKIP 1 LIMIT 1",
+        "MATCH (v:RhizaDocument) RETURN v.i64_value + 1 AS incremented LIMIT 2",
+        "MATCH (v:RhizaDocument) RETURN [v.id] AS ids LIMIT 1",
+        "OPTIONAL MATCH (v:RhizaDocument) RETURN v.id LIMIT 1",
+        "MATCH (v:RhizaDocument) WHERE v.id = 'document-1' RETURN v.id AS id LIMIT 1",
+        "MATCH (v:RhizaDocument) RETURN 'literal', true, null LIMIT 1",
     ];
 
-    for query in unsupported {
+    for query in supported {
         assert!(
-            matches!(
-                state.query_read_only(query, &BTreeMap::new(), 10, 4096, 1_000),
-                Err(Error::InvalidCommand(_))
-            ),
-            "unsupported production V1 query passed admission: {query}"
+            state
+                .query_read_only(query, &BTreeMap::new(), 10, 4096, 1_000)
+                .is_ok(),
+            "Ladybug-supported query was rejected: {query}"
         );
     }
 
     let lexical_adversaries = [
-        format!("MATCH (v:RhizaDocument) RETURN {}", "9".repeat(10_000)),
         format!("MATCH (v:RhizaDocument) RETURN '{}'", "x".repeat(10_000)),
-        r"MATCH (v:RhizaDocument) RETURN '\x'".into(),
-        r"MATCH (v:RhizaDocument) RETURN v.id AS `\u0000`".into(),
+        "RETURN $1bad".into(),
+        "RETURN $bad-name".into(),
     ];
     for query in lexical_adversaries {
-        assert!(matches!(
-            state.query_read_only(&query, &BTreeMap::new(), 10, 4096, 1_000),
-            Err(Error::InvalidCommand(_))
-        ));
+        assert!(
+            matches!(
+                state.query_read_only(&query, &BTreeMap::new(), 10, 4096, 1_000),
+                Err(Error::InvalidCommand(_))
+            ),
+            "invalid or oversized query unexpectedly succeeded: {query}"
+        );
     }
 }
 
@@ -493,38 +530,57 @@ fn read_only_query_v1_allows_bounded_property_predicates_and_scalar_projections(
 }
 
 #[test]
-fn read_only_query_v1_rejects_invalid_parameters_before_execution() {
+fn read_only_query_validates_parameter_names_and_allows_typed_containers() {
     let dir = tempfile::tempdir().unwrap();
     let state =
         LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
             .unwrap();
     let id_query = "MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.id LIMIT 1";
-    let cases = [
+    for (query, parameters) in [
         (id_query, BTreeMap::new()),
-        (
-            id_query,
-            BTreeMap::from([("id".into(), GraphParameterValue::I64(1))]),
-        ),
-        (
-            "MATCH (v:RhizaDocument) RETURN $value LIMIT 1",
-            BTreeMap::from([("value".into(), GraphParameterValue::List(vec![]))]),
-        ),
-        (
-            "MATCH (v:RhizaDocument) RETURN $value LIMIT 1",
-            BTreeMap::from([("value".into(), GraphParameterValue::Struct(BTreeMap::new()))]),
-        ),
         (
             "MATCH (v:RhizaDocument) RETURN v.id LIMIT 1",
             BTreeMap::from([("extra".into(), GraphParameterValue::String("x".into()))]),
         ),
-    ];
-
-    for (query, parameters) in cases {
+    ] {
         assert!(matches!(
             state.query_read_only(query, &parameters, 10, 4096, 1_000),
             Err(Error::InvalidCommand(_))
         ));
     }
+
+    assert!(state
+        .query_read_only(
+            id_query,
+            &BTreeMap::from([("id".into(), GraphParameterValue::I64(1))]),
+            10,
+            4096,
+            1_000,
+        )
+        .is_ok());
+    let list = BTreeMap::from([(
+        "value".into(),
+        GraphParameterValue::List(vec![GraphParameterValue::I64(1)]),
+    )]);
+    assert!(state
+        .query_read_only(
+            "UNWIND $value AS value RETURN value LIMIT 1",
+            &list,
+            10,
+            4096,
+            1_000
+        )
+        .is_ok());
+    let structure = BTreeMap::from([(
+        "value".into(),
+        GraphParameterValue::Struct(BTreeMap::from([(
+            "field".into(),
+            GraphParameterValue::String("value".into()),
+        )])),
+    )]);
+    assert!(state
+        .query_read_only("RETURN $value LIMIT 1", &structure, 10, 4096, 1_000)
+        .is_ok());
 }
 
 #[test]

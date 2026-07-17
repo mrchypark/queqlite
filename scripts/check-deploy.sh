@@ -50,7 +50,8 @@ for replicas in 3 7; do
     }]}
   ' > "$tmp/config-${profile}-${id}.json"
   [ "$(jq '[.members[].token] | unique | length' "$tmp/config-${profile}-${id}.json")" = "$replicas" ]
-  RHIZA_EXECUTION_PROFILE="$profile" scripts/render-k8s-config.sh "$id" "$replicas" \
+  env -u RHIZA_IMAGE RHIZA_EXECUTION_PROFILE="$profile" \
+    scripts/render-k8s-config.sh "$id" "$replicas" \
     "$tmp/config-${profile}-${id}.json" "$tmp/config-${profile}-${id}.yaml" successor
   yq eval '.' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval 'select(.kind == "StatefulSet") | .metadata.name' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}-c${id}" ]
@@ -61,6 +62,7 @@ for replicas in 3 7; do
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.selector.matchLabels["rhiza.dev/execution-profile"]' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "$profile" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].image' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}:dev" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_DATA_DIR") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/var/lib/rhiza/${profile}" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].env[] | select(.name == "RHIZA_CONFIG_BUNDLE_FILE") | .value' "$tmp/config-${profile}-${id}.yaml")" = "/etc/rhiza/${profile}/config.json" ]
   [ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].resources.requests.cpu' "$tmp/config-${profile}-${id}.yaml")" = 250m ]
@@ -85,6 +87,12 @@ for replicas in 3 7; do
 done
 done
 
+RHIZA_EXECUTION_PROFILE=sql RHIZA_IMAGE=registry.example/rhiza-sql:v1 \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+    "$tmp/config-sql-3-custom-image.yaml" successor
+[ "$(yq eval -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[0].image' \
+  "$tmp/config-sql-3-custom-image.yaml")" = registry.example/rhiza-sql:v1 ]
+
 jq '.members |= to_entries | .members |= map(
   .value + {
     recorder_tcp_addr:("rhiza-sql-c3-" + (.key|tostring) + ".rhiza-sql-c3:8082")
@@ -102,6 +110,10 @@ RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
   "$tmp/config-sql-3-tcp.yaml")" = tcp-postcard ]
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TLS") | .value' \
+  "$tmp/config-sql-3-tcp.yaml")" = off ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
   select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value' \
   "$tmp/config-sql-3-tcp.yaml")" = '0.0.0.0:8082' ]
 if yq eval -r 'select(.kind == "StatefulSet") |
@@ -117,12 +129,104 @@ if yq eval -r 'select(.kind == "StatefulSet") |
   echo "plaintext recorder render retained TLS secret mount" >&2
   exit 1
 fi
-if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-tls-postcard \
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+  RHIZA_RECORDER_TLS_SECRET=irrelevant \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
-    "$tmp/removed-tls-transport.yaml"; then
-  echo "render accepted removed tcp-tls-postcard transport" >&2
+    "$tmp/plaintext-with-tls-secret.yaml"; then
+  echo "plaintext render accepted an irrelevant TLS secret" >&2
   exit 1
 fi
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+  RHIZA_RECORDER_TLS=sometimes \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
+    "$tmp/invalid-tls-switch.yaml"; then
+  echo "render accepted an invalid RHIZA_RECORDER_TLS value" >&2
+  exit 1
+fi
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=http \
+  RHIZA_RECORDER_TLS=on \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+    "$tmp/http-with-tls.yaml"; then
+  echo "HTTP render accepted RHIZA_RECORDER_TLS=on" >&2
+  exit 1
+fi
+jq '
+  .members |= (to_entries | map(
+    .key as $ordinal |
+    .value + {
+      recorder_tls_server_name:("rhiza-sql-c3-\($ordinal).rhiza-sql-c3")
+    }
+  ))
+' "$tmp/config-sql-3-tcp.json" > "$tmp/config-sql-3-tls.json"
+if RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+  RHIZA_RECORDER_TLS=on \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tls.json" \
+    "$tmp/missing-tls-secret.yaml"; then
+  echo "TLS render accepted a missing RHIZA_RECORDER_TLS_SECRET" >&2
+  exit 1
+fi
+RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
+  RHIZA_RECORDER_TLS=on \
+  RHIZA_RECORDER_TLS_SECRET=rhiza-recorder-tls \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tls.json" \
+    "$tmp/config-sql-3-tls.yaml"
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
+  "$tmp/config-sql-3-tls.yaml")" = tcp-postcard ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TLS") | .value' \
+  "$tmp/config-sql-3-tls.yaml")" = on ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_RECORDER_TLS_CERT_FILE") | .value' \
+  "$tmp/config-sql-3-tls.yaml")" = /run/secrets/rhiza/recorder-tls/tls.crt ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
+  .secret.secretName' "$tmp/config-sql-3-tls.yaml")" = rhiza-recorder-tls ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.volumes[] | select(.name == "recorder-tls") |
+  .secret.items | map(.key) | sort | join(",")' \
+  "$tmp/config-sql-3-tls.yaml")" = ca-bundle.pem,tls.crt,tls.key ]
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].volumeMounts[] |
+  select(.name == "recorder-tls") | .mountPath' \
+  "$tmp/config-sql-3-tls.yaml")" = /run/secrets/rhiza/recorder-tls ]
+
+for recorder_tls in off on; do
+  candidate_bundle="$tmp/config-sql-3-tcp.json"
+  candidate_env=()
+  if [ "$recorder_tls" = on ]; then
+    candidate_bundle="$tmp/config-sql-3-tls.json"
+    candidate_env+=(RHIZA_RECORDER_TLS_SECRET=rhiza-recorder-tls)
+  fi
+  env RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc \
+    RHIZA_RECORDER_TLS="$recorder_tls" "${candidate_env[@]}" \
+    scripts/render-k8s-config.sh 3 3 "$candidate_bundle" \
+      "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].env[] |
+    select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
+    "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = tcp-postcard-rpc ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].env[] |
+    select(.name == "RHIZA_RECORDER_TLS") | .value' \
+    "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = "$recorder_tls" ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].env[] |
+    select(.name == "RHIZA_RECORDER_TCP_LISTEN") | .value' \
+    "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = '0.0.0.0:8082' ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].image' \
+    "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = rhiza-sql:dev ]
+done
+
+# The renderer's default scoped images must compile every runtime transport it can select.
+# shellcheck disable=SC2016 # Literal Docker/CI feature mapping assertions.
+grep -Fq -- '--features "$RHIZA_PROFILE,recorder-postcard-rpc"' Dockerfile
+# shellcheck disable=SC2016 # Literal Docker/CI feature mapping assertions.
+grep -Fq -- '--features "$RHIZA_PROFILE,recorder-postcard-rpc"' .github/workflows/ci.yml
 
 RHIZA_CPU_REQUEST=100m RHIZA_MEMORY_REQUEST=256Mi \
 RHIZA_CPU_LIMIT=1 RHIZA_MEMORY_LIMIT=1Gi RHIZA_DATA_SIZE_LIMIT=8Gi \

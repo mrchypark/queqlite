@@ -14,13 +14,24 @@ axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1"
 postcard = { version = "1", features = ["alloc"] }
+postcard-rpc = { version = "=0.12.1", features = ["use-std"] }
+postcard-schema = "=0.2.5"
 prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rhiza = { path = "../crates/rhiza", features = ["graph", "kv"] }
+rhiza-core = { path = "../crates/rhiza-core" }
+rhiza-graph = { path = "../crates/rhiza-graph" }
+rhiza-kv = { path = "../crates/rhiza-kv" }
+rhiza-node = { path = "../crates/rhiza-node", features = ["graph", "kv", "recorder-postcard-rpc"] }
+rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
+rhiza-sql = { path = "../crates/rhiza-sql" }
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[ "$#" -ge 4 ] && [ "$#" -le 5 ] || {
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
   echo "usage: $0 SERVICE POD METHOD PATH [JSON_BODY]" >&2
   exit 64
-}
+fi
 service="$1" pod="$2" method="$3" path="$4" body="${5-}"
 [ -n "$body" ] || body='{}'
 profile="${RHIZA_EXECUTION_PROFILE-}"

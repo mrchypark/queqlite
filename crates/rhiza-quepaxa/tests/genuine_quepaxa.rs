@@ -865,14 +865,13 @@ fn old_qrec_state_fails_closed() {
     let digest = LogHash::digest(&[&bytes]);
     bytes.extend_from_slice(digest.as_bytes());
     std::fs::write(path, bytes).unwrap();
-    let store = RecorderFileStore::new_with_id(root.path(), "n1", "cluster", 1, 1).unwrap();
-    assert_eq!(
-        store.load(1),
+    assert!(matches!(
+        RecorderFileStore::new_with_id(root.path(), "n1", "cluster", 1, 1),
         Err(Error::MigrationRequired {
-            format: "QREC",
-            version: 3,
+            format: "recorder durable head",
+            version: 2,
         })
-    );
+    ));
 }
 
 #[derive(Default)]

@@ -1,0 +1,12 @@
+turso-size-perf v0.1.0 (/Users/cypark/Documents/project/rhiza/experiments/turso-size-perf)
+rusqlite v0.40.1
+bitflags v2.13.1
+fallible-iterator v0.3.0
+fallible-streaming-iterator v0.1.9
+hashlink v0.12.1
+hashbrown v0.17.1
+foldhash v0.2.0
+libsqlite3-sys v0.38.1
+smallvec v1.15.2
+tokio v1.48.0
+pin-project-lite v0.2.17

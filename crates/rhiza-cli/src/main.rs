@@ -17,27 +17,45 @@ use rhiza_core::{
 };
 use rhiza_log::LogStore;
 use rhiza_node::{
-    effective_cluster_id, install_successor_recorder, node_router,
+    effective_cluster_id, execution_profile_compiled, install_successor_recorder, node_router,
     node_router_with_admin_and_tasks, node_router_with_checkpoint,
     node_router_with_checkpoint_and_admin_tasks, recorder_router_for_generation,
     recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
     restore_checkpoint_to_fresh_data_dir_for_node, restore_successor_checkpoint_to_fresh_data_dir,
-    run_e2e, serve_recorder_tcp, validate_recorder_tcp_endpoint, AdminActivateRequest,
-    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
-    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    AdminActivateRequest, AdminActivateResponse, AdminCompactRequest, AdminCompactResponse,
+    AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
     AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
-    AdminTaskTracker, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
-    HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
-    ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse, SqlQueryRequest,
-    SqlQueryResponse, StopInformation, TcpPostcardRecorderClient, WriteRequest, WriteResponse,
+    AdminTaskTracker, CheckpointCoordinator, DurabilityMode, HttpLogPeer, HttpRecorderClient,
+    LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
+    RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation, TcpPostcardRecorderClient,
     ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH,
-    ADMIN_STOP_PATH, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, READ_PATH, SQL_EXECUTE_PATH,
-    SQL_QUERY_PATH, VERSION_HEADER, WRITE_PATH,
+    ADMIN_STOP_PATH, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+};
+#[cfg(feature = "sql")]
+use rhiza_node::{
+    run_e2e, E2eConfig, ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse,
+    SqlQueryRequest, SqlQueryResponse, WriteRequest, WriteResponse, READ_PATH, SQL_EXECUTE_PATH,
+    SQL_QUERY_PATH, WRITE_PATH,
+};
+#[cfg(feature = "recorder-postcard-rpc")]
+use rhiza_node::{
+    serve_recorder_postcard_rpc, serve_recorder_postcard_rpc_tls,
+    RecorderPostcardRpcTlsClientConfig, RecorderPostcardRpcTlsServerConfig,
+    TcpPostcardRpcRecorderClient,
+};
+#[cfg(feature = "graph")]
+use rhiza_node::{GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto, GRAPH_QUERY_PATH};
+#[cfg(feature = "kv")]
+use rhiza_node::{
+    KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest, KvScanRequest,
+    KvScanResponse, KV_DELETE_PATH, KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_KV_SCAN_ROWS,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
     DecisionProof, Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
 };
+#[cfg(feature = "sql")]
 use rhiza_sql::{SqlStatement, SqlValue};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -64,6 +82,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
             Err(error) => fail("status", error),
         },
+        #[cfg(feature = "sql")]
         Command::E2e(config) => match run_e2e(config).await {
             Ok(report) => {
                 println!(
@@ -182,6 +201,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
             Err(error) => fail("membership activate", error),
         },
+        #[cfg(feature = "sql")]
         Command::Write(args) => match request_write(&args).await {
             Ok(response) => {
                 println!(
@@ -193,10 +213,12 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
             Err(error) => fail("write", error),
         },
+        #[cfg(feature = "sql")]
         Command::Read(args) => match request_read(&args).await {
             Ok(response) => finish_read(&args, response),
             Err(error) => fail("read", error),
         },
+        #[cfg(feature = "sql")]
         Command::SqlExecute(args) => match request_sql_execute(&args).await {
             Ok(response) => match serde_json::to_string(&response) {
                 Ok(json) => {
@@ -207,6 +229,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("sql execute", error),
         },
+        #[cfg(feature = "sql")]
         Command::SqlQuery(args) => match request_sql_query(&args).await {
             Ok(response) => match serde_json::to_string(&response) {
                 Ok(json) => {
@@ -216,6 +239,61 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
                 Err(error) => fail("sql query", error.to_string()),
             },
             Err(error) => fail("sql query", error),
+        },
+        #[cfg(feature = "graph")]
+        Command::GraphQuery(args) => match request_graph_query(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph query", error.to_string()),
+            },
+            Err(error) => fail("graph query", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvGet(args) => match request_kv_get(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv get", error.to_string()),
+            },
+            Err(error) => fail("kv get", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvScan(args) => match request_kv_scan(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv scan", error.to_string()),
+            },
+            Err(error) => fail("kv scan", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvPut(args) => match request_kv_put(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv put", error.to_string()),
+            },
+            Err(error) => fail("kv put", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvDelete(args) => match request_kv_delete(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv delete", error.to_string()),
+            },
+            Err(error) => fail("kv delete", error),
         },
         Command::Health(args) => match request_health(&args).await {
             Ok(()) => {
@@ -229,6 +307,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
 
 enum Command {
     Status(HealthArgs),
+    #[cfg(feature = "sql")]
     E2e(E2eConfig),
     Serve(Box<ServeConfig>),
     InitCheckpoint(CheckpointCommandConfig),
@@ -244,13 +323,28 @@ enum Command {
     MembershipStop(Box<AdminCommandConfig>),
     MembershipInstallSuccessor(Box<AdminCommandConfig>),
     MembershipActivate(Box<AdminCommandConfig>),
+    #[cfg(feature = "sql")]
     Write(WriteArgs),
+    #[cfg(feature = "sql")]
     Read(ReadArgs),
+    #[cfg(feature = "sql")]
     SqlExecute(SqlExecuteArgs),
+    #[cfg(feature = "sql")]
     SqlQuery(SqlQueryArgs),
+    #[cfg(feature = "graph")]
+    GraphQuery(GraphQueryArgs),
+    #[cfg(feature = "kv")]
+    KvGet(KvGetArgs),
+    #[cfg(feature = "kv")]
+    KvScan(KvScanArgs),
+    #[cfg(feature = "kv")]
+    KvPut(KvPutArgs),
+    #[cfg(feature = "kv")]
+    KvDelete(KvDeleteArgs),
     Health(HealthArgs),
 }
 
+#[cfg(feature = "sql")]
 struct WriteArgs {
     urls: Vec<String>,
     token: String,
@@ -259,6 +353,7 @@ struct WriteArgs {
     value: String,
 }
 
+#[cfg(feature = "sql")]
 struct ReadArgs {
     urls: Vec<String>,
     token: String,
@@ -267,6 +362,7 @@ struct ReadArgs {
     expect: Option<String>,
 }
 
+#[cfg(feature = "sql")]
 struct SqlExecuteArgs {
     urls: Vec<String>,
     token: String,
@@ -274,12 +370,50 @@ struct SqlExecuteArgs {
     statement: SqlStatement,
 }
 
+#[cfg(feature = "sql")]
 struct SqlQueryArgs {
     urls: Vec<String>,
     token: String,
     statement: SqlStatement,
     consistency: Option<ReadConsistency>,
     max_rows: Option<u32>,
+}
+
+#[cfg(feature = "graph")]
+struct GraphQueryArgs {
+    urls: Vec<String>,
+    token: String,
+    statement: GraphQueryStatementDto,
+    consistency: Option<ReadConsistency>,
+    max_rows: Option<u32>,
+}
+
+#[cfg(feature = "kv")]
+struct KvGetArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvGetRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvScanArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvScanRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvPutArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvPutRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvDeleteArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvDeleteRequest,
 }
 
 struct HealthArgs {
@@ -344,12 +478,15 @@ struct MemberDocument {
     log_url: Option<String>,
     #[serde(default)]
     recorder_tcp_addr: Option<String>,
+    #[serde(default)]
+    recorder_tls_server_name: Option<String>,
     token: String,
 }
 
 #[derive(Clone, Debug)]
 struct RecorderTcpPeer {
     address: String,
+    tls_server_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -389,11 +526,48 @@ impl fmt::Debug for ConfigurationBundle {
 enum RecorderTransport {
     Http,
     TcpPostcard,
+    TcpTlsPostcard,
+    #[cfg(feature = "recorder-postcard-rpc")]
+    TcpPostcardRpc,
+    #[cfg(feature = "recorder-postcard-rpc")]
+    TcpTlsPostcardRpc,
+}
+
+impl RecorderTransport {
+    fn is_tcp(self) -> bool {
+        !matches!(self, Self::Http)
+    }
+
+    fn is_tls(self) -> bool {
+        match self {
+            Self::TcpTlsPostcard => true,
+            #[cfg(feature = "recorder-postcard-rpc")]
+            Self::TcpTlsPostcardRpc => true,
+            _ => false,
+        }
+    }
+
+    fn selector(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::TcpPostcard | Self::TcpTlsPostcard => "tcp-postcard",
+            #[cfg(feature = "recorder-postcard-rpc")]
+            Self::TcpPostcardRpc | Self::TcpTlsPostcardRpc => "tcp-postcard-rpc",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct RecorderTcpConfig {
     listen: String,
+    tls: Option<RecorderTlsFiles>,
+}
+
+#[derive(Clone, Debug)]
+struct RecorderTlsFiles {
+    certificate: PathBuf,
+    private_key: PathBuf,
+    ca_bundle: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -603,25 +777,47 @@ impl ServeConfig {
         let client_listen = lookup("RHIZA_CLIENT_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
         let recorder_listen =
             lookup("RHIZA_RECORDER_LISTEN").unwrap_or_else(|| "0.0.0.0:8081".into());
-        let recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
+        let requested_recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
             None | Some("http") => RecorderTransport::Http,
             Some("tcp-postcard") => RecorderTransport::TcpPostcard,
-            Some(_) => return Err("RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard".into()),
-        };
-        for removed in [
-            "RHIZA_RECORDER_TLS_CERT_FILE",
-            "RHIZA_RECORDER_TLS_KEY_FILE",
-            "RHIZA_RECORDER_TLS_CA_FILE",
-        ] {
-            if lookup(removed).is_some() {
-                return Err(format!(
-                    "{removed} is no longer supported; tcp-postcard is plaintext and in-cluster only"
-                ));
+            Some("tcp-postcard-rpc") => {
+                #[cfg(feature = "recorder-postcard-rpc")]
+                {
+                    RecorderTransport::TcpPostcardRpc
+                }
+                #[cfg(not(feature = "recorder-postcard-rpc"))]
+                {
+                    return Err(
+                        "RHIZA_RECORDER_TRANSPORT=tcp-postcard-rpc is not compiled; enable the recorder-postcard-rpc feature"
+                            .into(),
+                    );
+                }
             }
+            Some(_) => {
+                return Err(
+                    "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc".into(),
+                )
+            }
+        };
+        let recorder_tls_enabled = match lookup("RHIZA_RECORDER_TLS").as_deref() {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err("RHIZA_RECORDER_TLS must be on|off".into()),
+        };
+        if recorder_tls_enabled && requested_recorder_transport == RecorderTransport::Http {
+            return Err(
+                "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc"
+                    .into(),
+            );
         }
+        let recorder_transport = match (requested_recorder_transport, recorder_tls_enabled) {
+            (RecorderTransport::TcpPostcard, true) => RecorderTransport::TcpTlsPostcard,
+            #[cfg(feature = "recorder-postcard-rpc")]
+            (RecorderTransport::TcpPostcardRpc, true) => RecorderTransport::TcpTlsPostcardRpc,
+            (transport, _) => transport,
+        };
         let tcp_listen = optional_env(&mut lookup, "RHIZA_RECORDER_TCP_LISTEN")?;
-        let tcp_requested =
-            recorder_transport == RecorderTransport::TcpPostcard || tcp_listen.is_some();
+        let tcp_requested = recorder_transport.is_tcp() || tcp_listen.is_some();
         let recorder_tcp = if tcp_requested {
             let listen = tcp_listen.ok_or_else(|| {
                 "RHIZA_RECORDER_TCP_LISTEN is required for recorder TCP".to_string()
@@ -629,14 +825,74 @@ impl ServeConfig {
             listen.parse::<std::net::SocketAddr>().map_err(|_| {
                 "RHIZA_RECORDER_TCP_LISTEN must be an IP socket address".to_string()
             })?;
-            Some(RecorderTcpConfig { listen })
+            let tls = if recorder_transport.is_tls() {
+                Some(RecorderTlsFiles {
+                    certificate: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_CERT_FILE",
+                    )?),
+                    private_key: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_KEY_FILE",
+                    )?),
+                    ca_bundle: PathBuf::from(required_env(
+                        &mut lookup,
+                        "RHIZA_RECORDER_TLS_CA_FILE",
+                    )?),
+                })
+            } else {
+                for name in [
+                    "RHIZA_RECORDER_TLS_CERT_FILE",
+                    "RHIZA_RECORDER_TLS_KEY_FILE",
+                    "RHIZA_RECORDER_TLS_CA_FILE",
+                ] {
+                    if lookup(name).is_some() {
+                        return Err(format!("{name} is irrelevant unless RHIZA_RECORDER_TLS=on"));
+                    }
+                }
+                None
+            };
+            Some(RecorderTcpConfig { listen, tls })
         } else {
+            for name in [
+                "RHIZA_RECORDER_TLS_CERT_FILE",
+                "RHIZA_RECORDER_TLS_KEY_FILE",
+                "RHIZA_RECORDER_TLS_CA_FILE",
+            ] {
+                if lookup(name).is_some() {
+                    return Err(format!("{name} is irrelevant unless RHIZA_RECORDER_TLS=on"));
+                }
+            }
             None
         };
-        if recorder_transport == RecorderTransport::TcpPostcard
-            && bundle.recorder_tcp_peers.iter().any(Option::is_none)
+        if recorder_transport.is_tcp() && bundle.recorder_tcp_peers.iter().any(Option::is_none) {
+            return Err(format!(
+                "{} requires recorder_tcp_addr for every bundle member",
+                recorder_transport.selector()
+            ));
+        }
+        if recorder_transport.is_tls()
+            && bundle
+                .recorder_tcp_peers
+                .iter()
+                .flatten()
+                .any(|peer| peer.tls_server_name.is_none())
         {
-            return Err("tcp-postcard requires recorder_tcp_addr for every bundle member".into());
+            return Err(format!(
+                "{} with RHIZA_RECORDER_TLS=on requires recorder_tls_server_name for every bundle member",
+                recorder_transport.selector()
+            ));
+        }
+        if !recorder_transport.is_tls()
+            && bundle
+                .recorder_tcp_peers
+                .iter()
+                .flatten()
+                .any(|peer| peer.tls_server_name.is_some())
+        {
+            return Err(
+                "recorder_tls_server_name is irrelevant unless RHIZA_RECORDER_TLS=on".into(),
+            );
         }
         let object_store_mode = lookup("RHIZA_OBJECT_STORE");
         let (recovery_generation, remote) = match object_store_mode {
@@ -766,6 +1022,7 @@ where
     };
     match command.as_str() {
         "status" => parse_status(args).map(Command::Status),
+        #[cfg(feature = "sql")]
         "e2e" => parse_e2e(args).map(Command::E2e),
         "serve" => {
             reject_extra_args(args)?;
@@ -792,9 +1049,16 @@ where
         }
         "gc" => parse_gc_command(args),
         "membership" => parse_membership_command(args),
+        #[cfg(feature = "sql")]
         "write" => parse_write(args).map(Command::Write),
+        #[cfg(feature = "sql")]
         "read" => parse_read(args).map(Command::Read),
+        #[cfg(feature = "sql")]
         "sql" => parse_sql_command(args),
+        #[cfg(feature = "graph")]
+        "graph" => parse_graph_command(args),
+        #[cfg(feature = "kv")]
+        "kv" => parse_kv_command(args),
         "health" => parse_health(args).map(Command::Health),
         _ => Err(format!("unknown command: {command}")),
     }
@@ -816,10 +1080,12 @@ fn validate_config_bundle_stdin() -> Result<u64, String> {
     parse_configuration_bundle(&json).map(|bundle| bundle.config_id)
 }
 
+#[cfg(feature = "sql")]
 fn parse_write(args: impl IntoIterator<Item = String>) -> Result<WriteArgs, String> {
     parse_write_with_lookup(args, |name| env::var(name).ok())
 }
 
+#[cfg(feature = "sql")]
 fn parse_write_with_lookup(
     args: impl IntoIterator<Item = String>,
     lookup: impl FnMut(&str) -> Option<String>,
@@ -851,10 +1117,12 @@ fn parse_write_with_lookup(
     })
 }
 
+#[cfg(feature = "sql")]
 fn parse_read(args: impl IntoIterator<Item = String>) -> Result<ReadArgs, String> {
     parse_read_with_lookup(args, |name| env::var(name).ok())
 }
 
+#[cfg(feature = "sql")]
 fn parse_read_with_lookup(
     args: impl IntoIterator<Item = String>,
     lookup: impl FnMut(&str) -> Option<String>,
@@ -891,6 +1159,7 @@ fn parse_read_with_lookup(
     })
 }
 
+#[cfg(feature = "sql")]
 fn parse_sql_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
@@ -903,6 +1172,7 @@ fn parse_sql_command(args: impl IntoIterator<Item = String>) -> Result<Command, 
     }
 }
 
+#[cfg(feature = "sql")]
 fn parse_sql_execute(
     args: impl IntoIterator<Item = String>,
     lookup: impl FnMut(&str) -> Option<String>,
@@ -936,6 +1206,7 @@ fn parse_sql_execute(
     })
 }
 
+#[cfg(feature = "sql")]
 fn parse_sql_query(
     args: impl IntoIterator<Item = String>,
     lookup: impl FnMut(&str) -> Option<String>,
@@ -983,10 +1254,262 @@ fn parse_sql_query(
     })
 }
 
+#[cfg(feature = "sql")]
 fn parse_sql_parameters(value: &str) -> Result<Vec<SqlValue>, String> {
     serde_json::from_str(value).map_err(|error| format!("invalid --params-json: {error}"))
 }
 
+#[cfg(feature = "graph")]
+fn parse_graph_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        Some("query") => {
+            parse_graph_query(args, |name| env::var(name).ok()).map(Command::GraphQuery)
+        }
+        Some(other) => Err(format!("unknown graph command: {other}")),
+        None => Err("missing graph command: query".into()),
+    }
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_query(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphQueryArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut cypher = None;
+    let mut parameters = std::collections::BTreeMap::new();
+    let mut consistency = None;
+    let mut max_rows = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--cypher" => cypher = Some(next_value(&mut args, "--cypher")?),
+            "--params-json" => {
+                parameters = serde_json::from_str(&next_value(&mut args, "--params-json")?)
+                    .map_err(|error| format!("invalid --params-json: {error}"))?
+            }
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            "--max-rows" => {
+                max_rows = Some(
+                    next_value(&mut args, "--max-rows")?
+                        .parse::<u32>()
+                        .map_err(|_| "--max-rows must be a positive integer".to_string())?,
+                )
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(GraphQueryArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        statement: GraphQueryStatementDto {
+            cypher: required_arg(cypher, "--cypher")?,
+            parameters,
+        },
+        consistency,
+        max_rows,
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        Some("get") => parse_kv_get(args, |name| env::var(name).ok()).map(Command::KvGet),
+        Some("scan") => parse_kv_scan(args, |name| env::var(name).ok()).map(Command::KvScan),
+        Some("put") => parse_kv_put(args, |name| env::var(name).ok()).map(Command::KvPut),
+        Some("delete") => parse_kv_delete(args, |name| env::var(name).ok()).map(Command::KvDelete),
+        Some(other) => Err(format!("unknown kv command: {other}")),
+        None => Err("missing kv command: get|scan|put|delete".into()),
+    }
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_get(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvGetArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut key = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvGetArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvGetRequest {
+            key: required_arg(key, "--key-base64")?,
+            consistency,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_scan(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvScanArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut start = None;
+    let mut end = None;
+    let mut prefix = None;
+    let mut cursor = None;
+    let mut limit = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--start-base64" => start = Some(next_value(&mut args, "--start-base64")?),
+            "--end-base64" => end = Some(next_value(&mut args, "--end-base64")?),
+            "--prefix-base64" => prefix = Some(next_value(&mut args, "--prefix-base64")?),
+            "--cursor-base64" => cursor = Some(next_value(&mut args, "--cursor-base64")?),
+            "--limit" => {
+                let parsed = next_value(&mut args, "--limit")?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be a positive integer".to_string())?;
+                if parsed == 0 || parsed > MAX_KV_SCAN_ROWS {
+                    return Err(format!("--limit must be between 1 and {MAX_KV_SCAN_ROWS}"));
+                }
+                limit = Some(parsed);
+            }
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    match (&prefix, &start, &end) {
+        (Some(_), None, None) | (None, Some(_), _) => {}
+        _ => {
+            return Err(
+                "provide either --prefix-base64 alone or --start-base64 with optional --end-base64"
+                    .into(),
+            )
+        }
+    }
+    Ok(KvScanArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvScanRequest {
+            start,
+            end,
+            prefix,
+            cursor,
+            limit,
+            consistency,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_put(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvPutArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut key = None;
+    let mut value = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            "--value-base64" => value = Some(next_value(&mut args, "--value-base64")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvPutArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvPutRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            key: required_arg(key, "--key-base64")?,
+            value: required_arg(value, "--value-base64")?,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_delete(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvDeleteArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut key = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvDeleteArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvDeleteRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            key: required_arg(key, "--key-base64")?,
+        },
+    })
+}
+
+#[cfg(any(feature = "graph", feature = "kv"))]
+fn parse_multimodel_read_consistency(value: &str) -> Result<ReadConsistency, String> {
+    match value {
+        "local" => Ok(ReadConsistency::Local),
+        "read_barrier" => Ok(ReadConsistency::ReadBarrier),
+        _ => value
+            .strip_prefix("applied_index:")
+            .ok_or_else(|| {
+                "consistency must be `local`, `read_barrier`, or `applied_index:N`".to_string()
+            })?
+            .parse::<u64>()
+            .map(ReadConsistency::AppliedIndex)
+            .map_err(|_| {
+                "consistency must be `local`, `read_barrier`, or `applied_index:N`".to_string()
+            }),
+    }
+}
+
+#[cfg(feature = "sql")]
 fn parse_read_consistency(value: &str) -> Result<ReadConsistency, String> {
     match value {
         "local" => Ok(ReadConsistency::Local),
@@ -1018,6 +1541,7 @@ fn parse_health(args: impl IntoIterator<Item = String>) -> Result<HealthArgs, St
     })
 }
 
+#[cfg(feature = "sql")]
 fn parse_e2e(args: impl IntoIterator<Item = String>) -> Result<E2eConfig, String> {
     let mut data_dir = env::var("RHIZA_DATA_DIR").unwrap_or_else(|_| "./.rhiza-e2e".into());
     let mut object_store =
@@ -1121,9 +1645,17 @@ fn required_env(
 fn execution_profile(
     lookup: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<ExecutionProfile, String> {
-    required_env(lookup, "RHIZA_EXECUTION_PROFILE")?
+    let profile = required_env(lookup, "RHIZA_EXECUTION_PROFILE")?
         .parse()
-        .map_err(|_| "RHIZA_EXECUTION_PROFILE must be sql|graph|kv".to_string())
+        .map_err(|_| "RHIZA_EXECUTION_PROFILE must be sql|graph|kv".to_string())?;
+    if execution_profile_compiled(profile) {
+        Ok(profile)
+    } else {
+        Err(format!(
+            "RHIZA_EXECUTION_PROFILE={} is not compiled into this binary",
+            profile.as_str()
+        ))
+    }
 }
 
 fn positive_env(
@@ -1648,10 +2180,27 @@ fn parse_configuration_bundle(json: &str) -> Result<ConfigurationBundle, String>
         .into_iter()
         .map(|member| {
             let recorder_tcp = match member.recorder_tcp_addr {
-                None => None,
+                None => {
+                    if member.recorder_tls_server_name.is_some() {
+                        return Err(
+                            "recorder_tls_server_name requires recorder_tcp_addr".to_string()
+                        );
+                    }
+                    None
+                }
                 Some(address) => {
                     validate_recorder_tcp_endpoint(&address)?;
-                    Some(RecorderTcpPeer { address })
+                    if member
+                        .recorder_tls_server_name
+                        .as_ref()
+                        .is_some_and(|name| name.trim().is_empty())
+                    {
+                        return Err("recorder_tls_server_name must not be empty".into());
+                    }
+                    Some(RecorderTcpPeer {
+                        address,
+                        tls_server_name: member.recorder_tls_server_name,
+                    })
                 }
             };
             let log_url = member.log_url.unwrap_or_else(|| member.url.clone());
@@ -2264,13 +2813,14 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
 }
 
 fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
-    match config.recorder_transport {
-        RecorderTransport::Http => Ok(&config.recorder_listen),
-        RecorderTransport::TcpPostcard => config
+    if config.recorder_transport.is_tcp() {
+        config
             .recorder_tcp
             .as_ref()
             .map(|tcp| tcp.listen.as_str())
-            .ok_or_else(|| "recorder TCP configuration is missing".to_string()),
+            .ok_or_else(|| "recorder TCP configuration is missing".to_string())
+    } else {
+        Ok(&config.recorder_listen)
     }
 }
 
@@ -2312,6 +2862,91 @@ async fn spawn_recorder_server(
                     recorder,
                     peers,
                     recovery_generation,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+            })))
+        }
+        RecorderTransport::TcpTlsPostcard => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let tls = tcp
+                .tls
+                .as_ref()
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            let certificate = fs::read(&tls.certificate)
+                .map_err(|error| format!("cannot read recorder TLS certificate: {error}"))?;
+            let private_key = fs::read(&tls.private_key)
+                .map_err(|error| format!("cannot read recorder TLS private key: {error}"))?;
+            let tls = RecorderTlsServerConfig::from_pem(&certificate, &private_key)?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
+            let peers = config.bundle.peers.clone();
+            let recovery_generation = config.recovery_generation;
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                serve_recorder_tcp_tls(
+                    listener,
+                    recorder,
+                    peers,
+                    recovery_generation,
+                    tls,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+            })))
+        }
+        #[cfg(feature = "recorder-postcard-rpc")]
+        RecorderTransport::TcpPostcardRpc => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TCP listener: {error}"))?;
+            let peers = config.bundle.peers.clone();
+            let recovery_generation = config.recovery_generation;
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                serve_recorder_postcard_rpc(
+                    listener,
+                    recorder,
+                    peers,
+                    recovery_generation,
+                    wait_for_shutdown(shutdown),
+                )
+                .await
+            })))
+        }
+        #[cfg(feature = "recorder-postcard-rpc")]
+        RecorderTransport::TcpTlsPostcardRpc => {
+            let tcp = config
+                .recorder_tcp
+                .as_ref()
+                .ok_or_else(|| "recorder TCP configuration is missing".to_string())?;
+            let tls = tcp
+                .tls
+                .as_ref()
+                .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+            let certificate = fs::read(&tls.certificate)
+                .map_err(|error| format!("cannot read recorder TLS certificate: {error}"))?;
+            let private_key = fs::read(&tls.private_key)
+                .map_err(|error| format!("cannot read recorder TLS private key: {error}"))?;
+            let tls = RecorderPostcardRpcTlsServerConfig::from_pem(&certificate, &private_key)?;
+            let listener = tokio::net::TcpListener::bind(&tcp.listen)
+                .await
+                .map_err(|error| format!("cannot bind recorder TLS listener: {error}"))?;
+            let peers = config.bundle.peers.clone();
+            let recovery_generation = config.recovery_generation;
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                serve_recorder_postcard_rpc_tls(
+                    listener,
+                    recorder,
+                    peers,
+                    recovery_generation,
+                    tls,
                     wait_for_shutdown(shutdown),
                 )
                 .await
@@ -2416,6 +3051,19 @@ fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String
 
 fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, String> {
     let local_token = config.local_peer_token()?.to_owned();
+    let tls_ca_bundle = if config.recorder_transport.is_tls() {
+        let tls = config
+            .recorder_tcp
+            .as_ref()
+            .and_then(|tcp| tcp.tls.as_ref())
+            .ok_or_else(|| "recorder TLS configuration is missing".to_string())?;
+        Some(
+            fs::read(&tls.ca_bundle)
+                .map_err(|error| format!("cannot read recorder TLS CA bundle: {error}"))?,
+        )
+    } else {
+        None
+    };
     let recorders = config
         .bundle
         .peers
@@ -2444,6 +3092,67 @@ fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, Stri
                         config.node_id.clone(),
                         local_token.clone(),
                         config.recovery_generation,
+                    )?)
+                }
+                RecorderTransport::TcpTlsPostcard => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    let server_name = endpoint.tls_server_name.as_deref().ok_or_else(|| {
+                        format!("recorder TLS server name is missing for {}", peer.node_id())
+                    })?;
+                    let ca_bundle = tls_ca_bundle
+                        .as_deref()
+                        .ok_or_else(|| "recorder TLS CA bundle is missing".to_string())?;
+                    let tls = RecorderTlsClientConfig::from_ca_pem(ca_bundle, server_name)?;
+                    Box::new(TcpPostcardRecorderClient::new_tls(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                        tls,
+                    )?)
+                }
+                #[cfg(feature = "recorder-postcard-rpc")]
+                RecorderTransport::TcpPostcardRpc => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    Box::new(TcpPostcardRpcRecorderClient::new(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                    )?)
+                }
+                #[cfg(feature = "recorder-postcard-rpc")]
+                RecorderTransport::TcpTlsPostcardRpc => {
+                    let endpoint = config.bundle.recorder_tcp_peers[index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("recorder TCP endpoint is missing for {}", peer.node_id())
+                        })?;
+                    let server_name = endpoint.tls_server_name.as_deref().ok_or_else(|| {
+                        format!("recorder TLS server name is missing for {}", peer.node_id())
+                    })?;
+                    let ca_bundle = tls_ca_bundle
+                        .as_deref()
+                        .ok_or_else(|| "recorder TLS CA bundle is missing".to_string())?;
+                    let tls =
+                        RecorderPostcardRpcTlsClientConfig::from_ca_pem(ca_bundle, server_name)?;
+                    Box::new(TcpPostcardRpcRecorderClient::new_tls(
+                        &endpoint.address,
+                        peer.node_id(),
+                        config.node_id.clone(),
+                        local_token.clone(),
+                        config.recovery_generation,
+                        tls,
                     )?)
                 }
             };
@@ -3485,6 +4194,7 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
         .map(|entry| entry.is_some())
 }
 
+#[cfg(feature = "sql")]
 async fn request_write(args: &WriteArgs) -> Result<WriteResponse, String> {
     let request = WriteRequest {
         request_id: args.request_id.clone(),
@@ -3494,6 +4204,7 @@ async fn request_write(args: &WriteArgs) -> Result<WriteResponse, String> {
     client_json_request(&args.urls, &args.token, WRITE_PATH, &request, true).await
 }
 
+#[cfg(feature = "sql")]
 async fn request_read(args: &ReadArgs) -> Result<ReadResponse, String> {
     let request = ReadRequest {
         key: args.key.clone(),
@@ -3509,6 +4220,7 @@ async fn request_read(args: &ReadArgs) -> Result<ReadResponse, String> {
     .await
 }
 
+#[cfg(feature = "sql")]
 async fn request_sql_execute(args: &SqlExecuteArgs) -> Result<SqlExecuteResponse, String> {
     let request = SqlExecuteRequest {
         request_id: args.request_id.clone(),
@@ -3517,6 +4229,7 @@ async fn request_sql_execute(args: &SqlExecuteArgs) -> Result<SqlExecuteResponse
     client_json_request(&args.urls, &args.token, SQL_EXECUTE_PATH, &request, true).await
 }
 
+#[cfg(feature = "sql")]
 async fn request_sql_query(args: &SqlQueryArgs) -> Result<SqlQueryResponse, String> {
     let request = SqlQueryRequest {
         statement: args.statement.clone(),
@@ -3531,6 +4244,57 @@ async fn request_sql_query(args: &SqlQueryArgs) -> Result<SqlQueryResponse, Stri
         read_can_hedge(request.consistency),
     )
     .await
+}
+
+#[cfg(feature = "graph")]
+async fn request_graph_query(args: &GraphQueryArgs) -> Result<GraphQueryResponse, String> {
+    let request = GraphQueryRequest {
+        statement: args.statement.clone(),
+        consistency: args.consistency,
+        max_rows: args.max_rows,
+    };
+    client_json_request(
+        &args.urls,
+        &args.token,
+        GRAPH_QUERY_PATH,
+        &request,
+        read_can_hedge(request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_get(args: &KvGetArgs) -> Result<KvGetResponse, String> {
+    client_json_request(
+        &args.urls,
+        &args.token,
+        KV_GET_PATH,
+        &args.request,
+        read_can_hedge(args.request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_scan(args: &KvScanArgs) -> Result<KvScanResponse, String> {
+    client_json_request(
+        &args.urls,
+        &args.token,
+        KV_SCAN_PATH,
+        &args.request,
+        read_can_hedge(args.request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_put(args: &KvPutArgs) -> Result<KvMutationResponse, String> {
+    client_json_request(&args.urls, &args.token, KV_PUT_PATH, &args.request, true).await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_delete(args: &KvDeleteArgs) -> Result<KvMutationResponse, String> {
+    client_json_request(&args.urls, &args.token, KV_DELETE_PATH, &args.request, true).await
 }
 
 const CLIENT_HEDGE_DELAY: Duration = Duration::from_millis(100);
@@ -3557,7 +4321,7 @@ impl Default for ClientPolicy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sql"))]
 impl ClientPolicy {
     fn test(hedge_delay: Duration, operation_timeout: Duration) -> Self {
         Self {
@@ -3824,6 +4588,7 @@ fn server_error_detail(status: reqwest::StatusCode, error: ServerErrorResponse) 
     detail
 }
 
+#[cfg(feature = "sql")]
 fn finish_read(args: &ReadArgs, response: ReadResponse) -> i32 {
     if let Some(expected) = &args.expect {
         if response.value.as_deref() != Some(expected) {
@@ -3850,6 +4615,7 @@ fn fail(context: &str, error: impl std::fmt::Display) -> i32 {
     1
 }
 
+#[cfg(feature = "sql")]
 fn parse_object_store(value: &str) -> Result<ObjStoreConfig, String> {
     parse_object_store_with_lookup(value, true, &mut |name| env::var(name).ok())
 }
@@ -3925,7 +4691,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get --url <preferred> [--token <token>] --key-base64 <base64> [--consistency local|read_barrier|applied_index:N]\n  rhiza kv scan --url <preferred> [--token <token>] (--start-base64 <base64> [--end-base64 <base64>]|--prefix-base64 <base64>) [--cursor-base64 <base64>] [--limit N] [--consistency local|read_barrier|applied_index:N]\n  rhiza kv put --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64> --value-base64 <base64>\n  rhiza kv delete --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64>\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -3933,34 +4699,39 @@ fn usage() {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc, Arc, Condvar, Mutex,
-        },
-    };
+    use std::collections::HashMap;
+    #[cfg(feature = "sql")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "sql")]
+    use std::sync::{mpsc, Condvar};
+    #[cfg(any(feature = "sql", all(feature = "graph", feature = "kv")))]
+    use std::sync::{Arc, Mutex};
 
-    use axum::{
-        extract::State,
-        http::{HeaderMap, StatusCode},
-        routing::{get, post},
-        Json, Router,
-    };
+    #[cfg(feature = "sql")]
+    use axum::extract::State;
+    #[cfg(feature = "sql")]
+    use axum::http::HeaderMap;
+    #[cfg(any(feature = "sql", all(feature = "graph", feature = "kv")))]
+    use axum::routing::post;
+    use axum::{http::StatusCode, routing::get, Json, Router};
     use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
     use rhiza_core::{
         ConfigChange, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
     };
-    use rhiza_node::{
-        NodeStatus, ReadRequest, RuntimeConfigurationStatus, WriteRequest, PROTOCOL_VERSION,
-        VERSION_HEADER,
-    };
+    #[cfg(feature = "graph")]
+    use rhiza_node::GraphQueryParameterDto;
+    use rhiza_node::{NodeStatus, RuntimeConfigurationStatus};
+    #[cfg(feature = "sql")]
+    use rhiza_node::{ReadRequest, WriteRequest, PROTOCOL_VERSION, VERSION_HEADER};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-    use rhiza_quepaxa::{AcceptedValue, RecordRequest, RecordSummary, RecorderReply};
+    use rhiza_quepaxa::AcceptedValue;
+    #[cfg(feature = "sql")]
+    use rhiza_quepaxa::{RecordRequest, RecordSummary, RecorderReply};
 
     use super::*;
 
     #[test]
+    #[cfg(feature = "sql")]
     fn e2e_parser_rejects_the_removed_verify_restore_alias() {
         assert!(matches!(parse_command(["e2e"]), Ok(Command::E2e(_))));
         assert_eq!(
@@ -3974,6 +4745,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn write_parser_builds_request_when_all_flags_are_present() {
         let command = parse_command([
             "write",
@@ -4001,6 +4773,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn client_parsers_preserve_ordered_repeated_endpoints() {
         let command = parse_command([
             "write",
@@ -4048,6 +4821,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn write_uses_environment_client_token_when_flag_is_absent() {
         let args = parse_write_with_lookup(
             [
@@ -4069,6 +4843,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn read_uses_environment_client_token_when_flag_is_absent() {
         let args = parse_read_with_lookup(
             ["--url", "http://127.0.0.1:8080", "--key", "alpha"].map(String::from),
@@ -4080,6 +4855,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn read_parser_rejects_unknown_consistency() {
         let error = parse_command([
             "read",
@@ -4099,6 +4875,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn read_parsers_accept_only_canonical_read_barrier_consistency() {
         let consistency = "read_barrier";
         let read = parse_command([
@@ -4139,6 +4916,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn sql_parsers_preserve_typed_parameters_and_query_controls() {
         let execute = parse_command([
             "sql",
@@ -4184,6 +4962,207 @@ mod tests {
         };
         assert_eq!(query.consistency, Some(ReadConsistency::ReadBarrier));
         assert_eq!(query.max_rows, Some(25));
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_query_parser_preserves_full_cypher_typed_parameters_and_controls() {
+        let command = parse_command([
+            "graph",
+            "query",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--cypher",
+            "MATCH (u:User)-[:FOLLOWS]->(v) WHERE u.id = $id RETURN v.name ORDER BY v.name",
+            "--params-json",
+            r#"{"id":{"type":"u64","value":7},"tags":{"type":"list","value":[{"type":"string","value":"rust"}]}}"#,
+            "--consistency",
+            "applied_index:42",
+            "--max-rows",
+            "25",
+        ])
+        .unwrap();
+        let Command::GraphQuery(args) = command else {
+            panic!("expected graph query command");
+        };
+
+        assert!(args
+            .statement
+            .cypher
+            .contains("MATCH (u:User)-[:FOLLOWS]->(v)"));
+        assert_eq!(
+            args.statement.parameters["id"],
+            GraphQueryParameterDto::U64(7)
+        );
+        assert_eq!(args.consistency, Some(ReadConsistency::AppliedIndex(42)));
+        assert_eq!(args.max_rows, Some(25));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_parsers_preserve_base64_and_validate_scan_shape() {
+        let put = parse_command([
+            "kv",
+            "put",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--request-id",
+            "put-1",
+            "--key-base64",
+            "/wA=",
+            "--value-base64",
+            "AAEC",
+        ])
+        .unwrap();
+        let Command::KvPut(put) = put else {
+            panic!("expected KV put command");
+        };
+        assert_eq!(put.request.key, "/wA=");
+        assert_eq!(put.request.value, "AAEC");
+
+        let scan = parse_command([
+            "kv",
+            "scan",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--prefix-base64",
+            "/w==",
+            "--cursor-base64",
+            "/wA=",
+            "--limit",
+            "10",
+            "--consistency",
+            "read_barrier",
+        ])
+        .unwrap();
+        let Command::KvScan(scan) = scan else {
+            panic!("expected KV scan command");
+        };
+        assert_eq!(scan.request.prefix.as_deref(), Some("/w=="));
+        assert_eq!(scan.request.cursor.as_deref(), Some("/wA="));
+        assert_eq!(scan.request.limit, Some(10));
+
+        assert!(parse_command([
+            "kv",
+            "scan",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--prefix-base64",
+            "YQ==",
+            "--start-base64",
+            "YQ==",
+        ])
+        .is_err());
+    }
+
+    #[cfg(all(feature = "graph", feature = "kv"))]
+    #[tokio::test]
+    async fn graph_and_kv_query_clients_send_the_public_route_schemas_unchanged() {
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let graph_captured = Arc::clone(&captured);
+        let kv_captured = Arc::clone(&captured);
+        let app = Router::new()
+            .route(
+                GRAPH_QUERY_PATH,
+                post(move |Json(request): Json<GraphQueryRequest>| {
+                    let captured = Arc::clone(&graph_captured);
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(request).unwrap());
+                        Json(GraphQueryResponse {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            applied_index: 7,
+                            hash: LogHash::ZERO,
+                        })
+                    }
+                }),
+            )
+            .route(
+                KV_SCAN_PATH,
+                post(move |Json(request): Json<KvScanRequest>| {
+                    let captured = Arc::clone(&kv_captured);
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(request).unwrap());
+                        Json(KvScanResponse {
+                            entries: Vec::new(),
+                            next_cursor: None,
+                            applied_index: 8,
+                            hash: LogHash::ZERO,
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = parse_graph_query(
+            [
+                "--url",
+                &url,
+                "--token",
+                "client-secret",
+                "--cypher",
+                "MATCH (n) WHERE n.id = $id RETURN n",
+                "--params-json",
+                r#"{"id":{"type":"u64","value":7}}"#,
+                "--consistency",
+                "applied_index:7",
+                "--max-rows",
+                "20",
+            ]
+            .map(String::from),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(request_graph_query(&graph).await.unwrap().applied_index, 7);
+
+        let kv = parse_kv_scan(
+            [
+                "--url",
+                &url,
+                "--token",
+                "client-secret",
+                "--prefix-base64",
+                "/w==",
+                "--cursor-base64",
+                "/wA=",
+                "--limit",
+                "10",
+                "--consistency",
+                "local",
+            ]
+            .map(String::from),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(request_kv_scan(&kv).await.unwrap().applied_index, 8);
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured[0]["statement"]["cypher"],
+            "MATCH (n) WHERE n.id = $id RETURN n"
+        );
+        assert_eq!(captured[0]["statement"]["parameters"]["id"]["type"], "u64");
+        assert_eq!(captured[0]["consistency"]["applied_index"], 7);
+        assert_eq!(captured[1]["prefix"], "/w==");
+        assert_eq!(captured[1]["cursor"], "/wA=");
+        assert_eq!(captured[1]["limit"], 10);
+        server.abort();
     }
 
     #[test]
@@ -4234,8 +5213,9 @@ mod tests {
 
     #[test]
     fn serve_config_uses_default_listeners_and_local_peer_token() {
+        let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
         let values = HashMap::from([
-            ("RHIZA_EXECUTION_PROFILE", "sql"),
+            ("RHIZA_EXECUTION_PROFILE", profile_name),
             ("RHIZA_CLUSTER_ID", "cluster-a"),
             ("RHIZA_NODE_ID", "node-2"),
             ("RHIZA_DATA_DIR", "/tmp/node-2"),
@@ -4248,8 +5228,8 @@ mod tests {
             ServeConfig::from_lookup(|name| values.get(name).map(ToString::to_string)).unwrap();
 
         assert_eq!(config.client_listen, "0.0.0.0:8080");
-        assert_eq!(config.execution_profile, ExecutionProfile::Sqlite);
-        assert_eq!(config.cluster_id, "rhiza:sql:cluster-a");
+        assert_eq!(config.execution_profile, profile);
+        assert_eq!(config.cluster_id, canonical_cluster_id);
         assert_eq!(config.recorder_listen, "0.0.0.0:8081");
         assert_eq!(config.local_peer_token().unwrap(), "peer-2-secret");
         assert_eq!(config.bundle.peers[0].base_url(), "http://node-1:8081");
@@ -4288,30 +5268,169 @@ mod tests {
         assert_eq!(config.recorder_transport, RecorderTransport::TcpPostcard);
         assert_eq!(config.recorder_tcp.as_ref().unwrap().listen, "0.0.0.0:8082");
 
-        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/removed/ca.pem");
+        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/irrelevant/ca.pem");
         let error = parse_serve_env(&values).unwrap_err();
-        assert!(error.contains("no longer supported"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
         values.remove("RHIZA_RECORDER_TLS_CA_FILE");
+    }
 
-        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-tls-postcard");
+    #[cfg(not(feature = "recorder-postcard-rpc"))]
+    #[test]
+    fn postcard_rpc_transport_reports_when_candidate_feature_is_absent() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard-rpc");
+
         let error = parse_serve_env(&values).unwrap_err();
-        assert!(error.contains("http|tcp-postcard"), "{error}");
+
+        assert!(error.contains("tcp-postcard-rpc"), "{error}");
+        assert!(error.contains("recorder-postcard-rpc"), "{error}");
+        assert!(error.contains("not compiled"), "{error}");
+    }
+
+    #[cfg(feature = "recorder-postcard-rpc")]
+    #[test]
+    fn postcard_rpc_transport_uses_tcp_listener_and_legacy_tls_configuration() {
+        let bundle = serde_json::json!({
+            "version": 1,
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "log_url":"http://node-1:8080", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        let mut values = base_serve_env();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard-rpc");
+        values.insert("RHIZA_RECORDER_TLS", "on");
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        values.insert("RHIZA_RECORDER_TLS_CERT_FILE", "/missing/tls.crt");
+        values.insert("RHIZA_RECORDER_TLS_KEY_FILE", "/missing/tls.key");
+        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/missing/ca-bundle.pem");
+
+        let config = parse_serve_env(&values).unwrap();
+
+        assert_eq!(
+            config.recorder_transport,
+            RecorderTransport::TcpTlsPostcardRpc
+        );
+        assert_eq!(active_recorder_listen(&config).unwrap(), "0.0.0.0:8082");
+        let tls = config.recorder_tcp.unwrap().tls.unwrap();
+        assert_eq!(tls.certificate, Path::new("/missing/tls.crt"));
+        assert_eq!(tls.private_key, Path::new("/missing/tls.key"));
+        assert_eq!(tls.ca_bundle, Path::new("/missing/ca-bundle.pem"));
     }
 
     #[test]
-    fn configuration_bundle_rejects_removed_tls_server_name() {
+    fn non_tls_transports_reject_bundle_tls_server_names() {
+        let bundle = serde_json::json!({
+            "version": 1,
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        let mut values = base_serve_env();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tls_server_name"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard");
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tls_server_name"), "{error}");
+        assert!(error.contains("irrelevant"), "{error}");
+    }
+
+    #[test]
+    fn tcp_postcard_tls_on_requires_all_tls_files_and_server_names() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-postcard");
+        values.insert("RHIZA_RECORDER_TLS", "on");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TCP_LISTEN"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TCP_LISTEN", "0.0.0.0:8082");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("RHIZA_RECORDER_TLS_CERT_FILE"), "{error}");
+
+        values.insert("RHIZA_RECORDER_TLS_CERT_FILE", "/missing/tls.crt");
+        values.insert("RHIZA_RECORDER_TLS_KEY_FILE", "/missing/tls.key");
+        values.insert("RHIZA_RECORDER_TLS_CA_FILE", "/missing/ca-bundle.pem");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(error.contains("recorder_tcp_addr"), "{error}");
+
+        let bundle = serde_json::json!({
+            "version": 1,
+            "config_id": 7,
+            "members": [
+                {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"peer-1-secret"},
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"peer-2-secret"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"peer-3-secret"}
+            ]
+        })
+        .to_string();
+        values.insert("RHIZA_CONFIG_BUNDLE", &bundle);
+        let config = parse_serve_env(&values).unwrap();
+        assert_eq!(config.recorder_transport, RecorderTransport::TcpTlsPostcard);
+        let tls = config.recorder_tcp.unwrap().tls.unwrap();
+        assert_eq!(tls.certificate, Path::new("/missing/tls.crt"));
+        assert_eq!(tls.private_key, Path::new("/missing/tls.key"));
+        assert_eq!(tls.ca_bundle, Path::new("/missing/ca-bundle.pem"));
+    }
+
+    #[test]
+    fn recorder_tls_switch_rejects_invalid_or_conflicting_configuration() {
+        let mut values = base_serve_env();
+        values.insert("RHIZA_RECORDER_TLS", "sometimes");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("RHIZA_RECORDER_TLS must be on|off"),
+            "{error}"
+        );
+
+        values.insert("RHIZA_RECORDER_TLS", "on");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("requires RHIZA_RECORDER_TRANSPORT=tcp-postcard"),
+            "{error}"
+        );
+
+        values.insert("RHIZA_RECORDER_TRANSPORT", "tcp-tls-postcard");
+        let error = parse_serve_env(&values).unwrap_err();
+        assert!(
+            error.contains("RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn configuration_bundle_accepts_tls_server_name_for_each_member() {
         let json = serde_json::json!({
             "version": 1,
             "config_id": 7,
             "members": [
                 {"node_id":"node-1", "url":"http://node-1:8081", "recorder_tcp_addr":"node-1:8082", "recorder_tls_server_name":"node-1", "token":"t1"},
-                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "token":"t2"},
-                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "token":"t3"}
+                {"node_id":"node-2", "url":"http://node-2:8081", "recorder_tcp_addr":"node-2:8082", "recorder_tls_server_name":"node-2", "token":"t2"},
+                {"node_id":"node-3", "url":"http://node-3:8081", "recorder_tcp_addr":"node-3:8082", "recorder_tls_server_name":"node-3", "token":"t3"}
             ]
         });
 
-        let error = parse_configuration_bundle(&json.to_string()).unwrap_err();
-        assert!(error.contains("unknown field"), "{error}");
+        let bundle = parse_configuration_bundle(&json.to_string()).unwrap();
+        assert_eq!(
+            bundle.recorder_tcp_peers[1]
+                .as_ref()
+                .unwrap()
+                .tls_server_name
+                .as_deref(),
+            Some("node-2")
+        );
     }
 
     #[test]
@@ -4485,8 +5604,9 @@ mod tests {
 
     #[test]
     fn checkpoint_identity_uses_the_required_profile_and_canonical_cluster_id() {
+        let (profile_name, _, canonical_cluster_id) = compiled_profile_fixture();
         let values = HashMap::from([
-            ("RHIZA_EXECUTION_PROFILE", "graph"),
+            ("RHIZA_EXECUTION_PROFILE", profile_name),
             ("RHIZA_CLUSTER_ID", "cluster-a"),
             ("RHIZA_EPOCH", "2"),
             ("RHIZA_CONFIG_BUNDLE", checkpoint_bundle_json()),
@@ -4499,7 +5619,7 @@ mod tests {
             CheckpointCommandConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
                 .unwrap();
 
-        assert_eq!(config.identity().cluster_id(), "rhiza:graph:cluster-a");
+        assert_eq!(config.identity().cluster_id(), canonical_cluster_id);
 
         let error = match CheckpointCommandConfig::from_lookup(|name| {
             (name != "RHIZA_EXECUTION_PROFILE")
@@ -4721,8 +5841,9 @@ mod tests {
     }
 
     fn base_serve_env() -> HashMap<&'static str, &'static str> {
+        let (profile_name, _, _) = compiled_profile_fixture();
         HashMap::from([
-            ("RHIZA_EXECUTION_PROFILE", "sql"),
+            ("RHIZA_EXECUTION_PROFILE", profile_name),
             ("RHIZA_CLUSTER_ID", "cluster-a"),
             ("RHIZA_NODE_ID", "node-2"),
             ("RHIZA_DATA_DIR", "/tmp/node-2"),
@@ -4730,6 +5851,17 @@ mod tests {
             ("RHIZA_CONFIG_BUNDLE", base_bundle_json()),
             ("RHIZA_CLIENT_TOKEN", "client-secret"),
         ])
+    }
+
+    fn compiled_profile_fixture() -> (&'static str, ExecutionProfile, &'static str) {
+        [
+            ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a"),
+            ("graph", ExecutionProfile::Graph, "rhiza:graph:cluster-a"),
+            ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
+        ]
+        .into_iter()
+        .find(|(_, profile, _)| execution_profile_compiled(*profile))
+        .expect("test builds enable at least one execution profile")
     }
 
     fn base_bundle_json() -> &'static str {
@@ -4759,10 +5891,17 @@ mod tests {
             ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
         ] {
             values.insert("RHIZA_EXECUTION_PROFILE", value);
-            let config = parse_serve_env(&values).unwrap();
-            assert_eq!(config.execution_profile, profile);
-            assert_eq!(config.cluster_id, expected_cluster_id);
-            assert_eq!(config.node_config().unwrap().execution_profile(), profile);
+            if execution_profile_compiled(profile) {
+                let config = parse_serve_env(&values).unwrap();
+                assert_eq!(config.execution_profile, profile);
+                assert_eq!(config.cluster_id, expected_cluster_id);
+                assert_eq!(config.node_config().unwrap().execution_profile(), profile);
+            } else {
+                assert_eq!(
+                    parse_serve_env(&values).unwrap_err(),
+                    format!("RHIZA_EXECUTION_PROFILE={value} is not compiled into this binary")
+                );
+            }
         }
 
         values.insert("RHIZA_EXECUTION_PROFILE", "sqlite");
@@ -4771,17 +5910,25 @@ mod tests {
             "RHIZA_EXECUTION_PROFILE must be sql|graph|kv"
         );
 
-        values.insert("RHIZA_EXECUTION_PROFILE", "graph");
-        values.insert("RHIZA_CLUSTER_ID", "rhiza:graph:cluster-a");
+        let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
+        values.insert("RHIZA_EXECUTION_PROFILE", profile_name);
+        values.insert("RHIZA_CLUSTER_ID", canonical_cluster_id);
         let canonical = parse_serve_env(&values).unwrap();
         assert_eq!(canonical.logical_cluster_id, "cluster-a");
-        assert_eq!(canonical.cluster_id, "rhiza:graph:cluster-a");
+        assert_eq!(canonical.cluster_id, canonical_cluster_id);
         assert_eq!(
             canonical.node_config().unwrap().execution_profile(),
-            ExecutionProfile::Graph
+            profile
         );
-        values.insert("RHIZA_EXECUTION_PROFILE", "kv");
-        assert!(parse_serve_env(&values).unwrap_err().contains("not kv"));
+        let foreign_cluster_id = match profile {
+            ExecutionProfile::Sqlite => "rhiza:graph:cluster-a",
+            ExecutionProfile::Graph => "rhiza:kv:cluster-a",
+            ExecutionProfile::Kv => "rhiza:sql:cluster-a",
+        };
+        values.insert("RHIZA_CLUSTER_ID", foreign_cluster_id);
+        assert!(parse_serve_env(&values)
+            .unwrap_err()
+            .contains(&format!("not {profile_name}")));
     }
 
     #[test]
@@ -4808,6 +5955,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn client_and_admin_commands_reject_unsafe_auth_and_non_origin_admin_urls() {
         for invalid in [" secret ", "a b", "a\tb", "café"] {
             assert!(parse_write_with_lookup(
@@ -4932,7 +6080,11 @@ mod tests {
         };
         assert!(validate_live_admin_target(&status, &serve, &[serve.bundle.config_id]).is_ok());
 
-        status.execution_profile = ExecutionProfile::Kv;
+        status.execution_profile = match serve.execution_profile {
+            ExecutionProfile::Sqlite => ExecutionProfile::Graph,
+            ExecutionProfile::Graph => ExecutionProfile::Kv,
+            ExecutionProfile::Kv => ExecutionProfile::Sqlite,
+        };
         assert_eq!(
             validate_live_admin_target(&status, &serve, &[serve.bundle.config_id]).unwrap_err(),
             "admin target fence mismatch for execution_profile; refusing mutating request"
@@ -5201,8 +6353,9 @@ mod tests {
 
     #[test]
     fn roll_parser_accepts_flags_or_env_and_requires_consecutive_generations() {
+        let (profile_name, _, _) = compiled_profile_fixture();
         let mut values = HashMap::from([
-            ("RHIZA_EXECUTION_PROFILE", "sql"),
+            ("RHIZA_EXECUTION_PROFILE", profile_name),
             ("RHIZA_CLUSTER_ID", "cluster-a"),
             ("RHIZA_EPOCH", "1"),
             (
@@ -5278,6 +6431,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "sql")]
     fn runtime_for_final_flush(root: &Path) -> Arc<NodeRuntime> {
         Arc::new(
             NodeRuntime::open(
@@ -5317,6 +6471,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "sql")]
     fn runtime_with_blocked_minority(
         root: &Path,
     ) -> (Arc<NodeRuntime>, mpsc::Receiver<()>, BlockingRelease) {
@@ -5383,9 +6538,11 @@ mod tests {
         (runtime, started_rx, release)
     }
 
+    #[cfg(feature = "sql")]
     #[derive(Clone, Default)]
     struct BlockingRelease(Arc<(Mutex<bool>, Condvar)>);
 
+    #[cfg(feature = "sql")]
     impl BlockingRelease {
         fn wait(&self) {
             let (released, condition) = &*self.0;
@@ -5402,12 +6559,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sql")]
     struct BlockingRecorder {
         inner: RecorderFileStore,
         started: mpsc::Sender<()>,
         release: BlockingRelease,
     }
 
+    #[cfg(feature = "sql")]
     impl RecorderRpc for BlockingRecorder {
         fn call(
             &self,
@@ -5450,6 +6609,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn remote_shutdown_flushes_the_applied_tip_before_returning() {
         let root = tempfile::tempdir().unwrap();
         let archive = local_checkpoint(&root.path().join("archive"), 1);
@@ -5492,6 +6652,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn remote_shutdown_preserves_the_primary_error_after_the_final_flush() {
         let root = tempfile::tempdir().unwrap();
         let archive = local_checkpoint(&root.path().join("archive"), 1);
@@ -5524,6 +6685,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sql")]
     async fn remote_shutdown_reports_primary_durability_and_consensus_errors_together() {
         let root = tempfile::tempdir().unwrap();
         let archive = local_checkpoint(&root.path().join("archive"), 1);
@@ -5566,6 +6728,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn unfinished_consensus_rpcs_fail_an_otherwise_successful_shutdown() {
         assert!(pending_consensus_rpc_result(true).is_ok());
         assert!(pending_consensus_rpc_result(false)
@@ -5574,6 +6737,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sql")]
     async fn consensus_drain_uses_only_the_remaining_shutdown_budget() {
         let root = tempfile::tempdir().unwrap();
         let (runtime, started, release) = runtime_with_blocked_minority(root.path());
@@ -5600,6 +6764,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
         const HANG_GUARD: Duration = Duration::from_secs(10);
 
@@ -5643,6 +6808,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn shutdown_deadline_bounds_a_stalled_drain_or_final_flush() {
         let result = before_shutdown_deadline(
             tokio::time::Instant::now() + Duration::from_millis(10),
@@ -5657,6 +6823,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn checkpoint_worker_stops_before_the_final_flush_phase() {
         let root = tempfile::tempdir().unwrap();
         let archive = local_checkpoint(&root.path().join("archive"), 1);
@@ -6021,6 +7188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sql")]
     fn nonfresh_rejoin_accepts_a_local_suffix_only_after_exact_checkpoint_inclusion() {
         let root = tempfile::tempdir().unwrap();
         let runtime = runtime_for_final_flush(root.path());
@@ -6063,6 +7231,7 @@ mod tests {
         listener.local_addr().unwrap().to_string()
     }
 
+    #[cfg(feature = "sql")]
     async fn wait_for_tcp(address: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -6077,6 +7246,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sql")]
     async fn wait_until_ready(address: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let args = HealthArgs {
@@ -6096,15 +7266,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "sql")]
     async fn sequential_http_cluster_start_reaches_readiness_without_process_restart() {
         sequential_cluster_start(RecorderTransport::Http).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "sql")]
     async fn sequential_tcp_postcard_cluster_commits_without_process_restart() {
         sequential_cluster_start(RecorderTransport::TcpPostcard).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(all(feature = "sql", feature = "recorder-postcard-rpc"))]
+    async fn sequential_postcard_rpc_cluster_commits_without_process_restart() {
+        sequential_cluster_start(RecorderTransport::TcpPostcardRpc).await;
+    }
+
+    #[cfg(feature = "sql")]
     async fn sequential_cluster_start(recorder_transport: RecorderTransport) {
         let temp = tempfile::tempdir().unwrap();
         let recorder_addresses = [
@@ -6166,6 +7345,7 @@ mod tests {
                     .map(|address| {
                         Some(RecorderTcpPeer {
                             address: address.clone(),
+                            tls_server_name: None,
                         })
                     })
                     .collect(),
@@ -6176,10 +7356,9 @@ mod tests {
             client_listen: client_addresses[index].clone(),
             recorder_listen: recorder_addresses[index].clone(),
             recorder_transport,
-            recorder_tcp: (recorder_transport == RecorderTransport::TcpPostcard).then(|| {
-                RecorderTcpConfig {
-                    listen: tcp_addresses[index].clone(),
-                }
+            recorder_tcp: recorder_transport.is_tcp().then(|| RecorderTcpConfig {
+                listen: tcp_addresses[index].clone(),
+                tls: None,
             }),
             recovery_generation: 1,
             remote: None,
@@ -6191,12 +7370,16 @@ mod tests {
         }));
         let first_recorder_address = match recorder_transport {
             RecorderTransport::Http => &recorder_addresses[0],
-            RecorderTransport::TcpPostcard => &tcp_addresses[0],
+            RecorderTransport::TcpPostcard | RecorderTransport::TcpTlsPostcard => &tcp_addresses[0],
+            #[cfg(feature = "recorder-postcard-rpc")]
+            RecorderTransport::TcpPostcardRpc | RecorderTransport::TcpTlsPostcardRpc => {
+                &tcp_addresses[0]
+            }
         };
         wait_for_tcp(first_recorder_address).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!first.is_finished());
-        if recorder_transport == RecorderTransport::TcpPostcard {
+        if recorder_transport.is_tcp() {
             assert!(tokio::net::TcpStream::connect(&recorder_addresses[0])
                 .await
                 .is_err());
@@ -6249,9 +7432,11 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sql")]
     #[derive(Clone, Default)]
     struct CapturedWrite(Arc<Mutex<Option<(HeaderMap, WriteRequest)>>>);
 
+    #[cfg(feature = "sql")]
     async fn capture_write(
         State(captured): State<CapturedWrite>,
         headers: HeaderMap,
@@ -6265,6 +7450,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn write_sends_protocol_json_and_bearer_headers() {
         let captured = CapturedWrite::default();
         let app = Router::new()
@@ -6301,6 +7487,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn write_retries_retryable_endpoint_with_the_same_request_id() {
         let first = CapturedWrite::default();
         let first_app = Router::new()
@@ -6360,6 +7547,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn write_retries_the_next_endpoint_after_a_transport_failure() {
         let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_address = unavailable_listener.local_addr().unwrap();
@@ -6395,6 +7583,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn write_does_not_retry_a_non_retryable_endpoint_error() {
         let first_app = Router::new().route(
             WRITE_PATH,
@@ -6446,6 +7635,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn write_hedges_a_slow_preferred_endpoint_with_the_same_request_id() {
         let first = CapturedWrite::default();
         let first_app = Router::new()
@@ -6505,10 +7695,12 @@ mod tests {
         assert_eq!(first_request.request_id, "request-1");
     }
 
+    #[cfg(feature = "sql")]
     #[derive(Clone, Default)]
     struct CapturedRead(Arc<Mutex<Option<ReadRequest>>>);
 
     #[test]
+    #[cfg(feature = "sql")]
     fn only_idempotent_reads_are_hedged() {
         assert!(!read_can_hedge(None));
         assert!(!read_can_hedge(Some(ReadConsistency::ReadBarrier)));
@@ -6517,6 +7709,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn read_retry_preserves_requested_consistency() {
         let first_app = Router::new().route(
             READ_PATH,
@@ -6581,6 +7774,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn read_barrier_waits_for_the_current_attempt_before_retrying() {
         let first_app = Router::new().route(
             READ_PATH,
@@ -6644,6 +7838,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn applied_index_read_hedges_and_preserves_consistency() {
         let first_app = Router::new().route(
             READ_PATH,
@@ -6711,6 +7906,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn attempt_deadline_retries_with_the_exact_serialized_body() {
         let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
         let first_bodies = Arc::clone(&bodies);
@@ -6789,6 +7985,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn operation_deadline_bounds_all_attempts() {
         let app = Router::new().route(
             WRITE_PATH,
@@ -6830,6 +8027,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn operation_deadline_preserves_the_last_structured_server_error() {
         let first_app = Router::new().route(
             WRITE_PATH,
@@ -6897,6 +8095,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn sql_execute_decodes_statement_and_returning_results() {
         let app = Router::new().route(
             SQL_EXECUTE_PATH,
@@ -6943,6 +8142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn request_errors_do_not_expose_client_token() {
         let app = Router::new().route(WRITE_PATH, post(|| async { StatusCode::UNAUTHORIZED }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7049,6 +8249,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sql")]
     async fn request_surfaces_structured_json_server_errors() {
         let app = Router::new().route(
             WRITE_PATH,

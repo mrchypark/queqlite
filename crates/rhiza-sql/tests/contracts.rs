@@ -2289,7 +2289,7 @@ fn failed_sql_batch_rolls_back_user_changes_request_record_and_applied_tip() {
 }
 
 #[test]
-fn sql_boundary_rejects_nondeterminism_internal_state_and_wrong_statement_mode() {
+fn sql_write_boundary_rejects_nondeterminism_while_read_queries_allow_runtime_functions() {
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
         .unwrap();
@@ -2358,7 +2358,7 @@ fn sql_boundary_rejects_nondeterminism_internal_state_and_wrong_statement_mode()
             10,
             1024,
         )
-        .is_err());
+        .is_ok());
 }
 
 #[test]

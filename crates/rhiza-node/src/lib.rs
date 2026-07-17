@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(feature = "sql", feature = "graph", feature = "kv")),
+    allow(dead_code, unreachable_code, unused_imports, unused_variables)
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
@@ -9,8 +14,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+compile_error!("rhiza-node requires at least one execution profile feature: sql, graph, or kv");
+
 #[cfg(feature = "graph")]
 use std::collections::BTreeMap;
+#[cfg(feature = "sql")]
+use std::sync::atomic::AtomicUsize;
 
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, Request, State},
@@ -20,6 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+#[cfg(feature = "sql")]
 use rhiza_archive::SnapshotRecord;
 use rhiza_core::{
     Command, CommandKind, ConfigChange, ConfigurationState, EntryType, ExecutionProfile, LogAnchor,
@@ -27,27 +38,35 @@ use rhiza_core::{
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
-    encode_replicated_graph_command, CanonicalF64, GraphColumn, GraphInternalId, GraphLogicalType,
-    GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
-    LadybugStateMachine, RequestRecord as GraphRequestRecord,
+    encode_replicated_graph_batch, encode_replicated_graph_command, CanonicalF64, GraphColumn,
+    GraphInternalId, GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel,
+    GraphResultValue, LadybugStateMachine, RequestRecord as GraphRequestRecord,
 };
-#[cfg(feature = "graph")]
-pub use rhiza_graph::{MAX_GRAPH_RESULT_CELLS, MAX_GRAPH_RETURN_PROJECTIONS};
 #[cfg(feature = "kv")]
-use rhiza_kv::{encode_replicated_kv_command, KvRequestRecord, RedbStateMachine};
-use rhiza_log::{
-    decode_segment_for_cluster, write_segment_file, FileLogStore, IndexRange, LogStore,
+use rhiza_kv::{
+    encode_replicated_kv_batch, encode_replicated_kv_command, KvRequestRecord, RedbStateMachine,
 };
+#[cfg(feature = "kv")]
+pub use rhiza_kv::{KvScanResult, KvScanRow, MAX_KV_SCAN_RESULT_BYTES, MAX_KV_SCAN_ROWS};
+#[cfg(feature = "sql")]
+use rhiza_log::{decode_segment_for_cluster, write_segment_file};
+use rhiza_log::{FileLogStore, IndexRange, LogStore};
+#[cfg(feature = "sql")]
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
+#[cfg(feature = "sql")]
+use rhiza_quepaxa::Consensus;
 use rhiza_quepaxa::{
-    CertifiedDecisionInspection, Consensus, DecisionInspection, DecisionProof, Membership,
-    RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc, RejectReason, ThreeNodeConsensus,
+    CertifiedDecisionInspection, DecisionInspection, DecisionProof, Membership, RecordRequest,
+    RecordSummary, RecorderFileStore, RecorderRpc, RejectReason, ThreeNodeConsensus,
 };
+#[cfg(feature = "sql")]
 use rhiza_sql::{
     encode_sql_command, restore_snapshot_file, RecoverySnapshot, RequestConflict, RequestOutcome,
     SqlCommand, SqlCommandResult, SqlEffectPreparation, SqlQueryResult, SqlStatement, SqlValue,
-    SqliteStateMachine, MAX_SQL_STATEMENTS, MAX_WRITE_BATCH_MEMBERS,
+    SqliteStateMachine, MAX_SQL_STATEMENTS,
 };
+#[cfg(not(feature = "sql"))]
+type SqlCommandResult = ();
 
 mod admin;
 pub mod durability;
@@ -66,8 +85,15 @@ pub use durability::{
 pub use graph::*;
 #[cfg(feature = "kv")]
 pub use kv::*;
+#[cfg(feature = "recorder-postcard-rpc")]
 pub use recorder_tcp::{
-    serve_recorder_tcp, validate_recorder_tcp_endpoint, TcpPostcardRecorderClient,
+    serve_recorder_postcard_rpc, serve_recorder_postcard_rpc_tls,
+    RecorderPostcardRpcTlsClientConfig, RecorderPostcardRpcTlsServerConfig,
+    TcpPostcardRpcRecorderClient,
+};
+pub use recorder_tcp::{
+    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
+    RecorderTlsClientConfig, RecorderTlsServerConfig, TcpPostcardRecorderClient,
 };
 
 pub const MAX_FETCH_ENTRIES: u32 = 1_024;
@@ -79,6 +105,7 @@ pub const MAX_HTTP_BODY_BYTES: usize = MAX_COMMAND_BYTES * 6 + 16 * 1024;
 pub const DEFAULT_CLIENT_CONCURRENCY: usize = 16;
 pub const DEFAULT_PEER_CONCURRENCY: usize = 32;
 pub const DEFAULT_WRITER_BATCH_MAX: usize = 8;
+const MAX_WRITE_BATCH_MEMBERS: usize = 64;
 pub const DEFAULT_WRITER_BATCH_WINDOW: Duration = Duration::from_micros(500);
 pub const PROTOCOL_VERSION: &str = "1";
 pub const RECORDER_PROTOCOL_VERSION: &str = "2";
@@ -95,9 +122,13 @@ pub const RECORDER_INSPECT_RECORD_PATH: &str = "/v2/quepaxa/recorder/inspect-rec
 pub const RECORDER_RECORD_PATH: &str = "/v2/quepaxa/recorder/record";
 pub const RECORDER_INSTALL_PROOF_PATH: &str = "/v2/quepaxa/recorder/install-decision-proof";
 pub const LOG_FETCH_PATH: &str = "/v1/log/fetch";
+#[cfg(feature = "sql")]
 pub const WRITE_PATH: &str = "/v1/write";
+#[cfg(feature = "sql")]
 pub const READ_PATH: &str = "/v1/read";
+#[cfg(feature = "sql")]
 pub const SQL_EXECUTE_PATH: &str = "/v1/sql/execute";
+#[cfg(feature = "sql")]
 pub const SQL_QUERY_PATH: &str = "/v1/sql/query";
 #[cfg(feature = "graph")]
 pub const GRAPH_PUT_DOCUMENT_PATH: &str = "/v1/graph/documents/put";
@@ -113,6 +144,9 @@ pub const KV_PUT_PATH: &str = "/v1/kv/put";
 pub const KV_DELETE_PATH: &str = "/v1/kv/delete";
 #[cfg(feature = "kv")]
 pub const KV_GET_PATH: &str = "/v1/kv/get";
+#[cfg(feature = "kv")]
+pub const KV_SCAN_PATH: &str = "/v1/kv/scan";
+#[cfg(feature = "sql")]
 pub const SQL_EXECUTE_RESPONSE_VERSION: u16 = 1;
 pub const LIVEZ_PATH: &str = "/livez";
 pub const READYZ_PATH: &str = "/readyz";
@@ -122,18 +156,26 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const SYNC_FLUSH_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const SYNC_FLUSH_RETRY_MAX: Duration = Duration::from_secs(1);
+#[cfg(feature = "sql")]
 pub const DEFAULT_SQL_MAX_ROWS: u32 = 1_000;
+#[cfg(feature = "sql")]
 pub const MAX_SQL_MAX_ROWS: u32 = 10_000;
+#[cfg(feature = "sql")]
 pub const MAX_SQL_RESULT_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "sql")]
 pub const MAX_SQL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "kv")]
+pub const DEFAULT_KV_SCAN_LIMIT: u32 = 100;
+#[cfg(feature = "kv")]
+pub const MAX_KV_SCAN_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(feature = "graph")]
-pub const DEFAULT_GRAPH_MAX_ROWS: u32 = DEFAULT_SQL_MAX_ROWS;
+pub const DEFAULT_GRAPH_MAX_ROWS: u32 = 1_000;
 #[cfg(feature = "graph")]
-pub const MAX_GRAPH_MAX_ROWS: u32 = MAX_SQL_MAX_ROWS;
+pub const MAX_GRAPH_MAX_ROWS: u32 = 10_000;
 #[cfg(feature = "graph")]
-pub const MAX_GRAPH_RESULT_BYTES: usize = MAX_SQL_RESULT_BYTES;
+pub const MAX_GRAPH_RESULT_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "graph")]
-pub const MAX_GRAPH_RESPONSE_BYTES: usize = MAX_SQL_RESPONSE_BYTES;
+pub const MAX_GRAPH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "graph")]
 const GRAPH_QUERY_TIMEOUT_MS: u64 = 5_000;
 
@@ -151,6 +193,14 @@ pub fn effective_cluster_id(
         return Ok(logical_cluster_id.to_owned());
     }
     Ok(format!("rhiza:{}:{logical_cluster_id}", profile.as_str()))
+}
+
+pub const fn execution_profile_compiled(profile: ExecutionProfile) -> bool {
+    match profile {
+        ExecutionProfile::Sqlite => cfg!(feature = "sql"),
+        ExecutionProfile::Graph => cfg!(feature = "graph"),
+        ExecutionProfile::Kv => cfg!(feature = "kv"),
+    }
 }
 
 fn canonical_cluster_profile(cluster_id: &str) -> Option<ExecutionProfile> {
@@ -763,12 +813,16 @@ enum WriteOperationResult {
 
 #[derive(Clone)]
 enum ClientWriteResponse {
+    #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+    Unavailable,
+    #[cfg(feature = "sql")]
     KeyValue(WriteResponse),
+    #[cfg(feature = "sql")]
     Sql(SqlExecuteResponse),
     #[cfg(feature = "graph")]
-    Graph(GraphMutationResponse),
+    Graph(GraphMutationOutcome),
     #[cfg(feature = "kv")]
-    Kv(KvMutationResponse),
+    Kv(KvMutationOutcome),
 }
 
 struct QueuedWrite {
@@ -780,7 +834,11 @@ struct QueuedWrite {
 }
 
 enum QueuedOperation {
+    #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+    Unavailable,
+    #[cfg(feature = "sql")]
     KeyValue,
+    #[cfg(feature = "sql")]
     Sql(SqlCommand),
     #[cfg(feature = "graph")]
     Graph(GraphCommandV1),
@@ -789,38 +847,97 @@ enum QueuedOperation {
 }
 
 struct RuntimeBatchMember {
+    #[cfg(feature = "sql")]
     request_id: String,
     payload: Vec<u8>,
     operation: QueuedOperation,
 }
 
+#[cfg(any(feature = "graph", feature = "kv"))]
+fn classify_pending_request(
+    canonical_by_request: &mut HashMap<String, usize>,
+    members: &[RuntimeBatchMember],
+    index: usize,
+    request_id: &str,
+) -> Result<Option<usize>, NodeError> {
+    let Some(&canonical) = canonical_by_request.get(request_id) else {
+        canonical_by_request.insert(request_id.to_owned(), index);
+        return Ok(None);
+    };
+    if members[canonical].payload == members[index].payload {
+        Ok(Some(canonical))
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "request id {request_id:?} was reused with another command in the same writer batch"
+        )))
+    }
+}
+
 impl ClientWriteResponse {
-    const fn applied_index(&self) -> LogIndex {
+    fn applied_index(&self) -> LogIndex {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::KeyValue(response) => response.applied_index,
+            #[cfg(feature = "sql")]
             Self::Sql(response) => response.applied_index,
             #[cfg(feature = "graph")]
-            Self::Graph(response) => response.applied_index,
+            Self::Graph(response) => response.applied_index(),
             #[cfg(feature = "kv")]
-            Self::Kv(response) => response.applied_index,
+            Self::Kv(response) => response.applied_index(),
         }
     }
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone)]
 pub struct NodeService {
     runtime: Arc<NodeRuntime>,
     coordinator: Option<Arc<CheckpointCoordinator>>,
+    #[cfg(feature = "sql")]
+    sql_reads_in_flight: Arc<AtomicUsize>,
 }
 
+#[cfg(feature = "sql")]
+struct SqlReadActivity {
+    active: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "sql")]
+impl SqlReadActivity {
+    fn enter(active: &Arc<AtomicUsize>) -> (Self, bool) {
+        let previous = active.fetch_add(1, Ordering::Relaxed);
+        debug_assert_ne!(previous, usize::MAX);
+        (
+            Self {
+                active: active.clone(),
+            },
+            previous == 0,
+        )
+    }
+}
+
+#[cfg(feature = "sql")]
+impl Drop for SqlReadActivity {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
+}
+
+#[cfg(feature = "sql")]
 impl NodeService {
     pub fn new(runtime: Arc<NodeRuntime>, coordinator: Option<Arc<CheckpointCoordinator>>) -> Self {
         Self {
             runtime,
             coordinator,
+            #[cfg(feature = "sql")]
+            sql_reads_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    #[cfg(feature = "sql")]
     pub async fn put(
         &self,
         request_id: &str,
@@ -835,6 +952,7 @@ impl NodeService {
         .await
     }
 
+    #[cfg(feature = "sql")]
     pub async fn write(&self, request: WriteRequest) -> Result<WriteResponse, NodeError> {
         self.write_allowed()?;
         let runtime = self.runtime.clone();
@@ -847,6 +965,7 @@ impl NodeService {
         Ok(response)
     }
 
+    #[cfg(feature = "sql")]
     pub async fn execute_sql(&self, command: SqlCommand) -> Result<SqlExecuteResponse, NodeError> {
         self.write_allowed()?;
         let runtime = self.runtime.clone();
@@ -858,6 +977,7 @@ impl NodeService {
         Ok(response)
     }
 
+    #[cfg(feature = "sql")]
     pub async fn read(
         &self,
         key: &str,
@@ -865,11 +985,12 @@ impl NodeService {
     ) -> Result<ReadResponse, NodeError> {
         let runtime = self.runtime.clone();
         let key = key.to_owned();
-        tokio::task::spawn_blocking(move || runtime.read(&key, consistency))
+        self.run_sql_read_operation(consistency, move || runtime.read(&key, consistency))
             .await
             .map_err(node_service_task_error)?
     }
 
+    #[cfg(feature = "sql")]
     pub async fn query(
         &self,
         statement: SqlStatement,
@@ -877,11 +998,39 @@ impl NodeService {
         max_rows: u32,
     ) -> Result<SqlQueryResponse, NodeError> {
         let runtime = self.runtime.clone();
-        tokio::task::spawn_blocking(move || runtime.query_sql(&statement, consistency, max_rows))
-            .await
-            .map_err(node_service_task_error)?
+        self.run_sql_read_operation(consistency, move || {
+            runtime.query_sql(&statement, consistency, max_rows)
+        })
+        .await
+        .map_err(node_service_task_error)?
     }
 
+    #[cfg(feature = "sql")]
+    async fn run_sql_read_operation<F, T>(
+        &self,
+        consistency: ReadConsistency,
+        operation: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if consistency == ReadConsistency::ReadBarrier {
+            return run_read_operation(consistency, operation).await;
+        }
+        let (activity, sole_read) = SqlReadActivity::enter(&self.sql_reads_in_flight);
+        let operation = move || {
+            let _activity = activity;
+            operation()
+        };
+        if sole_read {
+            run_read_operation(consistency, operation).await
+        } else {
+            tokio::task::spawn_blocking(operation).await
+        }
+    }
+
+    #[cfg(feature = "sql")]
     fn write_allowed(&self) -> Result<(), NodeError> {
         self.coordinator
             .as_ref()
@@ -889,6 +1038,7 @@ impl NodeService {
             .map_err(|error| NodeError::Unavailable(error.to_string()))
     }
 
+    #[cfg(feature = "sql")]
     async fn confirm_committed(&self, index: LogIndex) -> Result<(), NodeError> {
         confirm_write_durability(self.runtime.as_ref(), self.coordinator.as_deref(), index)
             .await
@@ -896,8 +1046,30 @@ impl NodeService {
     }
 }
 
+#[cfg(feature = "sql")]
 fn node_service_task_error(error: tokio::task::JoinError) -> NodeError {
     NodeError::Fatal(format!("node service task failed: {error}"))
+}
+
+#[doc(hidden)]
+pub async fn run_read_operation<F, T>(
+    consistency: ReadConsistency,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    if consistency != ReadConsistency::ReadBarrier
+        && matches!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        )
+    {
+        Ok(tokio::task::block_in_place(operation))
+    } else {
+        tokio::task::spawn_blocking(operation).await
+    }
 }
 
 #[derive(Clone)]
@@ -1189,12 +1361,20 @@ where
         runtime.config.writer_batch_max,
         runtime.config.writer_batch_window,
     ));
-    let client_routes = match runtime.config().execution_profile() {
-        ExecutionProfile::Sqlite => Router::new()
-            .route(WRITE_PATH, post(handle_write))
-            .route(READ_PATH, post(handle_read))
-            .route(SQL_EXECUTE_PATH, post(handle_sql_execute))
-            .route(SQL_QUERY_PATH, post(handle_sql_query)),
+    #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
+    let client_routes: Router = match runtime.config().execution_profile() {
+        ExecutionProfile::Sqlite => {
+            #[cfg(feature = "sql")]
+            {
+                Router::new()
+                    .route(WRITE_PATH, post(handle_write))
+                    .route(READ_PATH, post(handle_read))
+                    .route(SQL_EXECUTE_PATH, post(handle_sql_execute))
+                    .route(SQL_QUERY_PATH, post(handle_sql_query))
+            }
+            #[cfg(not(feature = "sql"))]
+            unreachable!("SQL runtime cannot open without the sql feature")
+        }
         ExecutionProfile::Graph => {
             #[cfg(feature = "graph")]
             {
@@ -1217,6 +1397,7 @@ where
                     .route(KV_PUT_PATH, post(handle_kv_put))
                     .route(KV_DELETE_PATH, post(handle_kv_delete))
                     .route(KV_GET_PATH, post(handle_kv_get))
+                    .route(KV_SCAN_PATH, post(handle_kv_scan))
             }
             #[cfg(not(feature = "kv"))]
             unreachable!("KV runtime cannot open without the kv feature")
@@ -1236,6 +1417,8 @@ where
         write_operations: write_operations.clone(),
         writer: writer.clone(),
     });
+    #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+    let client_routes: Router = Router::new();
     let health_routes = Router::new()
         .route(LIVEZ_PATH, get(handle_livez))
         .route(READYZ_PATH, get(handle_readyz))
@@ -1550,6 +1733,7 @@ where
     }
 }
 
+#[cfg(feature = "sql")]
 async fn handle_write(
     State(state): State<NodeRouteState>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -1568,6 +1752,7 @@ async fn handle_write(
     coordinate_write(state, permit, request_id, payload, operation).await
 }
 
+#[cfg(feature = "sql")]
 async fn handle_sql_execute(
     State(state): State<NodeRouteState>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -1688,12 +1873,20 @@ async fn coordinate_write(
     };
     match tokio::time::timeout_at(deadline, wait).await {
         Ok(WriteOperationResult::Runtime(Ok(response))) => match response {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            ClientWriteResponse::Unavailable => {
+                unreachable!("no execution profiles are compiled in")
+            }
+            #[cfg(feature = "sql")]
             ClientWriteResponse::KeyValue(response) => Json(response).into_response(),
+            #[cfg(feature = "sql")]
             ClientWriteResponse::Sql(response) => Json(response).into_response(),
             #[cfg(feature = "graph")]
-            ClientWriteResponse::Graph(response) => Json(response).into_response(),
+            ClientWriteResponse::Graph(outcome) => {
+                Json(graph_mutation_response(outcome)).into_response()
+            }
             #[cfg(feature = "kv")]
-            ClientWriteResponse::Kv(response) => Json(response).into_response(),
+            ClientWriteResponse::Kv(outcome) => Json(kv_mutation_response(outcome)).into_response(),
         },
         Ok(WriteOperationResult::Runtime(Err(error))) => node_error_response(error),
         Ok(WriteOperationResult::DurabilityUnavailable) => client_error_response(
@@ -1736,6 +1929,7 @@ async fn writer_loop(
         let mut members = Vec::with_capacity(queued.len());
         for queued in queued {
             members.push(RuntimeBatchMember {
+                #[cfg(feature = "sql")]
                 request_id: queued.request_id.clone(),
                 payload: queued.payload,
                 operation: queued.operation,
@@ -1796,6 +1990,7 @@ async fn writer_loop(
     }
 }
 
+#[cfg(feature = "sql")]
 async fn handle_sql_query(
     State(state): State<NodeRouteState>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -1821,9 +2016,24 @@ async fn handle_sql_query(
     })
     .await;
     match result {
-        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Ok(response)) => sql_query_http_response(response),
         Ok(Err(error)) => node_error_response(error),
         Err(error) => client_task_error(error),
+    }
+}
+
+#[cfg(feature = "sql")]
+fn sql_query_http_response(response: SqlQueryResponse) -> Response {
+    match serde_json::to_vec(&response) {
+        Ok(encoded) if encoded.len() <= MAX_SQL_RESPONSE_BYTES => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            encoded,
+        )
+            .into_response(),
+        Ok(_) => node_error_response(NodeError::InvalidRequest(format!(
+            "SQL response exceeds {MAX_SQL_RESPONSE_BYTES} bytes"
+        ))),
+        Err(error) => node_error_response(NodeError::InvalidRequest(error.to_string())),
     }
 }
 
@@ -2094,6 +2304,116 @@ async fn handle_kv_get(
     }
 }
 
+#[cfg(feature = "kv")]
+enum DecodedKvScan {
+    Range {
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    },
+    Prefix(Vec<u8>),
+}
+
+#[cfg(feature = "kv")]
+async fn handle_kv_scan(
+    State(state): State<NodeRouteState>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    request: Result<Json<KvScanRequest>, JsonRejection>,
+) -> Response {
+    let request = match client_json(request) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let limit = request
+        .limit
+        .unwrap_or(usize::try_from(DEFAULT_KV_SCAN_LIMIT).expect("u32 fits usize"));
+    if limit == 0 || limit > MAX_KV_SCAN_ROWS {
+        return node_error_response(NodeError::InvalidRequest(format!(
+            "limit must be between 1 and {MAX_KV_SCAN_ROWS}"
+        )));
+    }
+    let cursor = match request.cursor {
+        Some(cursor) => match decode_base64("cursor", &cursor) {
+            Ok(cursor) => Some(cursor),
+            Err(error) => return node_error_response(error),
+        },
+        None => None,
+    };
+    let scan = match (request.prefix, request.start, request.end) {
+        (Some(prefix), None, None) => match decode_base64("prefix", &prefix) {
+            Ok(prefix) => DecodedKvScan::Prefix(prefix),
+            Err(error) => return node_error_response(error),
+        },
+        (None, Some(start), end) => {
+            let start = match decode_base64("start", &start) {
+                Ok(start) => start,
+                Err(error) => return node_error_response(error),
+            };
+            let end = match end {
+                Some(end) => match decode_base64("end", &end) {
+                    Ok(end) => Some(end),
+                    Err(error) => return node_error_response(error),
+                },
+                None => None,
+            };
+            DecodedKvScan::Range { start, end }
+        }
+        _ => {
+            return node_error_response(NodeError::InvalidRequest(
+                "provide either prefix alone or start with optional end".into(),
+            ))
+        }
+    };
+    let runtime = state.runtime;
+    let consistency = request
+        .consistency
+        .unwrap_or(runtime.config.read_consistency());
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match scan {
+            DecodedKvScan::Range { start, end } => runtime.scan_kv_range(
+                &start,
+                end.as_deref(),
+                limit,
+                cursor.as_deref(),
+                consistency,
+            ),
+            DecodedKvScan::Prefix(prefix) => {
+                runtime.scan_kv_prefix(&prefix, limit, cursor.as_deref(), consistency)
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => {
+            let response = KvScanResponse {
+                entries: result
+                    .rows()
+                    .iter()
+                    .map(|row| KvScanEntryDto {
+                        key: encode_base64(row.key()),
+                        value: encode_base64(row.value()),
+                    })
+                    .collect(),
+                next_cursor: result.next_cursor().map(encode_base64),
+                applied_index: result.tip().applied_index(),
+                hash: result.tip().applied_hash(),
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_KV_SCAN_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => node_error_response(NodeError::ResourceExhausted(format!(
+                    "KV scan response exceeds {MAX_KV_SCAN_RESPONSE_BYTES} bytes"
+                ))),
+                Err(error) => node_error_response(NodeError::InvalidRequest(error.to_string())),
+            }
+        }
+        Ok(Err(error)) => node_error_response(error),
+        Err(error) => client_task_error(error),
+    }
+}
+
+#[cfg(feature = "sql")]
 async fn handle_read(
     State(state): State<NodeRouteState>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -2185,6 +2505,7 @@ async fn client_gate(
 }
 
 fn client_write_path(path: &str) -> bool {
+    #[cfg(feature = "sql")]
     if matches!(path, WRITE_PATH | SQL_EXECUTE_PATH) {
         return true;
     }
@@ -2220,7 +2541,11 @@ fn next_sync_flush_retry(current: Duration) -> Duration {
     current.saturating_mul(2).min(SYNC_FLUSH_RETRY_MAX)
 }
 
-async fn confirm_write_durability(
+/// Confirms that a committed write has reached the configured durability boundary.
+///
+/// Synchronous archive I/O failures are retried with bounded backoff until the
+/// archive recovers or the runtime begins shutdown.
+pub async fn confirm_write_durability(
     runtime: &NodeRuntime,
     coordinator: Option<&CheckpointCoordinator>,
     index: LogIndex,
@@ -2323,6 +2648,7 @@ fn secrets_equal(left: &[u8], right: &[u8]) -> bool {
 fn node_error_response(error: NodeError) -> Response {
     let (status, code, retryable, statement_index) = match &error {
         NodeError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", false, None),
+        #[cfg(feature = "sql")]
         NodeError::InvalidSqlStatement {
             statement_index, ..
         } => (
@@ -2331,6 +2657,7 @@ fn node_error_response(error: NodeError) -> Response {
             false,
             Some(*statement_index),
         ),
+        #[cfg(feature = "sql")]
         NodeError::RequestConflict(_) => (StatusCode::CONFLICT, "request_conflict", false, None),
         NodeError::PreconditionFailed(_) => {
             (StatusCode::CONFLICT, "precondition_failed", false, None)
@@ -2342,6 +2669,12 @@ fn node_error_response(error: NodeError) -> Response {
             None,
         ),
         NodeError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable", true, None),
+        NodeError::ResourceExhausted(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resource_exhausted",
+            true,
+            None,
+        ),
         NodeError::ConfigurationTransition { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "configuration_transition",
@@ -2492,6 +2825,7 @@ pub fn recover_successor_recorder_after_checkpoint(
             stop.entry.index,
             stop.entry.hash,
             tip.index(),
+            tip.hash(),
         )
         .map_err(|error| NodeError::Reconciliation(error.to_string()))
 }
@@ -3196,13 +3530,16 @@ pub enum NodeError {
     Reconciliation(String),
     Invariant(String),
     Unavailable(String),
+    ResourceExhausted(String),
     ConfigurationTransition {
         state: Box<ConfigurationState>,
     },
     Contention(String),
     WinnerLimitExceeded,
+    #[cfg(feature = "sql")]
     RequestConflict(RequestConflict),
     InvalidRequest(String),
+    #[cfg(feature = "sql")]
     InvalidSqlStatement {
         statement_index: usize,
         message: String,
@@ -3236,14 +3573,19 @@ impl fmt::Display for NodeError {
             Self::Reconciliation(message) => write!(f, "node reconciliation failed: {message}"),
             Self::Invariant(message) => write!(f, "node invariant failed: {message}"),
             Self::Unavailable(message) => write!(f, "node unavailable: {message}"),
+            Self::ResourceExhausted(message) => {
+                write!(f, "node query resources exhausted: {message}")
+            }
             Self::ConfigurationTransition { state } => write!(
                 f,
                 "node unavailable during configuration transition: {state:?}"
             ),
             Self::Contention(message) => write!(f, "node contention: {message}"),
             Self::WinnerLimitExceeded => write!(f, "foreign winner retry limit exceeded"),
+            #[cfg(feature = "sql")]
             Self::RequestConflict(conflict) => conflict.fmt(f),
             Self::InvalidRequest(message) => write!(f, "invalid request: {message}"),
+            #[cfg(feature = "sql")]
             Self::InvalidSqlStatement {
                 statement_index,
                 message,
@@ -3286,6 +3628,7 @@ pub struct StopInformation {
     pub proof: DecisionProof,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteRequest {
@@ -3294,6 +3637,7 @@ pub struct WriteRequest {
     pub value: String,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WriteResponse {
     pub applied_index: LogIndex,
@@ -3309,6 +3653,7 @@ pub struct ClientErrorResponse {
     pub statement_index: Option<usize>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {
@@ -3316,6 +3661,7 @@ pub struct ReadRequest {
     pub consistency: Option<ReadConsistency>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ReadResponse {
     pub value: Option<String>,
@@ -3323,6 +3669,7 @@ pub struct ReadResponse {
     pub hash: LogHash,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlExecuteRequest {
@@ -3330,6 +3677,7 @@ pub struct SqlExecuteRequest {
     pub statements: Vec<SqlStatement>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SqlExecuteResponse {
     pub version: u16,
@@ -3339,12 +3687,14 @@ pub struct SqlExecuteResponse {
     pub results: Vec<SqlStatementResult>,
 }
 
+#[cfg(feature = "sql")]
 impl From<WriteResponse> for SqlExecuteResponse {
     fn from(response: WriteResponse) -> Self {
         sql_execute_response(response, None)
     }
 }
 
+#[cfg(feature = "sql")]
 fn sql_execute_response(
     response: WriteResponse,
     result: Option<SqlCommandResult>,
@@ -3371,6 +3721,7 @@ fn sql_execute_response(
     }
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SqlStatementResult {
     pub statement_index: usize,
@@ -3379,6 +3730,7 @@ pub struct SqlStatementResult {
     pub returning: Option<SqlQueryResult>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlQueryRequest {
@@ -3387,6 +3739,7 @@ pub struct SqlQueryRequest {
     pub max_rows: Option<u32>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SqlQueryResponse {
     pub columns: Vec<String>,
@@ -3959,6 +4312,18 @@ pub struct KvGetRequest {
 
 #[cfg(feature = "kv")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvScanRequest {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub prefix: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub consistency: Option<ReadConsistency>,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum KvMutationResultDto {
     Put { replaced: bool },
@@ -3977,6 +4342,22 @@ pub struct KvMutationResponse {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct KvGetResponse {
     pub value: Option<String>,
+    pub applied_index: LogIndex,
+    pub hash: LogHash,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvScanEntryDto {
+    pub key: String,
+    pub value: String,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvScanResponse {
+    pub entries: Vec<KvScanEntryDto>,
+    pub next_cursor: Option<String>,
     pub applied_index: LogIndex,
     pub hash: LogHash,
 }
@@ -4011,6 +4392,21 @@ fn kv_mutation_response(outcome: KvMutationOutcome) -> KvMutationResponse {
             }
         },
     }
+}
+
+#[cfg(feature = "kv")]
+fn validate_kv_scan_required_index(
+    result: &KvScanResult,
+    required_index: Option<LogIndex>,
+) -> Result<(), NodeError> {
+    let applied_index = result.tip().applied_index();
+    if required_index.is_some_and(|required| applied_index < required) {
+        return Err(NodeError::Unavailable(format!(
+            "local applied index {applied_index} has not reached {}",
+            required_index.expect("checked above")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "graph")]
@@ -4131,15 +4527,20 @@ fn decode_base64(field: &str, encoded: &str) -> Result<Vec<u8>, NodeError> {
 }
 
 enum Materializer {
-    Sql(SqliteStateMachine),
+    #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+    Unavailable,
+    #[cfg(feature = "sql")]
+    Sql(Box<SqliteStateMachine>),
     #[cfg(feature = "graph")]
     Graph(Arc<LadybugStateMachine>),
     #[cfg(feature = "kv")]
-    Kv(RedbStateMachine),
+    Kv(Arc<RedbStateMachine>),
 }
 
+#[cfg(feature = "sql")]
 struct SqlMaterializerGuard<'a>(MutexGuard<'a, Materializer>);
 
+#[cfg(feature = "sql")]
 impl std::ops::Deref for SqlMaterializerGuard<'_> {
     type Target = SqliteStateMachine;
 
@@ -4155,45 +4556,47 @@ impl std::ops::Deref for SqlMaterializerGuard<'_> {
 }
 
 impl Materializer {
-    fn ensure_profile_available(_profile: ExecutionProfile) -> Result<(), NodeError> {
-        #[cfg(not(feature = "graph"))]
-        if _profile == ExecutionProfile::Graph {
-            return Err(NodeError::Unavailable(
-                "graph execution profile is not compiled in".into(),
-            ));
+    fn ensure_profile_available(profile: ExecutionProfile) -> Result<(), NodeError> {
+        if execution_profile_compiled(profile) {
+            Ok(())
+        } else {
+            Err(NodeError::Unavailable(format!(
+                "{} execution profile is not compiled in",
+                profile.as_str()
+            )))
         }
-        #[cfg(not(feature = "kv"))]
-        if _profile == ExecutionProfile::Kv {
-            return Err(NodeError::Unavailable(
-                "kv execution profile is not compiled in".into(),
-            ));
-        }
-        Ok(())
     }
 
     fn open(config: &NodeConfig, config_id: u64) -> Result<Self, NodeError> {
         match config.execution_profile() {
             ExecutionProfile::Sqlite => {
-                let path = config.data_dir().join("sqlite/db.sqlite");
-                let state = if path.exists() {
-                    SqliteStateMachine::open(
-                        path,
-                        config.cluster_id(),
-                        config.node_id(),
-                        config.epoch(),
-                        config_id,
-                    )
-                } else {
-                    SqliteStateMachine::open_with_configuration(
-                        path,
-                        config.cluster_id(),
-                        config.node_id(),
-                        config.epoch(),
-                        config.configuration_state().clone(),
-                    )
+                #[cfg(feature = "sql")]
+                {
+                    let path = config.data_dir().join("sqlite/db.sqlite");
+                    let state = if path.exists() {
+                        SqliteStateMachine::open(
+                            path,
+                            config.cluster_id(),
+                            config.node_id(),
+                            config.epoch(),
+                            config_id,
+                        )
+                    } else {
+                        SqliteStateMachine::open_with_configuration(
+                            path,
+                            config.cluster_id(),
+                            config.node_id(),
+                            config.epoch(),
+                            config.configuration_state().clone(),
+                        )
+                    }
+                    .map_err(|error| NodeError::Storage(error.to_string()))?;
+                    Ok(Self::Sql(Box::new(state)))
                 }
-                .map_err(|error| NodeError::Storage(error.to_string()))?;
-                Ok(Self::Sql(state))
+                #[cfg(not(feature = "sql"))]
+                Err(NodeError::Unavailable(
+                    "sql execution profile is not compiled in".into(),
+                ))
             }
             ExecutionProfile::Graph => {
                 #[cfg(feature = "graph")]
@@ -4224,6 +4627,7 @@ impl Materializer {
                         config.epoch(),
                         config_id,
                     )
+                    .map(Arc::new)
                     .map(Self::Kv)
                     .map_err(|error| NodeError::Storage(error.to_string()))
                 }
@@ -4235,8 +4639,11 @@ impl Materializer {
         }
     }
 
-    const fn profile(&self) -> ExecutionProfile {
+    fn profile(&self) -> ExecutionProfile {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::Sql(_) => ExecutionProfile::Sqlite,
             #[cfg(feature = "graph")]
             Self::Graph(_) => ExecutionProfile::Graph,
@@ -4247,6 +4654,9 @@ impl Materializer {
 
     fn applied_index(&self) -> Result<LogIndex, String> {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::Sql(state) => state
                 .applied_index_value()
                 .map_err(|error| error.to_string()),
@@ -4259,6 +4669,9 @@ impl Materializer {
 
     fn applied_hash(&self) -> Result<LogHash, String> {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::Sql(state) => state
                 .applied_hash_value()
                 .map_err(|error| error.to_string()),
@@ -4271,6 +4684,9 @@ impl Materializer {
 
     fn configuration_state(&self) -> Result<Option<ConfigurationState>, String> {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::Sql(state) => state
                 .configuration_state_value()
                 .map(Some)
@@ -4284,6 +4700,9 @@ impl Materializer {
 
     fn apply_entry(&self, entry: &LogEntry) -> Result<Option<SqlCommandResult>, String> {
         match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
             Self::Sql(state) => state
                 .apply_entry_with_result(entry)
                 .map(|outcome| outcome.sql_result().cloned())
@@ -4317,11 +4736,13 @@ pub struct NodeRuntime {
     _data_root_lock: fs::File,
 }
 
+#[cfg(feature = "sql")]
 struct ExecutedPayload {
     response: WriteResponse,
     sql_result: Option<SqlCommandResult>,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedSnapshotPublication {
     anchor: RecoveryAnchor,
@@ -4405,6 +4826,7 @@ impl NodeRuntime {
         })
     }
 
+    #[cfg(feature = "sql")]
     pub fn write(
         &self,
         request_id: &str,
@@ -4428,6 +4850,48 @@ impl NodeRuntime {
         }
         let _commit = self.lock_commit()?;
         self.mutate_graph_payload_locked(&command, payload)
+    }
+
+    /// Executes an ordered, non-atomic batch of graph mutations.
+    ///
+    /// Valid commands may share one QuePaxa log entry. Per-command conflicts remain isolated in
+    /// the returned vector, whose order and length match `commands`. The whole vector is validated
+    /// before the first write attempt, so an outer `Err` guarantees that nothing was attempted.
+    #[cfg(feature = "graph")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "kv")),
+        allow(unreachable_patterns)
+    )]
+    pub fn mutate_graph_batch(
+        &self,
+        commands: Vec<GraphCommandV1>,
+    ) -> Result<Vec<Result<GraphMutationOutcome, NodeError>>, NodeError> {
+        self.require_execution_profile(ExecutionProfile::Graph)?;
+        validate_typed_batch_len(commands.len())?;
+        let mut members = Vec::with_capacity(commands.len());
+        for command in commands {
+            let payload = encode_replicated_graph_command(&command)
+                .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+            validate_command_size(&payload)?;
+            members.push(RuntimeBatchMember {
+                #[cfg(feature = "sql")]
+                request_id: command.request_id().to_owned(),
+                payload,
+                operation: QueuedOperation::Graph(command),
+            });
+        }
+        Ok(self
+            .execute_client_batch(members)
+            .into_iter()
+            .map(|result| {
+                result.and_then(|response| match response {
+                    ClientWriteResponse::Graph(outcome) => Ok(outcome),
+                    _ => Err(NodeError::Invariant(
+                        "graph batch returned a response for another profile".into(),
+                    )),
+                })
+            })
+            .collect())
     }
 
     #[cfg(feature = "graph")]
@@ -4527,6 +4991,48 @@ impl NodeRuntime {
         self.mutate_kv_payload_locked(&command, payload)
     }
 
+    /// Executes an ordered, non-atomic batch of KV mutations.
+    ///
+    /// Valid commands may share one QuePaxa log entry. Per-command conflicts remain isolated in
+    /// the returned vector, whose order and length match `commands`. The whole vector is validated
+    /// before the first write attempt, so an outer `Err` guarantees that nothing was attempted.
+    #[cfg(feature = "kv")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "graph")),
+        allow(unreachable_patterns)
+    )]
+    pub fn mutate_kv_batch(
+        &self,
+        commands: Vec<KvCommandV1>,
+    ) -> Result<Vec<Result<KvMutationOutcome, NodeError>>, NodeError> {
+        self.require_execution_profile(ExecutionProfile::Kv)?;
+        validate_typed_batch_len(commands.len())?;
+        let mut members = Vec::with_capacity(commands.len());
+        for command in commands {
+            let payload = encode_replicated_kv_command(&command)
+                .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+            validate_command_size(&payload)?;
+            members.push(RuntimeBatchMember {
+                #[cfg(feature = "sql")]
+                request_id: command.request_id().to_owned(),
+                payload,
+                operation: QueuedOperation::Kv(command),
+            });
+        }
+        Ok(self
+            .execute_client_batch(members)
+            .into_iter()
+            .map(|result| {
+                result.and_then(|response| match response {
+                    ClientWriteResponse::Kv(outcome) => Ok(outcome),
+                    _ => Err(NodeError::Invariant(
+                        "KV batch returned a response for another profile".into(),
+                    )),
+                })
+            })
+            .collect())
+    }
+
     #[cfg(feature = "kv")]
     fn mutate_kv_payload_locked(
         &self,
@@ -4582,6 +5088,52 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "kv")]
+    pub fn scan_kv_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, NodeError> {
+        match consistency {
+            ReadConsistency::Local => self.scan_kv_range_local(start, end, limit, cursor, None),
+            ReadConsistency::AppliedIndex(required) => {
+                self.scan_kv_range_local(start, end, limit, cursor, Some(required))
+            }
+            ReadConsistency::ReadBarrier => {
+                let _commit = self.lock_commit()?;
+                self.ensure_ready()?;
+                self.commit_read_barrier()?;
+                self.scan_kv_range_local(start, end, limit, cursor, None)
+            }
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    pub fn scan_kv_prefix(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, NodeError> {
+        match consistency {
+            ReadConsistency::Local => self.scan_kv_prefix_local(prefix, limit, cursor, None),
+            ReadConsistency::AppliedIndex(required) => {
+                self.scan_kv_prefix_local(prefix, limit, cursor, Some(required))
+            }
+            ReadConsistency::ReadBarrier => {
+                let _commit = self.lock_commit()?;
+                self.ensure_ready()?;
+                self.commit_read_barrier()?;
+                self.scan_kv_prefix_local(prefix, limit, cursor, None)
+            }
+        }
+    }
+
+    #[cfg(feature = "sql")]
     pub fn execute_sql(&self, command: SqlCommand) -> Result<WriteResponse, NodeError> {
         self.execute_sql_with_results(command)
             .map(|response| WriteResponse {
@@ -4590,6 +5142,49 @@ impl NodeRuntime {
             })
     }
 
+    /// Executes an ordered, non-atomic batch of SQL commands.
+    ///
+    /// Valid commands may share one QuePaxa log entry. Per-command conflicts remain isolated in
+    /// the returned vector, whose order and length match `commands`. The whole vector is validated
+    /// before the first write attempt, so an outer `Err` guarantees that nothing was attempted.
+    #[cfg(feature = "sql")]
+    pub fn execute_sql_batch(
+        &self,
+        commands: Vec<SqlCommand>,
+    ) -> Result<Vec<Result<SqlExecuteResponse, NodeError>>, NodeError> {
+        self.require_execution_profile(ExecutionProfile::Sqlite)?;
+        validate_typed_batch_len(commands.len())?;
+        let mut members = Vec::with_capacity(commands.len());
+        for command in commands {
+            validate_field(
+                "request_id",
+                &command.request_id,
+                MAX_REQUEST_ID_BYTES,
+                false,
+            )?;
+            let payload = encode_sql_command_with_index(&command)?;
+            validate_command_size(&payload)?;
+            members.push(RuntimeBatchMember {
+                request_id: command.request_id.clone(),
+                payload,
+                operation: QueuedOperation::Sql(command),
+            });
+        }
+        Ok(self
+            .execute_client_batch(members)
+            .into_iter()
+            .map(|result| {
+                result.and_then(|response| match response {
+                    ClientWriteResponse::Sql(response) => Ok(response),
+                    _ => Err(NodeError::Invariant(
+                        "SQL batch returned a response for another profile".into(),
+                    )),
+                })
+            })
+            .collect())
+    }
+
+    #[cfg(feature = "sql")]
     fn execute_sql_with_results(
         &self,
         command: SqlCommand,
@@ -4611,6 +5206,7 @@ impl NodeRuntime {
         Ok(sql_execute_response(outcome.response, outcome.sql_result))
     }
 
+    #[cfg(feature = "sql")]
     fn execute_client_batch(
         &self,
         members: Vec<RuntimeBatchMember>,
@@ -4660,7 +5256,7 @@ impl NodeRuntime {
                 .iter()
                 .map(|index| members[*index].payload.clone())
                 .collect::<Vec<_>>();
-            let proposal_payload = {
+            let prepared_prefix = {
                 let sqlite = match self.lock_sqlite() {
                     Ok(sqlite) => sqlite,
                     Err(error) => {
@@ -4670,17 +5266,30 @@ impl NodeRuntime {
                         break;
                     }
                 };
-                sqlite.prepare_write_batch(&original_payloads, last_index, last_hash)
+                sqlite.prepare_write_batch_prefix(
+                    &original_payloads,
+                    last_index,
+                    last_hash,
+                    MAX_COMMAND_BYTES,
+                )
             };
-            let proposal_payload = match proposal_payload {
-                Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
-                Ok(_) | Err(_) => {
+            let (proposal_count, proposal_payload) = match prepared_prefix {
+                Ok(Some((proposal_count, proposal_payload))) if proposal_count >= 2 => {
+                    (proposal_count, proposal_payload)
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_single_member_locked(&members[index]));
+                    continue;
+                }
+                Err(_) => {
                     for index in pending.drain(..) {
                         results[index] = Some(self.execute_single_member_locked(&members[index]));
                     }
                     break;
                 }
             };
+            let proposed_indices = pending[..proposal_count].to_vec();
             let slot = match last_index.checked_add(1) {
                 Some(slot) => slot,
                 None => {
@@ -4726,7 +5335,9 @@ impl NodeRuntime {
             }
             if entry.entry_type == EntryType::Command
                 && entry.payload == proposal_payload
-                && !remaining.is_empty()
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
             {
                 let error = self.latch(NodeError::Invariant(
                     "committed write batch did not record every request".into(),
@@ -4750,10 +5361,26 @@ impl NodeRuntime {
             .collect()
     }
 
+    #[cfg(not(feature = "sql"))]
+    fn execute_client_batch(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        self.execute_profile_client_batch(members)
+    }
+
     fn execute_profile_client_batch(
         &self,
         members: Vec<RuntimeBatchMember>,
     ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        #[cfg(feature = "graph")]
+        if self.config.execution_profile == ExecutionProfile::Graph {
+            return self.execute_graph_client_batch(members);
+        }
+        #[cfg(feature = "kv")]
+        if self.config.execution_profile == ExecutionProfile::Kv {
+            return self.execute_kv_client_batch(members);
+        }
         let _commit = match self.lock_commit() {
             Ok(commit) => commit,
             Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
@@ -4770,21 +5397,394 @@ impl NodeRuntime {
             .collect()
     }
 
+    #[cfg(feature = "graph")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "kv")),
+        allow(irrefutable_let_patterns, unreachable_patterns)
+    )]
+    fn execute_graph_client_batch(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
+        };
+        if let Err(error) = self
+            .ensure_ready()
+            .and_then(|_| self.ensure_writes_active())
+        {
+            return members.into_iter().map(|_| Err(error.clone())).collect();
+        }
+
+        let mut results = vec![None; members.len()];
+        let mut pending = Vec::new();
+        let mut canonical_by_request = HashMap::new();
+        let mut aliases = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            let QueuedOperation::Graph(command) = &member.operation else {
+                results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Graph,
+                    actual: ExecutionProfile::Sqlite,
+                }));
+                continue;
+            };
+            match self.check_graph_request(command.request_id(), &member.payload) {
+                Ok(Some(record)) => {
+                    results[index] = Some(Ok(ClientWriteResponse::Graph(
+                        GraphMutationOutcome::from_record(record),
+                    )));
+                }
+                Ok(None) => match classify_pending_request(
+                    &mut canonical_by_request,
+                    &members,
+                    index,
+                    command.request_id(),
+                ) {
+                    Ok(None) => pending.push(index),
+                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
+                    Err(error) => results[index] = Some(Err(error)),
+                },
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+
+        while !pending.is_empty() {
+            if pending.len() == 1 {
+                let index = pending[0];
+                results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                break;
+            }
+            let commands = pending
+                .iter()
+                .map(|index| match &members[*index].operation {
+                    QueuedOperation::Graph(command) => command.clone(),
+                    _ => unreachable!("graph pending members were validated above"),
+                })
+                .collect::<Vec<_>>();
+            let full_payload = match encode_replicated_graph_batch(&commands) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let error = NodeError::InvalidRequest(error.to_string());
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
+                (commands.len(), full_payload)
+            } else {
+                let mut prefix = None;
+                for count in (2..commands.len()).rev() {
+                    let payload = encode_replicated_graph_batch(&commands[..count])
+                        .expect("the validated graph batch prefix remains valid");
+                    if payload.len() <= MAX_COMMAND_BYTES {
+                        prefix = Some((count, payload));
+                        break;
+                    }
+                }
+                let Some(prefix) = prefix else {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                    continue;
+                };
+                prefix
+            };
+            let proposed_indices = pending[..proposal_count].to_vec();
+            let (last_index, last_hash) = match self.ensure_materialized_tip() {
+                Ok(tip) => tip,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let entry = match self.consensus.propose_at_cancellable(
+                slot,
+                last_hash,
+                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
+                &self.operation_cancelled,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let mut remaining = Vec::new();
+            for index in pending.drain(..) {
+                let member = &members[index];
+                let QueuedOperation::Graph(command) = &member.operation else {
+                    unreachable!("graph pending members were validated above");
+                };
+                match self.check_graph_request(command.request_id(), &member.payload) {
+                    Ok(Some(record)) => {
+                        results[index] = Some(Ok(ClientWriteResponse::Graph(
+                            GraphMutationOutcome::from_record(record),
+                        )));
+                    }
+                    Ok(None) => remaining.push(index),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+            if entry.entry_type == EntryType::Command
+                && entry.payload == proposal_payload
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
+            {
+                let error = self.latch(NodeError::Invariant(
+                    "committed graph batch did not record every request".into(),
+                ));
+                for index in remaining.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+            }
+            pending = remaining;
+        }
+
+        for (index, canonical) in aliases.into_iter().enumerate() {
+            if let Some(canonical) = canonical {
+                results[index] = results[canonical].clone();
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(self.latch(NodeError::Invariant(
+                        "graph writer batch omitted a request result".into(),
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "kv")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "graph")),
+        allow(irrefutable_let_patterns, unreachable_patterns)
+    )]
+    fn execute_kv_client_batch(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
+        };
+        if let Err(error) = self
+            .ensure_ready()
+            .and_then(|_| self.ensure_writes_active())
+        {
+            return members.into_iter().map(|_| Err(error.clone())).collect();
+        }
+
+        let mut results = vec![None; members.len()];
+        let mut pending = Vec::new();
+        let mut canonical_by_request = HashMap::new();
+        let mut aliases = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            let QueuedOperation::Kv(command) = &member.operation else {
+                results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Kv,
+                    actual: ExecutionProfile::Sqlite,
+                }));
+                continue;
+            };
+            match self.check_kv_request(command.request_id(), &member.payload) {
+                Ok(Some(record)) => {
+                    results[index] = Some(Ok(ClientWriteResponse::Kv(
+                        KvMutationOutcome::from_record(record),
+                    )));
+                }
+                Ok(None) => match classify_pending_request(
+                    &mut canonical_by_request,
+                    &members,
+                    index,
+                    command.request_id(),
+                ) {
+                    Ok(None) => pending.push(index),
+                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
+                    Err(error) => results[index] = Some(Err(error)),
+                },
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+
+        while !pending.is_empty() {
+            if pending.len() == 1 {
+                let index = pending[0];
+                results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                break;
+            }
+            let commands = pending
+                .iter()
+                .map(|index| match &members[*index].operation {
+                    QueuedOperation::Kv(command) => command.clone(),
+                    _ => unreachable!("KV pending members were validated above"),
+                })
+                .collect::<Vec<_>>();
+            let full_payload = match encode_replicated_kv_batch(&commands) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let error = NodeError::InvalidRequest(error.to_string());
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
+                (commands.len(), full_payload)
+            } else {
+                let mut prefix = None;
+                for count in (2..commands.len()).rev() {
+                    let payload = encode_replicated_kv_batch(&commands[..count])
+                        .expect("the validated KV batch prefix remains valid");
+                    if payload.len() <= MAX_COMMAND_BYTES {
+                        prefix = Some((count, payload));
+                        break;
+                    }
+                }
+                let Some(prefix) = prefix else {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                    continue;
+                };
+                prefix
+            };
+            let proposed_indices = pending[..proposal_count].to_vec();
+            let (last_index, last_hash) = match self.ensure_materialized_tip() {
+                Ok(tip) => tip,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let entry = match self.consensus.propose_at_cancellable(
+                slot,
+                last_hash,
+                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
+                &self.operation_cancelled,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let mut remaining = Vec::new();
+            for index in pending.drain(..) {
+                let member = &members[index];
+                let QueuedOperation::Kv(command) = &member.operation else {
+                    unreachable!("KV pending members were validated above");
+                };
+                match self.check_kv_request(command.request_id(), &member.payload) {
+                    Ok(Some(record)) => {
+                        results[index] = Some(Ok(ClientWriteResponse::Kv(
+                            KvMutationOutcome::from_record(record),
+                        )));
+                    }
+                    Ok(None) => remaining.push(index),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+            if entry.entry_type == EntryType::Command
+                && entry.payload == proposal_payload
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
+            {
+                let error = self.latch(NodeError::Invariant(
+                    "committed KV batch did not record every request".into(),
+                ));
+                for index in remaining.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+            }
+            pending = remaining;
+        }
+
+        for (index, canonical) in aliases.into_iter().enumerate() {
+            if let Some(canonical) = canonical {
+                results[index] = results[canonical].clone();
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(self.latch(NodeError::Invariant(
+                        "KV writer batch omitted a request result".into(),
+                    )))
+                })
+            })
+            .collect()
+    }
+
     fn execute_profile_member_locked(
         &self,
         member: &RuntimeBatchMember,
     ) -> Result<ClientWriteResponse, NodeError> {
         match &member.operation {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            QueuedOperation::Unavailable => unreachable!("no execution profiles are compiled in"),
             #[cfg(feature = "graph")]
             QueuedOperation::Graph(command) => self
                 .mutate_graph_payload_locked(command, member.payload.clone())
-                .map(graph_mutation_response)
                 .map(ClientWriteResponse::Graph),
             #[cfg(feature = "kv")]
             QueuedOperation::Kv(command) => self
                 .mutate_kv_payload_locked(command, member.payload.clone())
-                .map(kv_mutation_response)
                 .map(ClientWriteResponse::Kv),
+            #[cfg(feature = "sql")]
             QueuedOperation::KeyValue | QueuedOperation::Sql(_) => {
                 Err(NodeError::ExecutionProfileMismatch {
                     expected: self.config.execution_profile,
@@ -4794,6 +5794,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn execute_single_member_locked(
         &self,
         member: &RuntimeBatchMember,
@@ -4817,6 +5818,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn member_response(
         &self,
         member: &RuntimeBatchMember,
@@ -4833,6 +5835,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn execute_sql_payload_locked(
         &self,
         command: &SqlCommand,
@@ -4886,6 +5889,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn prepare_sql_proposal(
         &self,
         command: &SqlCommand,
@@ -4923,6 +5927,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn execute_payload_locked(
         &self,
         request_id: &str,
@@ -4974,6 +5979,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn replay_sql_result(
         &self,
         request_id: &str,
@@ -4997,6 +6003,7 @@ impl NodeRuntime {
         Ok(stored.1)
     }
 
+    #[cfg(feature = "sql")]
     pub fn read(&self, key: &str, consistency: ReadConsistency) -> Result<ReadResponse, NodeError> {
         validate_key(key)?;
         match consistency {
@@ -5011,6 +6018,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     pub fn query_sql(
         &self,
         statement: &SqlStatement,
@@ -5386,6 +6394,7 @@ impl NodeRuntime {
         fetch_runtime_log(self, request)
     }
 
+    #[cfg(feature = "sql")]
     pub fn create_recovery_snapshot(&self) -> Result<RecoverySnapshot, NodeError> {
         let _commit = self.lock_commit()?;
         self.ensure_ready()?;
@@ -5402,6 +6411,7 @@ impl NodeRuntime {
         coordinator.checkpoint_compact(self).await
     }
 
+    #[cfg(feature = "sql")]
     pub fn verify_snapshot_publication(
         &self,
         snapshot: &RecoverySnapshot,
@@ -5436,6 +6446,7 @@ impl NodeRuntime {
         })
     }
 
+    #[cfg(feature = "sql")]
     pub fn compact_log(&self, publication: &VerifiedSnapshotPublication) -> Result<(), NodeError> {
         let _commit = self.lock_commit()?;
         self.ensure_ready()?;
@@ -5475,6 +6486,7 @@ impl NodeRuntime {
             .and_then(|reason| reason.clone())
     }
 
+    #[cfg(feature = "sql")]
     fn read_local(
         &self,
         key: &str,
@@ -5482,8 +6494,8 @@ impl NodeRuntime {
     ) -> Result<ReadResponse, NodeError> {
         self.ensure_ready()?;
         let sqlite = self.lock_sqlite()?;
-        let applied_index = sqlite
-            .applied_index_value()
+        let (applied_index, hash) = sqlite
+            .applied_tip_value()
             .map_err(|error| self.map_sqlite_error(error))?;
         if required_index.is_some_and(|required| applied_index < required) {
             return Err(NodeError::Unavailable(format!(
@@ -5491,9 +6503,6 @@ impl NodeRuntime {
                 required_index.expect("checked above")
             )));
         }
-        let hash = sqlite
-            .applied_hash_value()
-            .map_err(|error| self.map_sqlite_error(error))?;
         let value = sqlite
             .get_value(key)
             .map_err(|error| self.map_sqlite_error(error))?;
@@ -5564,35 +6573,61 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<KvReadResponse, NodeError> {
         self.ensure_ready()?;
-        let materializer = self.lock_materializer()?;
-        let Materializer::Kv(kv) = &*materializer else {
-            return Err(NodeError::ExecutionProfileMismatch {
-                expected: ExecutionProfile::Kv,
-                actual: materializer.profile(),
-            });
-        };
-        let applied_index = kv
-            .applied_index()
-            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .get_with_tip(key)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        let (value, tip) = result.into_parts();
+        let applied_index = tip.applied_index();
         if required_index.is_some_and(|required| applied_index < required) {
             return Err(NodeError::Unavailable(format!(
                 "local applied index {applied_index} has not reached {}",
                 required_index.expect("checked above")
             )));
         }
-        let hash = kv
-            .applied_hash()
-            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
-        let value = kv
-            .get(key)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
         Ok(KvReadResponse {
             value,
             applied_index,
-            hash,
+            hash: tip.applied_hash(),
         })
     }
 
+    #[cfg(feature = "kv")]
+    fn scan_kv_range_local(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+        required_index: Option<LogIndex>,
+    ) -> Result<KvScanResult, NodeError> {
+        self.ensure_ready()?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .scan_range(start, end, limit, cursor)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        validate_kv_scan_required_index(&result, required_index)?;
+        Ok(result)
+    }
+
+    #[cfg(feature = "kv")]
+    fn scan_kv_prefix_local(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+        required_index: Option<LogIndex>,
+    ) -> Result<KvScanResult, NodeError> {
+        self.ensure_ready()?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .scan_prefix(prefix, limit, cursor)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        validate_kv_scan_required_index(&result, required_index)?;
+        Ok(result)
+    }
+
+    #[cfg(feature = "sql")]
     fn query_sql_local(
         &self,
         statement: &SqlStatement,
@@ -5601,8 +6636,8 @@ impl NodeRuntime {
     ) -> Result<SqlQueryResponse, NodeError> {
         self.ensure_ready()?;
         let sqlite = self.lock_sqlite()?;
-        let applied_index = sqlite
-            .applied_index_value()
+        let (applied_index, hash) = sqlite
+            .applied_tip_value()
             .map_err(|error| self.map_sqlite_error(error))?;
         if required_index.is_some_and(|required| applied_index < required) {
             return Err(NodeError::Unavailable(format!(
@@ -5610,34 +6645,27 @@ impl NodeRuntime {
                 required_index.expect("checked above")
             )));
         }
-        let hash = sqlite
-            .applied_hash_value()
-            .map_err(|error| self.map_sqlite_error(error))?;
         let SqlQueryResult { columns, rows } = sqlite
             .query_sql(
                 statement,
                 usize::try_from(max_rows).expect("u32 fits usize"),
                 MAX_SQL_RESULT_BYTES,
             )
-            .map_err(|error| NodeError::InvalidSqlStatement {
-                statement_index: 0,
-                message: error.to_string(),
+            .map_err(|error| match error {
+                rhiza_sql::Error::ResourceExhausted(message) => {
+                    NodeError::ResourceExhausted(message)
+                }
+                other => NodeError::InvalidSqlStatement {
+                    statement_index: 0,
+                    message: other.to_string(),
+                },
             })?;
-        let response = SqlQueryResponse {
+        Ok(SqlQueryResponse {
             columns,
             rows,
             applied_index,
             hash,
-        };
-        let encoded_size = serde_json::to_vec(&response)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?
-            .len();
-        if encoded_size > MAX_SQL_RESPONSE_BYTES {
-            return Err(NodeError::InvalidRequest(format!(
-                "SQL response exceeds {MAX_SQL_RESPONSE_BYTES} bytes"
-            )));
-        }
-        Ok(response)
+        })
     }
 
     fn commit_read_barrier(&self) -> Result<(), NodeError> {
@@ -5682,6 +6710,7 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "sql")]
     fn check_request(
         &self,
         request_id: &str,
@@ -5694,6 +6723,10 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "graph")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "kv")),
+        allow(irrefutable_let_patterns)
+    )]
     fn check_graph_request(
         &self,
         request_id: &str,
@@ -5712,6 +6745,10 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "kv")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "graph")),
+        allow(irrefutable_let_patterns)
+    )]
     fn check_kv_request(
         &self,
         request_id: &str,
@@ -5775,6 +6812,17 @@ impl NodeRuntime {
             .map_err(|error| self.latch(NodeError::Invariant(error)))
     }
 
+    fn require_execution_profile(&self, expected: ExecutionProfile) -> Result<(), NodeError> {
+        if self.config.execution_profile == expected {
+            Ok(())
+        } else {
+            Err(NodeError::ExecutionProfileMismatch {
+                expected,
+                actual: self.config.execution_profile,
+            })
+        }
+    }
+
     fn ensure_ready(&self) -> Result<(), NodeError> {
         if self.fatal.load(Ordering::Acquire) {
             return Err(NodeError::Fatal(
@@ -5819,6 +6867,10 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "graph")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "kv")),
+        allow(irrefutable_let_patterns)
+    )]
     fn graph_materializer(&self) -> Result<Arc<LadybugStateMachine>, NodeError> {
         let materializer = self.lock_materializer()?;
         let Materializer::Graph(graph) = &*materializer else {
@@ -5830,6 +6882,23 @@ impl NodeRuntime {
         Ok(Arc::clone(graph))
     }
 
+    #[cfg(feature = "kv")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "graph")),
+        allow(irrefutable_let_patterns)
+    )]
+    fn kv_materializer(&self) -> Result<Arc<RedbStateMachine>, NodeError> {
+        let materializer = self.lock_materializer()?;
+        let Materializer::Kv(kv) = &*materializer else {
+            return Err(NodeError::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Kv,
+                actual: materializer.profile(),
+            });
+        };
+        Ok(Arc::clone(kv))
+    }
+
+    #[cfg(feature = "sql")]
     fn lock_sqlite(&self) -> Result<SqlMaterializerGuard<'_>, NodeError> {
         let guard = self.lock_materializer()?;
         if !matches!(&*guard, Materializer::Sql(_)) {
@@ -5841,9 +6910,11 @@ impl NodeRuntime {
         Ok(SqlMaterializerGuard(guard))
     }
 
+    #[cfg(feature = "sql")]
     fn map_sqlite_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
             rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
+            rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message)
             | rhiza_sql::Error::IdentityMismatch(message)
             | rhiza_sql::Error::InvalidEntry(message)
@@ -5858,6 +6929,7 @@ impl NodeRuntime {
     fn map_graph_read_error(&self, error: rhiza_graph::Error) -> NodeError {
         match error {
             rhiza_graph::Error::InvalidCommand(_) => NodeError::InvalidRequest(error.to_string()),
+            rhiza_graph::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_graph::Error::Ladybug(_) | rhiza_graph::Error::Io(_) => {
                 self.latch(NodeError::Storage(error.to_string()))
             }
@@ -5867,6 +6939,26 @@ impl NodeRuntime {
             | rhiza_graph::Error::IdentityMismatch(_)
             | rhiza_graph::Error::RequestConflict { .. }
             | rhiza_graph::Error::InvalidSnapshot(_) => {
+                self.latch(NodeError::Invariant(error.to_string()))
+            }
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    fn map_kv_read_error(&self, error: rhiza_kv::Error) -> NodeError {
+        match error {
+            rhiza_kv::Error::InvalidCommand(_) | rhiza_kv::Error::InvalidQuery(_) => {
+                NodeError::InvalidRequest(error.to_string())
+            }
+            rhiza_kv::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
+            rhiza_kv::Error::Database(_) | rhiza_kv::Error::Io(_) => {
+                self.latch(NodeError::Storage(error.to_string()))
+            }
+            rhiza_kv::Error::Codec(_)
+            | rhiza_kv::Error::InvalidEntry(_)
+            | rhiza_kv::Error::PartialInitialization
+            | rhiza_kv::Error::RequestConflict { .. }
+            | rhiza_kv::Error::InvalidSnapshot(_) => {
                 self.latch(NodeError::Invariant(error.to_string()))
             }
         }
@@ -5980,19 +7072,26 @@ pub fn rehydrate_recorder_after_checkpoint(
 mod tests {
     use axum::http::HeaderValue;
 
-    #[cfg(feature = "graph")]
     use rhiza_core::{ExecutionProfile, LogHash};
     #[cfg(feature = "graph")]
+    use rhiza_graph::{GraphCommandV1, GraphValueV1};
+    #[cfg(feature = "kv")]
+    use rhiza_kv::KvCommandV1;
+    use rhiza_log::LogStore as _;
     use rhiza_quepaxa::ThreeNodeConsensus;
-    #[cfg(feature = "graph")]
     use std::sync::Arc;
 
-    use super::{
-        client_authenticated, next_sync_flush_retry, Duration, HeaderMap, PROTOCOL_VERSION,
-        SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
-    };
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    use super::node_error_response;
     #[cfg(feature = "graph")]
-    use super::{node_error_response, with_graph_client_permit, NodeConfig, NodeRuntime};
+    use super::with_graph_client_permit;
+    use super::{
+        client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
+        Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand, SqlQueryResponse,
+        SqlStatement, SqlValue, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
+        VERSION_HEADER,
+    };
+    use super::{NodeConfig, NodeRuntime, NodeService};
 
     #[test]
     fn client_authentication_rejects_empty_expected_token() {
@@ -6015,6 +7114,260 @@ mod tests {
         assert_eq!(
             delays,
             [50, 100, 200, 400, 800, 1_000, 1_000].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn blocking_operation_offloads_on_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let caller = std::thread::current().id();
+            let worker = run_read_operation(ReadConsistency::Local, || std::thread::current().id())
+                .await
+                .unwrap();
+
+            assert_ne!(worker, caller);
+        });
+    }
+
+    #[test]
+    fn blocking_operation_runs_inline_on_multi_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let caller = std::thread::current().id();
+            let worker = run_read_operation(ReadConsistency::AppliedIndex(1), || {
+                std::thread::current().id()
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(worker, caller);
+        });
+    }
+
+    #[test]
+    fn read_barrier_offloads_on_multi_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let caller = std::thread::current().id();
+            let worker =
+                run_read_operation(ReadConsistency::ReadBarrier, || std::thread::current().id())
+                    .await
+                    .unwrap();
+
+            assert_ne!(worker, caller);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_service_adaptive_sql_read_returns_point_and_query_results() {
+        let (_dir, runtime) = sql_test_runtime();
+        let service = NodeService::new(Arc::new(runtime), None);
+
+        let point = service
+            .read("missing", ReadConsistency::Local)
+            .await
+            .unwrap();
+        let query = service
+            .query(
+                SqlStatement {
+                    sql: "SELECT ?1 AS value".into(),
+                    parameters: vec![SqlValue::Integer(7)],
+                },
+                ReadConsistency::AppliedIndex(0),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(point.value, None);
+        assert_eq!(query.columns, vec!["value"]);
+        assert_eq!(query.rows, vec![vec![SqlValue::Integer(7)]]);
+    }
+
+    #[test]
+    fn node_service_adaptive_sql_read_stays_inline_and_recovers_direct_panic() {
+        let (_dir, runtime) = sql_test_runtime();
+        let service = NodeService::new(Arc::new(runtime), None);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let caller = std::thread::current().id();
+            let worker = service
+                .run_sql_read_operation(ReadConsistency::Local, || std::thread::current().id())
+                .await
+                .unwrap();
+
+            assert_eq!(worker, caller);
+            assert_eq!(
+                service
+                    .sql_reads_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(
+                service.run_sql_read_operation(ReadConsistency::AppliedIndex(0), || -> () {
+                    panic!("inline SQL read panic")
+                }),
+            )
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_service_adaptive_sql_read_offloads_overlap_and_recovers_join_error() {
+        let (_dir, runtime) = sql_test_runtime();
+        let service = NodeService::new(Arc::new(runtime), None);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .run_sql_read_operation(ReadConsistency::Local, move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        let caller = std::thread::current().id();
+        let worker = service
+            .run_sql_read_operation(ReadConsistency::AppliedIndex(0), || {
+                std::thread::current().id()
+            })
+            .await
+            .unwrap();
+        assert_ne!(worker, caller);
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        let error = service
+            .run_sql_read_operation(ReadConsistency::Local, || -> () {
+                panic!("contended SQL read panic")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.is_panic());
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap();
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn node_service_adaptive_sql_read_offloads_on_current_thread() {
+        let (_dir, node) = sql_test_runtime();
+        let service = NodeService::new(Arc::new(node), None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let caller = std::thread::current().id();
+            let worker = service
+                .run_sql_read_operation(ReadConsistency::Local, || std::thread::current().id())
+                .await
+                .unwrap();
+
+            assert_ne!(worker, caller);
+            assert_eq!(
+                service
+                    .sql_reads_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_service_read_barrier_offloads_without_counting_fast_reads() {
+        let (_dir, runtime) = sql_test_runtime();
+        let service = NodeService::new(Arc::new(runtime), None);
+        let caller = std::thread::current().id();
+        let worker = service
+            .run_sql_read_operation(ReadConsistency::ReadBarrier, || std::thread::current().id())
+            .await
+            .unwrap();
+
+        assert_ne!(worker, caller);
+        assert_eq!(
+            service
+                .sql_reads_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn embedded_sql_query_keeps_raw_budget_without_http_json_budget() {
+        let (_dir, runtime) = sql_test_runtime();
+        let response = runtime
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT replace(hex(zeroblob(700000)), '00', char(1)) AS value".into(),
+                    parameters: Vec::new(),
+                },
+                ReadConsistency::Local,
+                1,
+            )
+            .unwrap();
+
+        assert!(serde_json::to_vec(&response).unwrap().len() > MAX_SQL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn sql_http_response_rejects_encoded_body_over_limit() {
+        let response = SqlQueryResponse {
+            columns: vec!["value".into()],
+            rows: vec![vec![SqlValue::Text("\u{1}".repeat(700_000))]],
+            applied_index: 0,
+            hash: LogHash::ZERO,
+        };
+
+        assert_eq!(
+            sql_query_http_response(response).status(),
+            axum::http::StatusCode::BAD_REQUEST
         );
     }
 
@@ -6048,6 +7401,241 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
+    fn graph_resource_exhaustion_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = graph_test_runtime();
+
+        let error = runtime.map_graph_read_error(rhiza_graph::Error::ResourceExhausted(
+            "buffer pool is full".into(),
+        ));
+        let response = node_error_response(error);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_resource_exhaustion_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = kv_test_runtime();
+
+        let error = runtime.map_kv_read_error(rhiza_kv::Error::ResourceExhausted(
+            "scan result is too large".into(),
+        ));
+        let response = node_error_response(error);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_batch_coalesces_exact_retry_and_isolates_conflicting_duplicate() {
+        let (_dir, runtime) = graph_test_runtime();
+        let canonical =
+            GraphCommandV1::put_document("same", "document", GraphValueV1::String("first".into()))
+                .unwrap();
+        let conflict = GraphCommandV1::put_document(
+            "same",
+            "document",
+            GraphValueV1::String("conflict".into()),
+        )
+        .unwrap();
+        let unrelated =
+            GraphCommandV1::put_document("other", "other", GraphValueV1::U64(2)).unwrap();
+        let results = runtime
+            .mutate_graph_batch(vec![canonical.clone(), canonical, conflict, unrelated])
+            .unwrap();
+
+        let canonical = results[0].as_ref().unwrap().applied_index();
+        assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
+        assert!(matches!(
+            results[2],
+            Err(super::NodeError::InvalidRequest(_))
+        ));
+        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_batch_coalesces_exact_retry_and_isolates_conflicting_duplicate() {
+        let (_dir, runtime) = kv_test_runtime();
+        let canonical = KvCommandV1::put("same", b"key".to_vec(), b"first".to_vec()).unwrap();
+        let conflict = KvCommandV1::put("same", b"key".to_vec(), b"conflict".to_vec()).unwrap();
+        let unrelated = KvCommandV1::put("other", b"other".to_vec(), b"second".to_vec()).unwrap();
+        let results = runtime
+            .mutate_kv_batch(vec![canonical.clone(), canonical, conflict, unrelated])
+            .unwrap();
+
+        let canonical = results[0].as_ref().unwrap().applied_index();
+        assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
+        assert!(matches!(
+            results[2],
+            Err(super::NodeError::InvalidRequest(_))
+        ));
+        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+    }
+
+    #[test]
+    fn sql_batch_preflight_rejects_entire_vector_without_growing_log() {
+        let (_dir, runtime) = sql_test_runtime();
+        let valid = SqlCommand {
+            request_id: "valid".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE batch_items(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        let invalid = SqlCommand {
+            request_id: String::new(),
+            statements: valid.statements.clone(),
+        };
+
+        let error = runtime.execute_sql_batch(vec![valid, invalid]).unwrap_err();
+
+        assert!(matches!(error, NodeError::InvalidRequest(_)));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[test]
+    fn sql_batch_preserves_order_coalesces_and_retries_exactly() {
+        let (_dir, runtime) = sql_test_runtime();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE batch_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                        .into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let commands = (1..=3)
+            .map(|id| SqlCommand {
+                request_id: format!("insert-{id}"),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO batch_items(id, value) VALUES (?1, ?2)".into(),
+                    parameters: vec![SqlValue::Integer(id), SqlValue::Text(format!("value-{id}"))],
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let first = runtime.execute_sql_batch(commands.clone()).unwrap();
+        let first_indices = first
+            .iter()
+            .map(|result| result.as_ref().unwrap().applied_index)
+            .collect::<Vec<_>>();
+        let log_index = runtime.log_store().last_index().unwrap();
+        let replay = runtime.execute_sql_batch(commands).unwrap();
+
+        assert_eq!(first_indices, vec![2, 2, 2]);
+        assert_eq!(
+            replay
+                .iter()
+                .map(|result| result.as_ref().unwrap().applied_index)
+                .collect::<Vec<_>>(),
+            first_indices
+        );
+        assert_eq!(runtime.log_store().last_index().unwrap(), log_index);
+    }
+
+    #[test]
+    fn sql_batch_isolates_request_conflict_from_unrelated_member() {
+        let (_dir, runtime) = sql_test_runtime();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE batch_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                        .into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let insert = |request_id: &str, id: i64| SqlCommand {
+            request_id: request_id.into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO batch_items(id, value) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlValue::Integer(id), SqlValue::Text(format!("value-{id}"))],
+            }],
+        };
+
+        let results = runtime
+            .execute_sql_batch(vec![
+                insert("same", 1),
+                insert("same", 2),
+                insert("other", 3),
+            ])
+            .unwrap();
+
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(NodeError::RequestConflict(_))));
+        assert!(results[2].is_ok());
+        assert!(runtime.is_ready());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn typed_batch_wrong_profile_is_rejected_before_log_attempt() {
+        let (_dir, runtime) = graph_test_runtime();
+        let command = SqlCommand {
+            request_id: "wrong-profile".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE should_not_exist(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+
+        let error = runtime.execute_sql_batch(vec![command]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeError::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual: ExecutionProfile::Graph
+            }
+        ));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_query_timeout_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = graph_test_runtime();
+        let graph = runtime.graph_materializer().unwrap();
+        let graph_error = graph
+            .query_read_only(
+                "UNWIND range(1, 10000) AS x UNWIND range(1, 10000) AS y RETURN sum(x * y) AS total LIMIT 1",
+                &std::collections::BTreeMap::new(),
+                1,
+                1024 * 1024,
+                1,
+            )
+            .unwrap_err();
+
+        let response = node_error_response(runtime.map_graph_read_error(graph_error));
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
     fn graph_internal_error_returns_500_and_latches_readiness() {
         let (_dir, runtime) = graph_test_runtime();
 
@@ -6061,6 +7649,40 @@ mod tests {
         );
         assert!(!runtime.is_ready());
         assert!(runtime.is_fatal());
+    }
+
+    fn sql_test_runtime() -> (tempfile::TempDir, NodeRuntime) {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster_id = "node-unit-test";
+        let config = NodeConfig::new_embedded(
+            cluster_id,
+            "n1",
+            dir.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Sqlite)
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:sql:node-unit-test",
+                "n1",
+                1,
+                1,
+                [
+                    dir.path().join("recorders/n1"),
+                    dir.path().join("recorders/n2"),
+                    dir.path().join("recorders/n3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        (dir, runtime)
     }
 
     #[cfg(feature = "graph")]
@@ -6097,8 +7719,64 @@ mod tests {
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
         (dir, runtime)
     }
+
+    #[cfg(feature = "kv")]
+    fn kv_test_runtime() -> (tempfile::TempDir, NodeRuntime) {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster_id = "node-unit-test";
+        let config = NodeConfig::new_embedded(
+            cluster_id,
+            "n1",
+            dir.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Kv)
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:kv:node-unit-test",
+                "n1",
+                1,
+                1,
+                [
+                    dir.path().join("recorders/n1"),
+                    dir.path().join("recorders/n2"),
+                    dir.path().join("recorders/n3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        (dir, runtime)
+    }
 }
 
+fn validate_typed_batch_len(len: usize) -> Result<(), NodeError> {
+    if (1..=MAX_WRITE_BATCH_MEMBERS).contains(&len) {
+        Ok(())
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "write batch must contain 1..={MAX_WRITE_BATCH_MEMBERS} commands"
+        )))
+    }
+}
+
+fn validate_command_size(payload: &[u8]) -> Result<(), NodeError> {
+    if payload.len() <= MAX_COMMAND_BYTES {
+        Ok(())
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "command exceeds {MAX_COMMAND_BYTES} bytes"
+        )))
+    }
+}
+
+#[cfg(feature = "sql")]
 fn canonical_put(request_id: &str, key: &str, value: &str) -> Result<Vec<u8>, NodeError> {
     validate_field("request_id", request_id, MAX_REQUEST_ID_BYTES, false)?;
     validate_key(key)?;
@@ -6112,6 +7790,7 @@ fn canonical_put(request_id: &str, key: &str, value: &str) -> Result<Vec<u8>, No
     Ok(payload)
 }
 
+#[cfg(feature = "sql")]
 fn encode_sql_command_with_index(command: &SqlCommand) -> Result<Vec<u8>, NodeError> {
     encode_sql_command(command).map_err(|error| {
         let message = error.to_string();
@@ -6125,6 +7804,7 @@ fn encode_sql_command_with_index(command: &SqlCommand) -> Result<Vec<u8>, NodeEr
     })
 }
 
+#[cfg(feature = "sql")]
 fn first_invalid_sql_statement(
     command: &SqlCommand,
     mut invalid: impl FnMut(&SqlCommand) -> bool,
@@ -6141,10 +7821,12 @@ fn first_invalid_sql_statement(
     })
 }
 
+#[cfg(feature = "sql")]
 fn validate_key(key: &str) -> Result<(), NodeError> {
     validate_field("key", key, MAX_KEY_BYTES, false)
 }
 
+#[cfg(feature = "sql")]
 fn validate_field(
     name: &str,
     value: &str,
@@ -6169,6 +7851,7 @@ fn validate_field(
     Ok(())
 }
 
+#[cfg(feature = "sql")]
 fn write_response(outcome: RequestOutcome) -> WriteResponse {
     WriteResponse {
         applied_index: outcome.original_log_index(),
@@ -6509,6 +8192,7 @@ fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
     }
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct E2eConfig {
     pub data_dir: PathBuf,
@@ -6517,6 +8201,7 @@ pub struct E2eConfig {
     pub node_id: String,
 }
 
+#[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct E2eReport {
     pub applied_index: LogIndex,
@@ -6524,6 +8209,7 @@ pub struct E2eReport {
     pub object_keys: Vec<String>,
 }
 
+#[cfg(feature = "sql")]
 pub async fn run_e2e(config: E2eConfig) -> Result<E2eReport, Box<dyn std::error::Error>> {
     let sqlite_dir = config.data_dir.join("sqlite");
     let log_dir = config.data_dir.join("consensus").join("log");
@@ -6642,6 +8328,7 @@ pub async fn run_e2e(config: E2eConfig) -> Result<E2eReport, Box<dyn std::error:
     })
 }
 
+#[cfg(feature = "sql")]
 fn ensure_fresh_e2e_data_dir(
     data_dir: &std::path::Path,
     sqlite_dir: &std::path::Path,
@@ -6657,6 +8344,7 @@ fn ensure_fresh_e2e_data_dir(
     Ok(())
 }
 
+#[cfg(feature = "sql")]
 fn directory_has_entries(path: &std::path::Path) -> Result<bool, std::io::Error> {
     match fs::read_dir(path) {
         Ok(mut entries) => entries.next().transpose().map(|entry| entry.is_some()),

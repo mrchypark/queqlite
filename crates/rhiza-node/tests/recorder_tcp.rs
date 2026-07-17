@@ -2,7 +2,10 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
-use rhiza_node::{serve_recorder_tcp, PeerConfig, TcpPostcardRecorderClient};
+use rhiza_node::{
+    serve_recorder_tcp, serve_recorder_tcp_tls, PeerConfig, RecorderTlsClientConfig,
+    RecorderTlsServerConfig, TcpPostcardRecorderClient,
+};
 use rhiza_quepaxa::{
     CertifiedDecisionInspection, Error, Membership, RecorderFileStore, RecorderRpc,
     ThreeNodeConsensus,
@@ -19,6 +22,155 @@ fn peers() -> Vec<PeerConfig> {
             .unwrap()
         })
         .collect()
+}
+
+fn tls_material(name: &str) -> (String, String) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+    (cert.pem(), signing_key.serialize_pem())
+}
+
+async fn tls_server(
+    recorder: RecorderFileStore,
+    cert_pem: &str,
+    key_pem: &str,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config =
+        RecorderTlsServerConfig::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
+    let server = tokio::spawn(serve_recorder_tcp_tls(
+        listener,
+        recorder,
+        peers(),
+        7,
+        config,
+        std::future::pending(),
+    ));
+    (address, server)
+}
+
+fn recorder(root: &std::path::Path) -> RecorderFileStore {
+    RecorderFileStore::new_with_id(root.join("recorder"), "node-1", "rhiza:sql:cluster-a", 1, 1)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recorder_tls_round_trips_with_a_matching_ca_and_server_name() {
+    let root = tempfile::tempdir().unwrap();
+    let (cert_pem, key_pem) = tls_material("recorder.test");
+    let (address, server) = tls_server(recorder(root.path()), &cert_pem, &key_pem).await;
+    let tls = RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "recorder.test").unwrap();
+    let client =
+        TcpPostcardRecorderClient::new_tls(address, "node-1", "node-2", "peer-token-2", 7, tls)
+            .unwrap();
+
+    let identity = tokio::task::spawn_blocking(move || client.recorder_id())
+        .await
+        .unwrap();
+    assert_eq!(identity.unwrap(), "node-1");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recorder_tls_rejects_an_untrusted_ca_and_wrong_server_name() {
+    let root = tempfile::tempdir().unwrap();
+    let (cert_pem, key_pem) = tls_material("recorder.test");
+    let (other_ca, _) = tls_material("other.test");
+    let (address, server) = tls_server(recorder(root.path()), &cert_pem, &key_pem).await;
+
+    for tls in [
+        RecorderTlsClientConfig::from_ca_pem(other_ca.as_bytes(), "recorder.test").unwrap(),
+        RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "wrong.test").unwrap(),
+    ] {
+        let client =
+            TcpPostcardRecorderClient::new_tls(address, "node-1", "node-2", "peer-token-2", 7, tls)
+                .unwrap();
+        assert!(tokio::task::spawn_blocking(move || client.recorder_id())
+            .await
+            .unwrap()
+            .is_err());
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recorder_tls_and_plaintext_never_fall_back_to_each_other() {
+    let root = tempfile::tempdir().unwrap();
+    let (cert_pem, key_pem) = tls_material("recorder.test");
+    let (tls_address, tls_server) =
+        tls_server(recorder(&root.path().join("tls")), &cert_pem, &key_pem).await;
+    let plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain_address = plain_listener.local_addr().unwrap();
+    let plain_server = tokio::spawn(serve_recorder_tcp(
+        plain_listener,
+        recorder(&root.path().join("plain")),
+        peers(),
+        7,
+        std::future::pending(),
+    ));
+    let tls = RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "recorder.test").unwrap();
+    let tls_to_plain = TcpPostcardRecorderClient::new_tls(
+        plain_address,
+        "node-1",
+        "node-2",
+        "peer-token-2",
+        7,
+        tls,
+    )
+    .unwrap();
+    let plain_to_tls =
+        TcpPostcardRecorderClient::new(tls_address, "node-1", "node-2", "peer-token-2", 7).unwrap();
+
+    assert!(
+        tokio::task::spawn_blocking(move || tls_to_plain.recorder_id())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        tokio::task::spawn_blocking(move || plain_to_tls.recorder_id())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    tls_server.abort();
+    plain_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recorder_tls_rejects_bad_hello_after_a_valid_handshake() {
+    let root = tempfile::tempdir().unwrap();
+    let (cert_pem, key_pem) = tls_material("recorder.test");
+    let (address, server) = tls_server(recorder(root.path()), &cert_pem, &key_pem).await;
+    let tls = RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "recorder.test").unwrap();
+    let client =
+        TcpPostcardRecorderClient::new_tls(address, "node-1", "node-2", "wrong-token", 7, tls)
+            .unwrap();
+
+    assert!(tokio::task::spawn_blocking(move || client.recorder_id())
+        .await
+        .unwrap()
+        .is_err());
+    server.abort();
+}
+
+#[test]
+fn recorder_tls_configuration_rejects_invalid_pem_empty_roots_and_mismatched_keys() {
+    let (cert_pem, _) = tls_material("recorder.test");
+    let (_, other_key_pem) = tls_material("other.test");
+
+    assert!(RecorderTlsClientConfig::from_ca_pem(b"not pem", "recorder.test").is_err());
+    assert!(RecorderTlsClientConfig::from_ca_pem(b"", "recorder.test").is_err());
+    assert!(RecorderTlsClientConfig::from_ca_pem(cert_pem.as_bytes(), "bad name /").is_err());
+    assert!(RecorderTlsServerConfig::from_pem(b"not pem", other_key_pem.as_bytes()).is_err());
+    assert!(RecorderTlsServerConfig::from_pem(cert_pem.as_bytes(), b"not pem").is_err());
+    assert!(
+        RecorderTlsServerConfig::from_pem(cert_pem.as_bytes(), other_key_pem.as_bytes()).is_err()
+    );
 }
 
 #[test]

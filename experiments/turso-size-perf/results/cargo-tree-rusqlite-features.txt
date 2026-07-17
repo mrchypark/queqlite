@@ -1,0 +1,65 @@
+turso-size-perf v0.1.0 (/Users/cypark/Documents/project/rhiza/experiments/turso-size-perf)
+rusqlite feature "bundled"
+rusqlite v0.40.1
+bitflags feature "default"
+bitflags v2.13.1
+fallible-iterator feature "default"
+fallible-iterator v0.3.0
+fallible-iterator feature "alloc"
+fallible-iterator v0.3.0
+fallible-streaming-iterator feature "default"
+fallible-streaming-iterator v0.1.9
+hashlink feature "default"
+hashlink v0.12.1
+hashbrown feature "default-hasher"
+hashbrown v0.17.1
+foldhash v0.2.0
+libsqlite3-sys feature "default"
+libsqlite3-sys v0.38.1
+cc feature "default"
+cc v1.2.67
+find-msvc-tools feature "default"
+find-msvc-tools v0.1.9
+shlex feature "default"
+shlex v2.0.1
+shlex feature "std"
+shlex v2.0.1
+pkg-config feature "default"
+pkg-config v0.3.33
+vcpkg feature "default"
+vcpkg v0.2.15
+libsqlite3-sys feature "min_sqlite_version_3_34_1"
+libsqlite3-sys v0.38.1 (*)
+libsqlite3-sys feature "pkg-config"
+libsqlite3-sys v0.38.1 (*)
+libsqlite3-sys feature "vcpkg"
+libsqlite3-sys v0.38.1 (*)
+smallvec feature "default"
+smallvec v1.15.2
+rusqlite feature "modern_sqlite"
+rusqlite v0.40.1 (*)
+libsqlite3-sys feature "bundled_bindings"
+libsqlite3-sys v0.38.1 (*)
+libsqlite3-sys feature "bundled"
+libsqlite3-sys v0.38.1 (*)
+libsqlite3-sys feature "bundled_bindings" (*)
+libsqlite3-sys feature "cc"
+libsqlite3-sys v0.38.1 (*)
+rusqlite feature "default"
+rusqlite v0.40.1 (*)
+rusqlite feature "cache"
+rusqlite v0.40.1 (*)
+rusqlite feature "hashlink"
+rusqlite v0.40.1 (*)
+rusqlite feature "ffi-sqlite-wasm-rs"
+rusqlite v0.40.1 (*)
+tokio feature "default"
+tokio v1.48.0
+pin-project-lite feature "default"
+pin-project-lite v0.2.17
+tokio feature "rt-multi-thread"
+tokio v1.48.0 (*)
+tokio feature "rt"
+tokio v1.48.0 (*)
+tokio feature "sync"
+tokio v1.48.0 (*)

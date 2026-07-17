@@ -19,6 +19,8 @@ durability_interval="${RHIZA_DURABILITY_INTERVAL-}"
 durability_max_lag_set="${RHIZA_DURABILITY_MAX_LAG+x}"
 durability_interval_set="${RHIZA_DURABILITY_INTERVAL+x}"
 recorder_transport="${RHIZA_RECORDER_TRANSPORT:-http}"
+recorder_tls="${RHIZA_RECORDER_TLS:-off}"
+recorder_tls_dir=""
 target_base="${RHIZA_BENCH_TARGET_DIR:-target/rhiza-bench}"
 duration=30s
 warmup=5s
@@ -92,7 +94,8 @@ usage() {
     'Set RHIZA_BENCH_MULTI_ENDPOINT=1 to route retries across all three nodes.' \
     'Durability defaults to sync. Set RHIZA_DURABILITY_MODE=bounded with' \
     'RHIZA_DURABILITY_MAX_LAG, or periodic with RHIZA_DURABILITY_INTERVAL.' \
-    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard to benchmark the plaintext TCP/Postcard recorder.' \
+    'Set RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc to benchmark a TCP transport.' \
+    'Set RHIZA_RECORDER_TLS=on to enable server-authenticated TLS for either TCP transport.' \
     '' \
     'It creates a vind cluster, deploys RustFS plus a three-node rhiza cluster,' \
     'runs bench/rhiza-bench through a local port-forward, and emits artifacts.json.' >&2
@@ -101,6 +104,44 @@ usage() {
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || die "missing required command: $1"; }
 shell_quote() { printf '%q' "$1"; }
+
+generate_recorder_tls_material() {
+  local directory="$1" dns_name sans=""
+  shift
+  [ "$#" -gt 0 ] || die "recorder TLS requires at least one DNS name"
+  for dns_name in "$@"; do
+    case "$dns_name" in
+      ''|*[!A-Za-z0-9.-]*) die "invalid recorder TLS DNS name" ;;
+    esac
+    sans="${sans:+$sans,}DNS:$dns_name"
+  done
+  (
+    umask 077
+    mkdir -p "$directory"
+    chmod 700 "$directory"
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+      -subj '/CN=rhiza Recorder benchmark CA' \
+      -addext 'basicConstraints=critical,CA:TRUE' \
+      -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+      -keyout "$directory/ca.key" -out "$directory/ca-bundle.pem" \
+      >/dev/null 2>&1 || die "cannot generate recorder TLS benchmark CA"
+    openssl req -new -newkey rsa:2048 -nodes -sha256 \
+      -subj '/CN=rhiza Recorder benchmark' \
+      -keyout "$directory/tls.key" -out "$directory/server.csr" \
+      >/dev/null 2>&1 || die "cannot generate recorder TLS benchmark key"
+    printf '%s\n' \
+      "subjectAltName=$sans" \
+      'basicConstraints=critical,CA:FALSE' \
+      'keyUsage=critical,digitalSignature,keyEncipherment' \
+      'extendedKeyUsage=serverAuth' > "$directory/server.ext"
+    openssl x509 -req -sha256 -days 1 -in "$directory/server.csr" \
+      -CA "$directory/ca-bundle.pem" -CAkey "$directory/ca.key" -CAcreateserial \
+      -extfile "$directory/server.ext" -out "$directory/tls.crt" \
+      >/dev/null 2>&1 || die "cannot sign recorder TLS benchmark certificate"
+    rm -f "$directory/ca.key" "$directory/ca-bundle.srl" \
+      "$directory/server.csr" "$directory/server.ext"
+  )
+}
 
 endpoint_ready() {
   curl --connect-timeout 1 --max-time 3 -fsS "$1/readyz" >/dev/null 2>&1
@@ -692,14 +733,16 @@ case "$durability_mode" in
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for sync durability"
     ;;
   bounded)
-    [ -n "$durability_max_lag_set" ] && [ -n "$durability_max_lag" ] ||
+    if [ -z "$durability_max_lag_set" ] || [ -z "$durability_max_lag" ]; then
       die "RHIZA_DURABILITY_MAX_LAG is required for bounded durability"
+    fi
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for bounded durability"
     validate_duration RHIZA_DURABILITY_MAX_LAG "$durability_max_lag"
     ;;
   periodic)
-    [ -n "$durability_interval_set" ] && [ -n "$durability_interval" ] ||
+    if [ -z "$durability_interval_set" ] || [ -z "$durability_interval" ]; then
       die "RHIZA_DURABILITY_INTERVAL is required for periodic durability"
+    fi
     [ -z "$durability_max_lag_set" ] || die "RHIZA_DURABILITY_MAX_LAG is irrelevant for periodic durability"
     validate_duration RHIZA_DURABILITY_INTERVAL "$durability_interval"
     ;;
@@ -734,9 +777,15 @@ case "$object_metering" in 0|1) ;; *) die "RHIZA_BENCH_OBJECT_USAGE_METERING mus
 case "$resource_sampling" in 0|1) ;; *) die "RHIZA_BENCH_RESOURCE_SAMPLING must be 0 or 1";; esac
 case "$multi_endpoint" in 0|1) ;; *) die "RHIZA_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
 case "$recorder_transport" in
-  http|tcp-postcard) ;;
-  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard" ;;
+  http|tcp-postcard|tcp-postcard-rpc) ;;
+  *) die "RHIZA_RECORDER_TRANSPORT must be http|tcp-postcard|tcp-postcard-rpc" ;;
 esac
+case "$recorder_tls" in
+  on|off) ;;
+  *) die "RHIZA_RECORDER_TLS must be on|off" ;;
+esac
+[ "$recorder_tls" != on ] || [ "$recorder_transport" != http ] ||
+  die "RHIZA_RECORDER_TLS=on requires RHIZA_RECORDER_TRANSPORT=tcp-postcard|tcp-postcard-rpc"
 case "$sample_interval" in ''|*[!0-9]*) die "--sample-interval must be a positive integer";; esac
 [ "$sample_interval" -gt 0 ] || die "--sample-interval must be a positive integer"
 for tool in cargo curl docker jq kubectl openssl rustc sed timeout vcluster yq; do require "$tool"; done
@@ -912,6 +961,7 @@ emit_artifacts() {
     --arg durability_max_lag "$durability_max_lag" \
     --arg durability_interval "$durability_interval" \
     --arg recorder_transport "$recorder_transport" \
+    --arg recorder_tls "$recorder_tls" \
     --argjson benchmark_exit "$benchmark_status" \
     --argjson run_exit "$cleanup_status" \
     --argjson evidence "$evidence" \
@@ -922,7 +972,8 @@ emit_artifacts() {
     '{run_id:$run_id,cluster:$cluster,namespace:$namespace,benchmark_exit_status:$benchmark_exit,
       exit_status:$run_exit,evidence:$evidence,cleanup:$cleanup,provenance:$provenance,
       measurement_window:$measurement_window,
-      configuration:{recorder_transport:$recorder_transport,durability:{mode:$durability_mode,
+      configuration:{recorder_transport:$recorder_transport,recorder_tls:$recorder_tls,
+        durability:{mode:$durability_mode,
         max_lag:(if $durability_max_lag == "" then null else $durability_max_lag end),
         interval:(if $durability_interval == "" then null else $durability_interval end)}},
       cleaned_up:$cleaned_up,artifacts:{benchmark_json:$benchmark,resource_samples_jsonl:$resources,
@@ -935,6 +986,7 @@ cleanup_run() {
   cleanup_status="$1"
   local runtime_pods_json observed_runtime_image_ids
   mkdir -p "$target"
+  [ -z "$recorder_tls_dir" ] || rm -rf "$recorder_tls_dir"
   if [ "$resource_sampling" = 1 ] &&
     { [ -z "$sampler_pid" ] || ! kill -0 "$sampler_pid" 2>/dev/null; }; then
     resource_evidence_status=failed
@@ -1124,24 +1176,43 @@ k rollout status deployment/rustfs --timeout=240s >/dev/null
 k wait --for=condition=complete job/rustfs-create-bucket --timeout=240s >/dev/null
 
 bundle="$target/config-c1.json"
-jq -n --argjson tokens "$peer_tokens" --arg recorder_transport "$recorder_transport" '
+jq -n --argjson tokens "$peer_tokens" --arg recorder_transport "$recorder_transport" \
+  --arg recorder_tls "$recorder_tls" '
   {version:1,config_id:1,members:[range(3) as $n | {
     node_id:("node-" + ($n + 1 | tostring)),
     url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8081"),
     log_url:("http://rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8080"), token:$tokens[$n]
-  } + (if $recorder_transport == "tcp-postcard" then {
+  } + (if $recorder_transport != "http" then {
     recorder_tcp_addr:("rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1:8082")
+  } else {} end) + (if $recorder_tls == "on" then {
+    recorder_tls_server_name:("rhiza-sql-c1-" + ($n|tostring) + ".rhiza-sql-c1")
   } else {} end)]}
 ' > "$bundle"
 chmod 600 "$bundle"
 k create secret generic rhiza-sql-c1-bundle --from-file=config.json="$bundle" --dry-run=client -o yaml |
   yq eval '.immutable = true' - | k create -f - >/dev/null
 
+if [ "$recorder_tls" = on ]; then
+  recorder_tls_dir="$(mktemp -d "${TMPDIR:-/tmp}/rhiza-recorder-tls.XXXXXX")"
+  recorder_tls_names=()
+  while IFS= read -r dns_name; do recorder_tls_names+=("$dns_name"); done \
+    < <(jq -r '.members[].recorder_tls_server_name' "$bundle")
+  generate_recorder_tls_material "$recorder_tls_dir" "${recorder_tls_names[@]}"
+  k create secret generic rhiza-sql-c1-recorder-tls \
+    --from-file=tls.crt="$recorder_tls_dir/tls.crt" \
+    --from-file=tls.key="$recorder_tls_dir/tls.key" \
+    --from-file=ca-bundle.pem="$recorder_tls_dir/ca-bundle.pem" >/dev/null
+  export RHIZA_RECORDER_TLS_SECRET=rhiza-sql-c1-recorder-tls
+else
+  unset RHIZA_RECORDER_TLS_SECRET
+fi
+
 export RHIZA_IMAGE="$image" RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace"
 export RHIZA_CLUSTER_ID=rhiza-vind RHIZA_RECOVERY_GENERATION=1
 export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials
 export RHIZA_S3_ALLOW_HTTP=true
 export RHIZA_RECORDER_TRANSPORT="$recorder_transport"
+export RHIZA_RECORDER_TLS="$recorder_tls"
 scripts/k8s-object-job.sh 1 "$bundle" init-checkpoint >/dev/null
 RHIZA_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
 export RHIZA_CPU_REQUEST="$rhiza_cpu_request" RHIZA_CPU_LIMIT="$rhiza_cpu_limit"
@@ -1149,7 +1220,7 @@ export RHIZA_MEMORY_REQUEST="$rhiza_memory_request" RHIZA_MEMORY_LIMIT="$rhiza_m
 yq eval -i '(select(.kind == "StatefulSet" and .metadata.name == "rhiza-sql-c1") | .spec.template.spec.containers[] | select(.name == "rhiza") | .resources) = {"requests": {"cpu": strenv(RHIZA_CPU_REQUEST), "memory": strenv(RHIZA_MEMORY_REQUEST)}, "limits": {"cpu": strenv(RHIZA_CPU_LIMIT), "memory": strenv(RHIZA_MEMORY_LIMIT)}}' "$rendered_cluster"
 k create -f "$rendered_cluster" >/dev/null
 scripts/wait-k8s-statefulset-ready.sh rhiza-sql-c1 3 1
-if [ "$recorder_transport" = tcp-postcard ]; then
+if [ "$recorder_transport" != http ]; then
   for ordinal in 0 1 2; do
     k exec "rhiza-sql-c1-$ordinal" -- /bin/sh -ec '
       grep -Eqi ":1F92[[:space:]]+[0-9A-F]+:[0-9A-F]+[[:space:]]+0A" /proc/net/tcp /proc/net/tcp6
