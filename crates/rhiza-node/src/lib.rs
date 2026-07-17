@@ -784,7 +784,11 @@ impl LogPeer for HttpLogPeer {
 #[derive(Clone)]
 struct RecorderRouteState<R> {
     recorder: R,
+    peers: Vec<PeerConfig>,
 }
+
+#[derive(Clone)]
+struct AuthenticatedPeer(String);
 
 #[derive(Clone)]
 struct LogRouteState<P> {
@@ -1449,6 +1453,7 @@ fn recorder_routes<R>(
 where
     R: RecorderRpc + Clone + Send + Sync + 'static,
 {
+    let recorder_peers = peers.clone();
     Router::new()
         .route(RECORDER_IDENTITY_PATH, post(handle_recorder_identity::<R>))
         .route(
@@ -1481,7 +1486,10 @@ where
             },
             peer_gate,
         ))
-        .with_state(RecorderRouteState { recorder })
+        .with_state(RecorderRouteState {
+            recorder,
+            peers: recorder_peers,
+        })
 }
 
 fn log_routes<P>(
@@ -1630,6 +1638,7 @@ where
 async fn handle_recorder_record<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(authenticated_peer): Extension<AuthenticatedPeer>,
     Json(request): Json<RecorderWire<RecordRequest>>,
 ) -> Response
 where
@@ -1637,6 +1646,15 @@ where
 {
     if request.version != RECORDER_WIRE_VERSION || !valid_recorder_record(&request.body) {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !authenticated_proposer_admitted(
+        &authenticated_peer.0,
+        &request.body.proposal.proposer_id,
+        &state.peers,
+    ) {
+        return recorder_v2_response::<RecordSummary>(Ok(Err(rhiza_quepaxa::Error::Rejected(
+            RejectReason::InvalidRequest,
+        ))));
     }
     let recorder = state.recorder;
     recorder_v2_response(
@@ -1656,9 +1674,23 @@ fn valid_recorder_record(request: &RecordRequest) -> bool {
     !request.cluster_id.is_empty() && request.cluster_id.len() <= MAX_REQUEST_ID_BYTES
 }
 
+fn authenticated_proposer_admitted(
+    authenticated_peer_id: &str,
+    proposer_id: &str,
+    peers: &[PeerConfig],
+) -> bool {
+    // Record requests carry config identity but not its membership. Configured peers are therefore
+    // the transport identity authority for records and proofs until rebuilt after a transition.
+    peers
+        .iter()
+        .any(|peer| peer.node_id == authenticated_peer_id)
+        && peers.iter().any(|peer| peer.node_id == proposer_id)
+}
+
 async fn handle_recorder_install_proof<R>(
     State(state): State<RecorderRouteState<R>>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Extension(authenticated_peer): Extension<AuthenticatedPeer>,
     Json(request): Json<RecorderWire<InstallProofV2>>,
 ) -> Response
 where
@@ -1666,6 +1698,15 @@ where
 {
     if request.version != RECORDER_WIRE_VERSION {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !authenticated_proposer_admitted(
+        &authenticated_peer.0,
+        &request.body.proof.proposal().proposer_id,
+        &state.peers,
+    ) {
+        return recorder_v2_response::<()>(Ok(Err(rhiza_quepaxa::Error::Rejected(
+            RejectReason::InvalidRequest,
+        ))));
     }
     let recorder = state.recorder;
     recorder_v2_response(
@@ -2444,16 +2485,22 @@ async fn peer_gate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !recovery_generation_matches(request.headers(), state.recovery_generation)
-        || !peer_authenticated(request.headers(), &state.peers, state.protocol_version)
-    {
+    if !recovery_generation_matches(request.headers(), state.recovery_generation) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let Some(authenticated_peer) =
+        authenticated_peer(request.headers(), &state.peers, state.protocol_version)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let permit = match state.slots.try_acquire_owned() {
         Ok(permit) => Arc::new(permit),
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
     request.extensions_mut().insert(permit);
+    request
+        .extensions_mut()
+        .insert(AuthenticatedPeer(authenticated_peer));
     next.run(request).await
 }
 
@@ -2589,17 +2636,17 @@ pub async fn confirm_write_durability(
     }
 }
 
-fn peer_authenticated(headers: &HeaderMap, peers: &[PeerConfig], protocol_version: &str) -> bool {
+fn authenticated_peer(
+    headers: &HeaderMap,
+    peers: &[PeerConfig],
+    protocol_version: &str,
+) -> Option<String> {
     if header_text(headers, VERSION_HEADER) != Some(protocol_version) {
-        return false;
+        return None;
     }
-    let Some(node_id) = header_text(headers, NODE_ID_HEADER) else {
-        return false;
-    };
-    let Some(token) = bearer_token(headers) else {
-        return false;
-    };
-    peer_credentials_authenticated(node_id, token, peers)
+    let node_id = header_text(headers, NODE_ID_HEADER)?;
+    let token = bearer_token(headers)?;
+    peer_credentials_authenticated(node_id, token, peers).then(|| node_id.to_owned())
 }
 
 fn peer_credentials_authenticated(node_id: &str, token: &str, peers: &[PeerConfig]) -> bool {

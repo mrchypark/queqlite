@@ -20,9 +20,36 @@ Consensus*](https://discovery.ucl.ac.uk/id/eprint/10181480/1/quepaxa.pdf), SOSP
 | Hedging and leader selection reduce redundant work but are not safety or liveness requirements. The paper adapts both with MAB-style tuning. | rhiza sql currently uses a static preferred identity and preferred-first endpoint order; later endpoints are used only for fallback or hedge attempts. MAB leader/hedge tuning remains documentation-only in [`mab-leader-hedge-tuning.md`](mab-leader-hedge-tuning.md). |
 
 rhiza sql adds a configuration-safety boundary beyond the paper's static-membership
-model: ordinary commands do not install their proof on a second quorum before
-return, but `ConfigChange` decisions do. This distinction must not be summarized
-as "every decision waits for proof-quorum installation."
+model: ordinary decisions neither wait for nor require proof-quorum installation
+before returning; asynchronous proof dissemination may overlap the response.
+`ConfigChange` decisions do require proof-quorum installation before returning.
+This distinction must not be summarized as "every decision waits for
+proof-quorum installation."
+
+## Executable safety evidence and boundaries
+
+`crates/rhiza-quepaxa/tests/adversarial_agreement.rs` is deterministic executable
+evidence for a bounded set of agreement schedules; it is not a formal proof or
+whole-system verification. For fixed memberships of 3, 5, and 7 recorders, it
+keeps exactly a quorum live, drops every recorder RPC to the remaining minority,
+duplicates live record delivery, and replays a previously delivered lower-step
+request after a newer request on a separate probe slot. It then commits command A
+on the ordinary fast path, verifies that a later conflicting proposer B adopts the
+same `LogEntry`, closes the in-process recorder handles, reopens the live quorum,
+and reconstructs the same certified decision while the minority remains
+unavailable. A seeded `PrioritySource`, synchronization barriers, thread joins,
+and a channel watchdog timeout make that schedule repeatable without timing
+sleeps in the test controller.
+
+Residual gaps include:
+
+- concurrent proposer interleavings (the executable schedule orders proposer A
+  before conflicting proposer B);
+- dynamic membership and configuration-transition schedules;
+- `NodeRuntime`, qlog, and materializer integration;
+- real network transports, partitions, retransmission, and process failure;
+- Byzantine recorders or proposers; and
+- physical power loss and storage-device durability behavior.
 
 ## Performance comparability
 

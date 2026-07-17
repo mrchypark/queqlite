@@ -155,6 +155,39 @@ fn preferred_proposer_decides_in_step_four_with_fast_proof() {
 }
 
 #[test]
+fn unsorted_recorder_pairs_preserve_identity_and_reach_quorum() {
+    let root = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let recorders = ["n3", "n1", "n2"]
+        .into_iter()
+        .map(|id| {
+            let store = RecorderFileStore::new_with_membership(
+                root.path().join(id),
+                id,
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            (id.to_owned(), Box::new(store) as Box<dyn RecorderRpc>)
+        })
+        .collect();
+    let consensus =
+        ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+    let entry = consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, b"unsorted-recorders".to_vec()),
+        )
+        .unwrap();
+
+    assert_eq!(entry.payload, b"unsorted-recorders");
+}
+
+#[test]
 fn root_constructor_installs_membership_before_proof_installation() {
     let root = tempfile::tempdir().unwrap();
     let recorder_roots = ["n1", "n2", "n3"].map(|id| root.path().join(id));
@@ -248,11 +281,12 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
         }
     };
     assert!(matches!(proof, DecisionProof::Phase2 { step, .. } if step % 4 == 2));
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     assert!(matches!(
         consensus
             .inspect_certified_decision_at(1, LogHash::ZERO)
             .unwrap(),
-        CertifiedDecisionInspection::Pending
+        CertifiedDecisionInspection::Committed(_)
     ));
     assert!(matches!(
         consensus.recover_decision_at(1, LogHash::ZERO).unwrap(),
@@ -497,8 +531,8 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
             Command::new(CommandKind::Deterministic, b"reopen".to_vec()),
         )
         .unwrap();
-    assert!(engine.inspect_decision_proof_at(1).unwrap().is_none());
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
+    assert!(engine.inspect_decision_proof_at(1).unwrap().is_some());
     drop(engine);
 
     let reopened = consensus(root.path(), "n3").with_priority_source(Arc::new(FixedPriority));
@@ -1139,6 +1173,18 @@ impl RecorderRpc for CountingProofRecorder {
         Err(Error::Io("recorder unavailable".into()))
     }
 
+    fn store_command_for(
+        &self,
+        _cluster_id: String,
+        _epoch: u64,
+        _config_id: u64,
+        _config_digest: LogHash,
+        _command_hash: LogHash,
+        _command: StoredCommand,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn install_decision_proof(
         &self,
         _proof: DecisionProof,
@@ -1149,8 +1195,54 @@ impl RecorderRpc for CountingProofRecorder {
     }
 }
 
+#[derive(Clone)]
+struct BlockingProofRecorder {
+    store: RecorderFileStore,
+    started: Arc<(Mutex<usize>, Condvar)>,
+    completed: Arc<(Mutex<usize>, Condvar)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    proof_installs: Arc<AtomicUsize>,
+}
+
+impl RecorderRpc for BlockingProofRecorder {
+    fn call(&self, request: RecorderRequest) -> Result<RecorderReply, Error> {
+        self.store.call(request)
+    }
+
+    fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
+        self.store.record(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> Result<(), Error> {
+        self.proof_installs.fetch_add(1, Ordering::SeqCst);
+        let (started, started_condition) = &*self.started;
+        *started.lock().unwrap() += 1;
+        started_condition.notify_all();
+
+        let (release, release_condition) = &*self.release;
+        let released = release_condition
+            .wait_while(release.lock().unwrap(), |released| !*released)
+            .unwrap();
+        drop(released);
+        self.store.install_decision_proof(proof, membership)?;
+
+        let (completed, completed_condition) = &*self.completed;
+        *completed.lock().unwrap() += 1;
+        completed_condition.notify_all();
+        Ok(())
+    }
+
+    fn uses_typed_protocol(&self) -> bool {
+        true
+    }
+}
+
 #[test]
-fn preferred_fast_path_piggybacks_command_without_store_or_fetch_rpcs() {
+fn preferred_fast_path_piggybacks_command_before_async_proof_dissemination() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -1192,13 +1284,13 @@ fn preferred_fast_path_piggybacks_command_without_store_or_fetch_rpcs() {
     let entry = consensus
         .propose_stored_at(1, LogHash::ZERO, command.clone())
         .unwrap();
-    drop(consensus);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
     assert_eq!(entry.payload, command.payload);
-    assert_eq!(counts.legacy_stores.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.legacy_stores.load(Ordering::SeqCst), 2);
     assert_eq!(counts.fetches.load(Ordering::SeqCst), 0);
     assert!(counts.piggybacks.load(Ordering::SeqCst) >= membership.quorum_size());
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 2);
     for store in stores {
         assert_eq!(
             store.fetch_command(command.hash()).unwrap(),
@@ -1208,7 +1300,7 @@ fn preferred_fast_path_piggybacks_command_without_store_or_fetch_rpcs() {
 }
 
 #[test]
-fn non_preferred_path_piggybacks_command_without_a_separate_store_round() {
+fn non_preferred_path_piggybacks_command_before_async_proof_dissemination() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -1244,12 +1336,13 @@ fn non_preferred_path_piggybacks_command_without_a_separate_store_round() {
             Command::new(CommandKind::Deterministic, b"slow-path".to_vec()),
         )
         .unwrap();
-    drop(consensus);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
-    assert_eq!(counts.legacy_stores.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.legacy_stores.load(Ordering::SeqCst), 3);
     assert_eq!(counts.fetches.load(Ordering::SeqCst), 0);
     assert!(counts.piggybacks.load(Ordering::SeqCst) >= membership.quorum_size());
     assert!(counts.piggybacks.load(Ordering::SeqCst) <= 6);
+    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 3);
 }
 
 #[test]
@@ -1562,7 +1655,7 @@ fn proof_cache_accepts_different_metadata_for_the_same_decided_value() {
 }
 
 #[test]
-fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
+fn ordinary_fast_path_broadcasts_proof_cache_after_drain() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
@@ -1604,10 +1697,108 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
             Command::new(CommandKind::Deterministic, b"fast".to_vec()),
         )
         .unwrap();
-    drop(consensus);
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
-    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
-    assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 2);
+    assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ordinary_proof_workers_are_bounded_and_do_not_delay_proposals_or_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let started = Arc::new((Mutex::new(0), Condvar::new()));
+    let completed = Arc::new((Mutex::new(0), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let proof_installs = Arc::new(AtomicUsize::new(0));
+    let mut stores = Vec::new();
+    let mut recorders = Vec::new();
+    for id in membership.members() {
+        let store = RecorderFileStore::new_with_membership(
+            root.path().join(id),
+            id.clone(),
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        stores.push(store.clone());
+        recorders.push((
+            id.clone(),
+            Box::new(BlockingProofRecorder {
+                store,
+                started: Arc::clone(&started),
+                completed: Arc::clone(&completed),
+                release: Arc::clone(&release),
+                proof_installs: Arc::clone(&proof_installs),
+            }) as Box<dyn RecorderRpc>,
+        ));
+    }
+    let consensus =
+        ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+    let first = consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, b"first".to_vec()),
+        )
+        .unwrap();
+    let (started_mutex, started_condition) = &*started;
+    let (started_count, timeout) = started_condition
+        .wait_timeout_while(
+            started_mutex.lock().unwrap(),
+            Duration::from_secs(1),
+            |started| *started < 3,
+        )
+        .unwrap();
+    assert!(!timeout.timed_out());
+    assert_eq!(*started_count, 3);
+    drop(started_count);
+
+    let second = consensus
+        .propose_at(
+            2,
+            first.hash,
+            Command::new(CommandKind::Deterministic, b"second".to_vec()),
+        )
+        .unwrap();
+    consensus
+        .propose_at(
+            3,
+            second.hash,
+            Command::new(CommandKind::Deterministic, b"third".to_vec()),
+        )
+        .unwrap();
+    assert!(!consensus.finish_pending_rpcs(Duration::ZERO));
+
+    let (dropped_sender, dropped_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        drop(consensus);
+        dropped_sender.send(()).unwrap();
+    });
+    dropped_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let (released, release_condition) = &*release;
+    *released.lock().unwrap() = true;
+    release_condition.notify_all();
+    let (completed_mutex, completed_condition) = &*completed;
+    let (completed_count, timeout) = completed_condition
+        .wait_timeout_while(
+            completed_mutex.lock().unwrap(),
+            Duration::from_secs(1),
+            |completed| *completed < 6,
+        )
+        .unwrap();
+    assert!(!timeout.timed_out());
+    assert_eq!(*completed_count, 6);
+    assert_eq!(proof_installs.load(Ordering::SeqCst), 6);
+    assert!(stores[0].inspect_decision_proof(1).unwrap().is_some());
+    assert!(stores[0].inspect_decision_proof(2).unwrap().is_some());
+    assert!(stores[0].inspect_decision_proof(3).unwrap().is_none());
 }
 
 thread_local! {

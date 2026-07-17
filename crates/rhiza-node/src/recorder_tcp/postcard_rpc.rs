@@ -310,6 +310,7 @@ where
         "recorder postcard-rpc HELLO response",
     )
     .await?;
+    let authenticated_peer_id = hello.node_id;
 
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
@@ -366,10 +367,17 @@ where
             }
         };
         let call_recorder = recorder.clone();
+        let call_authenticated_peer_id = authenticated_peer_id.clone();
+        let call_peers = peers.clone();
         calls.spawn(async move {
             let dispatched = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                super::dispatch(call_recorder, body)
+                super::dispatch(
+                    call_recorder,
+                    body,
+                    &call_authenticated_peer_id,
+                    &call_peers,
+                )
             });
             let response = match tokio::time::timeout(dispatch_timeout, dispatched).await {
                 Ok(Ok(response)) => response,

@@ -32,11 +32,24 @@ See `examples/local_three_node.rs` for a complete runnable example.
 - `RecorderRpc` implementations must enforce a finite deadline for every
   network or process-bound operation. The consensus engine performs quorum RPCs
   concurrently and may return after a quorum while slower calls finish.
+- An ordinary command's proposal response does not wait for or require proof
+  dissemination. Its decision is offered to one fixed proof worker per
+  recorder. Each worker has room for one queued job in addition to its in-flight
+  RPC, stores the verified command bytes before idempotently installing the
+  proof, and drops new work when that bounded queue is full or disconnected.
+  These best-effort failures never change proposal success; sustained
+  saturation can therefore leave a recorder without a proof cache until later
+  recovery or dissemination.
+- Configuration-change decisions, and decisions reached after a transition was
+  observed, still install their proof on a recorder quorum synchronously before
+  the proposal succeeds.
 - Dropping `ThreeNodeConsensus` never waits indefinitely for outstanding RPC
-  workers. A transport that ignores its deadline can leak its own worker and
-  resources, but cannot block consensus destruction.
+  workers, including proof workers. A transport that ignores its deadline can
+  leak its own worker and resources, but cannot block consensus destruction.
 - Call `finish_pending_rpcs` with an application-selected bound before removing
-  local recorder storage or shutting down a transport used by in-flight calls.
+  local recorder storage or shutting down a transport used by accepted record
+  or proof jobs. The drain does not recover proof jobs already dropped because
+  a bounded worker queue was full.
 - `PrioritySource` is injectable for deterministic simulation. The default uses
   the operating system random source through `getrandom` and supports all
   platforms supported by that crate.

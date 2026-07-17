@@ -18,8 +18,8 @@ use rhiza_node::{
     TcpPostcardRecorderClient, TcpPostcardRpcRecorderClient,
 };
 use rhiza_quepaxa::{
-    AcceptedValue, DecisionProof, Membership, Proposal, ProposalPriority, RecordRequest,
-    RecordSummary, RecorderRpc,
+    AcceptedValue, DecisionProof, Error, Membership, Proposal, ProposalPriority, RecordRequest,
+    RecordSummary, RecorderRpc, RejectReason,
 };
 
 fn peers() -> Vec<PeerConfig> {
@@ -38,7 +38,7 @@ fn peers() -> Vec<PeerConfig> {
 fn proposal(command: &StoredCommand) -> Proposal {
     Proposal::new(
         ProposalPriority::MAX,
-        "node-2",
+        "node-1",
         1,
         AcceptedValue::from_command("rhiza:sql:cluster-a", 4, 1, 1, LogHash::ZERO, command),
     )
@@ -69,6 +69,20 @@ fn record_request(slot: u64) -> RecordRequest {
         step: 4,
         proposal: proposal(&command),
         command: Some(command),
+    }
+}
+
+fn decision_proof(proposer_id: &str, slot: u64) -> DecisionProof {
+    let mut request = record_request(slot);
+    request.proposal.proposer_id = proposer_id.into();
+    DecisionProof::FastPath {
+        cluster_id: request.cluster_id,
+        slot: request.slot,
+        epoch: request.epoch,
+        config_id: request.config_id,
+        config_digest: request.config_digest,
+        proposal: request.proposal,
+        summaries: Vec::new(),
     }
 }
 
@@ -177,6 +191,50 @@ async fn server<R: RecorderRpc + Clone + Send + Sync + 'static>(
 
 fn client(address: std::net::SocketAddr) -> TcpPostcardRpcRecorderClient {
     TcpPostcardRpcRecorderClient::new(address, "node-1", "node-2", "peer-token-2", 7).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postcard_rpc_accepts_member_relay_and_rejects_non_member_without_backend_call() {
+    let recorder = ProbeRecorder::default();
+    let state = Arc::clone(&recorder.state);
+    let (address, server) = server(recorder).await;
+
+    tokio::task::spawn_blocking(move || {
+        let client = client(address);
+        assert_eq!(client.record(record_request(1)).unwrap().slot, 1);
+        let mut foreign = record_request(2);
+        foreign.proposal.proposer_id = "node-9".into();
+        assert!(matches!(
+            client.record(foreign),
+            Err(Error::Rejected(RejectReason::InvalidRequest))
+        ));
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let proof = decision_proof("node-1", 3);
+        client
+            .install_decision_proof(proof.clone(), &membership)
+            .unwrap();
+        assert!(matches!(
+            client.install_decision_proof(decision_proof("node-9", 4), &membership),
+            Err(Error::Rejected(RejectReason::InvalidRequest))
+        ));
+        assert_eq!(client.recorder_id().unwrap(), "node-1");
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(state.lock().unwrap().summaries.len(), 1);
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .proposal()
+            .proposer_id,
+        "node-1"
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
