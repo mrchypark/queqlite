@@ -733,14 +733,16 @@ case "$durability_mode" in
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for sync durability"
     ;;
   bounded)
-    [ -n "$durability_max_lag_set" ] && [ -n "$durability_max_lag" ] ||
+    if [ -z "$durability_max_lag_set" ] || [ -z "$durability_max_lag" ]; then
       die "RHIZA_DURABILITY_MAX_LAG is required for bounded durability"
+    fi
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for bounded durability"
     validate_duration RHIZA_DURABILITY_MAX_LAG "$durability_max_lag"
     ;;
   periodic)
-    [ -n "$durability_interval_set" ] && [ -n "$durability_interval" ] ||
+    if [ -z "$durability_interval_set" ] || [ -z "$durability_interval" ]; then
       die "RHIZA_DURABILITY_INTERVAL is required for periodic durability"
+    fi
     [ -z "$durability_max_lag_set" ] || die "RHIZA_DURABILITY_MAX_LAG is irrelevant for periodic durability"
     validate_duration RHIZA_DURABILITY_INTERVAL "$durability_interval"
     ;;

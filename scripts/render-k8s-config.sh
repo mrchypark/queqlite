@@ -6,7 +6,9 @@ usage() {
   exit 64
 }
 
-[ "$#" -ge 4 ] && [ "$#" -le 5 ] || usage
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+  usage
+fi
 config_id="$1"
 replicas="$2"
 bundle="$3"
@@ -169,8 +171,9 @@ validate_memory_quantity RHIZA_DATA_SIZE_LIMIT "$data_size_limit"
 [ -z "$object_secret_set" ] || [ -n "$object_secret" ] ||
   die "RHIZA_OBJECT_SECRET must not be empty when set"
 if [ "$recorder_tls" = on ]; then
-  [ -n "$recorder_tls_secret_set" ] && [ -n "$recorder_tls_secret" ] ||
+  if [ -z "$recorder_tls_secret_set" ] || [ -z "$recorder_tls_secret" ]; then
     die "RHIZA_RECORDER_TLS_SECRET is required when RHIZA_RECORDER_TLS=on"
+  fi
 elif [ -n "$recorder_tls_secret_set" ]; then
   die "RHIZA_RECORDER_TLS_SECRET is irrelevant unless RHIZA_RECORDER_TLS=on"
 fi
@@ -197,15 +200,17 @@ case "$durability" in
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for sync durability"
     ;;
   bounded)
-    [ -n "$durability_max_lag_set" ] && [ -n "$durability_max_lag" ] ||
+    if [ -z "$durability_max_lag_set" ] || [ -z "$durability_max_lag" ]; then
       die "RHIZA_DURABILITY_MAX_LAG is required for bounded durability"
+    fi
     [ -z "$durability_interval_set" ] || die "RHIZA_DURABILITY_INTERVAL is irrelevant for bounded durability"
     validate_duration RHIZA_DURABILITY_MAX_LAG "$durability_max_lag"
     durability_max_lag_env="            - {name: RHIZA_DURABILITY_MAX_LAG, value: $durability_max_lag}"
     ;;
   periodic)
-    [ -n "$durability_interval_set" ] && [ -n "$durability_interval" ] ||
+    if [ -z "$durability_interval_set" ] || [ -z "$durability_interval" ]; then
       die "RHIZA_DURABILITY_INTERVAL is required for periodic durability"
+    fi
     [ -z "$durability_max_lag_set" ] || die "RHIZA_DURABILITY_MAX_LAG is irrelevant for periodic durability"
     validate_duration RHIZA_DURABILITY_INTERVAL "$durability_interval"
     durability_interval_env="            - {name: RHIZA_DURABILITY_INTERVAL, value: $durability_interval}"

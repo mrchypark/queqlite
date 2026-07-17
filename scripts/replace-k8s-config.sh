@@ -326,11 +326,11 @@ expected_stop_b64="$(openssl base64 -A -in "$stop_json")"
 if "${k[@]}" get secret "${new_name}-bundle" >/dev/null 2>&1; then
   actual_bundle_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.config\.json}')"
   actual_stop_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.stop\.json}')"
-  [ "$actual_bundle_b64" = "$expected_bundle_b64" ] &&
-    [ "$actual_stop_b64" = "$expected_stop_b64" ] || {
+  if [ "$actual_bundle_b64" != "$expected_bundle_b64" ] ||
+    [ "$actual_stop_b64" != "$expected_stop_b64" ]; then
     echo "existing successor transition Secret differs from the resume artifacts" >&2
     exit 65
-  }
+  fi
 else
   "${k[@]}" create secret generic "${new_name}-bundle" \
     --from-file=config.json="$successor_bundle" --from-file=stop.json="$stop_json" \
