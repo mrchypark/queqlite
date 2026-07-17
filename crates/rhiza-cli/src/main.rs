@@ -35,6 +35,13 @@ use rhiza_node::{
     LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, READ_PATH, SQL_EXECUTE_PATH, SQL_QUERY_PATH,
     VERSION_HEADER, WRITE_PATH,
 };
+#[cfg(feature = "graph")]
+use rhiza_node::{GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto, GRAPH_QUERY_PATH};
+#[cfg(feature = "kv")]
+use rhiza_node::{
+    KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest, KvScanRequest,
+    KvScanResponse, KV_DELETE_PATH, KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_KV_SCAN_ROWS,
+};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
     DecisionProof, Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
@@ -218,6 +225,61 @@ async fn run(args: impl IntoIterator<Item = String>) -> i32 {
             },
             Err(error) => fail("sql query", error),
         },
+        #[cfg(feature = "graph")]
+        Command::GraphQuery(args) => match request_graph_query(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("graph query", error.to_string()),
+            },
+            Err(error) => fail("graph query", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvGet(args) => match request_kv_get(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv get", error.to_string()),
+            },
+            Err(error) => fail("kv get", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvScan(args) => match request_kv_scan(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv scan", error.to_string()),
+            },
+            Err(error) => fail("kv scan", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvPut(args) => match request_kv_put(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv put", error.to_string()),
+            },
+            Err(error) => fail("kv put", error),
+        },
+        #[cfg(feature = "kv")]
+        Command::KvDelete(args) => match request_kv_delete(&args).await {
+            Ok(response) => match serde_json::to_string(&response) {
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+                Err(error) => fail("kv delete", error.to_string()),
+            },
+            Err(error) => fail("kv delete", error),
+        },
         Command::Health(args) => match request_health(&args).await {
             Ok(()) => {
                 println!("ok");
@@ -249,6 +311,16 @@ enum Command {
     Read(ReadArgs),
     SqlExecute(SqlExecuteArgs),
     SqlQuery(SqlQueryArgs),
+    #[cfg(feature = "graph")]
+    GraphQuery(GraphQueryArgs),
+    #[cfg(feature = "kv")]
+    KvGet(KvGetArgs),
+    #[cfg(feature = "kv")]
+    KvScan(KvScanArgs),
+    #[cfg(feature = "kv")]
+    KvPut(KvPutArgs),
+    #[cfg(feature = "kv")]
+    KvDelete(KvDeleteArgs),
     Health(HealthArgs),
 }
 
@@ -281,6 +353,43 @@ struct SqlQueryArgs {
     statement: SqlStatement,
     consistency: Option<ReadConsistency>,
     max_rows: Option<u32>,
+}
+
+#[cfg(feature = "graph")]
+struct GraphQueryArgs {
+    urls: Vec<String>,
+    token: String,
+    statement: GraphQueryStatementDto,
+    consistency: Option<ReadConsistency>,
+    max_rows: Option<u32>,
+}
+
+#[cfg(feature = "kv")]
+struct KvGetArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvGetRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvScanArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvScanRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvPutArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvPutRequest,
+}
+
+#[cfg(feature = "kv")]
+struct KvDeleteArgs {
+    urls: Vec<String>,
+    token: String,
+    request: KvDeleteRequest,
 }
 
 struct HealthArgs {
@@ -883,6 +992,10 @@ where
         "write" => parse_write(args).map(Command::Write),
         "read" => parse_read(args).map(Command::Read),
         "sql" => parse_sql_command(args),
+        #[cfg(feature = "graph")]
+        "graph" => parse_graph_command(args),
+        #[cfg(feature = "kv")]
+        "kv" => parse_kv_command(args),
         "health" => parse_health(args).map(Command::Health),
         _ => Err(format!("unknown command: {command}")),
     }
@@ -1073,6 +1186,256 @@ fn parse_sql_query(
 
 fn parse_sql_parameters(value: &str) -> Result<Vec<SqlValue>, String> {
     serde_json::from_str(value).map_err(|error| format!("invalid --params-json: {error}"))
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        Some("query") => {
+            parse_graph_query(args, |name| env::var(name).ok()).map(Command::GraphQuery)
+        }
+        Some(other) => Err(format!("unknown graph command: {other}")),
+        None => Err("missing graph command: query".into()),
+    }
+}
+
+#[cfg(feature = "graph")]
+fn parse_graph_query(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<GraphQueryArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut cypher = None;
+    let mut parameters = std::collections::BTreeMap::new();
+    let mut consistency = None;
+    let mut max_rows = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--cypher" => cypher = Some(next_value(&mut args, "--cypher")?),
+            "--params-json" => {
+                parameters = serde_json::from_str(&next_value(&mut args, "--params-json")?)
+                    .map_err(|error| format!("invalid --params-json: {error}"))?
+            }
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            "--max-rows" => {
+                max_rows = Some(
+                    next_value(&mut args, "--max-rows")?
+                        .parse::<u32>()
+                        .map_err(|_| "--max-rows must be a positive integer".to_string())?,
+                )
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(GraphQueryArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        statement: GraphQueryStatementDto {
+            cypher: required_arg(cypher, "--cypher")?,
+            parameters,
+        },
+        consistency,
+        max_rows,
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        Some("get") => parse_kv_get(args, |name| env::var(name).ok()).map(Command::KvGet),
+        Some("scan") => parse_kv_scan(args, |name| env::var(name).ok()).map(Command::KvScan),
+        Some("put") => parse_kv_put(args, |name| env::var(name).ok()).map(Command::KvPut),
+        Some("delete") => parse_kv_delete(args, |name| env::var(name).ok()).map(Command::KvDelete),
+        Some(other) => Err(format!("unknown kv command: {other}")),
+        None => Err("missing kv command: get|scan|put|delete".into()),
+    }
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_get(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvGetArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut key = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvGetArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvGetRequest {
+            key: required_arg(key, "--key-base64")?,
+            consistency,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_scan(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvScanArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut start = None;
+    let mut end = None;
+    let mut prefix = None;
+    let mut cursor = None;
+    let mut limit = None;
+    let mut consistency = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--start-base64" => start = Some(next_value(&mut args, "--start-base64")?),
+            "--end-base64" => end = Some(next_value(&mut args, "--end-base64")?),
+            "--prefix-base64" => prefix = Some(next_value(&mut args, "--prefix-base64")?),
+            "--cursor-base64" => cursor = Some(next_value(&mut args, "--cursor-base64")?),
+            "--limit" => {
+                let parsed = next_value(&mut args, "--limit")?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be a positive integer".to_string())?;
+                if parsed == 0 || parsed > MAX_KV_SCAN_ROWS {
+                    return Err(format!("--limit must be between 1 and {MAX_KV_SCAN_ROWS}"));
+                }
+                limit = Some(parsed);
+            }
+            "--consistency" => {
+                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                    &mut args,
+                    "--consistency",
+                )?)?)
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    match (&prefix, &start, &end) {
+        (Some(_), None, None) | (None, Some(_), _) => {}
+        _ => {
+            return Err(
+                "provide either --prefix-base64 alone or --start-base64 with optional --end-base64"
+                    .into(),
+            )
+        }
+    }
+    Ok(KvScanArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvScanRequest {
+            start,
+            end,
+            prefix,
+            cursor,
+            limit,
+            consistency,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_put(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvPutArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut key = None;
+    let mut value = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            "--value-base64" => value = Some(next_value(&mut args, "--value-base64")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvPutArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvPutRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            key: required_arg(key, "--key-base64")?,
+            value: required_arg(value, "--value-base64")?,
+        },
+    })
+}
+
+#[cfg(feature = "kv")]
+fn parse_kv_delete(
+    args: impl IntoIterator<Item = String>,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<KvDeleteArgs, String> {
+    let mut urls = Vec::new();
+    let mut token = None;
+    let mut request_id = None;
+    let mut key = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => urls.push(next_value(&mut args, "--url")?),
+            "--token" => token = Some(next_value(&mut args, "--token")?),
+            "--request-id" => request_id = Some(next_value(&mut args, "--request-id")?),
+            "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(KvDeleteArgs {
+        urls: required_urls(urls)?,
+        token: client_token(token, lookup)?,
+        request: KvDeleteRequest {
+            request_id: required_arg(request_id, "--request-id")?,
+            key: required_arg(key, "--key-base64")?,
+        },
+    })
+}
+
+#[cfg(any(feature = "graph", feature = "kv"))]
+fn parse_multimodel_read_consistency(value: &str) -> Result<ReadConsistency, String> {
+    match value {
+        "local" => Ok(ReadConsistency::Local),
+        "read_barrier" => Ok(ReadConsistency::ReadBarrier),
+        _ => value
+            .strip_prefix("applied_index:")
+            .ok_or_else(|| {
+                "consistency must be `local`, `read_barrier`, or `applied_index:N`".to_string()
+            })?
+            .parse::<u64>()
+            .map(ReadConsistency::AppliedIndex)
+            .map_err(|_| {
+                "consistency must be `local`, `read_barrier`, or `applied_index:N`".to_string()
+            }),
+    }
 }
 
 fn parse_read_consistency(value: &str) -> Result<ReadConsistency, String> {
@@ -3705,6 +4068,57 @@ async fn request_sql_query(args: &SqlQueryArgs) -> Result<SqlQueryResponse, Stri
     .await
 }
 
+#[cfg(feature = "graph")]
+async fn request_graph_query(args: &GraphQueryArgs) -> Result<GraphQueryResponse, String> {
+    let request = GraphQueryRequest {
+        statement: args.statement.clone(),
+        consistency: args.consistency,
+        max_rows: args.max_rows,
+    };
+    client_json_request(
+        &args.urls,
+        &args.token,
+        GRAPH_QUERY_PATH,
+        &request,
+        read_can_hedge(request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_get(args: &KvGetArgs) -> Result<KvGetResponse, String> {
+    client_json_request(
+        &args.urls,
+        &args.token,
+        KV_GET_PATH,
+        &args.request,
+        read_can_hedge(args.request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_scan(args: &KvScanArgs) -> Result<KvScanResponse, String> {
+    client_json_request(
+        &args.urls,
+        &args.token,
+        KV_SCAN_PATH,
+        &args.request,
+        read_can_hedge(args.request.consistency),
+    )
+    .await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_put(args: &KvPutArgs) -> Result<KvMutationResponse, String> {
+    client_json_request(&args.urls, &args.token, KV_PUT_PATH, &args.request, true).await
+}
+
+#[cfg(feature = "kv")]
+async fn request_kv_delete(args: &KvDeleteArgs) -> Result<KvMutationResponse, String> {
+    client_json_request(&args.urls, &args.token, KV_DELETE_PATH, &args.request, true).await
+}
+
 const CLIENT_HEDGE_DELAY: Duration = Duration::from_millis(100);
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -4097,7 +4511,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get --url <preferred> [--token <token>] --key-base64 <base64> [--consistency local|read_barrier|applied_index:N]\n  rhiza kv scan --url <preferred> [--token <token>] (--start-base64 <base64> [--end-base64 <base64>]|--prefix-base64 <base64>) [--cursor-base64 <base64>] [--limit N] [--consistency local|read_barrier|applied_index:N]\n  rhiza kv put --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64> --value-base64 <base64>\n  rhiza kv delete --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64>\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -4123,6 +4537,8 @@ mod tests {
     use rhiza_core::{
         ConfigChange, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
     };
+    #[cfg(feature = "graph")]
+    use rhiza_node::GraphQueryParameterDto;
     use rhiza_node::{
         NodeStatus, ReadRequest, RuntimeConfigurationStatus, WriteRequest, PROTOCOL_VERSION,
         VERSION_HEADER,
@@ -4356,6 +4772,207 @@ mod tests {
         };
         assert_eq!(query.consistency, Some(ReadConsistency::ReadBarrier));
         assert_eq!(query.max_rows, Some(25));
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_query_parser_preserves_full_cypher_typed_parameters_and_controls() {
+        let command = parse_command([
+            "graph",
+            "query",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--cypher",
+            "MATCH (u:User)-[:FOLLOWS]->(v) WHERE u.id = $id RETURN v.name ORDER BY v.name",
+            "--params-json",
+            r#"{"id":{"type":"u64","value":7},"tags":{"type":"list","value":[{"type":"string","value":"rust"}]}}"#,
+            "--consistency",
+            "applied_index:42",
+            "--max-rows",
+            "25",
+        ])
+        .unwrap();
+        let Command::GraphQuery(args) = command else {
+            panic!("expected graph query command");
+        };
+
+        assert!(args
+            .statement
+            .cypher
+            .contains("MATCH (u:User)-[:FOLLOWS]->(v)"));
+        assert_eq!(
+            args.statement.parameters["id"],
+            GraphQueryParameterDto::U64(7)
+        );
+        assert_eq!(args.consistency, Some(ReadConsistency::AppliedIndex(42)));
+        assert_eq!(args.max_rows, Some(25));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_parsers_preserve_base64_and_validate_scan_shape() {
+        let put = parse_command([
+            "kv",
+            "put",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--request-id",
+            "put-1",
+            "--key-base64",
+            "/wA=",
+            "--value-base64",
+            "AAEC",
+        ])
+        .unwrap();
+        let Command::KvPut(put) = put else {
+            panic!("expected KV put command");
+        };
+        assert_eq!(put.request.key, "/wA=");
+        assert_eq!(put.request.value, "AAEC");
+
+        let scan = parse_command([
+            "kv",
+            "scan",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--prefix-base64",
+            "/w==",
+            "--cursor-base64",
+            "/wA=",
+            "--limit",
+            "10",
+            "--consistency",
+            "read_barrier",
+        ])
+        .unwrap();
+        let Command::KvScan(scan) = scan else {
+            panic!("expected KV scan command");
+        };
+        assert_eq!(scan.request.prefix.as_deref(), Some("/w=="));
+        assert_eq!(scan.request.cursor.as_deref(), Some("/wA="));
+        assert_eq!(scan.request.limit, Some(10));
+
+        assert!(parse_command([
+            "kv",
+            "scan",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--prefix-base64",
+            "YQ==",
+            "--start-base64",
+            "YQ==",
+        ])
+        .is_err());
+    }
+
+    #[cfg(all(feature = "graph", feature = "kv"))]
+    #[tokio::test]
+    async fn graph_and_kv_query_clients_send_the_public_route_schemas_unchanged() {
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let graph_captured = Arc::clone(&captured);
+        let kv_captured = Arc::clone(&captured);
+        let app = Router::new()
+            .route(
+                GRAPH_QUERY_PATH,
+                post(move |Json(request): Json<GraphQueryRequest>| {
+                    let captured = Arc::clone(&graph_captured);
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(request).unwrap());
+                        Json(GraphQueryResponse {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            applied_index: 7,
+                            hash: LogHash::ZERO,
+                        })
+                    }
+                }),
+            )
+            .route(
+                KV_SCAN_PATH,
+                post(move |Json(request): Json<KvScanRequest>| {
+                    let captured = Arc::clone(&kv_captured);
+                    async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(request).unwrap());
+                        Json(KvScanResponse {
+                            entries: Vec::new(),
+                            next_cursor: None,
+                            applied_index: 8,
+                            hash: LogHash::ZERO,
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = parse_graph_query(
+            [
+                "--url",
+                &url,
+                "--token",
+                "client-secret",
+                "--cypher",
+                "MATCH (n) WHERE n.id = $id RETURN n",
+                "--params-json",
+                r#"{"id":{"type":"u64","value":7}}"#,
+                "--consistency",
+                "applied_index:7",
+                "--max-rows",
+                "20",
+            ]
+            .map(String::from),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(request_graph_query(&graph).await.unwrap().applied_index, 7);
+
+        let kv = parse_kv_scan(
+            [
+                "--url",
+                &url,
+                "--token",
+                "client-secret",
+                "--prefix-base64",
+                "/w==",
+                "--cursor-base64",
+                "/wA=",
+                "--limit",
+                "10",
+                "--consistency",
+                "local",
+            ]
+            .map(String::from),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(request_kv_scan(&kv).await.unwrap().applied_index, 8);
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured[0]["statement"]["cypher"],
+            "MATCH (n) WHERE n.id = $id RETURN n"
+        );
+        assert_eq!(captured[0]["statement"]["parameters"]["id"]["type"], "u64");
+        assert_eq!(captured[0]["consistency"]["applied_index"], 7);
+        assert_eq!(captured[1]["prefix"], "/w==");
+        assert_eq!(captured[1]["cursor"], "/wA=");
+        assert_eq!(captured[1]["limit"], 10);
+        server.abort();
     }
 
     #[test]

@@ -56,14 +56,23 @@ image serves any profile selected by `RHIZA_EXECUTION_PROFILE`.
 
 ## Embedded Rust API
 
-The implemented embedded surface for `rhiza sql` is the `rhiza` crate.
+The `rhiza` crate exposes the SQL, graph, and KV profiles through one embedded
+owner. Its default feature set is SQL-only; graph and KV are explicit opt-ins:
+
+| Cargo features | Embedded profiles |
+| --- | --- |
+| default or `--no-default-features` | SQL |
+| `--features graph` | SQL and graph |
+| `--features kv` | SQL and KV |
+| `--all-features` | SQL, graph, and KV |
+
 `Rhiza` owns the node runtime and background workers;
 cloneable `RhizaHandle` values are weak handles that stop working after
 owner shutdown. Applications inject recorder and log transports without
 configuring HTTP or Kubernetes:
 
 ```rust,no_run
-use rhiza::{EmbeddedConfig, EmbeddedIdentity, Rhiza, ReadConsistency};
+use rhiza::{EmbeddedConfig, EmbeddedIdentity, ExecutionProfile, Rhiza, ReadConsistency};
 
 # async fn example(
 #     recorders: Vec<(String, Box<dyn rhiza::RecorderRpc>)>,
@@ -71,6 +80,7 @@ use rhiza::{EmbeddedConfig, EmbeddedIdentity, Rhiza, ReadConsistency};
 let config = EmbeddedConfig::new(
     EmbeddedIdentity::new("cluster-a", "node-1", 1, 1),
     "./data/node-1",
+    ExecutionProfile::Sqlite,
     vec!["node-1".into(), "node-2".into(), "node-3".into()],
     recorders,
     vec![],
@@ -88,9 +98,12 @@ owner.shutdown().await?;
 # }
 ```
 
-`execute_sql` and `query` expose the same typed SQL, `RETURNING`, consistency,
-and persistent idempotency contracts as the HTTP adapter. The HTTP routes and
-CLI are secondary adapters over the same node service.
+For the SQL profile, `execute_sql` and `query` expose typed SQL, `RETURNING`,
+consistency, and persistent idempotency. With the corresponding crate features,
+graph profiles expose `mutate_graph` and `query_graph`; KV profiles expose
+`put_kv`, `delete_kv`, `get_kv`, `scan_kv_range`, and `scan_kv_prefix`. Every
+method checks the configured `ExecutionProfile`. HTTP routes and the CLI are
+secondary adapters over the same node service contracts.
 
 Kubernetes provides stable process identity, DNS, secrets, and orchestration;
 the runtime does not call Kubernetes APIs and receives no service-account
@@ -206,6 +219,14 @@ regenerated against the new exact base. Effects are capped at 256 KiB and are
 applied with conflict-abort semantics; this is bounded effect replication, not
 unrestricted arbitrary SQLite effect replication.
 
+Read-only SQL runs only against the selected local materialization, so it may
+use nondeterministic and runtime-introspection functions such as `random()`,
+`datetime('now')`, and `sqlite_version()`. Replicated writes still reject
+nondeterministic functions and other inputs that could make replicas diverge.
+Read execution is interrupted after five seconds; a timeout returns retryable
+`503 resource_exhausted`, releases the SQLite connection, and does not change
+node readiness.
+
 SQL parameters and result cells preserve SQLite `null`, `integer`, `real`,
 `text`, and `blob` types. For example:
 
@@ -262,39 +283,59 @@ KV clusters expose:
 - `POST /v1/kv/put`
 - `POST /v1/kv/delete`
 - `POST /v1/kv/get`
+- `POST /v1/kv/scan`
 
 Every request uses `x-rhiza-version: 1` and the client bearer token. Mutations
 require a stable `request_id`. Reads accept `local`, `read_barrier`, or
 `{"applied_index": N}` consistency. A read response returns the value,
 `applied_index`, and qlog `hash` from one materializer boundary.
 
-`/v1/graph/query` accepts one statement from the public Graph Query V1 subset:
-`MATCH (v:RhizaDocument) [WHERE v.id = $string_param] RETURN 1..=4
-property-or-parameter projections [LIMIT nonnegative-literal]`. `RETURN`
-accepts only whitelisted properties or scalar parameters, without aliases. The
-fixed properties are `id`, `kind`, `bool_value`, `i64_value`, `u64_value`,
-`f64_value`, `string_value`, and `bytes_value`. Every supplied parameter must be
-referenced exactly, parameter names must be ASCII identifiers, parameters must
-be scalar, and an ID predicate parameter must be a string.
+`/v1/graph/query` accepts one labeled read-only Cypher statement supported by
+the bundled LadybugDB engine. This includes labeled joins, aliases,
+expressions, scalar functions, aggregates, bounded collections, whole nodes,
+relationships, `DISTINCT`, `UNWIND`, `ORDER BY`, `SKIP`, and literal or
+parameterized `LIMIT` where the referenced schema supports them. Supplied typed parameters must exactly match
+the referenced parameters and may contain bounded scalar, list, or struct
+values. Mutations, DDL, transaction control, standalone administrative calls,
+external I/O, multiple statements, and the reserved `__Rhiza*` namespace are
+rejected. Every node pattern must name a static, non-reserved label: LadybugDB
+0.18.1 has no per-connection table ACL that could otherwise keep unlabeled
+patterns from scanning rhiza's internal nodes. LadybugDB's prepared-statement
+read-only classification is the final admission check.
 
-Other labels, literal/non-ID/compound predicates, literal or aliased
-projections, whole-node projections, relationships and paths, multiple
-patterns, collections, functions, operators, `DISTINCT`, subqueries, `UNWIND`,
-`ORDER BY`, `SKIP`, parameterized `LIMIT`, writes, DDL, transaction control,
-standalone `CALL`, and reserved `__Rhiza*` objects are rejected.
+Because LadybugDB 0.18.1 exposes no per-query memory or nested-value
+cardinality cap, container-producing expressions are admitted only when rhiza
+can prove their cumulative expansion size before execution. List/map literals,
+bounded parameters, statically sized `repeat()`, and `range()` with integer
+literal or integer parameter bounds are supported. Repeated parameter
+references count separately, and projected expansions are multiplied by the
+bounded result-row count against the same 1 MiB budget. Unbounded or
+oversized `range()`, `collect()`, list comprehensions, and functions that
+produce lists/maps from runtime data are rejected before LadybugDB execution.
+Padding functions must have a statically bounded length; multiplicative
+replacement functions are rejected. Direct node and relationship results
+remain supported.
+
+Every top-level `UNION` branch must contain exactly one explicit bounded
+`LIMIT`, and the sum of branch limits must not exceed `max_rows`. A non-`UNION`
+query is bounded by the server even when it omits `LIMIT`. Queries default to
+`max_rows: 1000` and accept at most 10,000 rows; query text is limited to 64
+KiB, serialized result data to 1 MiB, the encoded response to 4 MiB, and
+execution to the 5-second server timeout. LadybugDB uses a shared 512 MiB
+buffer pool with at most two query execution threads. The buffer pool bounds
+engine-managed pages across the database; it is not a 1 MiB per-query or total
+process RSS limit. There is no separate projection-count or result-cell limit.
 
 Graph queries support the same consistency modes and return typed columns and
-rows with the applied qlog tip from one materializer boundary. Each column has
-`name` and `logical_type`, and each row cell is a tagged scalar value. Queries
-default to `max_rows: 1000` and accept at most 10,000, while the stricter
-4-cell ceiling bounds returned rows multiplied by projections. A query accepts
-at most 4 return projections. Result data is limited to 1 MiB and the encoded
-response to 4 MiB. Graph writes remain the
-bounded semantic document commands. Query grammar, admission, row, cell, and
-byte limit violations return the normal non-retryable `400 invalid_request`
-JSON error without changing readiness; malformed request JSON continues to use
-`invalid_json`. Internal Ladybug, storage, connection, or state-corruption
-errors return `500` and latch the node out of readiness.
+rows with the applied qlog tip from one materializer boundary. Result values
+preserve Ladybug logical types, including nested collections and graph
+node/relationship values. Graph writes remain bounded semantic document
+commands. Admission, row, or byte limit violations return the normal
+non-retryable `400 invalid_request` JSON error without changing readiness;
+malformed request JSON continues to use `invalid_json`. Internal Ladybug,
+storage, connection, or state-corruption errors return `500` and latch the node
+out of readiness. Ladybug query timeout/interruption and buffer-pool exhaustion
+return retryable `503 resource_exhausted` without changing readiness.
 
 Graph values are typed as `null`, `bool`, `i64`, `u64`, `f64`, `string`, or
 `bytes`; graph byte values use padded base64. For example:
@@ -316,11 +357,15 @@ curl -sS http://127.0.0.1:8080/v1/graph/query \
   -H 'x-rhiza-version: 1' \
   -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"statement":{"cypher":"MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.id, v.string_value LIMIT 1","parameters":{"id":{"type":"string","value":"doc-1"}}},"consistency":"read_barrier","max_rows":100}'
+  -d '{"statement":{"cypher":"MATCH (v:RhizaDocument) WHERE v.id IN $ids RETURN v.id AS id, upper(v.string_value) AS value ORDER BY v.id LIMIT 10","parameters":{"ids":{"type":"list","value":[{"type":"string","value":"doc-1"}]}}},"consistency":"read_barrier","max_rows":100}'
+
+rhiza graph query --url http://127.0.0.1:8080 \
+  --cypher 'MATCH (v:RhizaDocument) RETURN v.id AS id ORDER BY v.id LIMIT 10' \
+  --consistency read_barrier --max-rows 100
 ```
 
-Graph Query V1 parameters and results use tagged scalar `null`, `bool`, `i64`,
-`u64`, `f64`, `string`, and `bytes` values. Bytes use canonical padded base64.
+Graph parameters and results use tagged typed values. Bytes use canonical
+padded base64.
 
 KV keys and values are bytes encoded as canonical padded base64 in both
 requests and responses. `a2V5` and `dmFsdWU=` below decode to `key` and
@@ -338,7 +383,34 @@ curl -sS http://127.0.0.1:8080/v1/kv/get \
   -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"key":"a2V5","consistency":{"applied_index":1}}'
+
+rhiza kv scan --url http://127.0.0.1:8080 \
+  --prefix-base64 a2V5 --limit 100 --consistency read_barrier
 ```
+
+KV scan accepts either a prefix or a half-open range (`start` with optional
+`end`) and returns ordered entries plus an opaque `next_cursor`. The default
+page size is 100 and the maximum is 1,024 entries. A page is also capped at 1
+MiB of combined raw key/value bytes and 2 MiB after JSON encoding. Entries and
+the applied qlog tip are observed from one materializer boundary; continue a
+scan by sending the returned cursor with the same prefix or range.
+
+## Write batching and the Recorder fast path
+
+The HTTP writer queue coalesces concurrent requests for up to eight members or
+500 microseconds by default. Graph and KV members are encoded as one canonical,
+ordered replicated batch, committed in one qlog entry, and applied atomically
+while retaining an independent request ID and retry result for every member.
+Oversized batches fall back to individual proposals.
+
+On the ordinary QuePaxa fast path, the preferred proposal can be decided after
+the phase-zero Recorder quorum; the command is piggybacked on the typed Record
+request and persisted before a Recorder acknowledges it. Combining that path
+with Graph/KV batching structurally reduces consensus proposals, qlog appends,
+and materializer synchronization boundaries per request under concurrency. It
+does not remove network, storage, checkpoint, or durability work, and the
+batching window can add latency at light load; no fixed throughput or latency
+claim follows from the structure alone.
 
 ## Storage Model
 

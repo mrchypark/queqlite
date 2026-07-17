@@ -4,6 +4,7 @@ use std::{
     io::{Cursor, Error as IoError, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use fallible_streaming_iterator::FallibleStreamingIterator;
@@ -69,6 +70,8 @@ pub const MAX_RETURNING_ROWS: usize = 1_024;
 pub const MAX_RETURNING_BYTES: usize = 1024 * 1024;
 pub const MAX_SQL_EFFECT_BYTES: usize = 256 * 1024;
 pub const MAX_WRITE_BATCH_MEMBERS: usize = 64;
+pub const DEFAULT_SQL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQL_PROGRESS_HANDLER_OPS: i32 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -437,6 +440,7 @@ pub enum Error {
     RestoreFailed,
     Io(String),
     Sqlite(String),
+    ResourceExhausted(String),
     InvalidCommand(String),
     IdentityMismatch(String),
     InvalidEntry(String),
@@ -451,6 +455,7 @@ impl std::fmt::Display for Error {
             Self::RestoreFailed => write!(f, "SQLite restore failed"),
             Self::Io(message) => write!(f, "SQLite io failed: {message}"),
             Self::Sqlite(message) => write!(f, "SQLite error: {message}"),
+            Self::ResourceExhausted(message) => write!(f, "SQLite resource exhausted: {message}"),
             Self::InvalidCommand(message) => write!(f, "invalid deterministic command: {message}"),
             Self::IdentityMismatch(field) => {
                 write!(f, "SQLite database identity mismatch for {field}")
@@ -827,15 +832,33 @@ impl SqliteStateMachine {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SqlQueryResult> {
+        self.query_sql_with_timeout(query, max_rows, max_bytes, DEFAULT_SQL_QUERY_TIMEOUT)
+    }
+
+    pub fn query_sql_with_timeout(
+        &self,
+        query: &SqlStatement,
+        max_rows: usize,
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<SqlQueryResult> {
         validate_sql_statement(query)?;
         if max_rows == 0 || max_bytes == 0 {
             return Err(Error::InvalidCommand(
                 "SQL query limits must be positive".into(),
             ));
         }
-        with_sql_authorizer(&self.conn, None, || {
-            validate_deterministic_bytecode(&self.conn, query)?;
-            let mut statement = self.conn.prepare(&query.sql).map_err(sqlite_error)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        self.conn
+            .progress_handler(
+                SQL_PROGRESS_HANDLER_OPS,
+                Some(move || Instant::now() >= deadline),
+            )
+            .map_err(sqlite_error)?;
+        let result = with_sql_authorizer(&self.conn, None, SqlAuthorizationMode::ReadOnly, || {
+            let mut statement = self.conn.prepare(&query.sql).map_err(sql_query_error)?;
             if !statement.readonly() {
                 return Err(Error::InvalidCommand("SQL query must be read-only".into()));
             }
@@ -847,10 +870,10 @@ impl SqliteStateMachine {
             let column_count = columns.len();
             let mut rows = statement
                 .query(params_from_iter(query.parameters.iter()))
-                .map_err(sqlite_error)?;
+                .map_err(sql_query_error)?;
             let mut result_rows = Vec::new();
             let mut result_bytes = columns.iter().map(String::len).sum::<usize>();
-            while let Some(row) = rows.next().map_err(sqlite_error)? {
+            while let Some(row) = rows.next().map_err(sql_query_error)? {
                 if result_rows.len() == max_rows {
                     return Err(Error::InvalidCommand(format!(
                         "SQL query exceeds {max_rows} rows"
@@ -858,7 +881,7 @@ impl SqliteStateMachine {
                 }
                 let mut values = Vec::with_capacity(column_count);
                 for column in 0..column_count {
-                    let value = sql_value(row.get_ref(column).map_err(sqlite_error)?)?;
+                    let value = sql_value(row.get_ref(column).map_err(sql_query_error)?)?;
                     result_bytes = result_bytes
                         .checked_add(sql_value_size(&value))
                         .ok_or_else(|| Error::InvalidCommand("SQL result size overflow".into()))?;
@@ -875,7 +898,16 @@ impl SqliteStateMachine {
                 columns,
                 rows: result_rows,
             })
-        })
+        });
+        let clear_result = self
+            .conn
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(sqlite_error);
+        match (result, clear_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
+        }
     }
 
     pub fn validate_sql_write(&self, command: &SqlCommand) -> Result<()> {
@@ -927,6 +959,23 @@ impl SqliteStateMachine {
         base_index: LogIndex,
         base_hash: LogHash,
     ) -> Result<Vec<u8>> {
+        self.prepare_write_batch_prefix(member_payloads, base_index, base_hash, usize::MAX)?
+            .map(|(_, payload)| payload)
+            .ok_or_else(|| Error::InvalidCommand("write batch has no encodable members".into()))
+    }
+
+    /// Prepares the largest ordered prefix whose canonical batch payload fits `max_payload_bytes`.
+    ///
+    /// Each candidate member is executed at most once in the rollback-only preview transaction.
+    /// The first member that would overflow the encoded batch is previewed to determine its
+    /// canonical size, but is not included in the returned payload.
+    pub fn prepare_write_batch_prefix(
+        &self,
+        member_payloads: &[Vec<u8>],
+        base_index: LogIndex,
+        base_hash: LogHash,
+        max_payload_bytes: usize,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
         if member_payloads.is_empty() || member_payloads.len() > MAX_WRITE_BATCH_MEMBERS {
             return Err(Error::InvalidCommand(format!(
                 "write batch must contain 1..={MAX_WRITE_BATCH_MEMBERS} members"
@@ -945,8 +994,9 @@ impl SqliteStateMachine {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidEntry("applied index is exhausted".into()))?;
         let mut proposals = Vec::with_capacity(member_payloads.len());
+        let mut encoded_len = WRITE_BATCH_V1_MAGIC.len() + 2;
         for member_payload in member_payloads {
-            match parse_command_operation(member_payload)? {
+            let proposal = match parse_command_operation(member_payload)? {
                 Operation::Put { .. } => {
                     let operation = parse_command_operation(member_payload)?;
                     apply_operation(
@@ -956,7 +1006,7 @@ impl SqliteStateMachine {
                         LogHash::ZERO,
                         member_payload,
                     )?;
-                    proposals.push(member_payload.clone());
+                    member_payload.clone()
                 }
                 Operation::Sql { version, command } => {
                     if version != SqlCommandVersion::V2 {
@@ -965,39 +1015,57 @@ impl SqliteStateMachine {
                         ));
                     }
                     if matching_request(&tx, &command.request_id, member_payload)?.is_some() {
-                        proposals.push(member_payload.clone());
-                        continue;
+                        member_payload.clone()
+                    } else {
+                        let (preparation, result) = prepare_sql_effect_in_transaction(
+                            &tx,
+                            &command,
+                            member_payload,
+                            base_index,
+                            base_hash,
+                        )?;
+                        let result_blob = encode_sql_result(&result)?;
+                        record_request(
+                            &tx,
+                            &command.request_id,
+                            preview_index,
+                            LogHash::ZERO,
+                            member_payload,
+                            Some(&result_blob),
+                        )?;
+                        match preparation {
+                            SqlEffectPreparation::Effect(payload) => payload,
+                            SqlEffectPreparation::StatementReplay => member_payload.clone(),
+                        }
                     }
-                    let (preparation, result) = prepare_sql_effect_in_transaction(
-                        &tx,
-                        &command,
-                        member_payload,
-                        base_index,
-                        base_hash,
-                    )?;
-                    let result_blob = encode_sql_result(&result)?;
-                    record_request(
-                        &tx,
-                        &command.request_id,
-                        preview_index,
-                        LogHash::ZERO,
-                        member_payload,
-                        Some(&result_blob),
-                    )?;
-                    proposals.push(match preparation {
-                        SqlEffectPreparation::Effect(payload) => payload,
-                        SqlEffectPreparation::StatementReplay => member_payload.clone(),
-                    });
                 }
                 Operation::SqlEffect(_) | Operation::Batch(_) | Operation::Noop => {
                     return Err(Error::InvalidCommand(
                         "write batch members must be original put or QSQL commands".into(),
                     ));
                 }
+            };
+            u32::try_from(proposal.len())
+                .map_err(|_| Error::InvalidCommand("write batch member is too large".into()))?;
+            let next_encoded_len = encoded_len
+                .checked_add(4)
+                .and_then(|len| len.checked_add(proposal.len()))
+                .ok_or_else(|| Error::InvalidCommand("write batch size is exhausted".into()))?;
+            if next_encoded_len > max_payload_bytes {
+                tx.rollback().map_err(sqlite_error)?;
+                return if proposals.is_empty() {
+                    Ok(None)
+                } else {
+                    let member_count = proposals.len();
+                    encode_write_batch(&proposals).map(|payload| Some((member_count, payload)))
+                };
             }
+            encoded_len = next_encoded_len;
+            proposals.push(proposal);
         }
         tx.rollback().map_err(sqlite_error)?;
-        encode_write_batch(&proposals)
+        let member_count = proposals.len();
+        encode_write_batch(&proposals).map(|payload| Some((member_count, payload)))
     }
 
     pub fn check_request(
@@ -1306,6 +1374,12 @@ enum SqlCommandVersion {
 enum SqlExecutionMode {
     StatementReplay,
     EffectPreparation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SqlAuthorizationMode {
+    ReadOnly,
+    DeterministicWrite,
 }
 
 fn parse_operation(entry: &LogEntry) -> Result<Operation<'_>> {
@@ -2032,93 +2106,99 @@ fn execute_sql_statements_inner(
     mode: SqlExecutionMode,
     audit: Option<Arc<Mutex<SqlEffectAudit>>>,
 ) -> Result<SqlCommandResult> {
-    let result = with_sql_authorizer(conn, audit, || {
-        let mut statement_results = Vec::with_capacity(statements.len());
-        let mut returning_rows = 0usize;
-        let mut returning_bytes = 0usize;
-        for operation in statements {
-            validate_deterministic_bytecode(conn, operation)?;
-            let mut statement = conn.prepare(&operation.sql).map_err(sqlite_error)?;
-            if statement.readonly() {
-                return Err(Error::InvalidCommand(
-                    "replicated SQL statements must mutate the database".into(),
-                ));
-            }
-            let column_count = statement.column_count();
-            if column_count != 0 {
-                match (version, mode) {
-                    (SqlCommandVersion::V1, _) => {
-                        return Err(Error::InvalidCommand(
-                            "replicated SQL does not support RETURNING; query separately".into(),
-                        ));
-                    }
-                    (SqlCommandVersion::V2, SqlExecutionMode::StatementReplay) => {
-                        return Err(Error::InvalidCommand(
-                            "QSQL v2 RETURNING must be prepared as a QEFX effect".into(),
-                        ));
-                    }
-                    (SqlCommandVersion::V2, SqlExecutionMode::EffectPreparation) => {}
+    let result = with_sql_authorizer(
+        conn,
+        audit,
+        SqlAuthorizationMode::DeterministicWrite,
+        || {
+            let mut statement_results = Vec::with_capacity(statements.len());
+            let mut returning_rows = 0usize;
+            let mut returning_bytes = 0usize;
+            for operation in statements {
+                validate_deterministic_bytecode(conn, operation)?;
+                let mut statement = conn.prepare(&operation.sql).map_err(sqlite_error)?;
+                if statement.readonly() {
+                    return Err(Error::InvalidCommand(
+                        "replicated SQL statements must mutate the database".into(),
+                    ));
                 }
-            }
-            let total_changes_before = conn.total_changes();
-            let returning = if column_count == 0 {
-                statement
-                    .execute(params_from_iter(operation.parameters.iter()))
-                    .map_err(sqlite_error)?;
-                None
-            } else {
-                let columns = statement
-                    .column_names()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                for column in &columns {
-                    add_returning_bytes(&mut returning_bytes, column.len())?;
+                let column_count = statement.column_count();
+                if column_count != 0 {
+                    match (version, mode) {
+                        (SqlCommandVersion::V1, _) => {
+                            return Err(Error::InvalidCommand(
+                                "replicated SQL does not support RETURNING; query separately"
+                                    .into(),
+                            ));
+                        }
+                        (SqlCommandVersion::V2, SqlExecutionMode::StatementReplay) => {
+                            return Err(Error::InvalidCommand(
+                                "QSQL v2 RETURNING must be prepared as a QEFX effect".into(),
+                            ));
+                        }
+                        (SqlCommandVersion::V2, SqlExecutionMode::EffectPreparation) => {}
+                    }
                 }
-                let mut result_rows = Vec::new();
-                {
-                    let mut rows = statement
-                        .query(params_from_iter(operation.parameters.iter()))
+                let total_changes_before = conn.total_changes();
+                let returning = if column_count == 0 {
+                    statement
+                        .execute(params_from_iter(operation.parameters.iter()))
                         .map_err(sqlite_error)?;
-                    while let Some(row) = rows.next().map_err(sqlite_error)? {
-                        returning_rows = returning_rows.checked_add(1).ok_or_else(|| {
-                            Error::InvalidCommand("SQL RETURNING row count overflow".into())
-                        })?;
-                        if returning_rows > MAX_RETURNING_ROWS {
-                            return Err(Error::InvalidCommand(format!(
-                                "SQL RETURNING exceeds {MAX_RETURNING_ROWS} rows"
-                            )));
-                        }
-                        let mut values = Vec::with_capacity(column_count);
-                        for column in 0..column_count {
-                            let value = sql_value(row.get_ref(column).map_err(sqlite_error)?)?;
-                            add_returning_bytes(&mut returning_bytes, sql_value_size(&value))?;
-                            values.push(value);
-                        }
-                        result_rows.push(values);
+                    None
+                } else {
+                    let columns = statement
+                        .column_names()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    for column in &columns {
+                        add_returning_bytes(&mut returning_bytes, column.len())?;
                     }
-                }
-                Some(SqlQueryResult {
-                    columns,
-                    rows: result_rows,
-                })
-            };
-            let total_changes = conn
-                .total_changes()
-                .checked_sub(total_changes_before)
-                .ok_or_else(|| Error::Sqlite("SQLite total_changes moved backwards".into()))?;
-            let rows_affected = if total_changes == 0 {
-                0
-            } else {
-                conn.changes()
-            };
-            statement_results.push(SqlStatementResult {
-                rows_affected,
-                returning,
-            });
-        }
-        Ok(SqlCommandResult { statement_results })
-    })?;
+                    let mut result_rows = Vec::new();
+                    {
+                        let mut rows = statement
+                            .query(params_from_iter(operation.parameters.iter()))
+                            .map_err(sqlite_error)?;
+                        while let Some(row) = rows.next().map_err(sqlite_error)? {
+                            returning_rows = returning_rows.checked_add(1).ok_or_else(|| {
+                                Error::InvalidCommand("SQL RETURNING row count overflow".into())
+                            })?;
+                            if returning_rows > MAX_RETURNING_ROWS {
+                                return Err(Error::InvalidCommand(format!(
+                                    "SQL RETURNING exceeds {MAX_RETURNING_ROWS} rows"
+                                )));
+                            }
+                            let mut values = Vec::with_capacity(column_count);
+                            for column in 0..column_count {
+                                let value = sql_value(row.get_ref(column).map_err(sqlite_error)?)?;
+                                add_returning_bytes(&mut returning_bytes, sql_value_size(&value))?;
+                                values.push(value);
+                            }
+                            result_rows.push(values);
+                        }
+                    }
+                    Some(SqlQueryResult {
+                        columns,
+                        rows: result_rows,
+                    })
+                };
+                let total_changes = conn
+                    .total_changes()
+                    .checked_sub(total_changes_before)
+                    .ok_or_else(|| Error::Sqlite("SQLite total_changes moved backwards".into()))?;
+                let rows_affected = if total_changes == 0 {
+                    0
+                } else {
+                    conn.changes()
+                };
+                statement_results.push(SqlStatementResult {
+                    rows_affected,
+                    returning,
+                });
+            }
+            Ok(SqlCommandResult { statement_results })
+        },
+    )?;
     validate_reserved_schema(conn)?;
     Ok(result)
 }
@@ -2256,6 +2336,7 @@ fn validate_sql_statement(statement: &SqlStatement) -> Result<()> {
 fn with_sql_authorizer<T>(
     conn: &Connection,
     audit: Option<Arc<Mutex<SqlEffectAudit>>>,
+    mode: SqlAuthorizationMode,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let effect_capture = audit.is_some();
@@ -2272,7 +2353,7 @@ fn with_sql_authorizer<T>(
         if session_schema_read {
             Authorization::Allow
         } else {
-            authorize_sql(context)
+            authorize_sql(context, mode)
         }
     }))
     .map_err(sqlite_error)?;
@@ -2322,7 +2403,7 @@ fn record_sql_effect_action(audit: &Arc<Mutex<SqlEffectAudit>>, action: &AuthAct
     }
 }
 
-fn authorize_sql(context: AuthContext<'_>) -> Authorization {
+fn authorize_sql(context: AuthContext<'_>, mode: SqlAuthorizationMode) -> Authorization {
     if context.database_name.is_some_and(|name| name != "main") {
         return Authorization::Deny;
     }
@@ -2343,7 +2424,13 @@ fn authorize_sql(context: AuthContext<'_>) -> Authorization {
         | AuthAction::CreateVtable { .. }
         | AuthAction::DropVtable { .. }
         | AuthAction::Savepoint { .. } => Authorization::Deny,
-        AuthAction::Function { function_name } if nondeterministic_function(function_name) => {
+        AuthAction::Function { function_name } if unsafe_sql_function(function_name) => {
+            Authorization::Deny
+        }
+        AuthAction::Function { function_name }
+            if mode == SqlAuthorizationMode::DeterministicWrite
+                && nondeterministic_function(function_name) =>
+        {
             Authorization::Deny
         }
         AuthAction::CreateIndex {
@@ -2433,6 +2520,10 @@ fn nondeterministic_function(name: &str) -> bool {
             | "sqlite_source_id"
             | "sqlite_version"
     )
+}
+
+fn unsafe_sql_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("load_extension")
 }
 
 fn validate_deterministic_bytecode(conn: &Connection, statement: &SqlStatement) -> Result<()> {
@@ -2928,6 +3019,130 @@ fn sqlite_error(error: rusqlite::Error) -> Error {
     Error::Sqlite(error.to_string())
 }
 
+fn sql_query_error(error: rusqlite::Error) -> Error {
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ffi::ErrorCode::OperationInterrupted =>
+        {
+            Error::ResourceExhausted("SQL query execution timed out".into())
+        }
+        _ => sqlite_error(error),
+    }
+}
+
 fn io_error(error: std::io::Error) -> Error {
     Error::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod query_policy_tests {
+    use super::*;
+
+    #[test]
+    fn read_query_timeout_interrupts_work_and_releases_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let database =
+            SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+                .unwrap();
+        let expensive = SqlStatement {
+            sql: "WITH RECURSIVE count(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM count WHERE value < 100000000) SELECT sum(value) FROM count".into(),
+            parameters: vec![],
+        };
+
+        assert_eq!(
+            database
+                .query_sql_with_timeout(&expensive, 1, 1024, Duration::ZERO)
+                .unwrap_err(),
+            Error::ResourceExhausted("SQL query execution timed out".into())
+        );
+
+        let quick = database
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                },
+                1,
+                1024,
+            )
+            .unwrap();
+        assert_eq!(quick.rows, vec![vec![SqlValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn bounded_batch_preparation_visits_each_candidate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let database =
+            SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+                .unwrap();
+        let value = "x".repeat(1024);
+        let members = (0..8)
+            .map(|index| format!("put\trequest-{index}\tkey-{index}\t{value}").into_bytes())
+            .collect::<Vec<_>>();
+        let max_payload_bytes = encode_write_batch(&members[..4]).unwrap().len();
+        let changes_before = database.conn.total_changes();
+
+        let (member_count, payload) = database
+            .prepare_write_batch_prefix(
+                &members,
+                0,
+                database.applied_hash_value().unwrap(),
+                max_payload_bytes,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(member_count, 4);
+        assert_eq!(payload, encode_write_batch(&members[..4]).unwrap());
+        assert_eq!(database.conn.total_changes() - changes_before, 10);
+    }
+
+    #[test]
+    fn read_query_allows_nondeterministic_and_runtime_introspection_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let database =
+            SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+                .unwrap();
+
+        let result = database
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT random(), datetime('now'), sqlite_version()".into(),
+                    parameters: vec![],
+                },
+                1,
+                4096,
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].len(), 3);
+    }
+
+    #[test]
+    fn replicated_write_still_rejects_nondeterministic_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let database =
+            SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+                .unwrap();
+        let command = SqlCommand {
+            request_id: "nondeterministic-write".into(),
+            statements: vec![
+                SqlStatement {
+                    sql: "CREATE TABLE generated(value INTEGER DEFAULT (random()))".into(),
+                    parameters: vec![],
+                },
+                SqlStatement {
+                    sql: "INSERT INTO generated DEFAULT VALUES".into(),
+                    parameters: vec![],
+                },
+            ],
+        };
+
+        assert!(matches!(
+            database.validate_sql_write(&command),
+            Err(Error::InvalidCommand(_)) | Err(Error::Sqlite(_))
+        ));
+        assert_eq!(database.applied_index_value().unwrap(), 0);
+    }
 }

@@ -4,11 +4,14 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
+use rhiza_kv::{encode_replicated_kv_batch, encode_replicated_kv_command};
+use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, CheckpointCoordinator,
     ClientErrorResponse, DurabilityMode, KvCommandResultV1, KvCommandV1, KvGetResponse,
-    KvMutationResponse, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, KV_GET_PATH,
-    KV_PUT_PATH, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    KvMutationResponse, KvScanResponse, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
+    KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_COMMAND_BYTES, MAX_KV_SCAN_ROWS, PROTOCOL_VERSION,
+    READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
@@ -70,6 +73,60 @@ fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
     assert_eq!(read.value, Some(b"value".to_vec()));
     assert_eq!(read.applied_index, 2);
     assert_eq!(read.hash, runtime.applied_hash().unwrap());
+}
+
+#[test]
+fn kv_scan_pages_ranges_and_prefixes_with_the_exact_snapshot_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(
+        kv_config(dir.path()),
+        consensus(dir.path(), "recorders"),
+        &[],
+    )
+    .unwrap();
+    for (request, key, value) in [
+        ("put-a", b"a".as_slice(), b"one".as_slice()),
+        ("put-aa", b"aa".as_slice(), b"two".as_slice()),
+        ("put-b", b"b".as_slice(), b"three".as_slice()),
+    ] {
+        runtime
+            .mutate_kv(KvCommandV1::put(request, key.to_vec(), value.to_vec()).unwrap())
+            .unwrap();
+    }
+
+    let first = runtime
+        .scan_kv_range(b"a", Some(b"b"), 1, None, ReadConsistency::Local)
+        .unwrap();
+    assert_eq!(first.rows()[0].key(), b"a");
+    assert_eq!(first.next_cursor(), Some(b"a".as_slice()));
+    assert_eq!(first.tip().applied_index(), 3);
+    assert_eq!(first.tip().applied_hash(), runtime.applied_hash().unwrap());
+
+    let second = runtime
+        .scan_kv_range(
+            b"a",
+            Some(b"b"),
+            1,
+            first.next_cursor(),
+            ReadConsistency::AppliedIndex(first.tip().applied_index()),
+        )
+        .unwrap();
+    assert_eq!(second.rows()[0].key(), b"aa");
+    assert_eq!(second.next_cursor(), None);
+
+    let prefix = runtime
+        .scan_kv_prefix(b"a", 10, None, ReadConsistency::ReadBarrier)
+        .unwrap();
+    assert_eq!(
+        prefix
+            .rows()
+            .iter()
+            .map(|entry| entry.key())
+            .collect::<Vec<_>>(),
+        vec![b"a".as_slice(), b"aa".as_slice()]
+    );
+    assert_eq!(prefix.tip().applied_index(), 4);
+    assert_eq!(prefix.tip().applied_hash(), runtime.applied_hash().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -146,6 +203,304 @@ async fn kv_http_routes_use_base64_and_map_invalid_input_without_mutating_state(
     assert_eq!(get.value.as_deref(), Some("dmFsdWU="));
     assert_eq!(get.applied_index, 2);
     assert_ne!(get.hash, put.hash);
+
+    let second_put = client
+        .post(&put_url)
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({
+            "request_id": "request-2",
+            "key": "a2V5Mg==",
+            "value": "dmFsdWUy"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second_put.status().is_success());
+
+    let scan_url = format!("http://{addr}{KV_SCAN_PATH}");
+    let scan = client
+        .post(&scan_url)
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({
+            "prefix": "a2V5",
+            "limit": 1,
+            "consistency": "local"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(scan.status().is_success());
+    let scan = scan.json::<KvScanResponse>().await.unwrap();
+    assert_eq!(scan.entries[0].key, "a2V5");
+    assert_eq!(scan.entries[0].value, "dmFsdWU=");
+    assert_eq!(scan.next_cursor.as_deref(), Some("a2V5"));
+    assert_eq!(scan.applied_index, 3);
+
+    for invalid in [
+        serde_json::json!({"prefix":"a2V5", "start":"aQ=="}),
+        serde_json::json!({"start":"aQ==", "cursor":"***"}),
+        serde_json::json!({"prefix":"a2V5", "limit":0}),
+        serde_json::json!({"prefix":"a2V5", "limit":MAX_KV_SCAN_ROWS + 1}),
+    ] {
+        let response = client
+            .post(&scan_url)
+            .header(VERSION_HEADER, PROTOCOL_VERSION)
+            .bearer_auth("client-token")
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<ClientErrorResponse>().await.unwrap().code,
+            "invalid_request"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn largest_node_valid_kv_record_scans_without_latching_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(
+            kv_http_config(dir.path()),
+            consensus(dir.path(), "largest-recorders"),
+            &[],
+        )
+        .unwrap(),
+    );
+    let recorder = RecorderFileStore::new_with_id(
+        dir.path().join("largest-http-recorder"),
+        "n1",
+        CLUSTER_ID,
+        1,
+        1,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served_runtime = Arc::clone(&runtime);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, node_router(served_runtime, recorder))
+            .await
+            .unwrap();
+    });
+    let request_id = "largest-http";
+    let key = b"k";
+    let empty = KvCommandV1::put(request_id, key.to_vec(), Vec::new()).unwrap();
+    let overhead = encode_replicated_kv_command(&empty).unwrap().len();
+    let value = vec![b'v'; MAX_COMMAND_BYTES - overhead];
+    let command = KvCommandV1::put(request_id, key.to_vec(), value.clone()).unwrap();
+    assert_eq!(
+        encode_replicated_kv_command(&command).unwrap().len(),
+        MAX_COMMAND_BYTES
+    );
+    let client = reqwest::Client::new();
+
+    let put = post_kv_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": request_id,
+            "key": encode_base64(key),
+            "value": encode_base64(&value)
+        }),
+    )
+    .await;
+    assert!(
+        put.status().is_success(),
+        "put failed: {}",
+        put.text().await.unwrap()
+    );
+
+    let scan = client
+        .post(format!("http://{addr}{KV_SCAN_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&serde_json::json!({"prefix": "", "limit": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        scan.status().is_success(),
+        "scan failed: {}",
+        scan.text().await.unwrap()
+    );
+    let ready = client
+        .get(format!("http://{addr}{READYZ_PATH}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(ready.status().is_success());
+    assert!(runtime.is_ready());
+    assert!(!runtime.is_fatal());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_http_config(dir.path())
+        .with_writer_batching(8, Duration::from_millis(20))
+        .unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(config, consensus(dir.path(), "batch-recorders"), &[]).unwrap());
+    let recorder = RecorderFileStore::new_with_id(
+        dir.path().join("batch-http-recorder"),
+        "n1",
+        CLUSTER_ID,
+        1,
+        1,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served_runtime = Arc::clone(&runtime);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, node_router(served_runtime, recorder))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let first_body = serde_json::json!({
+        "request_id": "batch-a",
+        "key": "c2hhcmVk",
+        "value": "Zmlyc3Q="
+    });
+    let second_body = serde_json::json!({
+        "request_id": "batch-b",
+        "key": "c2hhcmVk",
+        "value": "c2Vjb25k"
+    });
+
+    let (first, second) = tokio::join!(
+        post_kv_put(&client, addr, &first_body),
+        post_kv_put(&client, addr, &second_body)
+    );
+    let first = first.json::<KvMutationResponse>().await.unwrap();
+    let second = second.json::<KvMutationResponse>().await.unwrap();
+
+    assert_eq!(first.applied_index, second.applied_index);
+    assert_eq!(first.hash, second.hash);
+    assert_ne!(first.result, second.result);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+    let first_retry = post_kv_put(&client, addr, &first_body)
+        .await
+        .json::<KvMutationResponse>()
+        .await
+        .unwrap();
+    let second_retry = post_kv_put(&client, addr, &second_body)
+        .await
+        .json::<KvMutationResponse>()
+        .await
+        .unwrap();
+    assert_eq!(first_retry, first);
+    assert_eq!(second_retry, second);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+    let conflict = post_kv_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": "batch-a",
+            "key": "c2hhcmVk",
+            "value": "Y29uZmxpY3Q="
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        conflict.json::<ClientErrorResponse>().await.unwrap().code,
+        "invalid_request"
+    );
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_http_config(dir.path())
+        .with_writer_batching(4, Duration::from_millis(50))
+        .unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(config, consensus(dir.path(), "byte-cap-recorders"), &[]).unwrap(),
+    );
+    let recorder = RecorderFileStore::new_with_id(
+        dir.path().join("byte-cap-http-recorder"),
+        "n1",
+        CLUSTER_ID,
+        1,
+        1,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served_runtime = Arc::clone(&runtime);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, node_router(served_runtime, recorder))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let value = vec![0; 66 * 1024];
+    let commands = (0..4)
+        .map(|index| {
+            KvCommandV1::put(
+                format!("large-{index}"),
+                format!("key-{index}").into_bytes(),
+                value.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(commands
+        .iter()
+        .all(|command| encode_replicated_kv_command(command).unwrap().len() <= MAX_COMMAND_BYTES));
+    assert!(encode_replicated_kv_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
+    assert!(encode_replicated_kv_batch(&commands[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
+
+    let encoded_value = "A".repeat(value.len() / 3 * 4);
+    let encoded_keys = ["a2V5LTA=", "a2V5LTE=", "a2V5LTI=", "a2V5LTM="];
+    let mut requests = tokio::task::JoinSet::new();
+    for (index, key) in encoded_keys.into_iter().enumerate() {
+        let client = client.clone();
+        let value = encoded_value.clone();
+        requests.spawn(async move {
+            let response = post_kv_put(
+                &client,
+                addr,
+                &serde_json::json!({
+                    "request_id": format!("large-{index}"),
+                    "key": key,
+                    "value": value
+                }),
+            )
+            .await;
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            (status, body)
+        });
+    }
+    let mut indices = Vec::new();
+    while let Some(response) = requests.join_next().await {
+        let (status, body) = response.unwrap();
+        assert!(status.is_success(), "KV write failed with {status}: {body}");
+        indices.push(
+            serde_json::from_str::<KvMutationResponse>(&body)
+                .unwrap()
+                .applied_index,
+        );
+    }
+    indices.sort_unstable();
+    indices.dedup();
+
+    assert_eq!(indices, [1, 2]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
     server.abort();
 }
 
@@ -330,4 +685,27 @@ fn consensus(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
         )
         .unwrap(),
     )
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[usize::from(first >> 2)] as char);
+        encoded.push(ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }

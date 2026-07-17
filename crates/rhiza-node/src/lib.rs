@@ -27,14 +27,16 @@ use rhiza_core::{
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
-    encode_replicated_graph_command, CanonicalF64, GraphColumn, GraphInternalId, GraphLogicalType,
-    GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
-    LadybugStateMachine, RequestRecord as GraphRequestRecord,
+    encode_replicated_graph_batch, encode_replicated_graph_command, CanonicalF64, GraphColumn,
+    GraphInternalId, GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel,
+    GraphResultValue, LadybugStateMachine, RequestRecord as GraphRequestRecord,
 };
-#[cfg(feature = "graph")]
-pub use rhiza_graph::{MAX_GRAPH_RESULT_CELLS, MAX_GRAPH_RETURN_PROJECTIONS};
 #[cfg(feature = "kv")]
-use rhiza_kv::{encode_replicated_kv_command, KvRequestRecord, RedbStateMachine};
+use rhiza_kv::{
+    encode_replicated_kv_batch, encode_replicated_kv_command, KvRequestRecord, RedbStateMachine,
+};
+#[cfg(feature = "kv")]
+pub use rhiza_kv::{KvScanResult, KvScanRow, MAX_KV_SCAN_RESULT_BYTES, MAX_KV_SCAN_ROWS};
 use rhiza_log::{
     decode_segment_for_cluster, write_segment_file, FileLogStore, IndexRange, LogStore,
 };
@@ -114,6 +116,8 @@ pub const KV_PUT_PATH: &str = "/v1/kv/put";
 pub const KV_DELETE_PATH: &str = "/v1/kv/delete";
 #[cfg(feature = "kv")]
 pub const KV_GET_PATH: &str = "/v1/kv/get";
+#[cfg(feature = "kv")]
+pub const KV_SCAN_PATH: &str = "/v1/kv/scan";
 pub const SQL_EXECUTE_RESPONSE_VERSION: u16 = 1;
 pub const LIVEZ_PATH: &str = "/livez";
 pub const READYZ_PATH: &str = "/readyz";
@@ -127,6 +131,10 @@ pub const DEFAULT_SQL_MAX_ROWS: u32 = 1_000;
 pub const MAX_SQL_MAX_ROWS: u32 = 10_000;
 pub const MAX_SQL_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_SQL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "kv")]
+pub const DEFAULT_KV_SCAN_LIMIT: u32 = 100;
+#[cfg(feature = "kv")]
+pub const MAX_KV_SCAN_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(feature = "graph")]
 pub const DEFAULT_GRAPH_MAX_ROWS: u32 = DEFAULT_SQL_MAX_ROWS;
 #[cfg(feature = "graph")]
@@ -795,6 +803,26 @@ struct RuntimeBatchMember {
     operation: QueuedOperation,
 }
 
+#[cfg(any(feature = "graph", feature = "kv"))]
+fn classify_pending_request(
+    canonical_by_request: &mut HashMap<String, usize>,
+    members: &[RuntimeBatchMember],
+    index: usize,
+    request_id: &str,
+) -> Result<Option<usize>, NodeError> {
+    let Some(&canonical) = canonical_by_request.get(request_id) else {
+        canonical_by_request.insert(request_id.to_owned(), index);
+        return Ok(None);
+    };
+    if members[canonical].payload == members[index].payload {
+        Ok(Some(canonical))
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "request id {request_id:?} was reused with another command in the same writer batch"
+        )))
+    }
+}
+
 impl ClientWriteResponse {
     const fn applied_index(&self) -> LogIndex {
         match self {
@@ -1218,6 +1246,7 @@ where
                     .route(KV_PUT_PATH, post(handle_kv_put))
                     .route(KV_DELETE_PATH, post(handle_kv_delete))
                     .route(KV_GET_PATH, post(handle_kv_get))
+                    .route(KV_SCAN_PATH, post(handle_kv_scan))
             }
             #[cfg(not(feature = "kv"))]
             unreachable!("KV runtime cannot open without the kv feature")
@@ -2095,6 +2124,115 @@ async fn handle_kv_get(
     }
 }
 
+#[cfg(feature = "kv")]
+enum DecodedKvScan {
+    Range {
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    },
+    Prefix(Vec<u8>),
+}
+
+#[cfg(feature = "kv")]
+async fn handle_kv_scan(
+    State(state): State<NodeRouteState>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    request: Result<Json<KvScanRequest>, JsonRejection>,
+) -> Response {
+    let request = match client_json(request) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let limit = request
+        .limit
+        .unwrap_or(usize::try_from(DEFAULT_KV_SCAN_LIMIT).expect("u32 fits usize"));
+    if limit == 0 || limit > MAX_KV_SCAN_ROWS {
+        return node_error_response(NodeError::InvalidRequest(format!(
+            "limit must be between 1 and {MAX_KV_SCAN_ROWS}"
+        )));
+    }
+    let cursor = match request.cursor {
+        Some(cursor) => match decode_base64("cursor", &cursor) {
+            Ok(cursor) => Some(cursor),
+            Err(error) => return node_error_response(error),
+        },
+        None => None,
+    };
+    let scan = match (request.prefix, request.start, request.end) {
+        (Some(prefix), None, None) => match decode_base64("prefix", &prefix) {
+            Ok(prefix) => DecodedKvScan::Prefix(prefix),
+            Err(error) => return node_error_response(error),
+        },
+        (None, Some(start), end) => {
+            let start = match decode_base64("start", &start) {
+                Ok(start) => start,
+                Err(error) => return node_error_response(error),
+            };
+            let end = match end {
+                Some(end) => match decode_base64("end", &end) {
+                    Ok(end) => Some(end),
+                    Err(error) => return node_error_response(error),
+                },
+                None => None,
+            };
+            DecodedKvScan::Range { start, end }
+        }
+        _ => {
+            return node_error_response(NodeError::InvalidRequest(
+                "provide either prefix alone or start with optional end".into(),
+            ))
+        }
+    };
+    let runtime = state.runtime;
+    let consistency = request
+        .consistency
+        .unwrap_or(runtime.config.read_consistency());
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match scan {
+            DecodedKvScan::Range { start, end } => runtime.scan_kv_range(
+                &start,
+                end.as_deref(),
+                limit,
+                cursor.as_deref(),
+                consistency,
+            ),
+            DecodedKvScan::Prefix(prefix) => {
+                runtime.scan_kv_prefix(&prefix, limit, cursor.as_deref(), consistency)
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => {
+            let response = KvScanResponse {
+                entries: result
+                    .rows()
+                    .iter()
+                    .map(|row| KvScanEntryDto {
+                        key: encode_base64(row.key()),
+                        value: encode_base64(row.value()),
+                    })
+                    .collect(),
+                next_cursor: result.next_cursor().map(encode_base64),
+                applied_index: result.tip().applied_index(),
+                hash: result.tip().applied_hash(),
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_KV_SCAN_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => node_error_response(NodeError::ResourceExhausted(format!(
+                    "KV scan response exceeds {MAX_KV_SCAN_RESPONSE_BYTES} bytes"
+                ))),
+                Err(error) => node_error_response(NodeError::InvalidRequest(error.to_string())),
+            }
+        }
+        Ok(Err(error)) => node_error_response(error),
+        Err(error) => client_task_error(error),
+    }
+}
+
 async fn handle_read(
     State(state): State<NodeRouteState>,
     Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -2221,7 +2359,11 @@ fn next_sync_flush_retry(current: Duration) -> Duration {
     current.saturating_mul(2).min(SYNC_FLUSH_RETRY_MAX)
 }
 
-async fn confirm_write_durability(
+/// Confirms that a committed write has reached the configured durability boundary.
+///
+/// Synchronous archive I/O failures are retried with bounded backoff until the
+/// archive recovers or the runtime begins shutdown.
+pub async fn confirm_write_durability(
     runtime: &NodeRuntime,
     coordinator: Option<&CheckpointCoordinator>,
     index: LogIndex,
@@ -2343,6 +2485,12 @@ fn node_error_response(error: NodeError) -> Response {
             None,
         ),
         NodeError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable", true, None),
+        NodeError::ResourceExhausted(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resource_exhausted",
+            true,
+            None,
+        ),
         NodeError::ConfigurationTransition { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "configuration_transition",
@@ -2493,6 +2641,7 @@ pub fn recover_successor_recorder_after_checkpoint(
             stop.entry.index,
             stop.entry.hash,
             tip.index(),
+            tip.hash(),
         )
         .map_err(|error| NodeError::Reconciliation(error.to_string()))
 }
@@ -3197,6 +3346,7 @@ pub enum NodeError {
     Reconciliation(String),
     Invariant(String),
     Unavailable(String),
+    ResourceExhausted(String),
     ConfigurationTransition {
         state: Box<ConfigurationState>,
     },
@@ -3237,6 +3387,9 @@ impl fmt::Display for NodeError {
             Self::Reconciliation(message) => write!(f, "node reconciliation failed: {message}"),
             Self::Invariant(message) => write!(f, "node invariant failed: {message}"),
             Self::Unavailable(message) => write!(f, "node unavailable: {message}"),
+            Self::ResourceExhausted(message) => {
+                write!(f, "node query resources exhausted: {message}")
+            }
             Self::ConfigurationTransition { state } => write!(
                 f,
                 "node unavailable during configuration transition: {state:?}"
@@ -3960,6 +4113,18 @@ pub struct KvGetRequest {
 
 #[cfg(feature = "kv")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvScanRequest {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub prefix: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub consistency: Option<ReadConsistency>,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum KvMutationResultDto {
     Put { replaced: bool },
@@ -3978,6 +4143,22 @@ pub struct KvMutationResponse {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct KvGetResponse {
     pub value: Option<String>,
+    pub applied_index: LogIndex,
+    pub hash: LogHash,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvScanEntryDto {
+    pub key: String,
+    pub value: String,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvScanResponse {
+    pub entries: Vec<KvScanEntryDto>,
+    pub next_cursor: Option<String>,
     pub applied_index: LogIndex,
     pub hash: LogHash,
 }
@@ -4012,6 +4193,21 @@ fn kv_mutation_response(outcome: KvMutationOutcome) -> KvMutationResponse {
             }
         },
     }
+}
+
+#[cfg(feature = "kv")]
+fn validate_kv_scan_required_index(
+    result: &KvScanResult,
+    required_index: Option<LogIndex>,
+) -> Result<(), NodeError> {
+    let applied_index = result.tip().applied_index();
+    if required_index.is_some_and(|required| applied_index < required) {
+        return Err(NodeError::Unavailable(format!(
+            "local applied index {applied_index} has not reached {}",
+            required_index.expect("checked above")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "graph")]
@@ -4132,11 +4328,11 @@ fn decode_base64(field: &str, encoded: &str) -> Result<Vec<u8>, NodeError> {
 }
 
 enum Materializer {
-    Sql(SqliteStateMachine),
+    Sql(Box<SqliteStateMachine>),
     #[cfg(feature = "graph")]
     Graph(Arc<LadybugStateMachine>),
     #[cfg(feature = "kv")]
-    Kv(RedbStateMachine),
+    Kv(Arc<RedbStateMachine>),
 }
 
 struct SqlMaterializerGuard<'a>(MutexGuard<'a, Materializer>);
@@ -4194,7 +4390,7 @@ impl Materializer {
                     )
                 }
                 .map_err(|error| NodeError::Storage(error.to_string()))?;
-                Ok(Self::Sql(state))
+                Ok(Self::Sql(Box::new(state)))
             }
             ExecutionProfile::Graph => {
                 #[cfg(feature = "graph")]
@@ -4225,6 +4421,7 @@ impl Materializer {
                         config.epoch(),
                         config_id,
                     )
+                    .map(Arc::new)
                     .map(Self::Kv)
                     .map_err(|error| NodeError::Storage(error.to_string()))
                 }
@@ -4583,6 +4780,51 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "kv")]
+    pub fn scan_kv_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, NodeError> {
+        match consistency {
+            ReadConsistency::Local => self.scan_kv_range_local(start, end, limit, cursor, None),
+            ReadConsistency::AppliedIndex(required) => {
+                self.scan_kv_range_local(start, end, limit, cursor, Some(required))
+            }
+            ReadConsistency::ReadBarrier => {
+                let _commit = self.lock_commit()?;
+                self.ensure_ready()?;
+                self.commit_read_barrier()?;
+                self.scan_kv_range_local(start, end, limit, cursor, None)
+            }
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    pub fn scan_kv_prefix(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, NodeError> {
+        match consistency {
+            ReadConsistency::Local => self.scan_kv_prefix_local(prefix, limit, cursor, None),
+            ReadConsistency::AppliedIndex(required) => {
+                self.scan_kv_prefix_local(prefix, limit, cursor, Some(required))
+            }
+            ReadConsistency::ReadBarrier => {
+                let _commit = self.lock_commit()?;
+                self.ensure_ready()?;
+                self.commit_read_barrier()?;
+                self.scan_kv_prefix_local(prefix, limit, cursor, None)
+            }
+        }
+    }
+
     pub fn execute_sql(&self, command: SqlCommand) -> Result<WriteResponse, NodeError> {
         self.execute_sql_with_results(command)
             .map(|response| WriteResponse {
@@ -4661,7 +4903,7 @@ impl NodeRuntime {
                 .iter()
                 .map(|index| members[*index].payload.clone())
                 .collect::<Vec<_>>();
-            let proposal_payload = {
+            let prepared_prefix = {
                 let sqlite = match self.lock_sqlite() {
                     Ok(sqlite) => sqlite,
                     Err(error) => {
@@ -4671,17 +4913,30 @@ impl NodeRuntime {
                         break;
                     }
                 };
-                sqlite.prepare_write_batch(&original_payloads, last_index, last_hash)
+                sqlite.prepare_write_batch_prefix(
+                    &original_payloads,
+                    last_index,
+                    last_hash,
+                    MAX_COMMAND_BYTES,
+                )
             };
-            let proposal_payload = match proposal_payload {
-                Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
-                Ok(_) | Err(_) => {
+            let (proposal_count, proposal_payload) = match prepared_prefix {
+                Ok(Some((proposal_count, proposal_payload))) if proposal_count >= 2 => {
+                    (proposal_count, proposal_payload)
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_single_member_locked(&members[index]));
+                    continue;
+                }
+                Err(_) => {
                     for index in pending.drain(..) {
                         results[index] = Some(self.execute_single_member_locked(&members[index]));
                     }
                     break;
                 }
             };
+            let proposed_indices = pending[..proposal_count].to_vec();
             let slot = match last_index.checked_add(1) {
                 Some(slot) => slot,
                 None => {
@@ -4727,7 +4982,9 @@ impl NodeRuntime {
             }
             if entry.entry_type == EntryType::Command
                 && entry.payload == proposal_payload
-                && !remaining.is_empty()
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
             {
                 let error = self.latch(NodeError::Invariant(
                     "committed write batch did not record every request".into(),
@@ -4755,6 +5012,14 @@ impl NodeRuntime {
         &self,
         members: Vec<RuntimeBatchMember>,
     ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        #[cfg(feature = "graph")]
+        if self.config.execution_profile == ExecutionProfile::Graph {
+            return self.execute_graph_client_batch(members);
+        }
+        #[cfg(feature = "kv")]
+        if self.config.execution_profile == ExecutionProfile::Kv {
+            return self.execute_kv_client_batch(members);
+        }
         let _commit = match self.lock_commit() {
             Ok(commit) => commit,
             Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
@@ -4768,6 +5033,370 @@ impl NodeRuntime {
         members
             .iter()
             .map(|member| self.execute_profile_member_locked(member))
+            .collect()
+    }
+
+    #[cfg(feature = "graph")]
+    fn execute_graph_client_batch(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
+        };
+        if let Err(error) = self
+            .ensure_ready()
+            .and_then(|_| self.ensure_writes_active())
+        {
+            return members.into_iter().map(|_| Err(error.clone())).collect();
+        }
+
+        let mut results = vec![None; members.len()];
+        let mut pending = Vec::new();
+        let mut canonical_by_request = HashMap::new();
+        let mut aliases = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            let QueuedOperation::Graph(command) = &member.operation else {
+                results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Graph,
+                    actual: ExecutionProfile::Sqlite,
+                }));
+                continue;
+            };
+            match self.check_graph_request(command.request_id(), &member.payload) {
+                Ok(Some(record)) => {
+                    results[index] = Some(Ok(ClientWriteResponse::Graph(graph_mutation_response(
+                        GraphMutationOutcome::from_record(record),
+                    ))));
+                }
+                Ok(None) => match classify_pending_request(
+                    &mut canonical_by_request,
+                    &members,
+                    index,
+                    command.request_id(),
+                ) {
+                    Ok(None) => pending.push(index),
+                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
+                    Err(error) => results[index] = Some(Err(error)),
+                },
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+
+        while !pending.is_empty() {
+            if pending.len() == 1 {
+                let index = pending[0];
+                results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                break;
+            }
+            let commands = pending
+                .iter()
+                .map(|index| match &members[*index].operation {
+                    QueuedOperation::Graph(command) => command.clone(),
+                    _ => unreachable!("graph pending members were validated above"),
+                })
+                .collect::<Vec<_>>();
+            let full_payload = match encode_replicated_graph_batch(&commands) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let error = NodeError::InvalidRequest(error.to_string());
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
+                (commands.len(), full_payload)
+            } else {
+                let mut prefix = None;
+                for count in (2..commands.len()).rev() {
+                    let payload = encode_replicated_graph_batch(&commands[..count])
+                        .expect("the validated graph batch prefix remains valid");
+                    if payload.len() <= MAX_COMMAND_BYTES {
+                        prefix = Some((count, payload));
+                        break;
+                    }
+                }
+                let Some(prefix) = prefix else {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                    continue;
+                };
+                prefix
+            };
+            let proposed_indices = pending[..proposal_count].to_vec();
+            let (last_index, last_hash) = match self.ensure_materialized_tip() {
+                Ok(tip) => tip,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let entry = match self.consensus.propose_at_cancellable(
+                slot,
+                last_hash,
+                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
+                &self.operation_cancelled,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let mut remaining = Vec::new();
+            for index in pending.drain(..) {
+                let member = &members[index];
+                let QueuedOperation::Graph(command) = &member.operation else {
+                    unreachable!("graph pending members were validated above");
+                };
+                match self.check_graph_request(command.request_id(), &member.payload) {
+                    Ok(Some(record)) => {
+                        results[index] = Some(Ok(ClientWriteResponse::Graph(
+                            graph_mutation_response(GraphMutationOutcome::from_record(record)),
+                        )));
+                    }
+                    Ok(None) => remaining.push(index),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+            if entry.entry_type == EntryType::Command
+                && entry.payload == proposal_payload
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
+            {
+                let error = self.latch(NodeError::Invariant(
+                    "committed graph batch did not record every request".into(),
+                ));
+                for index in remaining.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+            }
+            pending = remaining;
+        }
+
+        for (index, canonical) in aliases.into_iter().enumerate() {
+            if let Some(canonical) = canonical {
+                results[index] = results[canonical].clone();
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(self.latch(NodeError::Invariant(
+                        "graph writer batch omitted a request result".into(),
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "kv")]
+    fn execute_kv_client_batch(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
+        };
+        if let Err(error) = self
+            .ensure_ready()
+            .and_then(|_| self.ensure_writes_active())
+        {
+            return members.into_iter().map(|_| Err(error.clone())).collect();
+        }
+
+        let mut results = vec![None; members.len()];
+        let mut pending = Vec::new();
+        let mut canonical_by_request = HashMap::new();
+        let mut aliases = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            let QueuedOperation::Kv(command) = &member.operation else {
+                results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Kv,
+                    actual: ExecutionProfile::Sqlite,
+                }));
+                continue;
+            };
+            match self.check_kv_request(command.request_id(), &member.payload) {
+                Ok(Some(record)) => {
+                    results[index] = Some(Ok(ClientWriteResponse::Kv(kv_mutation_response(
+                        KvMutationOutcome::from_record(record),
+                    ))));
+                }
+                Ok(None) => match classify_pending_request(
+                    &mut canonical_by_request,
+                    &members,
+                    index,
+                    command.request_id(),
+                ) {
+                    Ok(None) => pending.push(index),
+                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
+                    Err(error) => results[index] = Some(Err(error)),
+                },
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+
+        while !pending.is_empty() {
+            if pending.len() == 1 {
+                let index = pending[0];
+                results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                break;
+            }
+            let commands = pending
+                .iter()
+                .map(|index| match &members[*index].operation {
+                    QueuedOperation::Kv(command) => command.clone(),
+                    _ => unreachable!("KV pending members were validated above"),
+                })
+                .collect::<Vec<_>>();
+            let full_payload = match encode_replicated_kv_batch(&commands) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let error = NodeError::InvalidRequest(error.to_string());
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
+                (commands.len(), full_payload)
+            } else {
+                let mut prefix = None;
+                for count in (2..commands.len()).rev() {
+                    let payload = encode_replicated_kv_batch(&commands[..count])
+                        .expect("the validated KV batch prefix remains valid");
+                    if payload.len() <= MAX_COMMAND_BYTES {
+                        prefix = Some((count, payload));
+                        break;
+                    }
+                }
+                let Some(prefix) = prefix else {
+                    let index = pending.remove(0);
+                    results[index] = Some(self.execute_profile_member_locked(&members[index]));
+                    continue;
+                };
+                prefix
+            };
+            let proposed_indices = pending[..proposal_count].to_vec();
+            let (last_index, last_hash) = match self.ensure_materialized_tip() {
+                Ok(tip) => tip,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let entry = match self.consensus.propose_at_cancellable(
+                slot,
+                last_hash,
+                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
+                &self.operation_cancelled,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let mut remaining = Vec::new();
+            for index in pending.drain(..) {
+                let member = &members[index];
+                let QueuedOperation::Kv(command) = &member.operation else {
+                    unreachable!("KV pending members were validated above");
+                };
+                match self.check_kv_request(command.request_id(), &member.payload) {
+                    Ok(Some(record)) => {
+                        results[index] = Some(Ok(ClientWriteResponse::Kv(kv_mutation_response(
+                            KvMutationOutcome::from_record(record),
+                        ))));
+                    }
+                    Ok(None) => remaining.push(index),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+            if entry.entry_type == EntryType::Command
+                && entry.payload == proposal_payload
+                && remaining
+                    .iter()
+                    .any(|index| proposed_indices.contains(index))
+            {
+                let error = self.latch(NodeError::Invariant(
+                    "committed KV batch did not record every request".into(),
+                ));
+                for index in remaining.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+            }
+            pending = remaining;
+        }
+
+        for (index, canonical) in aliases.into_iter().enumerate() {
+            if let Some(canonical) = canonical {
+                results[index] = results[canonical].clone();
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(self.latch(NodeError::Invariant(
+                        "KV writer batch omitted a request result".into(),
+                    )))
+                })
+            })
             .collect()
     }
 
@@ -5565,33 +6194,57 @@ impl NodeRuntime {
         required_index: Option<LogIndex>,
     ) -> Result<KvReadResponse, NodeError> {
         self.ensure_ready()?;
-        let materializer = self.lock_materializer()?;
-        let Materializer::Kv(kv) = &*materializer else {
-            return Err(NodeError::ExecutionProfileMismatch {
-                expected: ExecutionProfile::Kv,
-                actual: materializer.profile(),
-            });
-        };
-        let applied_index = kv
-            .applied_index()
-            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .get_with_tip(key)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        let applied_index = result.tip().applied_index();
         if required_index.is_some_and(|required| applied_index < required) {
             return Err(NodeError::Unavailable(format!(
                 "local applied index {applied_index} has not reached {}",
                 required_index.expect("checked above")
             )));
         }
-        let hash = kv
-            .applied_hash()
-            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
-        let value = kv
-            .get(key)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
         Ok(KvReadResponse {
-            value,
+            value: result.value().map(ToOwned::to_owned),
             applied_index,
-            hash,
+            hash: result.tip().applied_hash(),
         })
+    }
+
+    #[cfg(feature = "kv")]
+    fn scan_kv_range_local(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+        required_index: Option<LogIndex>,
+    ) -> Result<KvScanResult, NodeError> {
+        self.ensure_ready()?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .scan_range(start, end, limit, cursor)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        validate_kv_scan_required_index(&result, required_index)?;
+        Ok(result)
+    }
+
+    #[cfg(feature = "kv")]
+    fn scan_kv_prefix_local(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+        required_index: Option<LogIndex>,
+    ) -> Result<KvScanResult, NodeError> {
+        self.ensure_ready()?;
+        let kv = self.kv_materializer()?;
+        let result = kv
+            .scan_prefix(prefix, limit, cursor)
+            .map_err(|error| self.map_kv_read_error(error))?;
+        validate_kv_scan_required_index(&result, required_index)?;
+        Ok(result)
     }
 
     fn query_sql_local(
@@ -5620,9 +6273,14 @@ impl NodeRuntime {
                 usize::try_from(max_rows).expect("u32 fits usize"),
                 MAX_SQL_RESULT_BYTES,
             )
-            .map_err(|error| NodeError::InvalidSqlStatement {
-                statement_index: 0,
-                message: error.to_string(),
+            .map_err(|error| match error {
+                rhiza_sql::Error::ResourceExhausted(message) => {
+                    NodeError::ResourceExhausted(message)
+                }
+                other => NodeError::InvalidSqlStatement {
+                    statement_index: 0,
+                    message: other.to_string(),
+                },
             })?;
         let response = SqlQueryResponse {
             columns,
@@ -5831,6 +6489,18 @@ impl NodeRuntime {
         Ok(Arc::clone(graph))
     }
 
+    #[cfg(feature = "kv")]
+    fn kv_materializer(&self) -> Result<Arc<RedbStateMachine>, NodeError> {
+        let materializer = self.lock_materializer()?;
+        let Materializer::Kv(kv) = &*materializer else {
+            return Err(NodeError::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Kv,
+                actual: materializer.profile(),
+            });
+        };
+        Ok(Arc::clone(kv))
+    }
+
     fn lock_sqlite(&self) -> Result<SqlMaterializerGuard<'_>, NodeError> {
         let guard = self.lock_materializer()?;
         if !matches!(&*guard, Materializer::Sql(_)) {
@@ -5845,6 +6515,7 @@ impl NodeRuntime {
     fn map_sqlite_error(&self, error: rhiza_sql::Error) -> NodeError {
         match error {
             rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
+            rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_sql::Error::InvalidCommand(message)
             | rhiza_sql::Error::IdentityMismatch(message)
             | rhiza_sql::Error::InvalidEntry(message)
@@ -5859,6 +6530,7 @@ impl NodeRuntime {
     fn map_graph_read_error(&self, error: rhiza_graph::Error) -> NodeError {
         match error {
             rhiza_graph::Error::InvalidCommand(_) => NodeError::InvalidRequest(error.to_string()),
+            rhiza_graph::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
             rhiza_graph::Error::Ladybug(_) | rhiza_graph::Error::Io(_) => {
                 self.latch(NodeError::Storage(error.to_string()))
             }
@@ -5868,6 +6540,26 @@ impl NodeRuntime {
             | rhiza_graph::Error::IdentityMismatch(_)
             | rhiza_graph::Error::RequestConflict { .. }
             | rhiza_graph::Error::InvalidSnapshot(_) => {
+                self.latch(NodeError::Invariant(error.to_string()))
+            }
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    fn map_kv_read_error(&self, error: rhiza_kv::Error) -> NodeError {
+        match error {
+            rhiza_kv::Error::InvalidCommand(_) | rhiza_kv::Error::InvalidQuery(_) => {
+                NodeError::InvalidRequest(error.to_string())
+            }
+            rhiza_kv::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
+            rhiza_kv::Error::Database(_) | rhiza_kv::Error::Io(_) => {
+                self.latch(NodeError::Storage(error.to_string()))
+            }
+            rhiza_kv::Error::Codec(_)
+            | rhiza_kv::Error::InvalidEntry(_)
+            | rhiza_kv::Error::PartialInitialization
+            | rhiza_kv::Error::RequestConflict { .. }
+            | rhiza_kv::Error::InvalidSnapshot(_) => {
                 self.latch(NodeError::Invariant(error.to_string()))
             }
         }
@@ -5981,19 +6673,29 @@ pub fn rehydrate_recorder_after_checkpoint(
 mod tests {
     use axum::http::HeaderValue;
 
-    #[cfg(feature = "graph")]
+    #[cfg(any(feature = "graph", feature = "kv"))]
     use rhiza_core::{ExecutionProfile, LogHash};
     #[cfg(feature = "graph")]
+    use rhiza_graph::{encode_replicated_graph_command, GraphCommandV1, GraphValueV1};
+    #[cfg(feature = "kv")]
+    use rhiza_kv::{encode_replicated_kv_command, KvCommandV1};
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    use rhiza_log::LogStore as _;
+    #[cfg(any(feature = "graph", feature = "kv"))]
     use rhiza_quepaxa::ThreeNodeConsensus;
-    #[cfg(feature = "graph")]
+    #[cfg(any(feature = "graph", feature = "kv"))]
     use std::sync::Arc;
 
+    #[cfg(feature = "graph")]
+    use super::with_graph_client_permit;
     use super::{
         client_authenticated, next_sync_flush_retry, Duration, HeaderMap, PROTOCOL_VERSION,
         SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
     };
-    #[cfg(feature = "graph")]
-    use super::{node_error_response, with_graph_client_permit, NodeConfig, NodeRuntime};
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    use super::{node_error_response, NodeConfig, NodeRuntime};
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    use super::{QueuedOperation, RuntimeBatchMember};
 
     #[test]
     fn client_authentication_rejects_empty_expected_token() {
@@ -6049,6 +6751,129 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
+    fn graph_resource_exhaustion_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = graph_test_runtime();
+
+        let error = runtime.map_graph_read_error(rhiza_graph::Error::ResourceExhausted(
+            "buffer pool is full".into(),
+        ));
+        let response = node_error_response(error);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_resource_exhaustion_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = kv_test_runtime();
+
+        let error = runtime.map_kv_read_error(rhiza_kv::Error::ResourceExhausted(
+            "scan result is too large".into(),
+        ));
+        let response = node_error_response(error);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_batch_coalesces_exact_retry_and_isolates_conflicting_duplicate() {
+        let (_dir, runtime) = graph_test_runtime();
+        let canonical =
+            GraphCommandV1::put_document("same", "document", GraphValueV1::String("first".into()))
+                .unwrap();
+        let conflict = GraphCommandV1::put_document(
+            "same",
+            "document",
+            GraphValueV1::String("conflict".into()),
+        )
+        .unwrap();
+        let unrelated =
+            GraphCommandV1::put_document("other", "other", GraphValueV1::U64(2)).unwrap();
+        let members = vec![
+            graph_batch_member(canonical.clone()),
+            graph_batch_member(canonical),
+            graph_batch_member(conflict),
+            graph_batch_member(unrelated),
+        ];
+
+        let results = runtime.execute_graph_client_batch(members);
+
+        let canonical = results[0].as_ref().unwrap().applied_index();
+        assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
+        assert!(matches!(
+            results[2],
+            Err(super::NodeError::InvalidRequest(_))
+        ));
+        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_batch_coalesces_exact_retry_and_isolates_conflicting_duplicate() {
+        let (_dir, runtime) = kv_test_runtime();
+        let canonical = KvCommandV1::put("same", b"key".to_vec(), b"first".to_vec()).unwrap();
+        let conflict = KvCommandV1::put("same", b"key".to_vec(), b"conflict".to_vec()).unwrap();
+        let unrelated = KvCommandV1::put("other", b"other".to_vec(), b"second".to_vec()).unwrap();
+        let members = vec![
+            kv_batch_member(canonical.clone()),
+            kv_batch_member(canonical),
+            kv_batch_member(conflict),
+            kv_batch_member(unrelated),
+        ];
+
+        let results = runtime.execute_kv_client_batch(members);
+
+        let canonical = results[0].as_ref().unwrap().applied_index();
+        assert_eq!(results[1].as_ref().unwrap().applied_index(), canonical);
+        assert!(matches!(
+            results[2],
+            Err(super::NodeError::InvalidRequest(_))
+        ));
+        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.is_ready());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_query_timeout_returns_503_without_latching_readiness() {
+        let (_dir, runtime) = graph_test_runtime();
+        let graph = runtime.graph_materializer().unwrap();
+        let graph_error = graph
+            .query_read_only(
+                "UNWIND range(1, 10000) AS x UNWIND range(1, 10000) AS y RETURN sum(x * y) AS total LIMIT 1",
+                &std::collections::BTreeMap::new(),
+                1,
+                1024 * 1024,
+                1,
+            )
+            .unwrap_err();
+
+        let response = node_error_response(runtime.map_graph_read_error(graph_error));
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(runtime.is_ready());
+        assert!(!runtime.is_fatal());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
     fn graph_internal_error_returns_500_and_latches_readiness() {
         let (_dir, runtime) = graph_test_runtime();
 
@@ -6097,6 +6922,59 @@ mod tests {
         );
         let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
         (dir, runtime)
+    }
+
+    #[cfg(feature = "graph")]
+    fn graph_batch_member(command: GraphCommandV1) -> RuntimeBatchMember {
+        RuntimeBatchMember {
+            request_id: command.request_id().to_owned(),
+            payload: encode_replicated_graph_command(&command).unwrap(),
+            operation: QueuedOperation::Graph(command),
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    fn kv_test_runtime() -> (tempfile::TempDir, NodeRuntime) {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster_id = "node-unit-test";
+        let config = NodeConfig::new_embedded(
+            cluster_id,
+            "n1",
+            dir.path().join("node"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Kv)
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:kv:node-unit-test",
+                "n1",
+                1,
+                1,
+                [
+                    dir.path().join("recorders/n1"),
+                    dir.path().join("recorders/n2"),
+                    dir.path().join("recorders/n3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        (dir, runtime)
+    }
+
+    #[cfg(feature = "kv")]
+    fn kv_batch_member(command: KvCommandV1) -> RuntimeBatchMember {
+        RuntimeBatchMember {
+            request_id: command.request_id().to_owned(),
+            payload: encode_replicated_kv_command(&command).unwrap(),
+            operation: QueuedOperation::Kv(command),
+        }
     }
 }
 

@@ -21,6 +21,7 @@ use rhiza_core::{
 use tempfile::NamedTempFile;
 
 const COMMAND_MAGIC: &[u8; 6] = b"RHGC\0\x01";
+const BATCH_COMMAND_MAGIC: &[u8; 6] = b"RHGB\0\x01";
 const RESULT_MAGIC: &[u8; 6] = b"RHGR\0\x01";
 const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-ladybug-snapshot-v1\0";
 const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"RHGS";
@@ -34,14 +35,17 @@ const MAX_BLOB_BYTES: usize = 4096;
 pub const MAX_GRAPH_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_GRAPH_PARAMETERS: usize = 999;
 pub const MAX_GRAPH_PARAMETER_DEPTH: usize = 16;
-// V1 can materialize at most one sentinel row beyond four admitted cells. With
-// four 256 KiB string cells per row, Ladybug's native result stays below about
-// 2 MiB before rhiza observes the sentinel and returns an explicit limit error.
-pub const MAX_GRAPH_RETURN_PROJECTIONS: usize = 4;
-pub const MAX_GRAPH_RESULT_CELLS: usize = 4;
 const MAX_GRAPH_PARAMETER_VALUES: usize = 4096;
-const MAX_GRAPH_CONTAINER_VALUES: usize = 1024;
+const MAX_GRAPH_PARAMETER_CONTAINER_VALUES: usize = 1024;
 const MAX_GRAPH_PARAMETER_NAME_BYTES: usize = 256;
+const LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
+const LADYBUG_MAX_NUM_THREADS: u64 = 2;
+const LADYBUG_BUFFER_POOL_EXHAUSTED: &str =
+    "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!";
+const LADYBUG_CONVERSION_ERROR_PREFIX: &str = "Conversion exception:";
+const BATCH_COMMAND_VERSION: u16 = 2;
+const BATCH_REQUEST_ID: &str = "__rhiza_graph_batch_v1";
+pub const MAX_GRAPH_BATCH_MEMBERS: usize = 64;
 
 const CREATE_META_TABLE: &str = r#"
 CREATE NODE TABLE IF NOT EXISTS __RhizaMeta(
@@ -83,6 +87,8 @@ pub fn graph_materializer_fingerprint() -> LogHash {
         &lbug::get_storage_version().to_be_bytes(),
         SCHEMA_VERSION.as_bytes(),
         COMMAND_MAGIC,
+        BATCH_COMMAND_MAGIC,
+        &BATCH_COMMAND_VERSION.to_be_bytes(),
     ])
 }
 
@@ -94,6 +100,7 @@ pub enum Error {
     InvalidEntry(String),
     IdentityMismatch(String),
     Ladybug(String),
+    ResourceExhausted(String),
     Io(String),
     RequestConflict {
         request_id: String,
@@ -114,6 +121,9 @@ impl std::fmt::Display for Error {
                 write!(f, "Ladybug database identity mismatch for {field}")
             }
             Self::Ladybug(message) => write!(f, "Ladybug error: {message}"),
+            Self::ResourceExhausted(message) => {
+                write!(f, "Ladybug query resources exhausted: {message}")
+            }
             Self::Io(message) => write!(f, "Ladybug snapshot I/O failed: {message}"),
             Self::RequestConflict { request_id, .. } => {
                 write!(
@@ -503,6 +513,36 @@ pub fn encode_replicated_graph_command(command: &GraphCommandV1) -> Result<Vec<u
     .map_err(|error| Error::InvalidCommand(error.to_string()))
 }
 
+/// Encodes ordered semantic graph mutations as one canonical replicated batch.
+pub fn encode_replicated_graph_batch(commands: &[GraphCommandV1]) -> Result<Vec<u8>> {
+    if commands.is_empty() || commands.len() > MAX_GRAPH_BATCH_MEMBERS {
+        return Err(Error::InvalidCommand(format!(
+            "graph batch must contain 1..={MAX_GRAPH_BATCH_MEMBERS} commands"
+        )));
+    }
+    let mut request_ids = BTreeSet::new();
+    let mut body = Vec::from(BATCH_COMMAND_MAGIC.as_slice());
+    body.extend_from_slice(&(commands.len() as u16).to_be_bytes());
+    for command in commands {
+        command.validate()?;
+        if !request_ids.insert(command.request_id()) {
+            return Err(Error::InvalidCommand(format!(
+                "graph batch repeats request id {:?}",
+                command.request_id()
+            )));
+        }
+        write_bytes(&mut body, &command.encode());
+    }
+    ReplicatedCommandEnvelope::new(
+        ExecutionProfile::Graph,
+        BATCH_COMMAND_VERSION,
+        BATCH_REQUEST_ID,
+        body,
+    )
+    .and_then(|envelope| envelope.encode())
+    .map_err(|error| Error::InvalidCommand(error.to_string()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphCommandResultV1 {
     PutDocument { created: bool },
@@ -853,15 +893,22 @@ impl LadybugStateMachine {
                 "hash does not match entry contents".into(),
             ));
         }
+        let commands = (entry.entry_type == EntryType::Command)
+            .then(|| decode_replicated_graph_commands(&entry.payload))
+            .transpose()?
+            .unwrap_or_default();
         let _writer = self
             .writer
             .lock()
             .map_err(|_| Error::Ladybug("state machine writer lock is poisoned".into()))?;
-        let guard = self.write_database()?;
+        // The lifecycle lock protects replacement/close of the Database handle.
+        // Normal writes are serialized by `writer`, but may share the stable
+        // handle with readers and rely on Ladybug's transaction isolation.
+        let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
         transaction(&connection, || {
-            self.apply_in_transaction(&connection, entry)
+            self.apply_in_transaction(&connection, entry, &commands)
         })
     }
 
@@ -898,10 +945,12 @@ impl LadybugStateMachine {
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
-        let value = document(&connection, id)?;
-        let applied_index = meta_u64(&connection, "applied_index")?;
-        let hash = meta_hash(&connection, "applied_hash")?;
-        Ok((value, applied_index, hash))
+        read_transaction(&connection, || {
+            let value = document(&connection, id)?;
+            let applied_index = meta_u64(&connection, "applied_index")?;
+            let hash = meta_hash(&connection, "applied_hash")?;
+            Ok((value, applied_index, hash))
+        })
     }
 
     /// Executes one admitted read-only Cypher statement and returns rows with the
@@ -924,21 +973,17 @@ impl LadybugStateMachine {
                 "graph query timeout must be positive".into(),
             ));
         }
-        let admitted = admit_read_only_query(statement, max_rows)?;
-        validate_query_parameter_contract(
-            parameters,
-            &admitted.referenced_parameters,
-            admitted.id_parameter.as_deref(),
-        )?;
+        let admitted = admit_read_only_query(statement, parameters, max_rows, max_bytes)?;
+        validate_query_parameter_contract(parameters, &admitted.referenced_parameters)?;
         let parameters = query_parameters(parameters)?;
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
         connection.set_query_timeout(timeout_ms);
-        {
+        read_transaction(&connection, || {
             let mut prepared = connection
                 .prepare(&admitted.statement)
-                .map_err(ladybug_error)?;
+                .map_err(ladybug_prepare_error)?;
             if !prepared.is_read_only() {
                 return Err(Error::InvalidCommand(
                     "graph query must be read-only".into(),
@@ -946,20 +991,21 @@ impl LadybugStateMachine {
             }
             let mut result = connection
                 .execute(&mut prepared, parameters)
-                .map_err(ladybug_error)?;
+                .map_err(ladybug_execution_error)?;
             let column_names = result.get_column_names();
             let column_types = result.get_column_data_types();
-            if column_names.len() != admitted.projection_count
-                || column_types.len() != admitted.projection_count
-            {
-                return Err(Error::InvalidCommand(
-                    "graph query projection shape does not match its admitted RETURN list".into(),
+            if column_names.len() != column_types.len() {
+                return Err(Error::Ladybug(
+                    "Ladybug query column names and types have different lengths".into(),
                 ));
             }
+            let mut budget = GraphResultBudget::new(max_bytes);
+            budget.ensure_elements(column_names.len())?;
             let columns = column_names
                 .into_iter()
                 .zip(column_types)
                 .map(|(name, logical_type)| {
+                    budget.reserve_column(&name, &logical_type)?;
                     Ok(GraphColumn {
                         name,
                         logical_type: graph_logical_type(logical_type)?,
@@ -969,18 +1015,9 @@ impl LadybugStateMachine {
             let tuple_count = usize::try_from(result.get_num_tuples()).map_err(|_| {
                 Error::InvalidCommand("graph query row count exceeds this platform".into())
             })?;
-            if tuple_count > admitted.allowed_rows {
-                let message = if max_rows <= MAX_GRAPH_RESULT_CELLS / admitted.projection_count {
-                    format!("graph query exceeds {max_rows} rows")
-                } else {
-                    format!("graph query exceeds {MAX_GRAPH_RESULT_CELLS} result cells")
-                };
-                return Err(Error::InvalidCommand(message));
-            }
-            let mut result_bytes = columns.iter().map(graph_column_size).sum::<usize>();
-            if result_bytes > max_bytes {
+            if tuple_count > max_rows {
                 return Err(Error::InvalidCommand(format!(
-                    "graph query exceeds {max_bytes} result bytes"
+                    "graph query exceeds {max_rows} rows"
                 )));
             }
             let mut rows = Vec::with_capacity(tuple_count);
@@ -990,30 +1027,11 @@ impl LadybugStateMachine {
                         Error::Ladybug("Ladybug result value conversion panicked".into())
                     })?;
                 let Some(row) = next else { break };
-                let next_cells = (rows.len() + 1)
-                    .checked_mul(admitted.projection_count)
-                    .ok_or_else(|| Error::InvalidCommand("graph result cell overflow".into()))?;
-                if next_cells > MAX_GRAPH_RESULT_CELLS {
-                    return Err(Error::InvalidCommand(format!(
-                        "graph query exceeds {MAX_GRAPH_RESULT_CELLS} result cells"
-                    )));
-                }
+                budget.reserve_row(&row)?;
                 let row = row
                     .into_iter()
                     .map(graph_result_value)
                     .collect::<Result<Vec<_>>>()?;
-                for value in &row {
-                    result_bytes = result_bytes
-                        .checked_add(graph_result_value_size(value))
-                        .ok_or_else(|| {
-                            Error::InvalidCommand("graph query result size overflow".into())
-                        })?;
-                    if result_bytes > max_bytes {
-                        return Err(Error::InvalidCommand(format!(
-                            "graph query exceeds {max_bytes} result bytes"
-                        )));
-                    }
-                }
                 rows.push(row);
             }
             let applied_index = meta_u64(&connection, "applied_index")?;
@@ -1024,7 +1042,7 @@ impl LadybugStateMachine {
                 applied_index,
                 hash,
             })
-        }
+        })
     }
 
     pub fn check_request(
@@ -1047,6 +1065,10 @@ impl LadybugStateMachine {
     /// Drains crate-owned operations, checkpoints, closes Ladybug, copies the
     /// single database file, and reopens it before returning.
     pub fn create_snapshot(&self, target: LogIndex) -> Result<LadybugSnapshot> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| Error::Ladybug("state machine writer lock is poisoned".into()))?;
         let mut guard = self.write_database()?;
         let checkpoint_wal = ladybug_sidecar(&self.path, ".wal.checkpoint");
         if checkpoint_wal.exists() {
@@ -1103,6 +1125,7 @@ impl LadybugStateMachine {
         &self,
         connection: &Connection<'_>,
         entry: &LogEntry,
+        commands: &[DecodedGraphCommand],
     ) -> Result<ApplyOutcome> {
         validate_identity(connection, &self.identity)?;
         if entry.cluster_id != self.identity.cluster_id {
@@ -1123,20 +1146,23 @@ impl LadybugStateMachine {
                     "current index was reapplied with a different hash".into(),
                 ));
             }
-            let result = if entry.entry_type == EntryType::Command {
-                let command = decode_replicated_graph_command(&entry.payload)?;
-                Some(
-                    matching_request(connection, command.request_id(), &entry.payload)?
-                        .ok_or_else(|| {
-                            Error::InvalidEntry(
-                                "applied graph command is missing its request record".into(),
-                            )
-                        })?
-                        .result,
-                )
-            } else {
-                None
-            };
+            let mut results = Vec::with_capacity(commands.len());
+            for member in commands {
+                results.push(
+                    matching_request(
+                        connection,
+                        member.command.request_id(),
+                        &member.individual_payload,
+                    )?
+                    .ok_or_else(|| {
+                        Error::InvalidEntry(
+                            "applied graph command is missing its request record".into(),
+                        )
+                    })?
+                    .result,
+                );
+            }
+            let result = (results.len() == 1).then(|| results.remove(0));
             return Ok(ApplyOutcome {
                 applied_index: current_index,
                 applied_hash: current_hash,
@@ -1160,16 +1186,27 @@ impl LadybugStateMachine {
 
         let result = match entry.entry_type {
             EntryType::Command => {
-                let command = decode_replicated_graph_command(&entry.payload)?;
-                if let Some(record) =
-                    matching_request(connection, command.request_id(), &entry.payload)?
-                {
-                    Some(record.result)
-                } else {
-                    let result = apply_command(connection, &command)?;
-                    record_request(connection, &command, entry, &result)?;
-                    Some(result)
+                let mut results = Vec::with_capacity(commands.len());
+                for member in commands {
+                    if let Some(record) = matching_request(
+                        connection,
+                        member.command.request_id(),
+                        &member.individual_payload,
+                    )? {
+                        results.push(record.result);
+                    } else {
+                        let result = apply_command(connection, &member.command)?;
+                        record_request(
+                            connection,
+                            &member.command,
+                            &member.individual_payload,
+                            entry,
+                            &result,
+                        )?;
+                        results.push(result);
+                    }
                 }
+                (results.len() == 1).then(|| results.remove(0))
             }
             EntryType::ConfigChange
             | EntryType::SnapshotBarrier
@@ -1221,6 +1258,81 @@ fn decode_replicated_graph_command(payload: &[u8]) -> Result<GraphCommandV1> {
         ));
     }
     Ok(command)
+}
+
+struct DecodedGraphCommand {
+    command: GraphCommandV1,
+    individual_payload: Vec<u8>,
+}
+
+fn decode_replicated_graph_commands(payload: &[u8]) -> Result<Vec<DecodedGraphCommand>> {
+    let envelope = ReplicatedCommandEnvelope::decode(payload)
+        .map_err(|error| Error::InvalidCommand(error.to_string()))?;
+    if envelope.profile() != ExecutionProfile::Graph {
+        return Err(Error::InvalidCommand(format!(
+            "expected graph execution profile, got {}",
+            envelope.profile()
+        )));
+    }
+    match envelope.command_version() {
+        1 => {
+            let command = decode_replicated_graph_command(payload)?;
+            Ok(vec![DecodedGraphCommand {
+                command,
+                individual_payload: payload.to_vec(),
+            }])
+        }
+        BATCH_COMMAND_VERSION => {
+            if envelope.request_id() != BATCH_REQUEST_ID {
+                return Err(Error::InvalidCommand(
+                    "graph batch envelope request id is invalid".into(),
+                ));
+            }
+            let mut decoder = Decoder::new(envelope.body());
+            if decoder.take(BATCH_COMMAND_MAGIC.len())? != BATCH_COMMAND_MAGIC {
+                return Err(Error::Codec(
+                    "wrong graph batch command magic or version".into(),
+                ));
+            }
+            let count = usize::from(u16::from_be_bytes(decoder.array()?));
+            if count == 0 || count > MAX_GRAPH_BATCH_MEMBERS {
+                return Err(Error::InvalidCommand(format!(
+                    "graph batch must contain 1..={MAX_GRAPH_BATCH_MEMBERS} commands"
+                )));
+            }
+            let mut request_ids = BTreeSet::new();
+            let mut commands = Vec::with_capacity(count);
+            for _ in 0..count {
+                let encoded = decoder.bytes(usize::MAX)?;
+                let command = GraphCommandV1::decode(encoded)?;
+                if !request_ids.insert(command.request_id().to_owned()) {
+                    return Err(Error::InvalidCommand(format!(
+                        "graph batch repeats request id {:?}",
+                        command.request_id()
+                    )));
+                }
+                let individual_payload = encode_replicated_graph_command(&command)?;
+                commands.push(DecodedGraphCommand {
+                    command,
+                    individual_payload,
+                });
+            }
+            if !decoder.is_empty() {
+                return Err(Error::Codec("trailing graph batch command bytes".into()));
+            }
+            let canonical = commands
+                .iter()
+                .map(|member| member.command.clone())
+                .collect::<Vec<_>>();
+            if encode_replicated_graph_batch(&canonical)? != payload {
+                return Err(Error::Codec("noncanonical graph batch command".into()));
+            }
+            Ok(commands)
+        }
+        version => Err(Error::InvalidCommand(format!(
+            "unsupported graph command version {version}"
+        ))),
+    }
 }
 
 pub fn restore_snapshot_file(
@@ -1372,14 +1484,20 @@ fn rebind_snapshot_node(database: &Database, target_node_id: &str) -> Result<()>
 }
 
 fn open_database(path: &Path) -> Result<Database> {
-    Database::new(
-        path,
-        SystemConfig::default()
-            .enable_multi_writes(false)
-            .throw_on_wal_replay_failure(true)
-            .enable_checksums(true),
-    )
-    .map_err(ladybug_error)
+    Database::new(path, ladybug_system_config()).map_err(ladybug_error)
+}
+
+fn ladybug_system_config() -> SystemConfig {
+    ladybug_system_config_with_limits(LADYBUG_BUFFER_POOL_BYTES, LADYBUG_MAX_NUM_THREADS)
+}
+
+fn ladybug_system_config_with_limits(buffer_pool_size: u64, max_num_threads: u64) -> SystemConfig {
+    SystemConfig::default()
+        .buffer_pool_size(buffer_pool_size)
+        .max_num_threads(max_num_threads)
+        .enable_multi_writes(false)
+        .throw_on_wal_replay_failure(true)
+        .enable_checksums(true)
 }
 
 fn initialize_or_validate(database: &Database, identity: &Identity) -> Result<()> {
@@ -1467,6 +1585,28 @@ fn transaction<T>(connection: &Connection<'_>, operation: impl FnOnce() -> Resul
     }
 }
 
+fn read_transaction<T>(
+    connection: &Connection<'_>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    connection
+        .query("BEGIN TRANSACTION READ ONLY")
+        .map_err(ladybug_error)?;
+    match operation() {
+        Ok(value) => match connection.query("COMMIT") {
+            Ok(_) => Ok(value),
+            Err(error) => {
+                let _ = connection.query("ROLLBACK");
+                Err(ladybug_error(error))
+            }
+        },
+        Err(error) => {
+            let _ = connection.query("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QueryToken {
     kind: QueryTokenKind,
@@ -1486,13 +1626,15 @@ enum QueryTokenKind {
 
 struct AdmittedQuery {
     statement: String,
-    projection_count: usize,
-    allowed_rows: usize,
     referenced_parameters: BTreeSet<String>,
-    id_parameter: Option<String>,
 }
 
-fn admit_read_only_query(statement: &str, max_rows: usize) -> Result<AdmittedQuery> {
+fn admit_read_only_query(
+    statement: &str,
+    parameters: &BTreeMap<String, GraphParameterValue>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<AdmittedQuery> {
     if statement.trim().is_empty() || statement.len() > MAX_GRAPH_QUERY_BYTES {
         return Err(Error::InvalidCommand(format!(
             "graph query must contain 1..={MAX_GRAPH_QUERY_BYTES} bytes"
@@ -1504,12 +1646,14 @@ fn admit_read_only_query(statement: &str, max_rows: usize) -> Result<AdmittedQue
         ));
     }
     let mut tokens = lex_query(statement)?;
-    if tokens
+    let body_end = if tokens
         .last()
         .is_some_and(|token| token.kind == QueryTokenKind::Semicolon)
     {
-        tokens.pop();
-    }
+        tokens.pop().expect("last token checked").start
+    } else {
+        statement.len()
+    };
     if tokens.is_empty()
         || tokens
             .iter()
@@ -1531,54 +1675,20 @@ fn admit_read_only_query(statement: &str, max_rows: usize) -> Result<AdmittedQue
                     "graph query cannot access the reserved __Rhiza namespace".into(),
                 ));
             }
-            QueryTokenKind::Symbol('{') | QueryTokenKind::Symbol('}') => {
-                return Err(Error::InvalidCommand(
-                    "graph query subqueries and map literals are not supported".into(),
-                ));
-            }
             _ => {}
         }
     }
-    reject_function_calls(&tokens)?;
-
-    let pattern_start = if token_is_keyword(tokens.first(), "MATCH") {
-        1
-    } else {
-        return Err(Error::InvalidCommand(
-            "graph query must begin with MATCH".into(),
-        ));
-    };
-    let (where_index, return_index) = find_match_clauses(&tokens, pattern_start)?;
-    validate_typed_pattern(&tokens[pattern_start..where_index.unwrap_or(return_index)])?;
-    let id_parameter = if let Some(where_index) = where_index {
-        if where_index + 1 == return_index {
-            return Err(Error::InvalidCommand(
-                "graph query WHERE clause cannot be empty".into(),
-            ));
-        }
-        validate_where_expression(&tokens[where_index + 1..return_index])?
-    } else {
-        None
-    };
-    let return_layout = validate_return_layout(&tokens, return_index + 1)?;
-    let projection_count =
-        validate_return_projections(&tokens[return_index + 1..return_layout.projection_end])?;
-    let cell_rows = MAX_GRAPH_RESULT_CELLS / projection_count;
-    let allowed_rows = max_rows.min(cell_rows);
-    let requested_limit = return_layout.limit;
-    let execution_limit = match requested_limit {
-        Some(limit) if limit <= allowed_rows => limit,
-        _ => allowed_rows
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidCommand("graph query row limit overflow".into()))?,
-    };
-    let base_end = return_layout
-        .limit_start
-        .unwrap_or_else(|| tokens.last().expect("nonempty checked").end);
-    let base = statement[..base_end]
-        .trim_end()
-        .trim_end_matches(';')
-        .trim_end();
+    reject_admin_external_or_transaction_queries(&tokens)?;
+    reject_unlabeled_node_patterns(&tokens)?;
+    let execution_row_bound = static_execution_row_bound(&tokens, parameters, max_rows)?;
+    reject_unbounded_result_containers(
+        statement,
+        &tokens,
+        parameters,
+        max_bytes,
+        execution_row_bound,
+    )?;
+    let body = statement[..body_end].trim_end();
     let referenced_parameters = tokens
         .iter()
         .filter_map(|token| match &token.kind {
@@ -1587,12 +1697,474 @@ fn admit_read_only_query(statement: &str, max_rows: usize) -> Result<AdmittedQue
         })
         .collect();
     Ok(AdmittedQuery {
-        statement: format!("{base} LIMIT {execution_limit}"),
-        projection_count,
-        allowed_rows,
+        statement: bounded_read_statement(body, &tokens, parameters, max_rows)?,
         referenced_parameters,
-        id_parameter,
     })
+}
+
+fn reject_unbounded_result_containers(
+    statement: &str,
+    tokens: &[QueryToken],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+    max_bytes: usize,
+    execution_row_bound: usize,
+) -> Result<()> {
+    let mut remaining_expansion_bytes = max_bytes;
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(result_clause_at(tokens, index), Some("RETURN" | "WITH")) {
+            let literal_bytes = match token.kind {
+                QueryTokenKind::StringLiteral => token.end.saturating_sub(token.start),
+                _ => 0,
+            };
+            let projected_bytes = literal_bytes
+                .checked_add(8)
+                .and_then(|bytes| bytes.checked_mul(execution_row_bound.max(1)))
+                .ok_or_else(|| {
+                    Error::InvalidCommand("graph projected expression size overflow".into())
+                })?;
+            reserve_static_expansion(&mut remaining_expansion_bytes, projected_bytes, max_bytes)?;
+        }
+        if let QueryTokenKind::Parameter(name) = &token.kind {
+            let value = parameters.get(name).ok_or_else(|| {
+                Error::InvalidCommand(format!("graph query parameter is missing: {name}"))
+            })?;
+            let multiplier = result_expansion_multiplier(tokens, index, execution_row_bound);
+            reserve_static_expansion(
+                &mut remaining_expansion_bytes,
+                graph_parameter_expansion_bytes(value)?
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| {
+                        Error::InvalidCommand("graph parameter expansion size overflow".into())
+                    })?,
+                max_bytes,
+            )?;
+        }
+        let QueryTokenKind::Identifier { value, .. } = &token.kind else {
+            continue;
+        };
+        if !token_is_symbol(tokens.get(index.saturating_add(1)), '(') {
+            continue;
+        }
+        let function = value.to_ascii_uppercase();
+        if function == "RANGE" {
+            let (arguments, _) = function_arguments(tokens, index.saturating_add(1))?;
+            let cardinality = static_range_cardinality(&arguments, parameters)?;
+            let bytes = cardinality
+                .checked_mul(16)
+                .and_then(|bytes| bytes.checked_add(16))
+                .and_then(|bytes| {
+                    bytes.checked_mul(result_expansion_multiplier(
+                        tokens,
+                        index,
+                        execution_row_bound,
+                    ))
+                })
+                .ok_or_else(|| {
+                    Error::InvalidCommand("graph RANGE result cardinality overflow".into())
+                })?;
+            reserve_static_expansion(&mut remaining_expansion_bytes, bytes, max_bytes)?;
+            continue;
+        }
+        if function == "REPEAT" {
+            let bytes = repeat_expansion_bytes(statement, tokens, index, parameters)?
+                .checked_mul(result_expansion_multiplier(
+                    tokens,
+                    index,
+                    execution_row_bound,
+                ))
+                .ok_or_else(|| Error::InvalidCommand("graph REPEAT result size overflow".into()))?;
+            reserve_static_expansion(&mut remaining_expansion_bytes, bytes, max_bytes)?;
+            continue;
+        }
+        if matches!(function.as_str(), "LPAD" | "RPAD") {
+            let bytes = pad_expansion_bytes(tokens, index, parameters)?
+                .checked_mul(result_expansion_multiplier(
+                    tokens,
+                    index,
+                    execution_row_bound,
+                ))
+                .ok_or_else(|| {
+                    Error::InvalidCommand("graph LPAD/RPAD result size overflow".into())
+                })?;
+            reserve_static_expansion(&mut remaining_expansion_bytes, bytes, max_bytes)?;
+            continue;
+        }
+        if matches!(function.as_str(), "REPLACE" | "REGEXP_REPLACE") {
+            return Err(Error::InvalidCommand(format!(
+                "graph expansion function {value} has no statically bounded result size"
+            )));
+        }
+        if unbounded_container_function(&function) {
+            return Err(Error::InvalidCommand(format!(
+                "graph container function {value} has no statically bounded result cardinality"
+            )));
+        }
+    }
+
+    reject_list_comprehensions(tokens)
+}
+
+fn result_expansion_multiplier(tokens: &[QueryToken], index: usize, row_bound: usize) -> usize {
+    if matches!(result_clause_at(tokens, index), Some("RETURN" | "WITH")) {
+        row_bound.max(1)
+    } else {
+        1
+    }
+}
+
+fn result_clause_at(tokens: &[QueryToken], end: usize) -> Option<&'static str> {
+    let mut clause = None;
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    for token in tokens.iter().take(end) {
+        if round == 0 && square == 0 && curly == 0 {
+            for keyword in [
+                "MATCH", "WHERE", "WITH", "UNWIND", "RETURN", "ORDER", "SKIP", "LIMIT", "UNION",
+            ] {
+                if token_is_keyword(Some(token), keyword) {
+                    clause = Some(keyword);
+                    break;
+                }
+            }
+        }
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    clause
+}
+
+fn static_execution_row_bound(
+    tokens: &[QueryToken],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+    max_rows: usize,
+) -> Result<usize> {
+    let overflow_probe = max_rows
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidCommand("graph query row limit overflow".into()))?;
+    if tokens
+        .iter()
+        .enumerate()
+        .any(|(index, _)| union_clause_starts_at(tokens, index))
+    {
+        return Ok(max_rows);
+    }
+    let Some(limit_index) = trailing_limit_index(tokens, 0, tokens.len()) else {
+        return Ok(overflow_probe);
+    };
+    let (_, requested) = requested_limit(tokens, limit_index, tokens.len(), parameters)?;
+    Ok(if requested <= max_rows {
+        requested
+    } else {
+        overflow_probe
+    })
+}
+
+fn reserve_static_expansion(remaining: &mut usize, bytes: usize, max_bytes: usize) -> Result<()> {
+    *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+        Error::InvalidCommand(format!(
+            "graph statically expanded values exceed {max_bytes} result bytes"
+        ))
+    })?;
+    Ok(())
+}
+
+fn graph_parameter_expansion_bytes(value: &GraphParameterValue) -> Result<usize> {
+    match value {
+        GraphParameterValue::Null | GraphParameterValue::Bool(_) => Ok(1),
+        GraphParameterValue::I64(_) | GraphParameterValue::U64(_) | GraphParameterValue::F64(_) => {
+            Ok(16)
+        }
+        GraphParameterValue::String(value) => value
+            .len()
+            .checked_add(16)
+            .ok_or_else(|| Error::InvalidCommand("graph parameter expansion size overflow".into())),
+        GraphParameterValue::Bytes(value) => value
+            .len()
+            .checked_add(16)
+            .ok_or_else(|| Error::InvalidCommand("graph parameter expansion size overflow".into())),
+        GraphParameterValue::List(values) => values.iter().try_fold(16usize, |size, value| {
+            size.checked_add(graph_parameter_expansion_bytes(value)?)
+                .ok_or_else(|| {
+                    Error::InvalidCommand("graph parameter expansion size overflow".into())
+                })
+        }),
+        GraphParameterValue::Struct(fields) => {
+            fields.iter().try_fold(16usize, |size, (name, value)| {
+                let value_size = graph_parameter_expansion_bytes(value)?;
+                size.checked_add(name.len())
+                    .and_then(|size| size.checked_add(value_size))
+                    .ok_or_else(|| {
+                        Error::InvalidCommand("graph parameter expansion size overflow".into())
+                    })
+            })
+        }
+    }
+}
+
+fn repeat_expansion_bytes(
+    statement: &str,
+    tokens: &[QueryToken],
+    function: usize,
+    parameters: &BTreeMap<String, GraphParameterValue>,
+) -> Result<usize> {
+    let (arguments, _) = function_arguments(tokens, function.saturating_add(1))?;
+    let [string, count] = arguments.as_slice() else {
+        return Err(Error::InvalidCommand(
+            "graph REPEAT must have statically bounded string and count arguments".into(),
+        ));
+    };
+    let string_bytes = static_string_bytes(statement, string, parameters, "REPEAT")?;
+    let count = static_integer(count, parameters)?;
+    let count = usize::try_from(count).map_err(|_| {
+        Error::InvalidCommand("graph REPEAT count must be a nonnegative integer".into())
+    })?;
+    let bytes = string_bytes
+        .checked_mul(count)
+        .ok_or_else(|| Error::InvalidCommand("graph REPEAT result size overflow".into()))?;
+    Ok(bytes)
+}
+
+fn pad_expansion_bytes(
+    tokens: &[QueryToken],
+    function: usize,
+    parameters: &BTreeMap<String, GraphParameterValue>,
+) -> Result<usize> {
+    let (arguments, _) = function_arguments(tokens, function.saturating_add(1))?;
+    let [_, count, _] = arguments.as_slice() else {
+        return Err(Error::InvalidCommand(
+            "graph LPAD/RPAD must have string, count, and padding arguments".into(),
+        ));
+    };
+    let count = static_integer(count, parameters)?;
+    let count = usize::try_from(count).map_err(|_| {
+        Error::InvalidCommand("graph LPAD/RPAD count must be a nonnegative integer".into())
+    })?;
+    count
+        .checked_mul(4)
+        .ok_or_else(|| Error::InvalidCommand("graph LPAD/RPAD result size overflow".into()))
+}
+
+fn static_string_bytes(
+    statement: &str,
+    tokens: &[QueryToken],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+    function: &str,
+) -> Result<usize> {
+    match tokens {
+        [QueryToken {
+            kind: QueryTokenKind::StringLiteral,
+            start,
+            end,
+        }] => statement
+            .get(start.saturating_add(1)..end.saturating_sub(1))
+            .map(str::len)
+            .ok_or_else(|| Error::InvalidCommand(format!("graph {function} string is invalid"))),
+        [QueryToken {
+            kind: QueryTokenKind::Parameter(name),
+            ..
+        }] => match parameters.get(name) {
+            Some(GraphParameterValue::String(value)) => Ok(value.len()),
+            Some(_) => Err(Error::InvalidCommand(format!(
+                "graph {function} string parameter must be a string"
+            ))),
+            None => Err(Error::InvalidCommand(format!(
+                "graph {function} parameter is missing: {name}"
+            ))),
+        },
+        _ => Err(Error::InvalidCommand(format!(
+            "graph {function} result bytes must be statically bounded by a string literal or parameter"
+        ))),
+    }
+}
+
+fn function_arguments(tokens: &[QueryToken], open: usize) -> Result<(Vec<&[QueryToken]>, usize)> {
+    let mut arguments = Vec::new();
+    let mut start = open.saturating_add(1);
+    let mut round = 1usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => {
+                round = round.saturating_sub(1);
+                if round == 0 {
+                    if index > start || !arguments.is_empty() {
+                        arguments.push(&tokens[start..index]);
+                    }
+                    return Ok((arguments, index));
+                }
+            }
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            QueryTokenKind::Symbol(',') if round == 1 && square == 0 && curly == 0 => {
+                arguments.push(&tokens[start..index]);
+                start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    Err(Error::InvalidCommand(
+        "graph query contains an unterminated function call".into(),
+    ))
+}
+
+fn static_range_cardinality(
+    arguments: &[&[QueryToken]],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+) -> Result<usize> {
+    if !(2..=3).contains(&arguments.len()) {
+        return Err(Error::InvalidCommand(
+            "graph RANGE must have static start, end, and optional step arguments".into(),
+        ));
+    }
+    let start = static_integer(arguments[0], parameters)?;
+    let end = static_integer(arguments[1], parameters)?;
+    let step = if arguments.len() == 3 {
+        static_integer(arguments[2], parameters)?
+    } else {
+        1
+    };
+    if step == 0 {
+        return Err(Error::InvalidCommand(
+            "graph RANGE step must not be zero".into(),
+        ));
+    }
+    let distance = if step > 0 {
+        if start > end {
+            return Ok(0);
+        }
+        end.checked_sub(start)
+    } else {
+        if start < end {
+            return Ok(0);
+        }
+        start.checked_sub(end)
+    }
+    .ok_or_else(|| Error::InvalidCommand("graph RANGE distance overflow".into()))?;
+    let step = step.unsigned_abs();
+    let cardinality = distance
+        .unsigned_abs()
+        .checked_div(step)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Error::InvalidCommand("graph RANGE cardinality overflow".into()))?;
+    usize::try_from(cardinality)
+        .map_err(|_| Error::InvalidCommand("graph RANGE cardinality is too large".into()))
+}
+
+fn static_integer(
+    tokens: &[QueryToken],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+) -> Result<i128> {
+    match tokens {
+        [QueryToken {
+            kind: QueryTokenKind::Integer(value),
+            ..
+        }] => value
+            .parse::<i128>()
+            .map_err(|_| Error::InvalidCommand("graph RANGE integer is too large".into())),
+        [QueryToken {
+            kind: QueryTokenKind::Symbol('-'),
+            ..
+        }, QueryToken {
+            kind: QueryTokenKind::Integer(value),
+            ..
+        }] => value
+            .parse::<i128>()
+            .ok()
+            .and_then(i128::checked_neg)
+            .ok_or_else(|| Error::InvalidCommand("graph RANGE integer is too large".into())),
+        [QueryToken {
+            kind: QueryTokenKind::Parameter(name),
+            ..
+        }] => match parameters.get(name) {
+            Some(GraphParameterValue::I64(value)) => Ok(i128::from(*value)),
+            Some(GraphParameterValue::U64(value)) => Ok(i128::from(*value)),
+            Some(_) => Err(Error::InvalidCommand(
+                "graph RANGE parameters must be integers".into(),
+            )),
+            None => Err(Error::InvalidCommand(format!(
+                "graph RANGE parameter is missing: {name}"
+            ))),
+        },
+        _ => Err(Error::InvalidCommand(
+            "graph RANGE cardinality must be statically bounded by integer literals or parameters"
+                .into(),
+        )),
+    }
+}
+
+fn unbounded_container_function(function: &str) -> bool {
+    matches!(
+        function,
+        "COLLECT"
+            | "NODES"
+            | "RELS"
+            | "RELATIONSHIPS"
+            | "PROPERTIES"
+            | "LABELS"
+            | "KEYS"
+            | "MAP"
+            | "MAP_KEYS"
+            | "MAP_VALUES"
+            | "LIST_CONCAT"
+            | "LIST_CAT"
+            | "LIST_APPEND"
+            | "LIST_PREPEND"
+            | "LIST_SLICE"
+            | "LIST_SORT"
+            | "LIST_REVERSE_SORT"
+            | "LIST_DISTINCT"
+            | "LIST_REVERSE"
+            | "LIST_TRANSFORM"
+            | "LIST_FILTER"
+            | "ARRAY_VALUE"
+            | "ARRAY_CONCAT"
+            | "ARRAY_CAT"
+            | "ARRAY_APPEND"
+            | "ARRAY_PUSH_BACK"
+            | "ARRAY_PREPEND"
+            | "ARRAY_PUSH_FRONT"
+            | "ARRAY_SLICE"
+            | "REGEXP_EXTRACT_ALL"
+            | "REGEXP_SPLIT_TO_ARRAY"
+            | "STRING_SPLIT"
+            | "STR_SPLIT"
+            | "STRING_TO_ARRAY"
+    )
+}
+
+fn reject_list_comprehensions(tokens: &[QueryToken]) -> Result<()> {
+    let mut stack = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            QueryTokenKind::Symbol('[') => stack.push(index),
+            QueryTokenKind::Symbol(']') => {
+                let Some(open) = stack.pop() else { continue };
+                let body = &tokens[open.saturating_add(1)..index];
+                if body.iter().any(|token| token_is_keyword(Some(token), "IN"))
+                    && body.iter().any(|token| token_is_symbol(Some(token), '|'))
+                {
+                    return Err(Error::InvalidCommand(
+                        "graph list comprehensions have no statically bounded result cardinality"
+                            .into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn token_is_keyword(token: Option<&QueryToken>, keyword: &str) -> bool {
@@ -1607,333 +2179,466 @@ fn token_is_symbol(token: Option<&QueryToken>, symbol: char) -> bool {
     matches!(token.map(|token| &token.kind), Some(QueryTokenKind::Symbol(value)) if *value == symbol)
 }
 
-fn unsafe_clause_keyword(token: &QueryToken) -> bool {
-    let QueryTokenKind::Identifier {
-        value,
-        escaped: false,
-    } = &token.kind
-    else {
+fn call_clause_starts_at(tokens: &[QueryToken], index: usize) -> bool {
+    let mut cursor = index.saturating_add(1);
+    if token_is_symbol(tokens.get(cursor), '{') {
         return false;
-    };
-    matches!(
-        value.to_ascii_uppercase().as_str(),
-        "BEGIN"
-            | "COMMIT"
-            | "ROLLBACK"
-            | "CHECKPOINT"
-            | "TRANSACTION"
-            | "CALL"
-            | "COPY"
-            | "LOAD"
-            | "IMPORT"
-            | "EXPORT"
-            | "ATTACH"
-            | "DETACH"
-            | "INSTALL"
-            | "EXTENSION"
-            | "CREATE"
-            | "DROP"
-            | "ALTER"
-            | "RENAME"
-            | "TRUNCATE"
-            | "GRANT"
-            | "REVOKE"
-            | "MERGE"
-            | "SET"
-            | "DELETE"
-            | "REMOVE"
-            | "INSERT"
-            | "UPDATE"
-    )
+    }
+    if !matches!(
+        tokens.get(cursor).map(|token| &token.kind),
+        Some(QueryTokenKind::Identifier { .. })
+    ) {
+        return false;
+    }
+    cursor = cursor.saturating_add(1);
+    while token_is_symbol(tokens.get(cursor), '.')
+        && matches!(
+            tokens
+                .get(cursor.saturating_add(1))
+                .map(|token| &token.kind),
+            Some(QueryTokenKind::Identifier { .. })
+        )
+    {
+        cursor = cursor.saturating_add(2);
+    }
+    token_is_symbol(tokens.get(cursor), '(')
 }
 
-fn reject_function_calls(tokens: &[QueryToken]) -> Result<()> {
-    for (index, pair) in tokens.windows(2).enumerate() {
-        let QueryTokenKind::Identifier { value, escaped } = &pair[0].kind else {
+fn load_from_clause_starts_at(tokens: &[QueryToken], index: usize) -> bool {
+    let mut cursor = index.saturating_add(1);
+    if token_is_keyword(tokens.get(cursor), "FROM") {
+        return true;
+    }
+    if !token_is_keyword(tokens.get(cursor), "WITH")
+        || !token_is_keyword(tokens.get(cursor.saturating_add(1)), "HEADERS")
+        || !token_is_symbol(tokens.get(cursor.saturating_add(2)), '(')
+    {
+        return false;
+    }
+    cursor = cursor.saturating_add(2);
+    let mut depth = 0usize;
+    while let Some(token) = tokens.get(cursor) {
+        match token.kind {
+            QueryTokenKind::Symbol('(') => depth = depth.saturating_add(1),
+            QueryTokenKind::Symbol(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return token_is_keyword(tokens.get(cursor.saturating_add(1)), "FROM");
+                }
+            }
+            _ => {}
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    false
+}
+
+fn reject_admin_external_or_transaction_queries(tokens: &[QueryToken]) -> Result<()> {
+    for (index, token) in tokens.iter().enumerate() {
+        let QueryTokenKind::Identifier {
+            value,
+            escaped: false,
+        } = &token.kind
+        else {
             continue;
         };
-        if token_is_symbol(pair.get(1), '(')
-            && (*escaped
-                || !matches!(
-                    value.to_ascii_uppercase().as_str(),
-                    "MATCH" | "OPTIONAL" | "RETURN" | "WHERE"
-                ))
-        {
+        let keyword = value.to_ascii_uppercase();
+        let at_statement_start = index == 0;
+        let forbidden = match keyword.as_str() {
+            "CALL" => call_clause_starts_at(tokens, index),
+            "BEGIN" | "COMMIT" | "ROLLBACK" | "CHECKPOINT" | "COPY" | "ATTACH" | "DETACH"
+            | "INSTALL" => at_statement_start,
+            "TRANSACTION" => index
+                .checked_sub(1)
+                .is_some_and(|index| token_is_keyword(tokens.get(index), "BEGIN")),
+            "LOAD" => load_from_clause_starts_at(tokens, index) || at_statement_start,
+            "IMPORT" | "EXPORT" => {
+                at_statement_start && token_is_keyword(tokens.get(index + 1), "DATABASE")
+            }
+            _ => false,
+        };
+        if forbidden {
             return Err(Error::InvalidCommand(format!(
-                "graph query functions are not supported: token {index} ({value})"
+                "graph query cannot execute admin, external I/O, or transaction clause: {value}"
             )));
         }
     }
     Ok(())
 }
 
-fn find_match_clauses(
-    tokens: &[QueryToken],
-    pattern_start: usize,
-) -> Result<(Option<usize>, usize)> {
+fn reject_unlabeled_node_patterns(tokens: &[QueryToken]) -> Result<()> {
+    let mut matches = Vec::new();
+    let mut stack = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            QueryTokenKind::Symbol('(') => stack.push(index),
+            QueryTokenKind::Symbol(')') => {
+                if let Some(open) = stack.pop() {
+                    matches.push((open, index));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut match_pattern_depths = Vec::new();
     let mut round = 0usize;
     let mut square = 0usize;
-    let mut where_index = None;
-    for index in pattern_start..tokens.len() {
-        update_depth(&tokens[index], &mut round, &mut square)?;
-        if round != 0 || square != 0 {
-            continue;
+    let mut curly = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if token_is_keyword(Some(token), "MATCH") {
+            match_pattern_depths.push((index, round, square, curly));
         }
-        if token_is_keyword(tokens.get(index), "WHERE") && where_index.is_none() {
-            where_index = Some(index);
-        } else if token_is_keyword(tokens.get(index), "RETURN") {
-            return Ok((where_index, index));
-        } else if unsafe_clause_keyword(&tokens[index]) || matches_top_level_clause(&tokens[index])
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    for (open, close) in matches {
+        let follows_path = path_connector_after(tokens, close);
+        let precedes_path = path_connector_before(tokens, open);
+        let function_wrapper = open.checked_sub(1).is_some_and(|previous| {
+            matches!(
+                tokens.get(previous),
+                Some(QueryToken {
+                    kind: QueryTokenKind::Identifier { value, .. },
+                    ..
+                }) if !value.eq_ignore_ascii_case("MATCH")
+            )
+        });
+        let in_match_pattern = !function_wrapper
+            && match_pattern_depths.iter().any(
+                |&(match_index, base_round, base_square, base_curly)| {
+                    open > match_index
+                        && node_pattern_is_in_match_clause(
+                            tokens,
+                            match_index,
+                            open,
+                            base_round,
+                            base_square,
+                            base_curly,
+                        )
+                },
+            );
+        if (follows_path || precedes_path || in_match_pattern)
+            && !node_pattern_has_static_label(tokens, open, close)
         {
             return Err(Error::InvalidCommand(
-                "graph query contains an unsupported clause before RETURN".into(),
+                "graph node patterns must use an explicit non-reserved label".into(),
             ));
         }
     }
-    Err(Error::InvalidCommand(
-        "graph query must contain one top-level RETURN clause".into(),
+    Ok(())
+}
+
+fn node_pattern_is_in_match_clause(
+    tokens: &[QueryToken],
+    match_index: usize,
+    open: usize,
+    base_round: usize,
+    base_square: usize,
+    base_curly: usize,
+) -> bool {
+    let mut round = base_round;
+    let mut square = base_square;
+    let mut curly = base_curly;
+    for (index, token) in tokens
+        .iter()
+        .enumerate()
+        .take(open.saturating_add(1))
+        .skip(match_index.saturating_add(1))
+    {
+        let at_base = round == base_round && square == base_square && curly == base_curly;
+        if at_base
+            && index != open
+            && matches!(
+                token,
+                QueryToken {
+                    kind: QueryTokenKind::Identifier {
+                        value,
+                        escaped: false
+                    },
+                    ..
+                } if matches!(
+                    value.to_ascii_uppercase().as_str(),
+                    "WHERE"
+                        | "RETURN"
+                        | "WITH"
+                        | "UNWIND"
+                        | "ORDER"
+                        | "SKIP"
+                        | "LIMIT"
+                        | "UNION"
+                        | "MATCH"
+                        | "OPTIONAL"
+                        | "CALL"
+                )
+            )
+        {
+            return false;
+        }
+        match token.kind {
+            QueryTokenKind::Symbol('(') => {
+                if index == open {
+                    return at_base;
+                }
+                round = round.saturating_add(1);
+            }
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn node_pattern_has_static_label(tokens: &[QueryToken], open: usize, close: usize) -> bool {
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    for (offset, token) in tokens[open.saturating_add(1)..close].iter().enumerate() {
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            QueryTokenKind::Symbol(':') if round == 0 && square == 0 && curly == 0 => {
+                return matches!(
+                    tokens.get(open.saturating_add(2).saturating_add(offset)),
+                    Some(QueryToken {
+                        kind: QueryTokenKind::Identifier { .. },
+                        ..
+                    })
+                );
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn path_connector_after(tokens: &[QueryToken], close: usize) -> bool {
+    (token_is_symbol(tokens.get(close.saturating_add(1)), '-')
+        && matches!(
+            tokens.get(close.saturating_add(2)).map(|token| &token.kind),
+            Some(QueryTokenKind::Symbol('-' | '[' | '>'))
+        ))
+        || (token_is_symbol(tokens.get(close.saturating_add(1)), '<')
+            && token_is_symbol(tokens.get(close.saturating_add(2)), '-'))
+}
+
+fn path_connector_before(tokens: &[QueryToken], open: usize) -> bool {
+    let Some(previous) = open.checked_sub(1) else {
+        return false;
+    };
+    let before_previous = previous.checked_sub(1);
+    (token_is_symbol(tokens.get(previous), '-')
+        && matches!(
+            before_previous
+                .and_then(|index| tokens.get(index))
+                .map(|token| &token.kind),
+            Some(QueryTokenKind::Symbol('-' | ']' | '<'))
+        ))
+        || (token_is_symbol(tokens.get(previous), '>')
+            && before_previous.is_some_and(|index| token_is_symbol(tokens.get(index), '-')))
+}
+
+fn bounded_read_statement(
+    statement: &str,
+    tokens: &[QueryToken],
+    parameters: &BTreeMap<String, GraphParameterValue>,
+    max_rows: usize,
+) -> Result<String> {
+    let execution_limit = max_rows
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidCommand("graph query row limit overflow".into()))?;
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    let mut union_indices = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let top_level = round == 0 && square == 0 && curly == 0;
+        if top_level && union_clause_starts_at(tokens, index) {
+            union_indices.push(index);
+        }
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if !union_indices.is_empty() {
+        let mut total_limit = 0usize;
+        let mut branch_start = 0usize;
+        for branch_end in union_indices.iter().copied().chain([tokens.len()]) {
+            let Some(limit_index) = trailing_limit_index(tokens, branch_start, branch_end) else {
+                return Err(Error::InvalidCommand(
+                    "UNION queries require exactly one explicit bounded LIMIT in every branch"
+                        .into(),
+                ));
+            };
+            let (_, requested) = requested_limit(tokens, limit_index, branch_end, parameters)?;
+            total_limit = total_limit
+                .checked_add(requested)
+                .ok_or_else(|| Error::InvalidCommand("graph UNION LIMIT sum overflow".into()))?;
+            branch_start = branch_end.saturating_add(1);
+            if token_is_keyword(tokens.get(branch_start), "ALL") {
+                branch_start = branch_start.saturating_add(1);
+            }
+        }
+        if total_limit > max_rows {
+            return Err(Error::InvalidCommand(format!(
+                "graph UNION branch LIMIT sum {total_limit} exceeds max_rows {max_rows}"
+            )));
+        }
+        return Ok(statement.to_owned());
+    }
+    let Some(limit_index) = trailing_limit_index(tokens, 0, tokens.len()) else {
+        // Ladybug 0.18.1 does not support a CALL-subquery wrapper. Appending a
+        // top-level LIMIT is semantics-preserving for one non-UNION query part.
+        // UNION requires explicit per-branch limits above because the backend
+        // exposes no execution-time maximum-result-row setting.
+        return Ok(format!("{statement}\nLIMIT {execution_limit}"));
+    };
+    let (limit_value, requested) = requested_limit(tokens, limit_index, tokens.len(), parameters)?;
+    if requested <= max_rows {
+        return Ok(statement.to_owned());
+    }
+    if matches!(limit_value.kind, QueryTokenKind::Parameter(_)) {
+        return Err(Error::InvalidCommand(format!(
+            "graph LIMIT parameter exceeds max_rows {max_rows}"
+        )));
+    }
+    let relative_start = limit_value.start;
+    let relative_end = limit_value.end;
+    Ok(format!(
+        "{}{}{}",
+        &statement[..relative_start],
+        execution_limit,
+        &statement[relative_end..]
     ))
 }
 
-fn matches_top_level_clause(token: &QueryToken) -> bool {
-    [
-        "MATCH", "OPTIONAL", "WITH", "UNWIND", "CALL", "UNION", "RETURN",
-    ]
-    .iter()
-    .any(|keyword| token_is_keyword(Some(token), keyword))
-}
-
-fn update_depth(token: &QueryToken, round: &mut usize, square: &mut usize) -> Result<()> {
-    match token.kind {
-        QueryTokenKind::Symbol('(') => *round += 1,
-        QueryTokenKind::Symbol(')') => {
-            *round = round
-                .checked_sub(1)
-                .ok_or_else(|| Error::InvalidCommand("graph query has an unmatched ')'".into()))?;
-        }
-        QueryTokenKind::Symbol('[') => *square += 1,
-        QueryTokenKind::Symbol(']') => {
-            *square = square
-                .checked_sub(1)
-                .ok_or_else(|| Error::InvalidCommand("graph query has an unmatched ']'".into()))?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_typed_pattern(tokens: &[QueryToken]) -> Result<()> {
-    if tokens.len() != 5
-        || !token_is_symbol(tokens.first(), '(')
-        || !token_is_identifier(tokens.get(1), "v")
-        || !token_is_symbol(tokens.get(2), ':')
-        || !token_is_identifier(tokens.get(3), "RhizaDocument")
-        || !token_is_symbol(tokens.get(4), ')')
+fn union_clause_starts_at(tokens: &[QueryToken], index: usize) -> bool {
+    if !token_is_keyword(tokens.get(index), "UNION")
+        || index
+            .checked_sub(1)
+            .is_some_and(|previous| token_is_keyword(tokens.get(previous), "AS"))
     {
-        return Err(Error::InvalidCommand(
-            "graph query V1 requires exactly MATCH (v:RhizaDocument)".into(),
-        ));
+        return false;
     }
-    Ok(())
-}
+    let mut next = index.saturating_add(1);
+    if token_is_keyword(tokens.get(next), "ALL") {
+        next = next.saturating_add(1);
+    }
+    let Some(QueryToken {
+        kind: QueryTokenKind::Identifier {
+            value,
+            escaped: false,
+        },
+        ..
+    }) = tokens.get(next)
+    else {
+        return false;
+    };
 
-fn token_is_identifier(token: Option<&QueryToken>, expected: &str) -> bool {
-    matches!(
-        token.map(|token| &token.kind),
-        Some(QueryTokenKind::Identifier { value, .. }) if value == expected
+    // A branch starts with an unescaped clause keyword, but Ladybug may add
+    // valid clause starters over time. Reject only tokens that can continue a
+    // preceding expression instead of maintaining an incomplete allow-list.
+    !matches!(
+        value.to_ascii_uppercase().as_str(),
+        "ALL"
+            | "AS"
+            | "LIMIT"
+            | "SKIP"
+            | "ORDER"
+            | "BY"
+            | "WHERE"
+            | "ASC"
+            | "DESC"
+            | "AND"
+            | "OR"
+            | "XOR"
+            | "IN"
+            | "IS"
+            | "NULL"
     )
 }
 
-fn graph_document_property(token: Option<&QueryToken>) -> Option<&str> {
-    let Some(QueryToken {
-        kind: QueryTokenKind::Identifier { value, .. },
-        ..
-    }) = token
-    else {
+fn trailing_limit_index(tokens: &[QueryToken], start: usize, end: usize) -> Option<usize> {
+    let limit_index = end.checked_sub(2)?;
+    if limit_index < start || !token_is_keyword(tokens.get(limit_index), "LIMIT") {
         return None;
-    };
-    [
-        "id",
-        "kind",
-        "bool_value",
-        "i64_value",
-        "u64_value",
-        "f64_value",
-        "string_value",
-        "bytes_value",
-    ]
-    .into_iter()
-    .find(|property| value == property)
+    }
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    for token in tokens.get(start..limit_index)? {
+        match token.kind {
+            QueryTokenKind::Symbol('(') => round = round.saturating_add(1),
+            QueryTokenKind::Symbol(')') => round = round.saturating_sub(1),
+            QueryTokenKind::Symbol('[') => square = square.saturating_add(1),
+            QueryTokenKind::Symbol(']') => square = square.saturating_sub(1),
+            QueryTokenKind::Symbol('{') => curly = curly.saturating_add(1),
+            QueryTokenKind::Symbol('}') => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (round == 0 && square == 0 && curly == 0).then_some(limit_index)
 }
 
-fn validate_where_expression(tokens: &[QueryToken]) -> Result<Option<String>> {
-    let [variable, dot, property, equals, value] = tokens else {
+fn requested_limit<'a>(
+    tokens: &'a [QueryToken],
+    limit_index: usize,
+    branch_end: usize,
+    parameters: &BTreeMap<String, GraphParameterValue>,
+) -> Result<(&'a QueryToken, usize)> {
+    let [limit_value] = tokens.get(limit_index + 1..branch_end).unwrap_or_default() else {
         return Err(Error::InvalidCommand(
-            "graph query V1 WHERE must be exactly v.id = $parameter".into(),
+            "graph LIMIT must be one nonnegative integer or parameter".into(),
         ));
     };
-    if !token_is_identifier(Some(variable), "v")
-        || !token_is_symbol(Some(dot), '.')
-        || !token_is_identifier(Some(property), "id")
-        || !token_is_symbol(Some(equals), '=')
-    {
-        return Err(Error::InvalidCommand(
-            "graph query V1 WHERE must be exactly v.id = $parameter".into(),
-        ));
-    }
-    if let QueryTokenKind::Parameter(name) = &value.kind {
-        Ok(Some(name.clone()))
-    } else {
-        Err(Error::InvalidCommand(
-            "graph query V1 WHERE id must compare to a string parameter".into(),
-        ))
-    }
-}
-
-struct ReturnLayout {
-    projection_end: usize,
-    limit: Option<usize>,
-    limit_start: Option<usize>,
-}
-
-fn validate_return_layout(tokens: &[QueryToken], start: usize) -> Result<ReturnLayout> {
-    if start >= tokens.len() {
-        return Err(Error::InvalidCommand(
-            "graph RETURN clause cannot be empty".into(),
-        ));
-    }
-    let mut limit = None;
-    for index in start..tokens.len() {
-        if token_is_keyword(tokens.get(index), "ORDER")
-            && token_is_keyword(tokens.get(index + 1), "BY")
-        {
+    let requested = match &limit_value.kind {
+        QueryTokenKind::Integer(value) => value
+            .parse::<usize>()
+            .map_err(|_| Error::InvalidCommand("graph LIMIT is too large".into()))?,
+        QueryTokenKind::Parameter(name) => match parameters.get(name) {
+            Some(GraphParameterValue::U64(value)) => usize::try_from(*value)
+                .map_err(|_| Error::InvalidCommand("graph LIMIT is too large".into()))?,
+            Some(GraphParameterValue::I64(value)) if *value >= 0 => *value as usize,
+            Some(_) => {
+                return Err(Error::InvalidCommand(
+                    "graph LIMIT parameter must be a nonnegative integer".into(),
+                ))
+            }
+            None => {
+                return Err(Error::InvalidCommand(format!(
+                    "graph LIMIT parameter is missing: {name}"
+                )))
+            }
+        },
+        _ => {
             return Err(Error::InvalidCommand(
-                "graph query V1 does not support ORDER BY".into(),
-            ));
+                "graph LIMIT must be one nonnegative integer or parameter".into(),
+            ))
         }
-        if clause_keyword_here(tokens, index, "SKIP") {
-            return Err(Error::InvalidCommand(
-                "graph query V1 does not support SKIP".into(),
-            ));
-        }
-        if clause_keyword_here(tokens, index, "LIMIT") && limit.replace(index).is_some() {
-            return Err(Error::InvalidCommand(
-                "graph query has multiple LIMIT clauses".into(),
-            ));
-        }
-    }
-    let projection_end = limit.unwrap_or(tokens.len());
-    let (limit_value, limit_start) = if let Some(limit) = limit {
-        (
-            Some(parse_single_integer(
-                tokens,
-                limit + 1,
-                tokens.len(),
-                "LIMIT",
-            )?),
-            Some(tokens[limit].start),
-        )
-    } else {
-        (None, None)
     };
-    Ok(ReturnLayout {
-        projection_end,
-        limit: limit_value,
-        limit_start,
-    })
-}
-
-fn clause_keyword_here(tokens: &[QueryToken], index: usize, keyword: &str) -> bool {
-    token_is_keyword(tokens.get(index), keyword)
-        && !token_is_keyword(
-            index.checked_sub(1).and_then(|index| tokens.get(index)),
-            "AS",
-        )
-        && !token_is_symbol(
-            index.checked_sub(1).and_then(|index| tokens.get(index)),
-            '.',
-        )
-}
-
-fn parse_single_integer(
-    tokens: &[QueryToken],
-    start: usize,
-    end: usize,
-    clause: &str,
-) -> Result<usize> {
-    let [token] = tokens.get(start..end).unwrap_or_default() else {
-        return Err(Error::InvalidCommand(format!(
-            "graph {clause} must be one literal nonnegative integer"
-        )));
-    };
-    let QueryTokenKind::Integer(value) = &token.kind else {
-        return Err(Error::InvalidCommand(format!(
-            "graph {clause} must be one literal nonnegative integer"
-        )));
-    };
-    value
-        .parse()
-        .map_err(|_| Error::InvalidCommand(format!("graph {clause} integer is too large")))
-}
-
-fn validate_return_projections(tokens: &[QueryToken]) -> Result<usize> {
-    if tokens.is_empty() {
-        return Err(Error::InvalidCommand(
-            "graph RETURN clause cannot be empty".into(),
-        ));
-    }
-    let mut projections = Vec::new();
-    let mut start = 0usize;
-    for (index, token) in tokens.iter().enumerate() {
-        if token_is_symbol(Some(token), ',') {
-            projections.push(&tokens[start..index]);
-            start = index + 1;
-        }
-    }
-    projections.push(&tokens[start..]);
-    if projections.len() > MAX_GRAPH_RETURN_PROJECTIONS {
-        return Err(Error::InvalidCommand(format!(
-            "graph RETURN exceeds {MAX_GRAPH_RETURN_PROJECTIONS} projections"
-        )));
-    }
-    for projection in &projections {
-        validate_scalar_projection(projection)?;
-    }
-    Ok(projections.len())
-}
-
-fn validate_scalar_projection(tokens: &[QueryToken]) -> Result<()> {
-    if tokens.is_empty() {
-        return Err(Error::InvalidCommand(
-            "graph RETURN contains an empty projection".into(),
-        ));
-    }
-    let property = property_width(tokens).is_some_and(|width| width == tokens.len());
-    let parameter = matches!(
-        tokens,
-        [QueryToken {
-            kind: QueryTokenKind::Parameter(_),
-            ..
-        }]
-    );
-    if property || parameter {
-        Ok(())
-    } else {
-        Err(Error::InvalidCommand(
-            "graph RETURN projections must be one whitelisted property or parameter".into(),
-        ))
-    }
-}
-
-fn property_width(tokens: &[QueryToken]) -> Option<usize> {
-    if token_is_identifier(tokens.first(), "v")
-        && token_is_symbol(tokens.get(1), '.')
-        && graph_document_property(tokens.get(2)).is_some()
-    {
-        Some(3)
-    } else {
-        None
-    }
+    Ok((limit_value, requested))
 }
 
 fn lex_query(statement: &str) -> Result<Vec<QueryToken>> {
@@ -2205,30 +2910,12 @@ fn query_parameters(
 fn validate_query_parameter_contract(
     parameters: &BTreeMap<String, GraphParameterValue>,
     referenced: &BTreeSet<String>,
-    id_parameter: Option<&str>,
 ) -> Result<()> {
     let supplied = parameters.keys().cloned().collect::<BTreeSet<_>>();
     if supplied != *referenced {
         return Err(Error::InvalidCommand(
             "graph query parameters must exactly match referenced parameters".into(),
         ));
-    }
-    for value in parameters.values() {
-        if matches!(
-            value,
-            GraphParameterValue::List(_) | GraphParameterValue::Struct(_)
-        ) {
-            return Err(Error::InvalidCommand(
-                "graph query V1 parameters must be scalar".into(),
-            ));
-        }
-    }
-    if let Some(name) = id_parameter {
-        if !matches!(parameters.get(name), Some(GraphParameterValue::String(_))) {
-            return Err(Error::InvalidCommand(
-                "graph query V1 id parameter must be a string".into(),
-            ));
-        }
     }
     Ok(())
 }
@@ -2294,9 +2981,9 @@ fn query_parameter_value(
             Value::Blob(value.clone())
         }
         GraphParameterValue::List(values) => {
-            if values.len() > MAX_GRAPH_CONTAINER_VALUES {
+            if values.len() > MAX_GRAPH_PARAMETER_CONTAINER_VALUES {
                 return Err(Error::InvalidCommand(format!(
-                    "graph parameter lists cannot exceed {MAX_GRAPH_CONTAINER_VALUES} values"
+                    "graph parameter lists cannot exceed {MAX_GRAPH_PARAMETER_CONTAINER_VALUES} values"
                 )));
             }
             let converted = values
@@ -2317,9 +3004,9 @@ fn query_parameter_value(
             Value::List(element_type, converted)
         }
         GraphParameterValue::Struct(fields) => {
-            if fields.len() > MAX_GRAPH_CONTAINER_VALUES {
+            if fields.len() > MAX_GRAPH_PARAMETER_CONTAINER_VALUES {
                 return Err(Error::InvalidCommand(format!(
-                    "graph parameter structs cannot exceed {MAX_GRAPH_CONTAINER_VALUES} fields"
+                    "graph parameter structs cannot exceed {MAX_GRAPH_PARAMETER_CONTAINER_VALUES} fields"
                 )));
             }
             let fields = fields
@@ -2339,6 +3026,221 @@ fn query_parameter_value(
 
 fn graph_result_value(value: Value) -> Result<GraphResultValue> {
     graph_result_value_at(value, 0)
+}
+
+const GRAPH_RESULT_VALUE_OVERHEAD: usize = 8;
+
+struct GraphResultBudget {
+    limit: usize,
+    remaining_bytes: usize,
+    remaining_elements: usize,
+}
+
+impl GraphResultBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            remaining_bytes: limit,
+            remaining_elements: limit / GRAPH_RESULT_VALUE_OVERHEAD,
+        }
+    }
+
+    fn exceeded(&self) -> Error {
+        Error::InvalidCommand(format!("graph query exceeds {} result bytes", self.limit))
+    }
+
+    fn consume_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| self.exceeded())?;
+        Ok(())
+    }
+
+    fn ensure_elements(&self, elements: usize) -> Result<()> {
+        if elements > self.remaining_elements {
+            Err(self.exceeded())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn consume_element(&mut self) -> Result<()> {
+        self.remaining_elements = self
+            .remaining_elements
+            .checked_sub(1)
+            .ok_or_else(|| self.exceeded())?;
+        Ok(())
+    }
+
+    fn reserve_column(&mut self, name: &str, logical_type: &LogicalType) -> Result<()> {
+        self.consume_element()?;
+        self.consume_bytes(GRAPH_RESULT_VALUE_OVERHEAD.saturating_add(name.len()))?;
+        self.reserve_logical_type(logical_type, 0)
+    }
+
+    fn reserve_row(&mut self, row: &[Value]) -> Result<()> {
+        self.ensure_elements(row.len())?;
+        for value in row {
+            self.reserve_value(value, 0)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_logical_type(&mut self, logical_type: &LogicalType, depth: usize) -> Result<()> {
+        if depth > MAX_GRAPH_PARAMETER_DEPTH {
+            return Err(Error::InvalidCommand(format!(
+                "graph result nesting exceeds {MAX_GRAPH_PARAMETER_DEPTH}"
+            )));
+        }
+        self.consume_element()?;
+        self.consume_bytes(GRAPH_RESULT_VALUE_OVERHEAD)?;
+        match logical_type {
+            LogicalType::List { child_type } => {
+                self.reserve_logical_type(child_type, depth + 1)?;
+            }
+            LogicalType::Array {
+                child_type,
+                num_elements: _,
+            } => {
+                self.consume_bytes(8)?;
+                self.reserve_logical_type(child_type, depth + 1)?;
+            }
+            LogicalType::Struct { fields } | LogicalType::Union { types: fields } => {
+                self.ensure_elements(fields.len())?;
+                for (name, field_type) in fields {
+                    self.consume_bytes(name.len())?;
+                    self.reserve_logical_type(field_type, depth + 1)?;
+                }
+            }
+            LogicalType::Map {
+                key_type,
+                value_type,
+            } => {
+                self.reserve_logical_type(key_type, depth + 1)?;
+                self.reserve_logical_type(value_type, depth + 1)?;
+            }
+            LogicalType::Decimal { .. } => self.consume_bytes(8)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn reserve_value(&mut self, value: &Value, depth: usize) -> Result<()> {
+        if depth > MAX_GRAPH_PARAMETER_DEPTH {
+            return Err(Error::InvalidCommand(format!(
+                "graph result nesting exceeds {MAX_GRAPH_PARAMETER_DEPTH}"
+            )));
+        }
+        self.consume_element()?;
+        self.consume_bytes(GRAPH_RESULT_VALUE_OVERHEAD)?;
+        match value {
+            Value::Null(logical_type) => self.reserve_logical_type(logical_type, depth + 1)?,
+            Value::Bool(_) | Value::Int8(_) | Value::UInt8(_) => self.consume_bytes(1)?,
+            Value::Int16(_) | Value::UInt16(_) => self.consume_bytes(2)?,
+            Value::Int32(_) | Value::UInt32(_) => self.consume_bytes(4)?,
+            Value::Int64(_) | Value::UInt64(_) | Value::Double(_) => self.consume_bytes(8)?,
+            Value::InternalID(_) => self.consume_bytes(16)?,
+            Value::Int128(value) => {
+                self.consume_bytes(value.to_string().len().saturating_add(2))?
+            }
+            Value::Float(value) => self.consume_bytes(value.to_string().len().saturating_add(2))?,
+            Value::Date(value) => self.consume_bytes(value.to_string().len().saturating_add(2))?,
+            Value::Interval(value) => {
+                self.consume_bytes(value.to_string().len().saturating_add(2))?
+            }
+            Value::Timestamp(value)
+            | Value::TimestampTz(value)
+            | Value::TimestampNs(value)
+            | Value::TimestampMs(value)
+            | Value::TimestampSec(value) => {
+                self.consume_bytes(value.to_string().len().saturating_add(2))?
+            }
+            Value::String(value) => self.consume_bytes(value.len().saturating_add(2))?,
+            Value::Json(value) => self.consume_bytes(value.to_string().len().saturating_add(2))?,
+            Value::Blob(value) => self.consume_bytes(value.len())?,
+            Value::List(element_type, values) | Value::Array(element_type, values) => {
+                self.reserve_logical_type(element_type, depth + 1)?;
+                self.ensure_elements(values.len())?;
+                for value in values {
+                    self.reserve_value(value, depth + 1)?;
+                }
+            }
+            Value::Struct(fields) => {
+                self.ensure_elements(fields.len())?;
+                for (name, value) in fields {
+                    self.consume_bytes(name.len())?;
+                    self.reserve_value(value, depth + 1)?;
+                }
+            }
+            Value::Node(node) => self.reserve_node(node, depth + 1)?,
+            Value::Rel(rel) => self.reserve_rel(rel, depth + 1)?,
+            Value::RecursiveRel { nodes, rels } => {
+                self.ensure_elements(nodes.len().saturating_add(rels.len()))?;
+                for node in nodes {
+                    self.consume_element()?;
+                    self.reserve_node(node, depth + 1)?;
+                }
+                for rel in rels {
+                    self.consume_element()?;
+                    self.reserve_rel(rel, depth + 1)?;
+                }
+            }
+            Value::Map((key_type, value_type), entries) => {
+                self.reserve_logical_type(key_type, depth + 1)?;
+                self.reserve_logical_type(value_type, depth + 1)?;
+                self.ensure_elements(entries.len().saturating_mul(2))?;
+                for (key, value) in entries {
+                    self.reserve_value(key, depth + 1)?;
+                    self.reserve_value(value, depth + 1)?;
+                }
+            }
+            Value::Union { types, value } => {
+                self.ensure_elements(types.len())?;
+                for (name, logical_type) in types {
+                    self.consume_bytes(name.len())?;
+                    self.reserve_logical_type(logical_type, depth + 1)?;
+                }
+                self.reserve_value(value, depth + 1)?;
+            }
+            Value::UUID(value) => self.consume_bytes(value.to_string().len().saturating_add(2))?,
+            Value::Decimal(value) => {
+                self.consume_bytes(value.to_string().len().saturating_add(2))?
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_node(&mut self, node: &lbug::NodeVal, depth: usize) -> Result<()> {
+        if node
+            .get_label_name()
+            .to_ascii_lowercase()
+            .starts_with("__rhiza")
+        {
+            return Err(Error::InvalidCommand(
+                "graph query cannot return reserved __Rhiza nodes".into(),
+            ));
+        }
+        let properties = node.get_properties();
+        self.ensure_elements(properties.len())?;
+        self.consume_bytes(16usize.saturating_add(node.get_label_name().len()))?;
+        for (name, value) in properties {
+            self.consume_bytes(name.len())?;
+            self.reserve_value(value, depth)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_rel(&mut self, rel: &lbug::RelVal, depth: usize) -> Result<()> {
+        let properties = rel.get_properties();
+        self.ensure_elements(properties.len())?;
+        self.consume_bytes(32usize.saturating_add(rel.get_label_name().len()))?;
+        for (name, value) in properties {
+            self.consume_bytes(name.len())?;
+            self.reserve_value(value, depth)?;
+        }
+        Ok(())
+    }
 }
 
 fn graph_logical_type(value: LogicalType) -> Result<GraphLogicalType> {
@@ -2488,11 +3390,6 @@ fn graph_result_value_at(value: Value, depth: usize) -> Result<GraphResultValue>
 }
 
 fn graph_result_values(values: Vec<Value>, depth: usize) -> Result<Vec<GraphResultValue>> {
-    if values.len() > MAX_GRAPH_CONTAINER_VALUES {
-        return Err(Error::InvalidCommand(format!(
-            "graph result containers cannot exceed {MAX_GRAPH_CONTAINER_VALUES} values"
-        )));
-    }
     values
         .into_iter()
         .map(|value| graph_result_value_at(value, depth))
@@ -2529,135 +3426,6 @@ fn graph_rel(value: &lbug::RelVal, depth: usize) -> Result<GraphRel> {
             .map(|(name, value)| Ok((name.clone(), graph_result_value_at(value.clone(), depth)?)))
             .collect::<Result<Vec<_>>>()?,
     })
-}
-
-fn graph_result_value_size(value: &GraphResultValue) -> usize {
-    const OVERHEAD: usize = 8;
-    match value {
-        GraphResultValue::Null(logical_type) => {
-            OVERHEAD.saturating_add(graph_logical_type_size(logical_type))
-        }
-        GraphResultValue::I128(value)
-        | GraphResultValue::F32(value)
-        | GraphResultValue::Date(value)
-        | GraphResultValue::Interval(value)
-        | GraphResultValue::Timestamp(value)
-        | GraphResultValue::TimestampTz(value)
-        | GraphResultValue::TimestampNs(value)
-        | GraphResultValue::TimestampMs(value)
-        | GraphResultValue::TimestampSec(value)
-        | GraphResultValue::String(value)
-        | GraphResultValue::Json(value)
-        | GraphResultValue::Uuid(value)
-        | GraphResultValue::Decimal(value) => {
-            OVERHEAD.saturating_add(value.len()).saturating_add(2)
-        }
-        GraphResultValue::Bool(_) | GraphResultValue::I8(_) | GraphResultValue::U8(_) => {
-            OVERHEAD + 1
-        }
-        GraphResultValue::I16(_) | GraphResultValue::U16(_) => OVERHEAD + 2,
-        GraphResultValue::I32(_) | GraphResultValue::U32(_) => OVERHEAD + 4,
-        GraphResultValue::I64(_) | GraphResultValue::U64(_) | GraphResultValue::F64(_) => {
-            OVERHEAD + 8
-        }
-        GraphResultValue::InternalId(_) => OVERHEAD + 16,
-        GraphResultValue::Bytes(value) => OVERHEAD.saturating_add(value.len()),
-        GraphResultValue::List {
-            element_type,
-            values,
-        }
-        | GraphResultValue::Array {
-            element_type,
-            values,
-        } => values.iter().fold(
-            OVERHEAD.saturating_add(graph_logical_type_size(element_type)),
-            |size, value| size.saturating_add(graph_result_value_size(value)),
-        ),
-        GraphResultValue::Struct(fields) => fields.iter().fold(OVERHEAD, |size, (name, value)| {
-            size.saturating_add(name.len())
-                .saturating_add(graph_result_value_size(value))
-        }),
-        GraphResultValue::Node(node) => OVERHEAD.saturating_add(graph_node_size(node)),
-        GraphResultValue::Rel(rel) => OVERHEAD.saturating_add(graph_rel_size(rel)),
-        GraphResultValue::RecursiveRel { nodes, rels } => nodes
-            .iter()
-            .map(graph_node_size)
-            .chain(rels.iter().map(graph_rel_size))
-            .fold(OVERHEAD, usize::saturating_add),
-        GraphResultValue::Map {
-            key_type,
-            value_type,
-            entries,
-        } => entries.iter().fold(
-            OVERHEAD
-                .saturating_add(graph_logical_type_size(key_type))
-                .saturating_add(graph_logical_type_size(value_type)),
-            |size, (key, value)| {
-                size.saturating_add(graph_result_value_size(key))
-                    .saturating_add(graph_result_value_size(value))
-            },
-        ),
-        GraphResultValue::Union { variants, value } => variants
-            .iter()
-            .fold(OVERHEAD, |size, (name, logical_type)| {
-                size.saturating_add(name.len())
-                    .saturating_add(graph_logical_type_size(logical_type))
-            })
-            .saturating_add(graph_result_value_size(value)),
-    }
-}
-
-fn graph_column_size(column: &GraphColumn) -> usize {
-    8usize
-        .saturating_add(column.name.len())
-        .saturating_add(graph_logical_type_size(&column.logical_type))
-}
-
-fn graph_logical_type_size(logical_type: &GraphLogicalType) -> usize {
-    const OVERHEAD: usize = 8;
-    match logical_type {
-        GraphLogicalType::List(element_type) => {
-            OVERHEAD.saturating_add(graph_logical_type_size(element_type))
-        }
-        GraphLogicalType::Array {
-            element_type,
-            length: _,
-        } => OVERHEAD
-            .saturating_add(graph_logical_type_size(element_type))
-            .saturating_add(8),
-        GraphLogicalType::Struct(fields) | GraphLogicalType::Union(fields) => {
-            fields.iter().fold(OVERHEAD, |size, (name, logical_type)| {
-                size.saturating_add(name.len())
-                    .saturating_add(graph_logical_type_size(logical_type))
-            })
-        }
-        GraphLogicalType::Map {
-            key_type,
-            value_type,
-        } => OVERHEAD
-            .saturating_add(graph_logical_type_size(key_type))
-            .saturating_add(graph_logical_type_size(value_type)),
-        GraphLogicalType::Decimal { .. } => OVERHEAD + 8,
-        _ => OVERHEAD,
-    }
-}
-
-fn graph_node_size(node: &GraphNode) -> usize {
-    16 + node.label.len()
-        + node
-            .properties
-            .iter()
-            .map(|(name, value)| name.len() + graph_result_value_size(value))
-            .sum::<usize>()
-}
-
-fn graph_rel_size(rel: &GraphRel) -> usize {
-    32 + rel.label.len()
-        + rel
-            .properties
-            .iter()
-            .map(|(name, value)| name.len() + graph_result_value_size(value))
-            .sum::<usize>()
 }
 
 fn apply_command(
@@ -2779,6 +3547,7 @@ fn document(connection: &Connection<'_>, id: &str) -> Result<Option<GraphValueV1
 fn record_request(
     connection: &Connection<'_>,
     command: &GraphCommandV1,
+    command_payload: &[u8],
     entry: &LogEntry,
     result: &GraphCommandResultV1,
 ) -> Result<()> {
@@ -2789,7 +3558,7 @@ fn record_request(
             ("request_id", Value::String(command.request_id.clone())),
             (
                 "command_hash",
-                Value::String(command_digest(&entry.payload).to_hex()),
+                Value::String(command_digest(command_payload).to_hex()),
             ),
             ("original_log_index", Value::UInt64(entry.index)),
             ("original_log_hash", Value::String(entry.hash.to_hex())),
@@ -3087,6 +3856,37 @@ fn ladybug_error(error: lbug::Error) -> Error {
     Error::Ladybug(error.to_string())
 }
 
+fn ladybug_prepare_error(error: lbug::Error) -> Error {
+    match &error {
+        lbug::Error::FailedPreparedStatement(_) => Error::InvalidCommand(error.to_string()),
+        _ => Error::Ladybug(error.to_string()),
+    }
+}
+
+fn ladybug_execution_error(error: lbug::Error) -> Error {
+    match error {
+        lbug::Error::FailedQuery(message)
+            if message.starts_with(LADYBUG_CONVERSION_ERROR_PREFIX) =>
+        {
+            Error::InvalidCommand(format!("Query execution failed: {message}"))
+        }
+        lbug::Error::FailedQuery(message) if message == LADYBUG_BUFFER_POOL_EXHAUSTED => {
+            Error::ResourceExhausted(message)
+        }
+        lbug::Error::FailedQuery(message) if is_ladybug_interruption(&message) => {
+            Error::ResourceExhausted(format!(
+                "graph query timed out or was interrupted: {message}"
+            ))
+        }
+        error => Error::Ladybug(error.to_string()),
+    }
+}
+
+fn is_ladybug_interruption(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("interrupt") || message.contains("timed out") || message.contains("timeout")
+}
+
 fn io_error(error: std::io::Error) -> Error {
     Error::Io(error.to_string())
 }
@@ -3226,6 +4026,58 @@ mod query_tests {
     }
 
     #[test]
+    fn lifecycle_reader_does_not_block_normal_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap(),
+        );
+        let command = GraphCommandV1::put_document(
+            "request-1",
+            "document-1",
+            GraphValueV1::String("value".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&command).unwrap();
+        let hash = LogEntry::calculate_hash(
+            "cluster-1",
+            1,
+            7,
+            3,
+            EntryType::Command,
+            LogHash::ZERO,
+            &payload,
+        );
+        let entry = LogEntry {
+            cluster_id: "cluster-1".into(),
+            epoch: 7,
+            config_id: 3,
+            index: 1,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: LogHash::ZERO,
+            hash,
+        };
+        let lifecycle_reader = state.read_database().unwrap();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let state = std::sync::Arc::clone(&state);
+            scope.spawn(move || applied_tx.send(state.apply_entry(&entry)).unwrap());
+            applied_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("normal apply must not wait for a lifecycle reader")
+                .unwrap();
+        });
+        drop(lifecycle_reader);
+
+        assert_eq!(
+            state.get_document("document-1").unwrap(),
+            Some(GraphValueV1::String("value".into()))
+        );
+    }
+
+    #[test]
     fn direct_query_converts_nodes_and_relationships_without_display_coercion() {
         let dir = tempfile::tempdir().unwrap();
         let state =
@@ -3294,6 +4146,512 @@ mod query_tests {
     }
 
     #[test]
+    fn read_only_query_supports_general_cypher_and_collection_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        {
+            let guard = state.read_database().unwrap();
+            let database = guard.as_ref().unwrap();
+            let connection = Connection::new(database).unwrap();
+            transaction(&connection, || {
+                execute(
+                    &connection,
+                    "CREATE (:RhizaDocument {id: 'document-1', kind: 6, string_value: 'alpha'}), (:RhizaDocument {id: 'document-2', kind: 6, string_value: 'beta'}), (:RhizaDocument {id: 'document-3', kind: 6, string_value: 'gamma'})",
+                    vec![],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let parameters = BTreeMap::from([(
+            "ids".into(),
+            GraphParameterValue::List(vec![
+                GraphParameterValue::String("document-1".into()),
+                GraphParameterValue::String("document-2".into()),
+                GraphParameterValue::String("document-3".into()),
+            ]),
+        )]);
+
+        let result = state
+            .query_read_only(
+                "MATCH (v:RhizaDocument) WHERE v.id IN $ids RETURN v.id AS id, upper(v.string_value) AS value ORDER BY v.id",
+                &parameters,
+                10,
+                16 * 1024,
+                1_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "value"]
+        );
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].len(), 2);
+        assert!(matches!(&result.rows[0][1], GraphResultValue::String(value) if value == "ALPHA"));
+    }
+
+    #[test]
+    fn read_only_query_requires_bounded_limits_in_every_union_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        assert!(matches!(
+            state.query_read_only(
+                "RETURN 1 AS value UNION RETURN 2 AS value",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("explicit bounded LIMIT")
+        ));
+
+        assert!(matches!(
+            state.query_read_only(
+                "RETURN 1 AS return UNION RETURN 2 AS value LIMIT 1",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("explicit bounded LIMIT")
+        ));
+
+        assert!(matches!(
+            state.query_read_only(
+                "RETURN 1 AS value UNION WITH 2 AS value RETURN value LIMIT 1",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("explicit bounded LIMIT")
+        ));
+
+        let keyword_alias =
+            admit_read_only_query("RETURN 1 AS union LIMIT 1", &BTreeMap::new(), 1, 4096).unwrap();
+        assert_eq!(keyword_alias.statement, "RETURN 1 AS union LIMIT 1");
+
+        let result = state
+            .query_read_only(
+                "RETURN 1 AS value LIMIT 1 UNION RETURN 2 AS value LIMIT 1",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        let result = state
+            .query_read_only(
+                "RETURN 1 AS value LIMIT 1 UNION WITH 2 AS value RETURN value LIMIT 1",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        assert!(matches!(
+            state.query_read_only(
+                "RETURN 1 AS value LIMIT 1 UNION RETURN 2 AS value LIMIT 2",
+                &BTreeMap::new(),
+                2,
+                4096,
+                1_000,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("LIMIT sum")
+        ));
+    }
+
+    #[test]
+    fn read_only_query_bounds_large_collection_results_by_bytes_not_element_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        let result = state
+            .query_read_only(
+                "RETURN range(1, 1025) AS values LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                64 * 1024,
+                1_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &result.rows[0][0],
+            GraphResultValue::List { values, .. } if values.len() == 1025
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_unbounded_containers_before_ladybug_execution() {
+        let huge = admit_read_only_query(
+            "RETURN range(1, 70000) AS values LIMIT 1",
+            &BTreeMap::new(),
+            1,
+            1024 * 1024,
+        );
+        assert!(matches!(
+            huge,
+            Err(Error::InvalidCommand(message)) if message.contains("statically expanded values")
+        ));
+        assert!(matches!(
+            admit_read_only_query(
+                "RETURN repeat('a', 2000000) AS value LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                1024 * 1024,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("statically expanded values")
+        ));
+
+        for query in [
+            "UNWIND range(1, 1000000000) AS value RETURN value LIMIT 1",
+            "RETURN repeat('a', 800000), repeat('b', 800000) LIMIT 1",
+            "RETURN lpad('a', 100000000, 'x') AS value LIMIT 1",
+            "RETURN rpad('a', 100000000, 'x') AS value LIMIT 1",
+        ] {
+            assert!(
+                matches!(
+                    admit_read_only_query(query, &BTreeMap::new(), 1, 1024 * 1024),
+                    Err(Error::InvalidCommand(message))
+                        if message.contains("statically expanded values")
+                ),
+                "allocation-amplifying query must fail admission: {query}"
+            );
+        }
+
+        assert!(matches!(
+            admit_read_only_query(
+                "UNWIND range(1, 10000) AS x RETURN repeat('a', 4096) AS value LIMIT 10000",
+                &BTreeMap::new(),
+                10_000,
+                1024 * 1024,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("statically expanded values")
+        ));
+        let repeated_literal = format!(
+            "UNWIND range(1, 10000) AS x RETURN concat('{}') AS value LIMIT 10000",
+            "x".repeat(1024)
+        );
+        assert!(matches!(
+            admit_read_only_query(
+                &repeated_literal,
+                &BTreeMap::new(),
+                10_000,
+                1024 * 1024,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("statically expanded values")
+        ));
+
+        let repeated_parameter = BTreeMap::from([(
+            "value".into(),
+            GraphParameterValue::String("x".repeat(MAX_STRING_BYTES)),
+        )]);
+        assert!(matches!(
+            admit_read_only_query(
+                "RETURN [$value, $value, $value, $value] AS values LIMIT 1",
+                &repeated_parameter,
+                1,
+                1024 * 1024,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("statically expanded values")
+        ));
+        assert!(matches!(
+            admit_read_only_query(
+                "RETURN replace($value, 'x', $value) AS value LIMIT 1",
+                &repeated_parameter,
+                1,
+                1024 * 1024,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("expansion function")
+        ));
+
+        for query in [
+            "MATCH (v:RhizaDocument) RETURN collect(v.id) LIMIT 1",
+            "RETURN [value IN [1, 2] | value] AS values LIMIT 1",
+            "MATCH p = (a:RhizaDocument)-[:Related]->(b:RhizaDocument) RETURN nodes(p) LIMIT 1",
+            "RETURN string_split('a,b', ',') AS values LIMIT 1",
+        ] {
+            assert!(
+                matches!(
+                    admit_read_only_query(query, &BTreeMap::new(), 1, 1024 * 1024),
+                    Err(Error::InvalidCommand(message))
+                        if message.contains("statically bounded result cardinality")
+                            || message.contains("list comprehensions")
+                ),
+                "container-producing query must fail admission: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_allows_statically_bounded_range_parameters() {
+        let parameters = BTreeMap::from([
+            ("start".into(), GraphParameterValue::I64(-10)),
+            ("end".into(), GraphParameterValue::U64(10)),
+            ("step".into(), GraphParameterValue::U64(2)),
+        ]);
+        let admitted = admit_read_only_query(
+            "RETURN range($start, $end, $step) AS values LIMIT 1",
+            &parameters,
+            1,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.statement,
+            "RETURN range($start, $end, $step) AS values LIMIT 1"
+        );
+
+        assert!(matches!(
+            admit_read_only_query(
+                "RETURN range(1, 1 + 10) AS values LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                4096,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("statically bounded")
+        ));
+    }
+
+    #[test]
+    fn read_only_query_rejects_huge_nested_container_before_result_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        let error = state
+            .query_read_only(
+                "RETURN [range(1, 70000), range(1, 70000)] AS values LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                1024 * 1024,
+                5_000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidCommand(message) if message.contains("1048576 result bytes")
+        ));
+    }
+
+    #[test]
+    fn read_only_query_requires_static_labels_without_restricting_labeled_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        for query in [
+            "MATCH (n) RETURN n LIMIT 1",
+            "MATCH (n) RETURN count(n) LIMIT 1",
+            "MATCH (n:RhizaDocument)-->(m) RETURN m LIMIT 1",
+        ] {
+            assert!(matches!(
+                state.query_read_only(query, &BTreeMap::new(), 1, 4096, 1_000),
+                Err(Error::InvalidCommand(message))
+                    if message.contains("explicit non-reserved label")
+            ));
+        }
+
+        let labeled_join = state
+            .query_read_only(
+                "MATCH (a:RhizaDocument), (b:RhizaDocument) RETURN a.id, b.id LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                4096,
+                1_000,
+            )
+            .unwrap();
+        assert!(labeled_join.rows.is_empty());
+    }
+
+    #[test]
+    fn read_only_query_preserves_typed_whole_node_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        {
+            let guard = state.read_database().unwrap();
+            let database = guard.as_ref().unwrap();
+            let connection = Connection::new(database).unwrap();
+            execute(
+                &connection,
+                "CREATE (:RhizaDocument {id: 'document-1', kind: 3, i64_value: 7})",
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let result = state
+            .query_read_only(
+                "MATCH (v:RhizaDocument) RETURN v",
+                &BTreeMap::new(),
+                1,
+                16 * 1024,
+                1_000,
+            )
+            .unwrap();
+
+        assert!(
+            matches!(&result.rows[0][0], GraphResultValue::Node(node) if node.label == "RhizaDocument")
+        );
+    }
+
+    #[test]
+    fn read_only_query_keeps_safety_gates_and_classifies_user_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        for query in [
+            "CREATE (:RhizaDocument {id: 'forbidden'})",
+            "CALL show_tables() RETURN *",
+            "LOAD httpfs",
+            "MATCH (m:__RhizaMeta) RETURN m",
+            "RETURN (",
+        ] {
+            assert!(
+                matches!(
+                    state.query_read_only(query, &BTreeMap::new(), 10, 4096, 1_000),
+                    Err(Error::InvalidCommand(_))
+                ),
+                "user query must be rejected without becoming an internal Ladybug error: {query}"
+            );
+        }
+
+        let result = state
+            .query_read_only("RETURN 1 AS transaction", &BTreeMap::new(), 1, 4096, 1_000)
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn admission_rejects_load_from_in_every_reading_clause_position() {
+        for query in [
+            "LOAD FROM '/tmp/rhiza.csv' RETURN *",
+            "LOAD WITH HEADERS (id STRING) FROM '/tmp/rhiza.csv' RETURN id",
+            "MATCH (v:RhizaDocument) LOAD FROM '/tmp/rhiza.csv' RETURN v.id",
+            "WITH 1 AS seed LOAD WITH HEADERS (id STRING) FROM '/tmp/rhiza.csv' RETURN seed",
+        ] {
+            assert!(
+                matches!(
+                    admit_read_only_query(query, &BTreeMap::new(), 10, 4096),
+                    Err(Error::InvalidCommand(message)) if message.contains("external I/O")
+                ),
+                "LOAD FROM must be rejected by admission before Ladybug executes it: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_query_allows_nonreserved_keywords_as_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        {
+            let guard = state.read_database().unwrap();
+            let database = guard.as_ref().unwrap();
+            let connection = Connection::new(database).unwrap();
+            execute(
+                &connection,
+                "CREATE NODE TABLE KeywordNode(id STRING, call INT64, limit INT64, load INT64, PRIMARY KEY(id))",
+                vec![],
+            )
+            .unwrap();
+            execute(
+                &connection,
+                "CREATE (:KeywordNode {id: 'one', call: 1, limit: 2, load: 3})",
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let result = state
+            .query_read_only(
+                "MATCH (call:KeywordNode) RETURN call.call AS call, call.limit AS limit, call.load AS load LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                4096,
+                1_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "limit", "load"]
+        );
+        assert_eq!(result.rows.len(), 1);
+
+        let result = state
+            .query_read_only(
+                "MATCH (limit:KeywordNode) WITH limit AS load RETURN load.call AS call, load.limit AS limit, load.load AS load LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                4096,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn read_only_query_supports_bounded_parameterized_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        let admitted = BTreeMap::from([("limit".into(), GraphParameterValue::U64(1))]);
+        let result = state
+            .query_read_only(
+                "UNWIND [1, 2] AS n RETURN n LIMIT $limit",
+                &admitted,
+                2,
+                4096,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        let excessive = BTreeMap::from([("limit".into(), GraphParameterValue::U64(3))]);
+        assert!(matches!(
+            state.query_read_only(
+                "UNWIND [1, 2] AS n RETURN n LIMIT $limit",
+                &excessive,
+                2,
+                4096,
+                1_000,
+            ),
+            Err(Error::InvalidCommand(message)) if message.contains("max_rows")
+        ));
+    }
+
+    #[test]
     fn typed_empty_collections_and_union_descriptors_remain_distinct() {
         let empty_strings = graph_result_value(Value::List(LogicalType::String, vec![])).unwrap();
         let empty_integers = graph_result_value(Value::List(LogicalType::Int64, vec![])).unwrap();
@@ -3348,25 +4706,135 @@ mod query_tests {
     }
 
     #[test]
-    fn admission_injects_one_extra_row_for_explicit_limit_errors() {
-        let admitted = admit_read_only_query("MATCH (v:RhizaDocument) RETURN v.id", 10).unwrap();
-        assert!(admitted.statement.ends_with("LIMIT 5"));
-        assert_eq!(admitted.allowed_rows, 4);
-
-        let admitted =
-            admit_read_only_query("MATCH (v:RhizaDocument) RETURN v.id LIMIT 3", 10).unwrap();
-        assert!(admitted.statement.ends_with("LIMIT 3"));
-
-        let projections = std::iter::repeat_n("v.id", 4)
-            .collect::<Vec<_>>()
-            .join(", ");
+    fn admission_bounds_queries_without_overriding_a_smaller_explicit_limit() {
         let admitted = admit_read_only_query(
-            &format!("MATCH (v:RhizaDocument) RETURN {projections}"),
-            usize::MAX,
+            "MATCH (v:RhizaDocument) RETURN v.id",
+            &BTreeMap::new(),
+            10,
+            4096,
         )
         .unwrap();
-        assert_eq!(admitted.allowed_rows, 1);
-        assert!(admitted.statement.ends_with("LIMIT 2"));
+        assert!(admitted.statement.ends_with("LIMIT 11"));
+        assert!(admitted
+            .statement
+            .contains("MATCH (v:RhizaDocument) RETURN v.id"));
+
+        let admitted = admit_read_only_query(
+            "MATCH (v:RhizaDocument) RETURN v.id LIMIT 3",
+            &BTreeMap::new(),
+            10,
+            4096,
+        )
+        .unwrap();
+        assert!(admitted.statement.ends_with("LIMIT 3"));
+        assert!(admitted
+            .statement
+            .contains("MATCH (v:RhizaDocument) RETURN v.id LIMIT 3"));
+
+        let admitted =
+            admit_read_only_query("RETURN 1 AS limit", &BTreeMap::new(), 1, 4096).unwrap();
+        assert_eq!(admitted.statement, "RETURN 1 AS limit\nLIMIT 2");
+
+        let admitted = admit_read_only_query(
+            "RETURN 1 AS call, 2 AS load, 3 AS limit LIMIT 9",
+            &BTreeMap::new(),
+            1,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.statement,
+            "RETURN 1 AS call, 2 AS load, 3 AS limit LIMIT 2"
+        );
+
+        assert!(matches!(
+            admit_read_only_query("RETURN 1", &BTreeMap::new(), usize::MAX, 4096),
+            Err(Error::InvalidCommand(message)) if message.contains("overflow")
+        ));
+    }
+
+    #[test]
+    fn query_error_mapping_keeps_prepare_and_execution_failures_separate() {
+        assert!(matches!(
+            ladybug_prepare_error(lbug::Error::FailedPreparedStatement("syntax".into())),
+            Error::InvalidCommand(_)
+        ));
+        assert!(matches!(
+            ladybug_execution_error(lbug::Error::FailedQuery("storage".into())),
+            Error::Ladybug(_)
+        ));
+        assert!(matches!(
+            ladybug_execution_error(lbug::Error::FailedQuery(
+                "Conversion exception: Cast failed".into()
+            )),
+            Error::InvalidCommand(_)
+        ));
+        assert!(matches!(
+            ladybug_execution_error(lbug::Error::FailedQuery(
+                "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!".into()
+            )),
+            Error::ResourceExhausted(_)
+        ));
+        assert!(matches!(
+            ladybug_execution_error(lbug::Error::FailedQuery(
+                "Interrupted while executing query".into()
+            )),
+            Error::ResourceExhausted(_)
+        ));
+    }
+
+    #[test]
+    fn query_timeout_is_typed_as_resource_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        let error = state
+            .query_read_only(
+                "UNWIND range(1, 10000) AS x UNWIND range(1, 10000) AS y RETURN sum(x * y) AS total LIMIT 1",
+                &BTreeMap::new(),
+                1,
+                1024 * 1024,
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::ResourceExhausted(_)));
+    }
+
+    #[test]
+    fn admission_stops_amplified_results_before_native_materialization() {
+        let database =
+            Database::in_memory(ladybug_system_config_with_limits(8 * 1024 * 1024, 1)).unwrap();
+        let identity = Identity {
+            cluster_id: "cluster-1".into(),
+            node_id: "node-1".into(),
+            epoch: 7,
+            config_id: 3,
+        };
+        initialize_or_validate(&database, &identity).unwrap();
+        let state = LadybugStateMachine {
+            path: PathBuf::from(":memory:"),
+            identity,
+            database: RwLock::new(Some(database)),
+            writer: Mutex::new(()),
+        };
+
+        let error = state
+            .query_read_only(
+                "UNWIND range(1, 10000) AS x RETURN repeat('a', 4096) AS value LIMIT 10000",
+                &BTreeMap::new(),
+                10_000,
+                1024 * 1024,
+                5_000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidCommand(message) if message.contains("statically expanded values")
+        ));
     }
 
     proptest! {
@@ -3378,7 +4846,10 @@ mod query_tests {
             let query = format!(
                 "/* {comment} */ MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.id LIMIT 1"
             );
-            prop_assert!(admit_read_only_query(&query, 10).is_ok());
+            prop_assert!(admit_read_only_query(&query, &BTreeMap::from([(
+                "id".into(),
+                GraphParameterValue::String("document".into()),
+            )]), 10, 4096).is_ok());
         }
     }
 }

@@ -15,16 +15,16 @@ use rhiza_node::{
     ClientErrorResponse, ConfigError, FetchLogError, FetchLogRequest, FetchLogResponse,
     HttpLogPeer, HttpRecorderClient, InMemoryLogPeer, LogPeer, NodeConfig, NodeError, NodeRuntime,
     PeerConfig, ReadConsistency, ReadRequest, SqlExecuteRequest, SqlExecuteResponse, WriteRequest,
-    DEFAULT_WRITER_BATCH_MAX, DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_FETCH_ENTRIES,
-    MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
-    RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
+    DEFAULT_WRITER_BATCH_MAX, DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_COMMAND_BYTES,
+    MAX_FETCH_ENTRIES, MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH,
+    RECORDER_IDENTITY_PATH, RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
 };
 use rhiza_quepaxa::{
     AcceptedSummary, Ballot, DecisionProof, DecisionRecord, FixedMembership, IsrState, Membership,
     RecordRequest, RecordSummary, RecorderFileStore, RecorderReply, RecorderRequest, RecorderRpc,
     ThreeNodeConsensus,
 };
-use rhiza_sql::{SqlCommand, SqlStatement, SqlValue};
+use rhiza_sql::{encode_sql_command, encode_write_batch, SqlCommand, SqlStatement, SqlValue};
 
 fn test_config_digest() -> LogHash {
     FixedMembership::new(["node-1", "node-2", "node-3"])
@@ -1398,6 +1398,154 @@ async fn concurrent_sql_requests_share_one_entry_and_replay_distinct_returning_r
         runtime.log_store().last_index().unwrap(),
         last_index.map(|index| index + 1)
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path())
+        .with_writer_batching(4, Duration::from_millis(50))
+        .unwrap();
+    let runtime = Arc::new(NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap());
+    runtime
+        .execute_sql(SqlCommand {
+            request_id: "byte-cap-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE byte_cap(id INTEGER PRIMARY KEY, ordinal INTEGER UNIQUE, value TEXT)"
+                    .into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let recorder = RecorderFileStore::new_with_id(
+        dir.path().join("byte-cap-recorder"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served_runtime = Arc::clone(&runtime);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, node_router(served_runtime, recorder))
+            .await
+            .unwrap();
+    });
+    let value = "x".repeat(64 * 1024);
+    let commands = (0..4)
+        .map(|ordinal| SqlCommand {
+            request_id: format!("byte-cap-{ordinal}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO byte_cap(ordinal, value) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlValue::Integer(ordinal), SqlValue::Text(value.clone())],
+            }],
+        })
+        .collect::<Vec<_>>();
+    let payloads = commands
+        .iter()
+        .map(encode_sql_command)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(payloads
+        .iter()
+        .all(|payload| payload.len() <= MAX_COMMAND_BYTES));
+    assert!(encode_write_batch(&payloads).unwrap().len() > MAX_COMMAND_BYTES);
+    assert!(encode_write_batch(&payloads[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/v1/sql/execute");
+    let mut requests = tokio::task::JoinSet::new();
+    for command in commands.clone() {
+        let client = client.clone();
+        let url = url.clone();
+        requests.spawn(async move {
+            let response = client
+                .post(url)
+                .header(VERSION_HEADER, PROTOCOL_VERSION)
+                .bearer_auth("client-token")
+                .json(&SqlExecuteRequest {
+                    request_id: command.request_id.clone(),
+                    statements: command.statements.clone(),
+                })
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(
+                status.is_success(),
+                "SQL write failed with {status}: {body}"
+            );
+            (
+                command.request_id,
+                serde_json::from_str::<SqlExecuteResponse>(&body).unwrap(),
+            )
+        });
+    }
+    let mut responses = HashMap::new();
+    while let Some(response) = requests.join_next().await {
+        let (request_id, response) = response.unwrap();
+        responses.insert(request_id, response);
+    }
+
+    let mut indices = responses
+        .values()
+        .map(|response| response.applied_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(indices, [2, 3]);
+    let mut requests_per_index = HashMap::new();
+    for response in responses.values() {
+        *requests_per_index
+            .entry(response.applied_index)
+            .or_insert(0usize) += 1;
+    }
+    let mut chunk_sizes = requests_per_index.into_values().collect::<Vec<_>>();
+    chunk_sizes.sort_unstable();
+    assert_eq!(chunk_sizes, [1, 3]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+
+    for command in commands {
+        let original = responses.get(&command.request_id).unwrap();
+        assert_eq!(original.results[0].rows_affected, 1);
+        assert_eq!(original.results[0].returning, None);
+        let replay = client
+            .post(&url)
+            .header(VERSION_HEADER, PROTOCOL_VERSION)
+            .bearer_auth("client-token")
+            .json(&SqlExecuteRequest {
+                request_id: command.request_id,
+                statements: command.statements,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json::<SqlExecuteResponse>()
+            .await
+            .unwrap();
+        assert_eq!(&replay, original);
+    }
+    let ordered = runtime
+        .query_sql(
+            &SqlStatement {
+                sql: "SELECT ordinal FROM byte_cap ORDER BY ordinal".into(),
+                parameters: vec![],
+            },
+            ReadConsistency::Local,
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        ordered.rows,
+        (0..4)
+            .map(|ordinal| vec![SqlValue::Integer(ordinal)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
     server.abort();
 }
 

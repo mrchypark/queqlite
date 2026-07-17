@@ -13,7 +13,8 @@ drive consensus, and inspect decisions.
 ```rust
 use rhiza_quepaxa::{Command, CommandKind, Consensus, ThreeNodeConsensus};
 
-let base = std::env::temp_dir().join("rhiza-quepaxa-readme");
+let base = std::env::temp_dir().join(format!("rhiza-quepaxa-readme-{}", std::process::id()));
+let _ = std::fs::remove_dir_all(&base);
 let roots = [base.join("n1"), base.join("n2"), base.join("n3")];
 let consensus = ThreeNodeConsensus::new("cluster", "n1", 1, 1, roots)?;
 let entry = consensus.propose(Command::new(
@@ -39,6 +40,21 @@ See `examples/local_three_node.rs` for a complete runnable example.
 - `PrioritySource` is injectable for deterministic simulation. The default uses
   the operating system random source through `getrandom` and supports all
   platforms supported by that crate.
+
+## Recorder durability
+
+The file recorder treats `recorded-head.rec` as the authoritative normal-write
+manifest. Version 2 embeds the two most recent exact slot snapshots, so reopen
+is O(1) and can repair a missing or partial slot cache without forgetting a
+Paxos promise or accepted value. Older slot files become durable caches as the
+next manifest directory barrier completes. Structural configuration changes
+continue to use their separate crash-recovery intents.
+
+With command bytes already present, one normal record performs two file syncs
+(manifest and slot cache) and one directory sync. The previous slot/head intent
+path performed three file syncs and three directory syncs for the same record.
+An inline command adds one file sync in either design and is committed by the
+manifest's directory barrier.
 
 ## Compatibility policy
 

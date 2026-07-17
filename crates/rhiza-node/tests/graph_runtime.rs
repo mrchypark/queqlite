@@ -4,14 +4,15 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
+use rhiza_graph::{encode_replicated_graph_batch, encode_replicated_graph_command};
+use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, node_router_with_limits,
     CheckpointCoordinator, ClientErrorResponse, DurabilityMode, GraphCommandResultV1,
     GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphValueDto, GraphValueV1,
     NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, GRAPH_GET_DOCUMENT_PATH,
-    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_GRAPH_MAX_ROWS, MAX_GRAPH_RESULT_CELLS,
-    MAX_GRAPH_RETURN_PROJECTIONS, MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH,
-    VERSION_HEADER,
+    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_COMMAND_BYTES, MAX_GRAPH_MAX_ROWS,
+    MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
@@ -84,6 +85,143 @@ fn graph_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
     assert_eq!(read.value, Some(GraphValueV1::U64(42)));
     assert_eq!(read.applied_index, 2);
     assert_eq!(read.hash, runtime.applied_hash().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_http_config(dir.path())
+        .with_writer_batching(8, Duration::from_millis(20))
+        .unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(config, consensus(dir.path(), "batch-recorders"), &[]).unwrap());
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+    let first_body = serde_json::json!({
+        "request_id": "batch-a",
+        "id": "shared",
+        "value": {"type": "string", "value": "first"}
+    });
+    let second_body = serde_json::json!({
+        "request_id": "batch-b",
+        "id": "shared",
+        "value": {"type": "string", "value": "second"}
+    });
+
+    let (first, second) = tokio::join!(
+        post_graph_put(&client, addr, &first_body),
+        post_graph_put(&client, addr, &second_body)
+    );
+    assert!(first.status().is_success());
+    assert!(second.status().is_success());
+    let first = first.json::<GraphMutationResponse>().await.unwrap();
+    let second = second.json::<GraphMutationResponse>().await.unwrap();
+
+    assert_eq!(first.applied_index, second.applied_index);
+    assert_eq!(first.hash, second.hash);
+    assert_ne!(first.result, second.result);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+    let first_retry = post_graph_put(&client, addr, &first_body)
+        .await
+        .json::<GraphMutationResponse>()
+        .await
+        .unwrap();
+    let second_retry = post_graph_put(&client, addr, &second_body)
+        .await
+        .json::<GraphMutationResponse>()
+        .await
+        .unwrap();
+    assert_eq!(first_retry, first);
+    assert_eq!(second_retry, second);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+
+    let conflict = post_graph_put(
+        &client,
+        addr,
+        &serde_json::json!({
+            "request_id": "batch-a",
+            "id": "shared",
+            "value": {"type": "string", "value": "conflict"}
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        conflict.json::<ClientErrorResponse>().await.unwrap().code,
+        "invalid_request"
+    );
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_batch_byte_cap_falls_back_to_individual_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_http_config(dir.path())
+        .with_writer_batching(4, Duration::from_millis(50))
+        .unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(config, consensus(dir.path(), "byte-cap-recorders"), &[]).unwrap(),
+    );
+    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
+    let client = reqwest::Client::new();
+    let value = "x".repeat(65 * 1024);
+    let commands = (0..4)
+        .map(|index| {
+            GraphCommandV1::put_document(
+                format!("large-{index}"),
+                format!("large-{index}"),
+                GraphValueV1::String(value.clone()),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(commands.iter().all(
+        |command| encode_replicated_graph_command(command).unwrap().len() <= MAX_COMMAND_BYTES
+    ));
+    assert!(encode_replicated_graph_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
+    assert!(encode_replicated_graph_batch(&commands[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
+
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 0..4 {
+        let client = client.clone();
+        let value = value.clone();
+        requests.spawn(async move {
+            let response = post_graph_put(
+                &client,
+                addr,
+                &serde_json::json!({
+                    "request_id": format!("large-{index}"),
+                    "id": format!("large-{index}"),
+                    "value": {"type": "string", "value": value}
+                }),
+            )
+            .await;
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            (status, body)
+        });
+    }
+    let mut indices = Vec::new();
+    while let Some(response) = requests.join_next().await {
+        let (status, body) = response.unwrap();
+        assert!(
+            status.is_success(),
+            "graph write failed with {status}: {body}"
+        );
+        indices.push(
+            serde_json::from_str::<GraphMutationResponse>(&body)
+                .unwrap()
+                .applied_index,
+        );
+    }
+    indices.sort_unstable();
+    indices.dedup();
+
+    assert_eq!(indices, [1, 2]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -226,7 +364,7 @@ async fn graph_http_routes_enforce_auth_body_limits_and_return_atomic_value_with
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_query_returns_scalar_document_properties_for_all_consistency_modes() {
+async fn graph_query_returns_general_read_only_cypher_for_all_consistency_modes() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -249,9 +387,11 @@ async fn graph_query_returns_scalar_document_properties_for_all_consistency_mode
     let (addr, server) = serve_graph(runtime, dir.path()).await;
     let client = reqwest::Client::new();
     let statement = serde_json::json!({
-        "cypher": "MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.id, v.string_value LIMIT 1",
+        "cypher": "MATCH (v:RhizaDocument) WHERE v.id IN $ids RETURN v.id AS id, upper(v.string_value) AS value ORDER BY v.id",
         "parameters": {
-            "id": {"type": "string", "value": "document-1"}
+            "ids": {"type": "list", "value": [
+                {"type": "string", "value": "document-1"}
+            ]}
         }
     });
 
@@ -271,8 +411,8 @@ async fn graph_query_returns_scalar_document_properties_for_all_consistency_mode
     assert_eq!(
         local["columns"],
         serde_json::json!([
-            {"name":"v.id","logical_type":{"type":"string"}},
-            {"name":"v.string_value","logical_type":{"type":"string"}}
+            {"name":"id","logical_type":{"type":"string"}},
+            {"name":"value","logical_type":{"type":"string"}}
         ])
     );
     assert_eq!(
@@ -281,7 +421,7 @@ async fn graph_query_returns_scalar_document_properties_for_all_consistency_mode
     );
     assert_eq!(
         local["rows"][0][1],
-        serde_json::json!({"type":"string","value":"match-target"})
+        serde_json::json!({"type":"string","value":"MATCH-TARGET"})
     );
     assert_eq!(local["applied_index"], 1);
 
@@ -373,28 +513,18 @@ async fn graph_query_rejects_unsafe_statements_without_mutating_graph_state() {
 
     for cypher in [
         "CREATE (:Person {name: 'Ada'})",
+        "MATCH (v:RhizaDocument) SET v.string_value = 'changed' RETURN v.id",
+        "MATCH (v:RhizaDocument) DELETE v",
         "CREATE NODE TABLE Person(name STRING, PRIMARY KEY(name))",
+        "DROP TABLE RhizaDocument",
         "BEGIN TRANSACTION",
+        "CHECKPOINT",
         "CALL show_tables() RETURN *",
+        "COPY (MATCH (v:RhizaDocument) RETURN v.id) TO 'graph.csv'",
+        "ATTACH 'other.lbug' AS other",
+        "IMPORT DATABASE 'other'",
         "MATCH (m:__RhizaMeta) RETURN m",
-        "MATCH (n) RETURN n",
-        "MATCH (:RhizaDocument)-[r]->(:RhizaDocument) RETURN r",
-        "MATCH (:RhizaDocument)-[r:__RhizaRel]->(:RhizaDocument) RETURN r",
-        "MATCH (v:RhizaDocument) RETURN count(v)",
-        "MATCH (v:RhizaDocument) CALL { MATCH (e:RhizaDocument) RETURN e } RETURN v",
-        "UNWIND [1, 2] AS n RETURN n",
-        "MATCH (v:RhizaDocument) RETURN v.id LIMIT $limit",
-        "MATCH (v:OtherDocument) RETURN v.id",
-        "MATCH (v:RhizaDocument) RETURN v.unknown_property",
-        "MATCH (v:RhizaDocument) RETURN v",
-        "MATCH (v:RhizaDocument) RETURN DISTINCT v.id",
-        "MATCH (v:RhizaDocument) RETURN v.id ORDER BY v.id",
-        "MATCH (v:RhizaDocument) RETURN v.id SKIP 1",
-        "MATCH (v:RhizaDocument) RETURN v.id + 1",
-        "MATCH (v:RhizaDocument) WHERE v.id = 'document-1' RETURN v.id",
-        "MATCH (v:RhizaDocument) RETURN 'literal'",
-        "MATCH (v:RhizaDocument) RETURN 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
-        "MATCH (v:RhizaDocument) RETURN v.id AS id",
+        "RETURN 1; RETURN 2",
     ] {
         let rejected = post_graph_query(
             &client,
@@ -477,24 +607,6 @@ async fn graph_query_rejects_unsafe_statements_without_mutating_graph_state() {
         }),
         serde_json::json!({
             "statement": {
-                "cypher": "MATCH (v:RhizaDocument) RETURN $value",
-                "parameters": {"value": {"type": "list", "value": [
-                    {"type": "string", "value": "nested"}
-                ]}}
-            },
-            "consistency": "local"
-        }),
-        serde_json::json!({
-            "statement": {
-                "cypher": "MATCH (v:RhizaDocument) RETURN $value",
-                "parameters": {"value": {"type": "struct", "value": {
-                    "nested": {"type": "string", "value": "value"}
-                }}}
-            },
-            "consistency": "local"
-        }),
-        serde_json::json!({
-            "statement": {
                 "cypher": "MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.id",
                 "parameters": {"id": {"type": "u64", "value": 1}}
             },
@@ -529,6 +641,71 @@ async fn graph_query_rejects_unsafe_statements_without_mutating_graph_state() {
             "invalid graph query parameters latched runtime"
         );
     }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_cypher_is_rejected_without_changing_tip_or_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        NodeRuntime::open(
+            graph_http_config(dir.path()),
+            consensus(dir.path(), "recorders"),
+            &[],
+        )
+        .unwrap(),
+    );
+    runtime
+        .mutate_graph(
+            GraphCommandV1::put_document(
+                "malformed-query-seed",
+                "document-1",
+                GraphValueV1::String("unchanged".into()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let original_tip = (
+        runtime.applied_index().unwrap(),
+        runtime.applied_hash().unwrap(),
+    );
+    let (addr, server) = serve_graph(runtime.clone(), dir.path()).await;
+    let client = reqwest::Client::new();
+
+    let rejected = post_graph_query(
+        &client,
+        addr,
+        &serde_json::json!({
+            "statement": {
+                "cypher": "MATCH (v:RhizaDocument RETURN v",
+                "parameters": {}
+            },
+            "consistency": "local"
+        }),
+    )
+    .await;
+    assert_client_error(
+        rejected,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid_request",
+        false,
+    )
+    .await;
+    assert_eq!(
+        (
+            runtime.applied_index().unwrap(),
+            runtime.applied_hash().unwrap()
+        ),
+        original_tip
+    );
+    assert!(runtime.is_ready());
+    assert!(client
+        .get(format!("http://{addr}{READYZ_PATH}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
     server.abort();
 }
 
@@ -675,52 +852,6 @@ async fn graph_query_returns_explicit_errors_for_capacity_rows_and_invalid_value
     )
     .await;
 
-    assert_eq!(MAX_GRAPH_RETURN_PROJECTIONS, 4);
-    let wide_projection = (0..=MAX_GRAPH_RETURN_PROJECTIONS)
-        .map(|_| "v.id".to_owned())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rejected = post_graph_query(
-        &client,
-        addr,
-        &serde_json::json!({
-            "statement": {
-                "cypher": format!("MATCH (v:RhizaDocument) RETURN {wide_projection}"),
-                "parameters": {}
-            }
-        }),
-    )
-    .await;
-    assert_client_error_message_contains(
-        rejected,
-        reqwest::StatusCode::BAD_REQUEST,
-        "invalid_request",
-        false,
-        &MAX_GRAPH_RETURN_PROJECTIONS.to_string(),
-    )
-    .await;
-
-    assert_eq!(MAX_GRAPH_RESULT_CELLS, 4);
-    let rejected = post_graph_query(
-        &client,
-        addr,
-        &serde_json::json!({
-            "statement": {
-                "cypher": "MATCH (v:RhizaDocument) RETURN v.id",
-                "parameters": {}
-            },
-            "max_rows": 10
-        }),
-    )
-    .await;
-    assert_client_error_message_contains(
-        rejected,
-        reqwest::StatusCode::BAD_REQUEST,
-        "invalid_request",
-        false,
-        &MAX_GRAPH_RESULT_CELLS.to_string(),
-    )
-    .await;
     server.abort();
 }
 
@@ -903,24 +1034,6 @@ async fn assert_client_error(
     let body = response.json::<ClientErrorResponse>().await.unwrap();
     assert_eq!(body.code, code);
     assert_eq!(body.retryable, retryable);
-}
-
-async fn assert_client_error_message_contains(
-    response: reqwest::Response,
-    status: reqwest::StatusCode,
-    code: &str,
-    retryable: bool,
-    expected_message: &str,
-) {
-    assert_eq!(response.status(), status);
-    let body = response.json::<ClientErrorResponse>().await.unwrap();
-    assert_eq!(body.code, code);
-    assert_eq!(body.retryable, retryable);
-    assert!(
-        body.message.contains(expected_message),
-        "error message did not contain {expected_message:?}: {}",
-        body.message
-    );
 }
 
 fn restore_archive(archive_root: &Path, archive_backup: &Path) {

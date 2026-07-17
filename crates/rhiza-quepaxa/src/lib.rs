@@ -866,6 +866,12 @@ pub enum SealFaultPoint {
     AfterIntent,
     AfterSlot,
     AfterConfiguration,
+    BeforeRecordManifest,
+    AfterRecordManifest,
+    AfterRecordCache,
+    AfterHeadIntent,
+    AfterHeadConfiguration,
+    AfterHead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1073,9 +1079,34 @@ pub struct RecorderFileStore {
     config_id: ConfigId,
     config_digest: LogHash,
     configuration: Arc<Mutex<ConfigurationState>>,
+    recorded_head: Arc<Mutex<RecordedHeadProvenance>>,
+    recent_slots: Arc<Mutex<Vec<DurableSlotSnapshot>>>,
     seal_fault: Arc<Mutex<Option<SealFaultPoint>>>,
     _root_lock: Arc<fs::File>,
     sync: Arc<Mutex<()>>,
+}
+
+const RECORDED_HEAD_MAGIC: &[u8; 4] = b"QRHD";
+const RECORDED_HEAD_VERSION: u16 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableSlotSnapshot {
+    slot: Slot,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecordedHeadProvenance {
+    Empty,
+    SlotBacked {
+        slot: Slot,
+    },
+    CheckpointBacked {
+        stop_slot: Slot,
+        prefix_hash: LogHash,
+        recovered_tip: Slot,
+        recovered_hash: LogHash,
+    },
 }
 
 pub trait RecorderRpc: Send + Sync {
@@ -1193,7 +1224,36 @@ impl RecorderFileStore {
         epoch: Epoch,
         config_id: ConfigId,
     ) -> Result<Self> {
+        let (store, existing_format) =
+            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        store.open_or_initialize_recorded_head(existing_format)?;
+        Ok(store)
+    }
+
+    fn open_root(
+        root: impl Into<PathBuf>,
+        recorder_id: impl Into<NodeId>,
+        cluster_id: impl Into<ClusterId>,
+        epoch: Epoch,
+        config_id: ConfigId,
+    ) -> Result<(Self, bool)> {
         let root = root.into();
+        let head_exists = root.join("recorded-head.rec").exists();
+        let legacy_files_exist = if root.exists() && !head_exists {
+            fs::read_dir(&root)
+                .map_err(|err| Error::Io(err.to_string()))?
+                .filter_map(std::result::Result::ok)
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name == "configuration.rec"
+                        || name.starts_with("slot-")
+                        || name.starts_with("command-")
+                })
+        } else {
+            false
+        };
+        let existing_format = head_exists || legacy_files_exist;
         let recorder_id = recorder_id.into();
         if recorder_id.is_empty() {
             return Err(Error::EmptyRecorderIdentity);
@@ -1213,22 +1273,27 @@ impl RecorderFileStore {
             }
             Err(fs::TryLockError::Error(err)) => return Err(Error::Io(err.to_string())),
         }
-        Ok(Self {
-            root,
-            recorder_id,
-            cluster_id: cluster_id.into(),
-            epoch,
-            config_id,
-            config_digest: LogHash::ZERO,
-            configuration: Arc::new(Mutex::new(ConfigurationState::initial(
+        Ok((
+            Self {
+                root,
+                recorder_id,
+                cluster_id: cluster_id.into(),
+                epoch,
                 config_id,
-                LogHash::ZERO,
-                None,
-            ))),
-            seal_fault: Arc::new(Mutex::new(None)),
-            _root_lock: Arc::new(root_lock),
-            sync: Arc::new(Mutex::new(())),
-        })
+                config_digest: LogHash::ZERO,
+                configuration: Arc::new(Mutex::new(ConfigurationState::initial(
+                    config_id,
+                    LogHash::ZERO,
+                    None,
+                ))),
+                recorded_head: Arc::new(Mutex::new(RecordedHeadProvenance::Empty)),
+                recent_slots: Arc::new(Mutex::new(Vec::new())),
+                seal_fault: Arc::new(Mutex::new(None)),
+                _root_lock: Arc::new(root_lock),
+                sync: Arc::new(Mutex::new(())),
+            },
+            existing_format,
+        ))
     }
 
     pub fn new_with_membership(
@@ -1240,18 +1305,24 @@ impl RecorderFileStore {
         membership: Membership,
     ) -> Result<Self> {
         let recorder_id = recorder_id.into();
-        let mut store = Self::new_with_id(root, recorder_id, cluster_id, epoch, config_id)?;
+        let (mut store, existing_format) =
+            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
+        store.recover_configuration_head_intent()?;
         let configured = if store.configuration_path().exists() {
             decode_configuration_state(
                 &fs::read(store.configuration_path()).map_err(|err| Error::Io(err.to_string()))?,
             )?
         } else {
+            if existing_format {
+                return Err(Error::MigrationRequired {
+                    format: "recorder durable head",
+                    version: RECORDED_HEAD_VERSION,
+                });
+            }
             let configured =
                 ConfigurationState::initial(config_id, membership.digest(), Some(membership));
-            atomic_write(
-                &store.configuration_path(),
-                &encode_configuration_state(&configured)?,
-            )?;
+            store
+                .commit_configuration_head_unlocked(&configured, &RecordedHeadProvenance::Empty)?;
             configured
         };
         if configured
@@ -1265,6 +1336,7 @@ impl RecorderFileStore {
         store.config_digest = configured.config_digest;
         store.configuration = Arc::new(Mutex::new(configured));
         store.recover_intent()?;
+        store.open_or_initialize_recorded_head(existing_format)?;
         Ok(store)
     }
 
@@ -1386,14 +1458,20 @@ impl RecorderFileStore {
             max_accepted_or_decided_slot: None,
             activated: false,
         };
-        atomic_write(
-            &self.configuration_path(),
-            &encode_configuration_state(&installed)?,
-        )?;
+        let head = RecordedHeadProvenance::Empty;
+        self.commit_configuration_head_unlocked(&installed, &head)?;
         *self
             .configuration
             .lock()
             .map_err(|_| Error::Io("configuration lock poisoned".into()))? = installed.clone();
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        self.recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
         Ok(installed)
     }
 
@@ -1402,6 +1480,7 @@ impl RecorderFileStore {
         stop_slot: Slot,
         prefix_hash: LogHash,
         recovered_tip: Slot,
+        recovered_hash: LogHash,
     ) -> Result<ConfigurationState> {
         let _guard = self
             .sync
@@ -1431,14 +1510,25 @@ impl RecorderFileStore {
         let mut recovered = current;
         recovered.activated = true;
         recovered.max_accepted_or_decided_slot = Some(recovered_tip);
-        atomic_write(
-            &self.configuration_path(),
-            &encode_configuration_state(&recovered)?,
-        )?;
+        let head = RecordedHeadProvenance::CheckpointBacked {
+            stop_slot,
+            prefix_hash,
+            recovered_tip,
+            recovered_hash,
+        };
+        self.commit_configuration_head_unlocked(&recovered, &head)?;
         *self
             .configuration
             .lock()
             .map_err(|_| Error::Io("configuration lock poisoned".into()))? = recovered.clone();
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        self.recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
         Ok(recovered)
     }
 
@@ -1551,10 +1641,12 @@ impl RecorderFileStore {
                 let mut reply = state.apply(request).map_err(Error::Rejected)?;
                 let next_configuration =
                     self.transition_after_apply(&configuration, &state, change.as_ref(), None)?;
-                if next_configuration != configuration {
-                    self.commit_transition_unlocked(&state, &next_configuration)?;
-                } else if should_save {
-                    self.save_unlocked(&state)?;
+                if should_save || next_configuration != configuration {
+                    self.persist_state_transition_unlocked(
+                        &state,
+                        &configuration,
+                        &next_configuration,
+                    )?;
                 }
                 reply.recorder_id = self.recorder_id.clone();
                 Ok(reply)
@@ -1587,7 +1679,7 @@ impl RecorderFileStore {
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.recover_intent()?;
         if let Some(command) = &request.command {
-            self.store_command_unlocked(value.command_hash, command)?;
+            self.stage_command_unlocked(value.command_hash, command)?;
         }
         let configuration = self.configuration_state()?;
         let change = self.change_for_value_unlocked(value)?;
@@ -1598,6 +1690,9 @@ impl RecorderFileStore {
         self.validate_value_unlocked(request.slot, value)?;
         let state = self.load_unlocked(request.slot, request.config_digest)?;
         if let Some(proof) = state.decision_proof() {
+            if request.command.is_some() {
+                self.sync_root()?;
+            }
             return Ok(record_summary(
                 &self.recorder_id,
                 &state,
@@ -1611,11 +1706,7 @@ impl RecorderFileStore {
         next.accepted = None;
         let next_configuration =
             self.transition_after_apply(&configuration, &next, change.as_ref(), Some(value))?;
-        if next_configuration != configuration {
-            self.commit_transition_unlocked(&next, &next_configuration)?;
-        } else {
-            self.save_unlocked(&next)?;
-        }
+        self.persist_state_transition_unlocked(&next, &configuration, &next_configuration)?;
         Ok(record_summary(&self.recorder_id, &next, None))
     }
 
@@ -1670,11 +1761,7 @@ impl RecorderFileStore {
         }
         let next =
             self.transition_after_apply(&configuration, &state, change.as_ref(), Some(value))?;
-        if next != configuration {
-            self.commit_transition_unlocked(&state, &next)
-        } else {
-            self.save_unlocked(&state)
-        }
+        self.persist_state_transition_unlocked(&state, &configuration, &next)
     }
 
     fn validate_record_context(&self, request: &RecordRequest) -> Result<()> {
@@ -1735,11 +1822,7 @@ impl RecorderFileStore {
             .or_else(|| state.accepted().map(|accepted| &accepted.value));
         let next =
             self.transition_after_apply(&configuration, state, change.as_ref(), applied_value)?;
-        if next != configuration {
-            self.commit_transition_unlocked(state, &next)
-        } else {
-            self.save_unlocked(state)
-        }
+        self.persist_state_transition_unlocked(state, &configuration, &next)
     }
 
     pub fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
@@ -1754,6 +1837,11 @@ impl RecorderFileStore {
     }
 
     fn store_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
+        self.stage_command_unlocked(command_hash, command)?;
+        self.sync_root()
+    }
+
+    fn stage_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
         let path = self.command_path(command_hash);
         if path.exists() {
             return match self.fetch_command_unlocked(command_hash)? {
@@ -1761,7 +1849,8 @@ impl RecorderFileStore {
                 _ => Err(Error::CommandHashMismatch),
             };
         }
-        atomic_write(&path, &encode_stored_command(command))
+        atomic_replace(&path, &encode_stored_command(command))?;
+        Ok(())
     }
 
     pub fn fetch_command(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
@@ -1796,8 +1885,114 @@ impl RecorderFileStore {
         Ok(state)
     }
 
-    fn save_unlocked(&self, state: &RecorderSlotState) -> Result<()> {
-        atomic_write(&self.path(state.slot()), &encode_recorder_state(state)?)
+    fn open_or_initialize_recorded_head(&self, existing_format: bool) -> Result<()> {
+        let configuration = self.configuration_state()?;
+        let (head, recent_slots) = if self.recorded_head_path().exists() {
+            decode_recorded_head(
+                &fs::read(self.recorded_head_path()).map_err(|err| Error::Io(err.to_string()))?,
+                &self.cluster_id,
+                self.epoch,
+                &configuration,
+            )?
+        } else {
+            if existing_format {
+                return Err(Error::MigrationRequired {
+                    format: "recorder durable head",
+                    version: RECORDED_HEAD_VERSION,
+                });
+            }
+            let head = RecordedHeadProvenance::Empty;
+            atomic_write(
+                &self.recorded_head_path(),
+                &encode_recorded_head(&self.cluster_id, self.epoch, &configuration, &head, &[])?,
+            )?;
+            (head, Vec::new())
+        };
+        self.install_recorded_head(&configuration, head, recent_slots)
+    }
+
+    fn install_recorded_head(
+        &self,
+        configuration: &ConfigurationState,
+        head: RecordedHeadProvenance,
+        recent_slots: Vec<DurableSlotSnapshot>,
+    ) -> Result<()> {
+        let mut recovered_cache = false;
+        for snapshot in &recent_slots {
+            let state = decode_recorder_state(&snapshot.bytes)?;
+            if state.slot() != snapshot.slot
+                || state.cluster_id != self.cluster_id
+                || state.epoch != self.epoch
+                || state.config_id != configuration.config_id
+                || state.config_digest != configuration.config_digest
+            {
+                return Err(Error::Decode(
+                    "durable recorder snapshot identity mismatch".into(),
+                ));
+            }
+            for value in recorder_state_values(&state) {
+                self.validate_value_unlocked(snapshot.slot, value)?;
+            }
+            let path = self.path(snapshot.slot);
+            if fs::read(&path).ok().as_deref() != Some(snapshot.bytes.as_slice()) {
+                atomic_replace(&path, &snapshot.bytes)?;
+                recovered_cache = true;
+            }
+        }
+        if recovered_cache {
+            self.sync_root()?;
+        }
+        let recovered_max = match &head {
+            RecordedHeadProvenance::Empty => None,
+            RecordedHeadProvenance::SlotBacked { slot } => {
+                let state = self.load_unlocked(*slot, configuration.config_digest)?;
+                let mut values = recorder_state_values(&state).peekable();
+                if values.peek().is_none() {
+                    return Err(Error::Decode(
+                        "slot-backed recorder head references a state without a value".into(),
+                    ));
+                }
+                for value in values {
+                    self.validate_value_unlocked(*slot, value)?;
+                }
+                Some(*slot)
+            }
+            RecordedHeadProvenance::CheckpointBacked {
+                stop_slot,
+                prefix_hash,
+                recovered_tip,
+                recovered_hash,
+            } => {
+                let predecessor = configuration.predecessor.as_ref().ok_or_else(|| {
+                    Error::Decode("checkpoint-backed head has no predecessor binding".into())
+                })?;
+                if !configuration.activated
+                    || predecessor.stop_slot != *stop_slot
+                    || predecessor.prefix_hash != *prefix_hash
+                    || recovered_tip <= stop_slot
+                    || *recovered_hash == LogHash::ZERO
+                    || configuration.max_accepted_or_decided_slot != Some(*recovered_tip)
+                {
+                    return Err(Error::Decode(
+                        "checkpoint-backed recorder head evidence is invalid".into(),
+                    ));
+                }
+                Some(*recovered_tip)
+            }
+        };
+        self.configuration
+            .lock()
+            .map_err(|_| Error::Io("configuration lock poisoned".into()))?
+            .max_accepted_or_decided_slot = recovered_max;
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        *self
+            .recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))? = recent_slots;
+        Ok(())
     }
 
     fn fetch_command_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
@@ -2024,7 +2219,37 @@ impl RecorderFileStore {
         self.root.join("configuration.intent")
     }
 
+    fn configuration_head_intent_path(&self) -> PathBuf {
+        self.root.join("configuration-head.intent")
+    }
+
+    fn recorded_head_path(&self) -> PathBuf {
+        self.root.join("recorded-head.rec")
+    }
+
+    fn head_after_slot_state(
+        &self,
+        configuration: &ConfigurationState,
+        slot_state: &RecorderSlotState,
+    ) -> Result<RecordedHeadProvenance> {
+        let current = self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))?
+            .clone();
+        if configuration.max_accepted_or_decided_slot == Some(slot_state.slot())
+            && recorder_state_values(slot_state).next().is_some()
+        {
+            Ok(RecordedHeadProvenance::SlotBacked {
+                slot: slot_state.slot(),
+            })
+        } else {
+            Ok(current)
+        }
+    }
+
     fn recover_intent(&self) -> Result<()> {
+        self.recover_configuration_head_intent()?;
         let path = self.intent_path();
         if !path.exists() {
             return Ok(());
@@ -2032,8 +2257,14 @@ impl RecorderFileStore {
         let (slot, slot_bytes, configuration_bytes) =
             decode_transition_intent(&fs::read(&path).map_err(|err| Error::Io(err.to_string()))?)?;
         let configuration = decode_configuration_state(&configuration_bytes)?;
+        let slot_state = decode_recorder_state(&slot_bytes)?;
+        let head = self.head_after_slot_state(&configuration, &slot_state)?;
         atomic_write(&self.path(slot), &slot_bytes)?;
         atomic_write(&self.configuration_path(), &configuration_bytes)?;
+        atomic_write(
+            &self.recorded_head_path(),
+            &encode_recorded_head(&self.cluster_id, self.epoch, &configuration, &head, &[])?,
+        )?;
         fs::remove_file(path).map_err(|err| Error::Io(err.to_string()))?;
         fs::File::open(&self.root)
             .and_then(|directory| directory.sync_all())
@@ -2042,6 +2273,106 @@ impl RecorderFileStore {
             .configuration
             .lock()
             .map_err(|_| Error::Io("configuration lock poisoned".into()))? = configuration;
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        self.recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
+        Ok(())
+    }
+
+    fn recover_configuration_head_intent(&self) -> Result<()> {
+        let path = self.configuration_head_intent_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let intent_bytes = fs::read(&path).map_err(|err| Error::Io(err.to_string()))?;
+        let (configuration_bytes, head_bytes) = decode_configuration_head_intent(&intent_bytes)?;
+        atomic_write(&self.configuration_path(), configuration_bytes)?;
+        atomic_write(&self.recorded_head_path(), head_bytes)?;
+        fs::remove_file(path).map_err(|err| Error::Io(err.to_string()))?;
+        self.sync_root()
+    }
+
+    fn commit_configuration_head_unlocked(
+        &self,
+        configuration: &ConfigurationState,
+        head: &RecordedHeadProvenance,
+    ) -> Result<()> {
+        let configuration_bytes = encode_configuration_state(configuration)?;
+        let head_bytes =
+            encode_recorded_head(&self.cluster_id, self.epoch, configuration, head, &[])?;
+        atomic_write(
+            &self.configuration_head_intent_path(),
+            &encode_configuration_head_intent(&configuration_bytes, &head_bytes),
+        )?;
+        self.fail_seal_at(SealFaultPoint::AfterHeadIntent)?;
+        atomic_write(&self.configuration_path(), &configuration_bytes)?;
+        self.fail_seal_at(SealFaultPoint::AfterHeadConfiguration)?;
+        atomic_write(&self.recorded_head_path(), &head_bytes)?;
+        self.fail_seal_at(SealFaultPoint::AfterHead)?;
+        fs::remove_file(self.configuration_head_intent_path())
+            .map_err(|err| Error::Io(err.to_string()))?;
+        self.sync_root()
+    }
+
+    fn persist_state_transition_unlocked(
+        &self,
+        slot_state: &RecorderSlotState,
+        previous: &ConfigurationState,
+        next: &ConfigurationState,
+    ) -> Result<()> {
+        if configuration_structure_changed(previous, next) {
+            return self.commit_transition_unlocked(slot_state, next);
+        }
+        let slot_bytes = encode_recorder_state(slot_state)?;
+        let head = self.head_after_slot_state(next, slot_state)?;
+        let mut recent_slots = self
+            .recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clone();
+        recent_slots.retain(|snapshot| snapshot.slot != slot_state.slot());
+        recent_slots.push(DurableSlotSnapshot {
+            slot: slot_state.slot(),
+            bytes: slot_bytes.clone(),
+        });
+        if recent_slots.len() > 2 {
+            recent_slots.drain(..recent_slots.len() - 2);
+        }
+        let head_bytes =
+            encode_recorded_head(&self.cluster_id, self.epoch, next, &head, &recent_slots)?;
+        // The manifest is authoritative. Its directory barrier also makes the previous
+        // transaction's slot cache durable before that snapshot ages out on the next write.
+        self.fail_seal_at(SealFaultPoint::BeforeRecordManifest)?;
+        atomic_write(&self.recorded_head_path(), &head_bytes)?;
+        self.fail_seal_at(SealFaultPoint::AfterRecordManifest)?;
+        atomic_replace(&self.path(slot_state.slot()), &slot_bytes)?;
+        self.fail_seal_at(SealFaultPoint::AfterRecordCache)?;
+        *self
+            .configuration
+            .lock()
+            .map_err(|_| Error::Io("configuration lock poisoned".into()))? = next.clone();
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        *self
+            .recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))? = recent_slots;
+        Ok(())
+    }
+
+    fn sync_root(&self) -> Result<()> {
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| Error::Io(err.to_string()))?;
+        #[cfg(test)]
+        record_directory_sync();
         Ok(())
     }
 
@@ -2052,6 +2383,9 @@ impl RecorderFileStore {
     ) -> Result<()> {
         let slot_bytes = encode_recorder_state(slot_state)?;
         let configuration_bytes = encode_configuration_state(configuration)?;
+        let head = self.head_after_slot_state(configuration, slot_state)?;
+        let head_bytes =
+            encode_recorded_head(&self.cluster_id, self.epoch, configuration, &head, &[])?;
         atomic_write(
             &self.intent_path(),
             &encode_transition_intent(slot_state.slot(), &slot_bytes, &configuration_bytes)?,
@@ -2061,6 +2395,7 @@ impl RecorderFileStore {
         self.fail_seal_at(SealFaultPoint::AfterSlot)?;
         atomic_write(&self.configuration_path(), &configuration_bytes)?;
         self.fail_seal_at(SealFaultPoint::AfterConfiguration)?;
+        atomic_write(&self.recorded_head_path(), &head_bytes)?;
         fs::remove_file(self.intent_path()).map_err(|err| Error::Io(err.to_string()))?;
         fs::File::open(&self.root)
             .and_then(|directory| directory.sync_all())
@@ -2069,6 +2404,14 @@ impl RecorderFileStore {
             .configuration
             .lock()
             .map_err(|_| Error::Io("configuration lock poisoned".into()))? = configuration.clone();
+        *self
+            .recorded_head
+            .lock()
+            .map_err(|_| Error::Io("recorder head lock poisoned".into()))? = head;
+        self.recent_slots
+            .lock()
+            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+            .clear();
         Ok(())
     }
 
@@ -2097,6 +2440,46 @@ impl RecorderFileStore {
             .map(|state| state.config_id)
             .unwrap_or(self.config_id)
     }
+}
+
+fn configuration_structure_changed(
+    previous: &ConfigurationState,
+    next: &ConfigurationState,
+) -> bool {
+    previous.config_id != next.config_id
+        || previous.config_digest != next.config_digest
+        || previous.membership != next.membership
+        || previous.predecessor != next.predecessor
+        || previous.seal != next.seal
+        || previous.activated != next.activated
+}
+
+fn recorder_state_values(state: &RecorderSlotState) -> impl Iterator<Item = &AcceptedValue> {
+    [
+        state.accepted.as_ref().map(|accepted| &accepted.value),
+        state.decided.as_ref().map(|decided| &decided.value),
+        state
+            .isr
+            .first_current
+            .as_ref()
+            .and_then(|proposal| proposal.value.as_ref()),
+        state
+            .isr
+            .aggregate_current
+            .as_ref()
+            .and_then(|proposal| proposal.value.as_ref()),
+        state
+            .isr
+            .aggregate_prior
+            .as_ref()
+            .and_then(|proposal| proposal.value.as_ref()),
+        state
+            .decided_proof
+            .as_ref()
+            .and_then(|proof| proof.proposal().value.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 pub struct ThreeNodeConsensus {
@@ -4421,7 +4804,239 @@ fn decode_stored_command(bytes: &[u8]) -> Result<StoredCommand> {
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+std::thread_local! {
+    static SYNC_COUNTS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+fn record_file_sync() {
+    SYNC_COUNTS.with(|counts| {
+        let (file, directory) = counts.get();
+        counts.set((file + 1, directory));
+    });
+}
+
+#[cfg(test)]
+fn record_directory_sync() {
+    SYNC_COUNTS.with(|counts| {
+        let (file, directory) = counts.get();
+        counts.set((file, directory + 1));
+    });
+}
+
+#[cfg(test)]
+fn reset_sync_counts() {
+    SYNC_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+fn sync_counts() -> (usize, usize) {
+    SYNC_COUNTS.with(std::cell::Cell::get)
+}
+
+const CONFIGURATION_HEAD_INTENT_MAGIC: &[u8; 4] = b"QCHI";
+
+fn encode_configuration_head_intent(configuration: &[u8], head: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(CONFIGURATION_HEAD_INTENT_MAGIC);
+    put_u16(&mut encoded, 1);
+    put_u64(&mut encoded, configuration.len() as u64);
+    encoded.extend_from_slice(configuration);
+    put_u64(&mut encoded, head.len() as u64);
+    encoded.extend_from_slice(head);
+    encoded
+}
+
+fn decode_configuration_head_intent(bytes: &[u8]) -> Result<(&[u8], &[u8])> {
+    let mut cursor = 0;
+    if bytes.get(..CONFIGURATION_HEAD_INTENT_MAGIC.len()) != Some(CONFIGURATION_HEAD_INTENT_MAGIC) {
+        return Err(Error::Decode(
+            "invalid configuration-head intent magic".into(),
+        ));
+    }
+    cursor += CONFIGURATION_HEAD_INTENT_MAGIC.len();
+    if read_u16(bytes, &mut cursor)? != 1 {
+        return Err(Error::Decode(
+            "unsupported configuration-head intent version".into(),
+        ));
+    }
+    let configuration_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| Error::Decode("configuration-head intent length overflow".into()))?;
+    let configuration_end = cursor
+        .checked_add(configuration_len)
+        .ok_or_else(|| Error::Decode("configuration-head intent length overflow".into()))?;
+    let configuration = bytes
+        .get(cursor..configuration_end)
+        .ok_or_else(|| Error::Decode("truncated configuration-head intent".into()))?;
+    cursor = configuration_end;
+    let head_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| Error::Decode("configuration-head intent length overflow".into()))?;
+    let head_end = cursor
+        .checked_add(head_len)
+        .ok_or_else(|| Error::Decode("configuration-head intent length overflow".into()))?;
+    let head = bytes
+        .get(cursor..head_end)
+        .ok_or_else(|| Error::Decode("truncated configuration-head intent".into()))?;
+    if head_end != bytes.len() {
+        return Err(Error::Decode(
+            "trailing configuration-head intent bytes".into(),
+        ));
+    }
+    Ok((configuration, head))
+}
+
+fn encode_recorded_head(
+    cluster_id: &str,
+    epoch: Epoch,
+    configuration: &ConfigurationState,
+    provenance: &RecordedHeadProvenance,
+    recent_slots: &[DurableSlotSnapshot],
+) -> Result<Vec<u8>> {
+    if recent_slots.len() > 2 {
+        return Err(Error::Io(
+            "recorder manifest can retain at most two slot snapshots".into(),
+        ));
+    }
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(RECORDED_HEAD_MAGIC);
+    put_u16(&mut encoded, RECORDED_HEAD_VERSION);
+    put_bytes(&mut encoded, cluster_id.as_bytes())?;
+    put_u64(&mut encoded, epoch);
+    put_u64(&mut encoded, configuration.config_id);
+    encoded.extend_from_slice(configuration.config_digest.as_bytes());
+    match provenance {
+        RecordedHeadProvenance::Empty => encoded.push(0),
+        RecordedHeadProvenance::SlotBacked { slot } => {
+            encoded.push(1);
+            put_u64(&mut encoded, *slot);
+        }
+        RecordedHeadProvenance::CheckpointBacked {
+            stop_slot,
+            prefix_hash,
+            recovered_tip,
+            recovered_hash,
+        } => {
+            encoded.push(2);
+            put_u64(&mut encoded, *stop_slot);
+            encoded.extend_from_slice(prefix_hash.as_bytes());
+            put_u64(&mut encoded, *recovered_tip);
+            encoded.extend_from_slice(recovered_hash.as_bytes());
+        }
+    }
+    put_u16(&mut encoded, recent_slots.len() as u16);
+    for snapshot in recent_slots {
+        put_u64(&mut encoded, snapshot.slot);
+        put_bytes(&mut encoded, &snapshot.bytes)?;
+    }
+    let digest = LogHash::digest(&[&encoded]);
+    encoded.extend_from_slice(digest.as_bytes());
+    Ok(encoded)
+}
+
+fn decode_recorded_head(
+    bytes: &[u8],
+    expected_cluster_id: &str,
+    expected_epoch: Epoch,
+    configuration: &ConfigurationState,
+) -> Result<(RecordedHeadProvenance, Vec<DurableSlotSnapshot>)> {
+    if bytes.get(..RECORDED_HEAD_MAGIC.len()) != Some(RECORDED_HEAD_MAGIC) {
+        return Err(Error::Decode("invalid recorder durable head magic".into()));
+    }
+    let mut version_cursor = RECORDED_HEAD_MAGIC.len();
+    if read_u16(bytes, &mut version_cursor)? != RECORDED_HEAD_VERSION {
+        return Err(Error::MigrationRequired {
+            format: "recorder durable head",
+            version: RECORDED_HEAD_VERSION,
+        });
+    }
+    if bytes.len() < 32 {
+        return Err(Error::Decode("truncated recorder durable head".into()));
+    }
+    let (body, digest) = bytes.split_at(bytes.len() - 32);
+    if LogHash::digest(&[body]).as_bytes() != digest {
+        return Err(Error::Decode(
+            "recorder durable head digest mismatch".into(),
+        ));
+    }
+    let mut cursor = 0;
+    cursor += RECORDED_HEAD_MAGIC.len();
+    let _version = read_u16(body, &mut cursor)?;
+    let cluster_id = String::from_utf8(read_bytes(body, &mut cursor)?)
+        .map_err(|error| Error::Decode(error.to_string()))?;
+    let epoch = read_u64(body, &mut cursor)?;
+    let config_id = read_u64(body, &mut cursor)?;
+    let config_digest = read_hash(body, &mut cursor)?;
+    if cluster_id != expected_cluster_id
+        || epoch != expected_epoch
+        || config_id != configuration.config_id
+        || config_digest != configuration.config_digest
+    {
+        return Err(Error::Decode(
+            "recorder durable head identity mismatch".into(),
+        ));
+    }
+    let provenance = match read_u8(body, &mut cursor)? {
+        0 => RecordedHeadProvenance::Empty,
+        1 => RecordedHeadProvenance::SlotBacked {
+            slot: read_u64(body, &mut cursor)?,
+        },
+        2 => RecordedHeadProvenance::CheckpointBacked {
+            stop_slot: read_u64(body, &mut cursor)?,
+            prefix_hash: read_hash(body, &mut cursor)?,
+            recovered_tip: read_u64(body, &mut cursor)?,
+            recovered_hash: read_hash(body, &mut cursor)?,
+        },
+        value => {
+            return Err(Error::Decode(format!(
+                "invalid recorder durable head provenance {value}"
+            )))
+        }
+    };
+    let recent_count = usize::from(read_u16(body, &mut cursor)?);
+    if recent_count > 2 {
+        return Err(Error::Decode(
+            "recorder manifest contains too many slot snapshots".into(),
+        ));
+    }
+    let mut recent_slots = Vec::with_capacity(recent_count);
+    for _ in 0..recent_count {
+        let slot = read_u64(body, &mut cursor)?;
+        if recent_slots
+            .iter()
+            .any(|snapshot: &DurableSlotSnapshot| snapshot.slot == slot)
+        {
+            return Err(Error::Decode(
+                "recorder manifest contains duplicate slot snapshots".into(),
+            ));
+        }
+        recent_slots.push(DurableSlotSnapshot {
+            slot,
+            bytes: read_bytes(body, &mut cursor)?,
+        });
+    }
+    if cursor != body.len() {
+        return Err(Error::Decode("trailing recorder durable head bytes".into()));
+    }
+    Ok((provenance, recent_slots))
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_replace(path, bytes)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Io("atomic write path has no parent".into()))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| Error::Io(err.to_string()))?;
+    #[cfg(test)]
+    record_directory_sync();
+    Ok(())
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Io("atomic write path has no parent".into()))?;
@@ -4446,9 +5061,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        record_file_sync();
         drop(file);
         fs::rename(&temp_path, path)?;
-        fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if let Err(err) = result {
@@ -4605,9 +5221,10 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceptedValue, ConfigChange, Consensus, Error, Membership, Proposal, ProposalPriority,
-        ProposerProgress, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
-        RejectReason, SingleNodeConsensus, ThreeNodeConsensus,
+        reset_sync_counts, sync_counts, AcceptedValue, ConfigChange, ConfigurationState, Consensus,
+        Error, Membership, Proposal, ProposalPriority, ProposerProgress, RecordRequest,
+        RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderRpc, RejectReason,
+        SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
@@ -4729,6 +5346,104 @@ mod tests {
         assert_eq!(second.index, 2);
         assert_eq!(second.prev_hash, first.hash);
         assert_eq!(second.hash, second.recompute_hash());
+    }
+
+    #[test]
+    fn normal_record_uses_one_directory_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"barrier-count".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        reset_sync_counts();
+
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: None,
+            })
+            .unwrap();
+
+        assert_eq!(sync_counts(), (2, 1));
+        assert!(!root.path().join("slot-head.intent").exists());
+
+        let inline = StoredCommand::new(EntryType::Command, b"inline-command".to_vec());
+        let inline_value = AcceptedValue::from_command("cluster", 9, 1, 1, LogHash::ZERO, &inline);
+        reset_sync_counts();
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 9,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 2, inline_value),
+                command: Some(inline),
+            })
+            .unwrap();
+
+        assert_eq!(sync_counts(), (3, 1));
+    }
+
+    #[test]
+    fn fresh_initialization_recovers_when_configuration_was_published_before_head() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let (store, existing_format) =
+            RecorderFileStore::open_root(root.path(), "n1", "cluster", 1, 1).unwrap();
+        assert!(!existing_format);
+        let configuration =
+            ConfigurationState::initial(1, membership.digest(), Some(membership.clone()));
+        store
+            .set_seal_fault(Some(SealFaultPoint::AfterHeadConfiguration))
+            .unwrap();
+
+        assert!(matches!(
+            store.commit_configuration_head_unlocked(
+                &configuration,
+                &RecordedHeadProvenance::Empty,
+            ),
+            Err(Error::Io(message))
+                if message.contains("AfterHeadConfiguration")
+        ));
+        assert!(root.path().join("configuration.rec").exists());
+        assert!(!root.path().join("recorded-head.rec").exists());
+        assert!(root.path().join("configuration-head.intent").exists());
+        drop(store);
+
+        let reopened = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.configuration_state().unwrap().membership(),
+            Some(&membership)
+        );
+        assert!(root.path().join("recorded-head.rec").exists());
+        assert!(!root.path().join("configuration-head.intent").exists());
     }
 
     #[test]

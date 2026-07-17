@@ -1,3 +1,5 @@
+#[cfg(feature = "graph")]
+use std::collections::BTreeMap;
 use std::{
     fmt,
     path::PathBuf,
@@ -8,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use rhiza_node::{ConfigError, NodeConfig, NodeError, NodeRuntime, NodeService};
+use rhiza_node::{
+    confirm_write_durability, ConfigError, NodeConfig, NodeError, NodeRuntime, NodeService,
+};
 use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},
@@ -16,11 +20,23 @@ use tokio::{
 };
 
 pub use rhiza_core::ExecutionProfile;
+#[cfg(feature = "graph")]
+pub use rhiza_graph::{
+    CanonicalF64, GraphColumn, GraphCommandResultV1, GraphCommandV1, GraphInternalId,
+    GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
+    GraphValueV1,
+};
+#[cfg(feature = "kv")]
+pub use rhiza_kv::{KvCommandResultV1, KvCommandV1, KvReadTip, KvScanResult, KvScanRow};
 pub use rhiza_node::{
     effective_cluster_id, CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
     LogPeer, NodeStatus, ReadConsistency, ReadResponse, SqlExecuteResponse, SqlQueryResponse,
     SqlStatementResult, WriteRequest, WriteResponse,
 };
+#[cfg(feature = "graph")]
+pub use rhiza_node::{GraphMutationOutcome, GraphReadResponse};
+#[cfg(feature = "kv")]
+pub use rhiza_node::{KvMutationOutcome, KvReadResponse};
 pub use rhiza_quepaxa::RecorderRpc;
 pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
@@ -54,6 +70,7 @@ impl EmbeddedIdentity {
 pub struct EmbeddedConfig {
     pub identity: EmbeddedIdentity,
     pub data_dir: PathBuf,
+    pub execution_profile: ExecutionProfile,
     pub members: Vec<String>,
     pub recorders: Vec<(String, Box<dyn RecorderRpc>)>,
     pub log_peers: Vec<Box<dyn LogPeer>>,
@@ -64,6 +81,7 @@ impl EmbeddedConfig {
     pub fn new(
         identity: EmbeddedIdentity,
         data_dir: impl Into<PathBuf>,
+        execution_profile: ExecutionProfile,
         members: impl Into<Vec<String>>,
         recorders: Vec<(String, Box<dyn RecorderRpc>)>,
         log_peers: Vec<Box<dyn LogPeer>>,
@@ -72,6 +90,7 @@ impl EmbeddedConfig {
         Self {
             identity,
             data_dir: data_dir.into(),
+            execution_profile,
             members: members.into(),
             recorders,
             log_peers,
@@ -83,6 +102,10 @@ impl EmbeddedConfig {
 #[derive(Debug)]
 pub enum Error {
     Closed,
+    ExecutionProfileMismatch {
+        expected: ExecutionProfile,
+        actual: ExecutionProfile,
+    },
     Config(ConfigError),
     Consensus(ConsensusError),
     Node(NodeError),
@@ -95,6 +118,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "rhiza is closed"),
+            Self::ExecutionProfileMismatch { expected, actual } => write!(
+                f,
+                "execution profile mismatch: expected {expected}, got {actual}"
+            ),
             Self::Config(error) => error.fmt(f),
             Self::Consensus(error) => error.fmt(f),
             Self::Node(error) => error.fmt(f),
@@ -113,7 +140,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Closed => None,
+            Self::Closed | Self::ExecutionProfileMismatch { .. } => None,
             Self::Config(error) => Some(error),
             Self::Consensus(error) => Some(error),
             Self::Node(error) => Some(error),
@@ -151,6 +178,7 @@ impl From<DurabilityError> for Error {
 struct Inner {
     runtime: Arc<NodeRuntime>,
     service: NodeService,
+    execution_profile: ExecutionProfile,
     coordinator: Option<Arc<CheckpointCoordinator>>,
     operations: Arc<RwLock<()>>,
     closed: AtomicBool,
@@ -172,6 +200,7 @@ impl Rhiza {
         let EmbeddedConfig {
             identity,
             data_dir,
+            execution_profile,
             members,
             recorders,
             log_peers,
@@ -184,7 +213,8 @@ impl Rhiza {
             identity.epoch,
             identity.config_id,
             members,
-        )?;
+        )?
+        .with_execution_profile(execution_profile)?;
         let effective_cluster_id = node_config.cluster_id().to_owned();
         let consensus = Arc::new(ThreeNodeConsensus::from_recorders_with_ids(
             effective_cluster_id,
@@ -208,6 +238,7 @@ impl Rhiza {
         let inner = Arc::new(Inner {
             runtime,
             service,
+            execution_profile,
             coordinator,
             operations: Arc::new(RwLock::new(())),
             closed: AtomicBool::new(false),
@@ -279,16 +310,19 @@ impl RhizaHandle {
         value: &str,
     ) -> Result<WriteResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner.service.put(request_id, key, value).await?)
     }
 
     pub async fn write(&self, request: WriteRequest) -> Result<WriteResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner.service.write(request).await?)
     }
 
     pub async fn execute_sql(&self, command: SqlCommand) -> Result<SqlExecuteResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner.service.execute_sql(command).await?)
     }
 
@@ -298,6 +332,7 @@ impl RhizaHandle {
         consistency: ReadConsistency,
     ) -> Result<ReadResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner.service.read(key, consistency).await?)
     }
 
@@ -308,10 +343,149 @@ impl RhizaHandle {
         max_rows: u32,
     ) -> Result<SqlQueryResponse, Error> {
         let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Sqlite)?;
         Ok(inner
             .service
             .query(statement, consistency, max_rows)
             .await?)
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn mutate_graph(
+        &self,
+        command: GraphCommandV1,
+    ) -> Result<GraphMutationOutcome, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        embedded_write_allowed(&inner)?;
+        let runtime = inner.runtime.clone();
+        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_graph(command))
+            .await
+            .map_err(Error::Worker)??;
+        confirm_embedded_write(&inner, outcome.applied_index()).await?;
+        Ok(outcome)
+    }
+
+    #[cfg(feature = "graph")]
+    pub async fn query_graph(
+        &self,
+        statement: impl Into<String>,
+        parameters: BTreeMap<String, GraphParameterValue>,
+        consistency: ReadConsistency,
+        max_rows: u32,
+    ) -> Result<GraphQueryResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Graph)?;
+        let runtime = inner.runtime.clone();
+        let statement = statement.into();
+        tokio::task::spawn_blocking(move || {
+            runtime.query_graph(&statement, &parameters, consistency, max_rows)
+        })
+        .await
+        .map_err(Error::Worker)?
+        .map_err(Error::Node)
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn put_kv(
+        &self,
+        request_id: impl Into<String>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<KvMutationOutcome, Error> {
+        let command = KvCommandV1::put(request_id, key, value)
+            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        self.mutate_kv(command).await
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn delete_kv(
+        &self,
+        request_id: impl Into<String>,
+        key: Vec<u8>,
+    ) -> Result<KvMutationOutcome, Error> {
+        let command = KvCommandV1::delete(request_id, key)
+            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        self.mutate_kv(command).await
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn mutate_kv(&self, command: KvCommandV1) -> Result<KvMutationOutcome, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        embedded_write_allowed(&inner)?;
+        let runtime = inner.runtime.clone();
+        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_kv(command))
+            .await
+            .map_err(Error::Worker)??;
+        confirm_embedded_write(&inner, outcome.applied_index()).await?;
+        Ok(outcome)
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn get_kv(
+        &self,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<KvReadResponse, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        let key = key.to_vec();
+        tokio::task::spawn_blocking(move || runtime.get_kv(&key, consistency))
+            .await
+            .map_err(Error::Worker)?
+            .map_err(Error::Node)
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn scan_kv_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        let start = start.to_vec();
+        let end = end.map(<[u8]>::to_vec);
+        let cursor = cursor.map(<[u8]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            runtime.scan_kv_range(
+                &start,
+                end.as_deref(),
+                limit,
+                cursor.as_deref(),
+                consistency,
+            )
+        })
+        .await
+        .map_err(Error::Worker)?
+        .map_err(Error::Node)
+    }
+
+    #[cfg(feature = "kv")]
+    pub async fn scan_kv_prefix(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        cursor: Option<&[u8]>,
+        consistency: ReadConsistency,
+    ) -> Result<KvScanResult, Error> {
+        let (inner, _operation) = self.begin_operation().await?;
+        require_profile(&inner, ExecutionProfile::Kv)?;
+        let runtime = inner.runtime.clone();
+        let prefix = prefix.to_vec();
+        let cursor = cursor.map(<[u8]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            runtime.scan_kv_prefix(&prefix, limit, cursor.as_deref(), consistency)
+        })
+        .await
+        .map_err(Error::Worker)?
+        .map_err(Error::Node)
     }
 
     pub async fn status(&self) -> Result<NodeStatus, Error> {
@@ -338,6 +512,39 @@ impl RhizaHandle {
         }
         Ok((inner, operation))
     }
+}
+
+fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Error> {
+    if inner.execution_profile == expected {
+        Ok(())
+    } else {
+        Err(Error::ExecutionProfileMismatch {
+            expected,
+            actual: inner.execution_profile,
+        })
+    }
+}
+
+#[cfg(any(feature = "graph", feature = "kv"))]
+fn embedded_write_allowed(inner: &Inner) -> Result<(), Error> {
+    if let Some(coordinator) = &inner.coordinator {
+        coordinator.write_allowed()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "graph", feature = "kv"))]
+async fn confirm_embedded_write(
+    inner: &Inner,
+    applied_index: rhiza_core::LogIndex,
+) -> Result<(), Error> {
+    confirm_write_durability(
+        inner.runtime.as_ref(),
+        inner.coordinator.as_deref(),
+        applied_index,
+    )
+    .await
+    .map_err(Error::Durability)
 }
 
 fn spawn_materializer(inner: &Arc<Inner>) -> JoinHandle<Result<(), Error>> {

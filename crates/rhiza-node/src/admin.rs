@@ -882,7 +882,10 @@ fn node_admin_status(error: &NodeError) -> (StatusCode, AdminErrorCode) {
         | NodeError::RequestConflict(_) => {
             (StatusCode::CONFLICT, AdminErrorCode::PreconditionFailed)
         }
-        NodeError::Unavailable(_) | NodeError::Contention(_) | NodeError::WinnerLimitExceeded => {
+        NodeError::Unavailable(_)
+        | NodeError::ResourceExhausted(_)
+        | NodeError::Contention(_)
+        | NodeError::WinnerLimitExceeded => {
             (StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable)
         }
         NodeError::UnsupportedAckMode(_)
