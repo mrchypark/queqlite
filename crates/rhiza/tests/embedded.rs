@@ -75,7 +75,7 @@ async fn executes_and_queries_sql_with_in_process_recorders() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn embedded_sql_batch_coalesces_in_order_and_retries_unchanged_vector() {
+async fn embedded_sql_batch_commits_qwal_entries_in_order_and_retries_unchanged_vector() {
     let root = tempfile::tempdir().unwrap();
     let rhiza = Rhiza::open(config(root.path())).await.unwrap();
     let handle = rhiza.handle();
@@ -104,10 +104,13 @@ async fn embedded_sql_batch_coalesces_in_order_and_retries_unchanged_vector() {
 
     assert_eq!(first, replay);
     assert!(first.iter().all(Result::is_ok));
-    assert!(first
-        .iter()
-        .map(|result| result.as_ref().unwrap().applied_index)
-        .all(|index| index == 2));
+    assert_eq!(
+        first
+            .iter()
+            .map(|result| result.as_ref().unwrap().applied_index)
+            .collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
     rhiza.shutdown().await.unwrap();
 }
 
