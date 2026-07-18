@@ -971,7 +971,11 @@ fn install_profile_snapshot(
                     decoded.applied_hash(),
                     decoded.materializer_fingerprint(),
                 )?;
-                let target_node_id = target_node_id.unwrap_or(decoded.created_by());
+                let target_node_id = target_node_id.ok_or_else(|| {
+                    DurabilityError::SnapshotVerification(
+                        "RHGS v2 graph snapshot restore requires a target node_id".into(),
+                    )
+                })?;
                 restore_graph_snapshot_file(
                     staging.join("ladybug/graph.lbug"),
                     &decoded,

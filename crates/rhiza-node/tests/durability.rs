@@ -796,6 +796,13 @@ async fn graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_no
     assert_eq!(remote.suffix().len(), 1);
     assert_eq!(remote.suffix()[0].index, second.applied_index());
 
+    let missing_target_dir = root.path().join("missing-target");
+    assert!(matches!(
+        restore_checkpoint_to_fresh_data_dir(archive.clone(), &missing_target_dir).await,
+        Err(DurabilityError::SnapshotVerification(message))
+            if message.contains("target node_id")
+    ));
+
     let restored_dir = root.path().join("restored");
     restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "n2")
         .await

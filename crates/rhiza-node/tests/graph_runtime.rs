@@ -3,15 +3,18 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_core::{ExecutionProfile, LogHash};
-use rhiza_graph::{encode_replicated_graph_batch, encode_replicated_graph_command};
-use rhiza_log::LogStore;
+use rhiza_core::{Command, CommandKind, ExecutionProfile, LogAnchor, LogHash};
+use rhiza_graph::{
+    apply_lgfx_to_exact_base, encode_replicated_graph_command, ControlStore, LadybugFileEffectV1,
+    LadybugStateMachine, PendingApply, LGFX_V1_MAGIC,
+};
+use rhiza_log::{FileLogStore, LogStore};
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, node_router_with_limits,
     CheckpointCoordinator, ClientErrorResponse, DurabilityMode, GraphCommandResultV1,
     GraphCommandV1, GraphGetDocumentResponse, GraphMutationResponse, GraphValueDto, GraphValueV1,
-    NodeConfig, NodeRuntime, PeerConfig, ReadConsistency, GRAPH_GET_DOCUMENT_PATH,
-    GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_COMMAND_BYTES, MAX_GRAPH_MAX_ROWS,
+    InMemoryLogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
+    GRAPH_GET_DOCUMENT_PATH, GRAPH_PUT_DOCUMENT_PATH, GRAPH_QUERY_PATH, MAX_GRAPH_MAX_ROWS,
     MAX_HTTP_BODY_BYTES, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
@@ -21,6 +24,7 @@ const CLUSTER_ID: &str = "rhiza:graph:cluster-a";
 
 #[test]
 fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
     let dir = tempfile::tempdir().unwrap();
     let config = graph_config(dir.path());
     let runtime =
@@ -51,6 +55,13 @@ fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
         (written.applied_index(), written.hash())
     );
     assert_eq!(runtime.config().cluster_id(), CLUSTER_ID);
+    assert!(runtime
+        .log_store()
+        .read(1)
+        .unwrap()
+        .unwrap()
+        .payload
+        .starts_with(LGFX_V1_MAGIC));
     drop(runtime);
 
     let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
@@ -65,6 +76,7 @@ fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
 
 #[test]
 fn graph_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
     let dir = tempfile::tempdir().unwrap();
     let runtime = NodeRuntime::open(
         graph_config(dir.path()),
@@ -87,8 +99,219 @@ fn graph_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
     assert_eq!(read.hash, runtime.applied_hash().unwrap());
 }
 
+#[test]
+fn graph_configuration_state_and_recovery_generation_survive_restart() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_config(dir.path())
+        .with_recovery_generation(7)
+        .unwrap();
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus(dir.path(), "configuration-recorders"),
+        &[],
+    )
+    .unwrap();
+    runtime.stop_current_configuration().unwrap();
+    let stopped = runtime.configuration_state().unwrap();
+    assert!(!stopped.is_active());
+    drop(runtime);
+
+    let reopened = NodeRuntime::open(
+        config.clone(),
+        consensus(dir.path(), "configuration-recorders"),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(reopened.configuration_state().unwrap(), stopped);
+    drop(reopened);
+
+    let wrong_generation = config.with_recovery_generation(8).unwrap();
+    assert!(matches!(
+        NodeRuntime::open(
+            wrong_generation,
+            consensus(dir.path(), "configuration-recorders"),
+            &[]
+        ),
+        Err(NodeError::Storage(message)) if message.contains("recovery_generation")
+    ));
+}
+
+#[test]
+fn graph_rebuild_from_uncompacted_qlog_replays_configuration_history_from_genesis() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_config(dir.path());
+    let runtime = NodeRuntime::open(
+        config.clone(),
+        consensus(dir.path(), "rebuild-recorders"),
+        &[],
+    )
+    .unwrap();
+    runtime
+        .mutate_graph(
+            GraphCommandV1::put_document("before-stop", "document", GraphValueV1::U64(7)).unwrap(),
+        )
+        .unwrap();
+    runtime.stop_current_configuration().unwrap();
+    let expected_configuration = runtime.configuration_state().unwrap();
+    let expected_tip = (
+        runtime.applied_index().unwrap(),
+        runtime.applied_hash().unwrap(),
+    );
+    drop(runtime);
+
+    let graph_path = config.data_dir().join("ladybug/graph.lbug");
+    std::fs::remove_file(&graph_path).unwrap();
+    std::fs::remove_file(graph_path.with_extension("lbug.control")).unwrap();
+
+    let rebuilt =
+        NodeRuntime::open(config, consensus(dir.path(), "rebuild-recorders"), &[]).unwrap();
+
+    assert_eq!(
+        rebuilt.configuration_state().unwrap(),
+        expected_configuration
+    );
+    assert_eq!(
+        (
+            rebuilt.applied_index().unwrap(),
+            rebuilt.applied_hash().unwrap()
+        ),
+        expected_tip
+    );
+    assert_eq!(
+        rebuilt
+            .get_graph_document("document", ReadConsistency::Local)
+            .unwrap()
+            .value,
+        Some(GraphValueV1::U64(7))
+    );
+}
+
+#[test]
+fn graph_startup_recovers_pending_first_lgfx_from_base_database() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    assert_graph_startup_recovers_pending_first_lgfx(false);
+}
+
+#[test]
+fn graph_startup_recovers_pending_first_lgfx_from_installed_target_database() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    assert_graph_startup_recovers_pending_first_lgfx(true);
+}
+
+#[test]
+fn graph_runtime_regenerates_lgfx_after_a_foreign_slot_winner() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let shared_consensus = consensus(dir.path(), "lost-slot-recorders");
+    let runtime =
+        NodeRuntime::open(graph_config(dir.path()), Arc::clone(&shared_consensus), &[]).unwrap();
+    let first = runtime
+        .mutate_graph(
+            GraphCommandV1::put_document("before-winner", "first", GraphValueV1::U64(1)).unwrap(),
+        )
+        .unwrap();
+    let winner = shared_consensus
+        .propose_at(
+            2,
+            first.hash(),
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
+        )
+        .unwrap();
+    let command =
+        GraphCommandV1::put_document("after-winner", "second", GraphValueV1::U64(2)).unwrap();
+
+    let committed = runtime.mutate_graph(command.clone()).unwrap();
+    let retried = runtime.mutate_graph(command).unwrap();
+
+    assert_eq!(committed.applied_index(), 3);
+    assert_eq!(retried, committed);
+    assert_eq!(runtime.log_store().read(2).unwrap(), Some(winner));
+    assert!(runtime
+        .log_store()
+        .read(3)
+        .unwrap()
+        .unwrap()
+        .payload
+        .starts_with(LGFX_V1_MAGIC));
+    assert_eq!(
+        runtime
+            .get_graph_document("second", ReadConsistency::Local)
+            .unwrap()
+            .value,
+        Some(GraphValueV1::U64(2))
+    );
+}
+
+#[test]
+fn graph_startup_rejects_semantic_rhgc_decision_before_mutating_qlog() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_config(dir.path());
+    let shared_consensus = consensus(dir.path(), "legacy-startup-recorders");
+    let semantic = encode_replicated_graph_command(
+        &GraphCommandV1::put_document("legacy", "document", GraphValueV1::U64(1)).unwrap(),
+    )
+    .unwrap();
+    shared_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, semantic),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        NodeRuntime::open(config.clone(), shared_consensus, &[]),
+        Err(NodeError::Invariant(message)) if message.contains("LGFX")
+    ));
+    let log = FileLogStore::open_with_configuration(
+        config.data_dir().join("consensus/log"),
+        config.cluster_id(),
+        config.epoch(),
+        config.log_initial_configuration().clone(),
+    )
+    .unwrap();
+    assert_eq!(log.last_index().unwrap(), None);
+}
+
+#[test]
+fn graph_peer_recovery_rejects_semantic_rhgc_winner_before_mutating_qlog() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_config(dir.path());
+    let shared_consensus = consensus(dir.path(), "legacy-peer-recorders");
+    let semantic = encode_replicated_graph_command(
+        &GraphCommandV1::put_document("legacy", "document", GraphValueV1::U64(1)).unwrap(),
+    )
+    .unwrap();
+    let decided = shared_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, semantic),
+        )
+        .unwrap();
+    let peer = InMemoryLogPeer::new(vec![decided]);
+
+    assert!(matches!(
+        NodeRuntime::open(config.clone(), shared_consensus, &[&peer]),
+        Err(NodeError::Invariant(message)) if message.contains("LGFX")
+    ));
+    let log = FileLogStore::open_with_configuration(
+        config.data_dir().join("consensus/log"),
+        config.cluster_id(),
+        config.epoch(),
+        config.log_initial_configuration().clone(),
+    )
+    .unwrap();
+    assert_eq!(log.last_index().unwrap(), None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
+async fn concurrent_graph_writes_commit_sequential_lgfx_and_retry_original_outcomes() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let config = graph_http_config(dir.path())
         .with_writer_batching(8, Duration::from_millis(20))
@@ -117,10 +340,20 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
     let first = first.json::<GraphMutationResponse>().await.unwrap();
     let second = second.json::<GraphMutationResponse>().await.unwrap();
 
-    assert_eq!(first.applied_index, second.applied_index);
-    assert_eq!(first.hash, second.hash);
+    let mut applied = [first.applied_index, second.applied_index];
+    applied.sort_unstable();
+    assert_eq!(applied, [1, 2]);
     assert_ne!(first.result, second.result);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+    for index in 1..=2 {
+        assert!(runtime
+            .log_store()
+            .read(index)
+            .unwrap()
+            .unwrap()
+            .payload
+            .starts_with(LGFX_V1_MAGIC));
+    }
 
     let first_retry = post_graph_put(&client, addr, &first_body)
         .await
@@ -134,7 +367,7 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
         .unwrap();
     assert_eq!(first_retry, first);
     assert_eq!(second_retry, second);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
 
     let conflict = post_graph_put(
         &client,
@@ -151,22 +384,21 @@ async fn concurrent_graph_writes_share_one_entry_and_retry_distinct_outcomes() {
         conflict.json::<ClientErrorResponse>().await.unwrap().code,
         "invalid_request"
     );
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn graph_batch_byte_cap_falls_back_to_individual_entries() {
+#[test]
+fn typed_graph_batch_preserves_order_as_individual_lgfx_entries() {
+    let _test_guard = graph_test_lock().blocking_lock_owned();
     let dir = tempfile::tempdir().unwrap();
-    let config = graph_http_config(dir.path())
-        .with_writer_batching(4, Duration::from_millis(50))
-        .unwrap();
-    let runtime = Arc::new(
-        NodeRuntime::open(config, consensus(dir.path(), "byte-cap-recorders"), &[]).unwrap(),
-    );
-    let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
-    let client = reqwest::Client::new();
-    let value = "x".repeat(65 * 1024);
+    let runtime = NodeRuntime::open(
+        graph_config(dir.path()),
+        consensus(dir.path(), "typed-batch-recorders"),
+        &[],
+    )
+    .unwrap();
+    let value = "x".repeat(128);
     let commands = (0..4)
         .map(|index| {
             GraphCommandV1::put_document(
@@ -177,55 +409,27 @@ async fn graph_batch_byte_cap_falls_back_to_individual_entries() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    assert!(commands.iter().all(
-        |command| encode_replicated_graph_command(command).unwrap().len() <= MAX_COMMAND_BYTES
-    ));
-    assert!(encode_replicated_graph_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
-    assert!(encode_replicated_graph_batch(&commands[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
-
-    let mut requests = tokio::task::JoinSet::new();
-    for index in 0..4 {
-        let client = client.clone();
-        let value = value.clone();
-        requests.spawn(async move {
-            let response = post_graph_put(
-                &client,
-                addr,
-                &serde_json::json!({
-                    "request_id": format!("large-{index}"),
-                    "id": format!("large-{index}"),
-                    "value": {"type": "string", "value": value}
-                }),
-            )
-            .await;
-            let status = response.status();
-            let body = response.text().await.unwrap();
-            (status, body)
-        });
+    let outcomes = runtime.mutate_graph_batch(commands).unwrap();
+    let indices = outcomes
+        .iter()
+        .map(|outcome| outcome.as_ref().unwrap().applied_index())
+        .collect::<Vec<_>>();
+    assert_eq!(indices, [1, 2, 3, 4]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(4));
+    for index in 1..=4 {
+        assert!(runtime
+            .log_store()
+            .read(index)
+            .unwrap()
+            .unwrap()
+            .payload
+            .starts_with(LGFX_V1_MAGIC));
     }
-    let mut indices = Vec::new();
-    while let Some(response) = requests.join_next().await {
-        let (status, body) = response.unwrap();
-        assert!(
-            status.is_success(),
-            "graph write failed with {status}: {body}"
-        );
-        indices.push(
-            serde_json::from_str::<GraphMutationResponse>(&body)
-                .unwrap()
-                .applied_index,
-        );
-    }
-    indices.sort_unstable();
-    indices.dedup();
-
-    assert_eq!(indices, [1, 2]);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_http_routes_enforce_auth_body_limits_and_return_atomic_value_with_tip() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -365,6 +569,7 @@ async fn graph_http_routes_enforce_auth_body_limits_and_return_atomic_value_with
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_query_returns_general_read_only_cypher_for_all_consistency_modes() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -485,6 +690,7 @@ async fn graph_query_returns_general_read_only_cypher_for_all_consistency_modes(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_query_rejects_unsafe_statements_without_mutating_graph_state() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -646,6 +852,7 @@ async fn graph_query_rejects_unsafe_statements_without_mutating_graph_state() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_cypher_is_rejected_without_changing_tip_or_readiness() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -711,6 +918,7 @@ async fn malformed_cypher_is_rejected_without_changing_tip_or_readiness() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_query_returns_explicit_errors_for_capacity_rows_and_invalid_values() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(
         NodeRuntime::open(
@@ -857,6 +1065,7 @@ async fn graph_query_returns_explicit_errors_for_capacity_rows_and_invalid_value
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_sync_checkpoint_outage_times_out_releases_capacity_and_retries_original_outcome() {
+    let _test_guard = graph_test_lock().lock_owned().await;
     let root = tempfile::tempdir().unwrap();
     let archive_root = root.path().join("archive");
     let archive_backup = root.path().join("archive-backup");
@@ -943,6 +1152,99 @@ fn graph_config(root: &Path) -> NodeConfig {
     .unwrap()
     .with_execution_profile(ExecutionProfile::Graph)
     .unwrap()
+}
+
+fn graph_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
+fn assert_graph_startup_recovers_pending_first_lgfx(target_installed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = graph_config(dir.path());
+    let shared_consensus = consensus(dir.path(), "pending-startup-recorders");
+    let runtime = NodeRuntime::open(config.clone(), Arc::clone(&shared_consensus), &[]).unwrap();
+    drop(runtime);
+
+    let command =
+        GraphCommandV1::put_document("pending-request", "document", GraphValueV1::U64(9)).unwrap();
+    let request = encode_replicated_graph_command(&command).unwrap();
+    let graph_path = config.data_dir().join("ladybug/graph.lbug");
+    let materializer = LadybugStateMachine::open_with_configuration(
+        &graph_path,
+        config.cluster_id(),
+        config.node_id(),
+        config.epoch(),
+        config.log_initial_configuration().clone(),
+        config.recovery_generation(),
+    )
+    .unwrap();
+    let encoded = materializer
+        .prepare_graph_effect(&request, 0, LogHash::ZERO)
+        .unwrap();
+    let effect = LadybugFileEffectV1::decode(&encoded).unwrap();
+    drop(materializer);
+
+    let entry = shared_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, encoded),
+        )
+        .unwrap();
+    let log = FileLogStore::open_with_configuration(
+        config.data_dir().join("consensus/log"),
+        config.cluster_id(),
+        config.epoch(),
+        config.log_initial_configuration().clone(),
+    )
+    .unwrap();
+    log.append(&entry).unwrap();
+    drop(log);
+
+    let pending = PendingApply::new(
+        LogAnchor::new(0, LogHash::ZERO),
+        LogAnchor::new(1, entry.hash),
+        effect.base_db_digest,
+        effect.target_db_digest,
+        effect.target_file_bytes,
+    );
+    let control_path = graph_path.with_extension("lbug.control");
+    let control = ControlStore::open_existing(&control_path).unwrap();
+    control.begin_pending(&pending).unwrap();
+    drop(control);
+
+    if target_installed {
+        let target = graph_path.with_extension("lbug.pending-target");
+        apply_lgfx_to_exact_base(&graph_path, &target, &effect).unwrap();
+        std::fs::rename(target, &graph_path).unwrap();
+    }
+    assert_eq!(
+        ControlStore::open_existing(&control_path)
+            .unwrap()
+            .pending()
+            .unwrap(),
+        Some(pending)
+    );
+
+    let reopened = NodeRuntime::open(config, shared_consensus, &[]).unwrap();
+    let read = reopened
+        .get_graph_document("document", ReadConsistency::Local)
+        .unwrap();
+    assert_eq!(read.value, Some(GraphValueV1::U64(9)));
+    assert_eq!((read.applied_index, read.hash), (1, entry.hash));
+    let retried = reopened.mutate_graph(command).unwrap();
+    assert_eq!((retried.applied_index(), retried.hash()), (1, entry.hash));
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+    drop(reopened);
+
+    assert_eq!(
+        ControlStore::open_existing(control_path)
+            .unwrap()
+            .pending()
+            .unwrap(),
+        None
+    );
 }
 
 fn graph_http_config(root: &Path) -> NodeConfig {

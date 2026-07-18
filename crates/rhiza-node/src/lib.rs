@@ -38,9 +38,9 @@ use rhiza_core::{
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
-    encode_replicated_graph_batch, encode_replicated_graph_command, CanonicalF64, GraphColumn,
-    GraphInternalId, GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel,
-    GraphResultValue, LadybugStateMachine, RequestRecord as GraphRequestRecord,
+    encode_replicated_graph_command, CanonicalF64, GraphColumn, GraphInternalId, GraphLogicalType,
+    GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
+    LadybugFileEffectV1, LadybugStateMachine, RequestRecord as GraphRequestRecord, LGFX_V1_MAGIC,
 };
 #[cfg(feature = "kv")]
 use rhiza_kv::{
@@ -858,7 +858,7 @@ struct RuntimeBatchMember {
     operation: QueuedOperation,
 }
 
-#[cfg(any(feature = "graph", feature = "kv"))]
+#[cfg(feature = "kv")]
 fn classify_pending_request(
     canonical_by_request: &mut HashMap<String, usize>,
     members: &[RuntimeBatchMember],
@@ -4622,7 +4622,7 @@ impl Materializer {
 
     fn open(
         config: &NodeConfig,
-        configuration_state: &ConfigurationState,
+        _configuration_state: &ConfigurationState,
     ) -> Result<Self, NodeError> {
         match config.execution_profile() {
             ExecutionProfile::Sqlite => {
@@ -4634,7 +4634,7 @@ impl Materializer {
                         config.cluster_id(),
                         config.node_id(),
                         config.epoch(),
-                        configuration_state.clone(),
+                        _configuration_state.clone(),
                     )
                     .map_err(|error| NodeError::Storage(error.to_string()))?;
                     Ok(Self::Sql(Box::new(state)))
@@ -4647,12 +4647,15 @@ impl Materializer {
             ExecutionProfile::Graph => {
                 #[cfg(feature = "graph")]
                 {
-                    LadybugStateMachine::open(
+                    LadybugStateMachine::open_with_configuration(
                         config.data_dir().join("ladybug/graph.lbug"),
                         config.cluster_id(),
                         config.node_id(),
                         config.epoch(),
-                        configuration_state.config_id(),
+                        // New DB/control pairs must replay uncompacted qlog history from genesis.
+                        // Existing pairs ignore this seed and retain their replicated control.
+                        config.log_initial_configuration().clone(),
+                        config.recovery_generation(),
                     )
                     .map(Arc::new)
                     .map(Self::Graph)
@@ -4671,7 +4674,7 @@ impl Materializer {
                         config.cluster_id(),
                         config.node_id(),
                         config.epoch(),
-                        configuration_state.config_id(),
+                        _configuration_state.config_id(),
                     )
                     .map(Arc::new)
                     .map(Self::Kv)
@@ -4738,9 +4741,55 @@ impl Materializer {
                 .map(Some)
                 .map_err(|error| error.to_string()),
             #[cfg(feature = "graph")]
-            Self::Graph(_) => Ok(None),
+            Self::Graph(state) => state
+                .configuration_state_value()
+                .map(Some)
+                .map_err(|error| error.to_string()),
             #[cfg(feature = "kv")]
             Self::Kv(_) => Ok(None),
+        }
+    }
+
+    /// Returns the committed base used only to seed startup qlog reconciliation.
+    ///
+    /// Graph may have a durable LGFX pending intent while its public read state
+    /// remains unavailable. In that case this returns the committed control
+    /// base so the matching next qlog entry can be redelivered.
+    fn startup_reconciliation_base_state(
+        &self,
+    ) -> Result<(LogAnchor, Option<ConfigurationState>), String> {
+        match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
+            Self::Sql(state) => Ok((
+                LogAnchor::new(
+                    state
+                        .applied_index_value()
+                        .map_err(|error| error.to_string())?,
+                    state
+                        .applied_hash_value()
+                        .map_err(|error| error.to_string())?,
+                ),
+                Some(
+                    state
+                        .configuration_state_value()
+                        .map_err(|error| error.to_string())?,
+                ),
+            )),
+            #[cfg(feature = "graph")]
+            Self::Graph(state) => state
+                .reconciliation_base_state()
+                .map(|(tip, configuration)| (tip, Some(configuration)))
+                .map_err(|error| error.to_string()),
+            #[cfg(feature = "kv")]
+            Self::Kv(state) => Ok((
+                LogAnchor::new(
+                    state.applied_index().map_err(|error| error.to_string())?,
+                    state.applied_hash().map_err(|error| error.to_string())?,
+                ),
+                None,
+            )),
         }
     }
 
@@ -4899,9 +4948,10 @@ impl NodeRuntime {
 
     /// Executes an ordered, non-atomic batch of graph mutations.
     ///
-    /// Valid commands may share one QuePaxa log entry. Per-command conflicts remain isolated in
-    /// the returned vector, whose order and length match `commands`. The whole vector is validated
-    /// before the first write attempt, so an outer `Err` guarantees that nothing was attempted.
+    /// Each newly applied command is prepared and committed as its own exact-base LGFX entry.
+    /// Per-command conflicts remain isolated in the returned vector, whose order and length match
+    /// `commands`. The whole vector is validated before the first write attempt, so an outer `Err`
+    /// guarantees that nothing was attempted.
     #[cfg(feature = "graph")]
     #[cfg_attr(
         all(not(feature = "sql"), not(feature = "kv")),
@@ -4952,6 +5002,20 @@ impl NodeRuntime {
         }
         loop {
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
+            let proposal_payload = self
+                .graph_materializer()?
+                .prepare_graph_effect(&payload, last_index, last_hash)
+                .map_err(|error| self.map_graph_mutation_error(error))?;
+            if !proposal_payload.starts_with(LGFX_V1_MAGIC) {
+                return Err(self.latch(NodeError::Invariant(
+                    "graph materializer prepared a non-LGFX proposal".into(),
+                )));
+            }
+            if proposal_payload.len() > MAX_COMMAND_BYTES {
+                return Err(NodeError::ResourceExhausted(format!(
+                    "graph LGFX effect exceeds {MAX_COMMAND_BYTES} bytes"
+                )));
+            }
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
             })?;
@@ -4960,7 +5024,7 @@ impl NodeRuntime {
                 .propose_at_cancellable(
                     slot,
                     last_hash,
-                    Command::new(CommandKind::Deterministic, payload.clone()),
+                    Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                     &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
@@ -4968,7 +5032,7 @@ impl NodeRuntime {
             if let Some(record) = self.check_graph_request(command.request_id(), &payload)? {
                 return Ok(GraphMutationOutcome::from_record(record));
             }
-            if entry.entry_type == EntryType::Command && entry.payload == payload {
+            if entry.entry_type == EntryType::Command && entry.payload == proposal_payload {
                 return Err(self.latch(NodeError::Invariant(
                     "committed graph request was not recorded by Ladybug".into(),
                 )));
@@ -5333,169 +5397,9 @@ impl NodeRuntime {
             return members.into_iter().map(|_| Err(error.clone())).collect();
         }
 
-        let mut results = vec![None; members.len()];
-        let mut pending = Vec::new();
-        let mut canonical_by_request = HashMap::new();
-        let mut aliases = vec![None; members.len()];
-        for (index, member) in members.iter().enumerate() {
-            let QueuedOperation::Graph(command) = &member.operation else {
-                results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
-                    expected: ExecutionProfile::Graph,
-                    actual: ExecutionProfile::Sqlite,
-                }));
-                continue;
-            };
-            match self.check_graph_request(command.request_id(), &member.payload) {
-                Ok(Some(record)) => {
-                    results[index] = Some(Ok(ClientWriteResponse::Graph(
-                        GraphMutationOutcome::from_record(record),
-                    )));
-                }
-                Ok(None) => match classify_pending_request(
-                    &mut canonical_by_request,
-                    &members,
-                    index,
-                    command.request_id(),
-                ) {
-                    Ok(None) => pending.push(index),
-                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
-                    Err(error) => results[index] = Some(Err(error)),
-                },
-                Err(error) => results[index] = Some(Err(error)),
-            }
-        }
-
-        while !pending.is_empty() {
-            if pending.len() == 1 {
-                let index = pending[0];
-                results[index] = Some(self.execute_profile_member_locked(&members[index]));
-                break;
-            }
-            let commands = pending
-                .iter()
-                .map(|index| match &members[*index].operation {
-                    QueuedOperation::Graph(command) => command.clone(),
-                    _ => unreachable!("graph pending members were validated above"),
-                })
-                .collect::<Vec<_>>();
-            let full_payload = match encode_replicated_graph_batch(&commands) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let error = NodeError::InvalidRequest(error.to_string());
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
-                (commands.len(), full_payload)
-            } else {
-                let mut prefix = None;
-                for count in (2..commands.len()).rev() {
-                    let payload = encode_replicated_graph_batch(&commands[..count])
-                        .expect("the validated graph batch prefix remains valid");
-                    if payload.len() <= MAX_COMMAND_BYTES {
-                        prefix = Some((count, payload));
-                        break;
-                    }
-                }
-                let Some(prefix) = prefix else {
-                    let index = pending.remove(0);
-                    results[index] = Some(self.execute_profile_member_locked(&members[index]));
-                    continue;
-                };
-                prefix
-            };
-            let proposed_indices = pending[..proposal_count].to_vec();
-            let (last_index, last_hash) = match self.ensure_materialized_tip() {
-                Ok(tip) => tip,
-                Err(error) => {
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            let slot = match last_index.checked_add(1) {
-                Some(slot) => slot,
-                None => {
-                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            let entry = match self.consensus.propose_at_cancellable(
-                slot,
-                last_hash,
-                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                &self.operation_cancelled,
-            ) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    let error = self.map_consensus_error(error);
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
-                for index in pending.drain(..) {
-                    results[index] = Some(Err(error.clone()));
-                }
-                break;
-            }
-
-            let mut remaining = Vec::new();
-            for index in pending.drain(..) {
-                let member = &members[index];
-                let QueuedOperation::Graph(command) = &member.operation else {
-                    unreachable!("graph pending members were validated above");
-                };
-                match self.check_graph_request(command.request_id(), &member.payload) {
-                    Ok(Some(record)) => {
-                        results[index] = Some(Ok(ClientWriteResponse::Graph(
-                            GraphMutationOutcome::from_record(record),
-                        )));
-                    }
-                    Ok(None) => remaining.push(index),
-                    Err(error) => results[index] = Some(Err(error)),
-                }
-            }
-            if entry.entry_type == EntryType::Command
-                && entry.payload == proposal_payload
-                && remaining
-                    .iter()
-                    .any(|index| proposed_indices.contains(index))
-            {
-                let error = self.latch(NodeError::Invariant(
-                    "committed graph batch did not record every request".into(),
-                ));
-                for index in remaining.drain(..) {
-                    results[index] = Some(Err(error.clone()));
-                }
-            }
-            pending = remaining;
-        }
-
-        for (index, canonical) in aliases.into_iter().enumerate() {
-            if let Some(canonical) = canonical {
-                results[index] = results[canonical].clone();
-            }
-        }
-
-        results
-            .into_iter()
-            .map(|result| {
-                result.unwrap_or_else(|| {
-                    Err(self.latch(NodeError::Invariant(
-                        "graph writer batch omitted a request result".into(),
-                    )))
-                })
-            })
+        members
+            .iter()
+            .map(|member| self.execute_profile_member_locked(member))
             .collect()
     }
 
@@ -6860,6 +6764,25 @@ impl NodeRuntime {
         }
     }
 
+    #[cfg(feature = "graph")]
+    fn map_graph_mutation_error(&self, error: rhiza_graph::Error) -> NodeError {
+        match error {
+            rhiza_graph::Error::InvalidCommand(_) | rhiza_graph::Error::RequestConflict { .. } => {
+                NodeError::InvalidRequest(error.to_string())
+            }
+            rhiza_graph::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
+            rhiza_graph::Error::Ladybug(_)
+            | rhiza_graph::Error::Io(_)
+            | rhiza_graph::Error::Closed => self.latch(NodeError::Storage(error.to_string())),
+            rhiza_graph::Error::Codec(_)
+            | rhiza_graph::Error::InvalidEntry(_)
+            | rhiza_graph::Error::IdentityMismatch(_)
+            | rhiza_graph::Error::InvalidSnapshot(_) => {
+                self.latch(NodeError::Invariant(error.to_string()))
+            }
+        }
+    }
+
     #[cfg(feature = "kv")]
     fn map_kv_read_error(&self, error: rhiza_kv::Error) -> NodeError {
         match error {
@@ -6988,9 +6911,14 @@ pub fn rehydrate_recorder_after_checkpoint(
 mod tests {
     use axum::http::HeaderValue;
 
+    #[cfg(feature = "graph")]
+    use rhiza_core::LogEntry;
     use rhiza_core::{EntryType, ExecutionProfile, LogHash, StoredCommand};
     #[cfg(feature = "graph")]
-    use rhiza_graph::{GraphCommandV1, GraphValueV1};
+    use rhiza_graph::{
+        encode_replicated_graph_batch, encode_replicated_graph_command, GraphCommandV1,
+        GraphValueV1, LGFX_V1_MAGIC,
+    };
     #[cfg(feature = "kv")]
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
@@ -7388,7 +7316,7 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
-    fn graph_batch_coalesces_exact_retry_and_isolates_conflicting_duplicate() {
+    fn graph_batch_preserves_order_with_one_lgfx_effect_per_new_request() {
         let (_dir, runtime) = graph_test_runtime();
         let canonical =
             GraphCommandV1::put_document("same", "document", GraphValueV1::String("first".into()))
@@ -7411,9 +7339,57 @@ mod tests {
             results[2],
             Err(super::NodeError::InvalidRequest(_))
         ));
-        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical);
-        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert_eq!(results[3].as_ref().unwrap().applied_index(), canonical + 1);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        for index in 1..=2 {
+            assert!(runtime
+                .log_store()
+                .read(index)
+                .unwrap()
+                .unwrap()
+                .payload
+                .starts_with(LGFX_V1_MAGIC));
+        }
         assert!(runtime.is_ready());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_profile_shape_rejects_semantic_rhgc_and_rhgb_commands() {
+        let first = GraphCommandV1::put_document("first", "first", GraphValueV1::U64(1)).unwrap();
+        let second =
+            GraphCommandV1::put_document("second", "second", GraphValueV1::U64(2)).unwrap();
+        let semantic_payloads = [
+            encode_replicated_graph_command(&first).unwrap(),
+            encode_replicated_graph_batch(&[first, second]).unwrap(),
+        ];
+
+        for payload in semantic_payloads {
+            let entry = LogEntry {
+                cluster_id: "rhiza:graph:node-unit-test".into(),
+                epoch: 1,
+                config_id: 1,
+                index: 1,
+                entry_type: EntryType::Command,
+                hash: LogEntry::calculate_hash(
+                    "rhiza:graph:node-unit-test",
+                    1,
+                    1,
+                    1,
+                    EntryType::Command,
+                    LogHash::ZERO,
+                    &payload,
+                ),
+                prev_hash: LogHash::ZERO,
+                payload,
+            };
+
+            assert!(
+                super::validate_profile_entry_shape(ExecutionProfile::Graph, &entry)
+                    .unwrap_err()
+                    .contains("LGFX")
+            );
+        }
     }
 
     #[cfg(feature = "kv")]
@@ -7866,15 +7842,11 @@ fn reconcile_local_storage(
         .logical_state()
         .map_err(|error| NodeError::Storage(error.to_string()))?;
     let log_last_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
-    let applied_index = materializer
-        .applied_index()
+    let (reconciliation_base, mut materializer_configuration) = materializer
+        .startup_reconciliation_base_state()
         .map_err(|error| NodeError::Storage(error.to_string()))?;
-    let applied_hash = materializer
-        .applied_hash()
-        .map_err(|error| NodeError::Storage(error.to_string()))?;
-    let mut materializer_configuration = materializer
-        .configuration_state()
-        .map_err(|error| NodeError::Storage(error.to_string()))?;
+    let applied_index = reconciliation_base.index();
+    let applied_hash = reconciliation_base.hash();
 
     if let Some(anchor) = &log_state.anchor {
         if anchor.recovery_generation() != config.recovery_generation {
@@ -7939,15 +7911,23 @@ fn reconcile_local_storage(
         materializer
             .apply_entry(&entry)
             .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
-        materializer_configuration = materializer
-            .configuration_state()
-            .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+        if index < log_last_index {
+            materializer_configuration = materializer
+                .configuration_state()
+                .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+        }
         expected_prev_hash = entry.hash;
     }
     let log_configuration = log_store
         .configuration_state()
         .map_err(|error| NodeError::Storage(error.to_string()))?;
-    if materializer_configuration
+    // Return to the normal public state boundary after suffix replay. This also
+    // fails startup if a pending graph intent had no matching qlog entry to
+    // redeliver and therefore remains unresolved.
+    let final_materializer_configuration = materializer
+        .configuration_state()
+        .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
+    if final_materializer_configuration
         .as_ref()
         .is_some_and(|configuration| configuration != &log_configuration)
     {
@@ -8128,6 +8108,21 @@ fn validate_runtime_entry(
     validate_entry_envelope(config, entry, expected_index, expected_prev_hash)?;
     validate_profile_entry_shape(config.execution_profile(), entry)
         .map_err(NodeError::Invariant)?;
+    #[cfg(feature = "graph")]
+    if config.execution_profile() == ExecutionProfile::Graph
+        && entry.entry_type == EntryType::Command
+    {
+        let effect = LadybugFileEffectV1::decode(&entry.payload)
+            .map_err(|error| NodeError::Invariant(error.to_string()))?;
+        if effect.recovery_generation != config.recovery_generation()
+            || effect.materializer_fingerprint != rhiza_graph::graph_materializer_fingerprint()
+        {
+            return Err(NodeError::Reconciliation(format!(
+                "graph LGFX entry {} has incompatible recovery generation or materializer fingerprint",
+                entry.index
+            )));
+        }
+    }
     configuration_state
         .validate_entry(entry)
         .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
@@ -8192,6 +8187,21 @@ pub(crate) fn validate_profile_entry_shape(
     if _profile == ExecutionProfile::Sqlite && entry.entry_type == EntryType::Command {
         decode_qwal_v1(&entry.payload)
             .map_err(|error| format!("SQLite command is not canonical QWAL v1: {error}"))?;
+    }
+    #[cfg(feature = "graph")]
+    if _profile == ExecutionProfile::Graph && entry.entry_type == EntryType::Command {
+        let effect = LadybugFileEffectV1::decode(&entry.payload)
+            .map_err(|error| format!("graph command is not canonical LGFX v1: {error}"))?;
+        if effect.cluster_id != entry.cluster_id
+            || effect.epoch != entry.epoch
+            || effect.configuration_id != entry.config_id
+            || effect.base_log_index.checked_add(1) != Some(entry.index)
+            || effect.base_log_hash != entry.prev_hash
+        {
+            return Err(
+                "graph LGFX identity or exact-base anchor does not match its qlog entry".into(),
+            );
+        }
     }
     Ok(())
 }
