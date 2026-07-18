@@ -4727,6 +4727,8 @@ mod tests {
     use rhiza_quepaxa::AcceptedValue;
     #[cfg(feature = "sql")]
     use rhiza_quepaxa::{RecordRequest, RecordSummary, RecorderReply};
+    #[cfg(feature = "sql")]
+    use rhiza_sql::{encode_sql_command, SqlCommand, SqlEffectPreparation, SqliteStateMachine};
 
     use super::*;
 
@@ -6401,11 +6403,41 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "sql")]
     fn entries(end: u64) -> Vec<LogEntry> {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateMachine::open(
+            root.path().join("state.sqlite"),
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap();
         let mut previous = LogHash::ZERO;
         (1..=end)
             .map(|index| {
-                let payload = format!("entry-{index}").into_bytes();
+                let command = SqlCommand {
+                    request_id: format!("checkpoint-entry-{index}"),
+                    statements: vec![
+                        SqlStatement {
+                            sql: "CREATE TABLE IF NOT EXISTS checkpoint_fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL)".into(),
+                            parameters: vec![],
+                        },
+                        SqlStatement {
+                            sql: "INSERT INTO checkpoint_fixture(id, value) VALUES (?1, ?2)"
+                                .into(),
+                            parameters: vec![
+                                SqlValue::Integer(index as i64),
+                                SqlValue::Text(format!("entry-{index}")),
+                            ],
+                        },
+                    ],
+                };
+                let request = encode_sql_command(&command).unwrap();
+                let SqlEffectPreparation::Effect(payload) = db
+                    .prepare_sql_effect(&command, &request, index - 1, previous)
+                    .unwrap();
                 let hash = LogEntry::calculate_hash(
                     "rhiza:sql:cluster-a",
                     index,
@@ -6422,6 +6454,37 @@ mod tests {
                     index,
                     entry_type: EntryType::Command,
                     payload,
+                    prev_hash: previous,
+                    hash,
+                };
+                db.apply_entry(&entry).unwrap();
+                previous = hash;
+                entry
+            })
+            .collect()
+    }
+
+    #[cfg(not(feature = "sql"))]
+    fn entries(end: u64) -> Vec<LogEntry> {
+        let mut previous = LogHash::ZERO;
+        (1..=end)
+            .map(|index| {
+                let hash = LogEntry::calculate_hash(
+                    "rhiza:sql:cluster-a",
+                    index,
+                    1,
+                    1,
+                    EntryType::Noop,
+                    previous,
+                    &[],
+                );
+                let entry = LogEntry {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    index,
+                    entry_type: EntryType::Noop,
+                    payload: Vec::new(),
                     prev_hash: previous,
                     hash,
                 };
@@ -6911,6 +6974,7 @@ mod tests {
         let target = local_checkpoint(root.path(), 2);
         target.initialize_checkpoint().await.unwrap();
         let mut divergent = entries(1);
+        divergent[0].entry_type = EntryType::Command;
         divergent[0].payload = b"divergent-entry".to_vec();
         divergent[0].hash = LogEntry::calculate_hash(
             "rhiza:sql:cluster-a",
