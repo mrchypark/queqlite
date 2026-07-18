@@ -20,6 +20,14 @@ use rhiza_core::{
 };
 use tempfile::NamedTempFile;
 
+mod lgfx;
+
+pub use lgfx::{
+    apply_lgfx_to_exact_base, capture_graph_entry_native_wal, diff_closed_ladybug_files,
+    lgfx_chunks_digest, open_lgfx_readback, replay_native_ladybug_wal, CapturedNativeLadybugWal,
+    LadybugFileChunkV1, LadybugFileEffectV1, LGFX_CHUNK_BYTES, LGFX_V1_MAGIC, MAX_LGFX_V1_BYTES,
+};
+
 const COMMAND_MAGIC: &[u8; 6] = b"RHGC\0\x01";
 const BATCH_COMMAND_MAGIC: &[u8; 6] = b"RHGB\0\x01";
 const RESULT_MAGIC: &[u8; 6] = b"RHGR\0\x01";

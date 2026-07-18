@@ -9,7 +9,10 @@ description = "LadybugDB materialized state machine for rhiza graph"
 
 [dependencies]
 lbug = "=0.18.1"
+postcard.workspace = true
 rhiza-core = { path = "../rhiza-core" }
+serde.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]

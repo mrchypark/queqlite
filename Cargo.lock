@@ -2044,8 +2044,11 @@ name = "rhiza-graph"
 version = "0.1.0"
 dependencies = [
  "lbug",
+ "postcard",
  "proptest",
  "rhiza-core",
+ "serde",
+ "sha2",
  "tempfile",
 ]
 
