@@ -47,22 +47,38 @@ See `examples/local_three_node.rs` for a complete runnable example.
   workers, including proof workers. A transport that ignores its deadline can
   leak its own worker and resources, but cannot block consensus destruction.
 - Call `finish_pending_rpcs` with an application-selected bound before removing
-  local recorder storage or shutting down a transport used by accepted record
-  or proof jobs. The drain does not recover proof jobs already dropped because
-  a bounded worker queue was full.
+  local recorder storage or shutting down a transport used by accepted record,
+  proof, or control jobs. The drain does not recover jobs already dropped
+  because a bounded worker queue was full.
+- Each recorder has one record worker and one control worker, each with room for
+  one queued job. Record saturation returns retryable `Pending`; control
+  saturation may surface retryable `NoQuorum` or `Unavailable`.
+- `register_command` is fallible: it rejects mismatched command hashes and
+  succeeds only after a recorder quorum stores the command. `NoQuorum` is
+  retryable.
 - `PrioritySource` is injectable for deterministic simulation. The default uses
   the operating system random source through `getrandom` and supports all
   platforms supported by that crate.
 
 ## Recorder durability
 
-Normal records are acknowledged from a bounded, checksummed append-only
+Normal records are acknowledged from a threshold-checkpointed, checksummed append-only
 `recorder.wal`. Each frame carries its generation and sequence, the previous
 frame digest, the exact slot/configuration/head state, and an optional inline
-command. Recovery replays only the continuous digest chain, truncates an
-incomplete unacknowledged tail, and fails closed on a complete corrupt frame.
-The WAL is checkpointed before its 16 MiB soft limit or 1,024-frame hard limit
-is exceeded.
+command. Recovery replays only the continuous digest chain. Fully present
+frames with checksum, digest-chain, generation, or sequence corruption fail
+closed. An incomplete final frame is treated as an unacknowledged torn tail and
+truncated. QWAL v1 cannot distinguish a genuinely torn final frame from a
+corrupted declared frame length that extends beyond EOF; that ambiguity remains
+an explicit residual format risk until the framing format changes.
+Before each append, the recorder evaluates the WAL's 16 MiB byte threshold and
+1,024-frame threshold. Because the check precedes the append, an individual
+frame can carry the WAL past the 16 MiB soft threshold; the recorder checkpoints
+before the following append. Command payloads have no separate hard size bound.
+The existing checkpoint format and 1,024-frame boundary are intentionally
+retained. A broader crash-safe checkpoint redesign is deferred; the logical
+boundary diagnostic below does not replace the physical power-loss deployment
+gate.
 
 The steady path acknowledges only after the appended frame is durable. On
 Linux it uses `File::sync_data` (`fdatasync`); other platforms conservatively
@@ -82,14 +98,38 @@ XFS, and the intended Kubernetes CSI remains a separate deployment gate.
 
 `recorder_sync_bench` measures the actual `RecorderFileStore::record_proposal`
 steady WAL append and acknowledgement path without pulling in a rhiza backend
-or network transport. A run is deliberately capped below the WAL checkpoint
-boundary and emits one JSON object with throughput, successful-call latency
-percentiles, error count, exact WAL byte/frame observations, and platform
-metadata. Request construction is completed before timing.
+or network transport. A default steady-state run is deliberately capped below
+the WAL checkpoint boundary; `--checkpoint-diagnostic` is the explicit
+boundary-crossing exception. Each run emits one JSON object with throughput,
+successful-call latency percentiles, error count, exact WAL byte/frame
+observations, and platform metadata. Every operation uses an equal-sized but
+distinct command payload and hash; `--payload-bytes` is the exact payload size
+and must be at least 2. All commands and requests are constructed before timing.
+
+The default `--command-mode inline` includes the inline command and its WAL
+persistence in every timed `record_proposal` call. `--command-mode pre-stored`
+stores every distinct command before warmup and before the timer starts, then
+omits commands from measured requests. Command pre-storage is therefore
+excluded from its latency and throughput.
 
 ```console
 cargo run --release -p rhiza-quepaxa --example recorder_sync_bench -- \
   --warmup 100 --operations 500 --label native
+```
+
+`--checkpoint-diagnostic` is a boundary-crossing correctness run, not a
+steady-state comparison. It forces `--warmup 0 --operations 1025` (and rejects
+conflicting explicit values). Operations 1 through 1024 fill generation 1;
+operation 1025 measures the synchronous checkpoint before the new proposal is
+appended as the first generation-2 frame. The command exits nonzero unless it
+observes exactly that one checkpoint, a durable-head generation of 2 through
+sequence 1024, and one checksummed generation-2 WAL frame at sequence 1025. It
+also drops and reopens the recorder with the expected membership, so production
+decoders validate the complete durable head and WAL before success is reported.
+
+```console
+cargo run --release -p rhiza-quepaxa --example recorder_sync_bench -- \
+  --checkpoint-diagnostic
 ```
 
 On Linux, `File::sync_data` reaches the normal dynamically linked `fdatasync`
@@ -106,9 +146,12 @@ and container provenance.
 python3 bench/run-recorder-sync-linux.py --pairs 12
 ```
 
-A 2026-07-17 Docker Desktop Linux/aarch64 diagnostic ran 12 balanced pairs,
-each with 100 warmups and 800 measured records. All 19,200 measured records
-succeeded. Median throughput was 2,983.9011487711614 ops/s for native
+The tracked 2026-07-17 Docker Desktop Linux/aarch64 results are a legacy
+diagnostic from an identical-command-per-slot harness. They predate the
+distinct-command workload and explicit command-mode methodology documented
+above, so they do not validate the current workload. That run used 12 balanced
+pairs, each with 100 warmups and 800 measured records. All 19,200 measured
+records succeeded. Median throughput was 2,983.9011487711614 ops/s for native
 `fdatasync` and 1,911.5215089204817 ops/s with the `fsync` preload. Dividing
 the aggregate medians gives 1.561008408666x. However, the median paired
 `fsync-preload/native` ratio was 0.9278500671968066, and each candidate won
@@ -119,7 +162,7 @@ paired result and win split remain mixed. All 12
 preload runs observed the expected 900 intercepts, and every run observed 900
 WAL frames in generation 1 without a checkpoint.
 
-The tracked artifacts are
+The legacy tracked artifacts are
 [`raw.jsonl`](../../docs/benchmarks/recorder-sync-linux-20260717/raw.jsonl)
 (24 rows, 49,782 bytes) and
 [`summary.json`](../../docs/benchmarks/recorder-sync-linux-20260717/summary.json)
@@ -128,18 +171,19 @@ container provenance. The QuePaxa source SHA-256 is
 `54ca511bd8be35e1b2deeb50a1f8f9ced66bb336194e4d7ba07c4473a9d60c1d`
 and the benchmark binary SHA-256 is
 `7bc075b29e7d49524ea51555b5cc95a0f6d1eea4b9eccff7d634caa27893459d`.
-Its recorded runner SHA-256
+The historical runner SHA-256 recorded by those artifacts is
 `bbe7d010c56fae73cc2d65d252093e2e547b4c191a8e14c9ccd7aa7454ed0b7d`
-matches the current runner. The fresh build provenance is retained under
-`target/recorder-sync-linux-build-final-v3-20260717`, and the runner's full-reuse
-gate verified it. The summary sets `production_valid=false`: measurements from
-a dirty tree remain diagnostic, and Docker Desktop's virtual filesystem cannot
-reproduce host power loss or the target CSI flush path. Linux `sync_data`
-remains a correctness-preserving candidate implementation of the smaller
-durability syscall. The aggregate Docker result is favorable, but paired
-performance is inconclusive and is not a production speedup claim. Production
-performance adoption requires clean physical crash/reopen and throughput/latency
-testing on the target ext4/XFS/CSI stack.
+and is retained only for historical provenance; it is not claimed to match the
+current runner. The artifacts record fresh build provenance under
+`target/recorder-sync-linux-build-final-v3-20260717` and record that the runner's
+full-reuse gate verified it. The summary sets `production_valid=false`:
+measurements from a dirty tree remain diagnostic, and Docker Desktop's virtual
+filesystem cannot reproduce host power loss or the target CSI flush path.
+Linux `sync_data` remains a correctness-preserving candidate implementation of
+the smaller durability syscall. The aggregate Docker result is favorable, but
+paired performance is inconclusive and is not a production speedup claim.
+Production performance adoption requires clean physical crash/reopen and
+throughput/latency testing on the target ext4/XFS/CSI stack.
 
 ## Compatibility policy
 

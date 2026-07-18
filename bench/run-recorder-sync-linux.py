@@ -200,6 +200,8 @@ def validate_report(report, candidate, operations, warmup, payload_bytes):
         errors.append("benchmark identity mismatch")
     if report.get("sync_variant") != candidate:
         errors.append("sync variant mismatch")
+    if report.get("command_mode") != "inline":
+        errors.append("command mode is not inline")
     if report.get("operations") != operations or report.get("warmup") != warmup:
         errors.append("operation counts mismatch")
     if report.get("payload_bytes") != payload_bytes:
@@ -307,6 +309,8 @@ def benchmark_command(
             str(warmup),
             "--payload-bytes",
             str(payload),
+            "--command-mode",
+            "inline",
             "--label",
             candidate,
         ]
@@ -434,6 +438,34 @@ def self_test():
     assert command[command.index("--entrypoint") + 1] == (
         "/artifacts/target/release/examples/recorder_sync_bench"
     )
+    assert command[command.index("--command-mode") + 1] == "inline"
+    valid_report = {
+        "benchmark": "recorder_wal_record",
+        "sync_variant": "native-fdatasync",
+        "command_mode": "inline",
+        "operations": 3,
+        "warmup": 2,
+        "payload_bytes": 128,
+        "completed": 3,
+        "errors": 0,
+        "latency_scope": "successful_calls_only",
+        "platform": {"os": "linux", "ld_preload": False},
+        "wal": {"frames": 5, "checkpoint_avoided_observed": True},
+        "future_additive_field": {"accepted": True},
+    }
+    validate_report(valid_report, "native-fdatasync", 3, 2, 128)
+    for invalid_mode in ("pre-stored", None):
+        invalid_report = dict(valid_report)
+        if invalid_mode is None:
+            invalid_report.pop("command_mode")
+        else:
+            invalid_report["command_mode"] = invalid_mode
+        try:
+            validate_report(invalid_report, "native-fdatasync", 3, 2, 128)
+        except ValueError as error:
+            assert "command mode is not inline" in str(error)
+        else:
+            raise AssertionError("wrong or missing command mode must fail validation")
     matching_hashes = {key: "same" for key in BUILD_REUSE_HASH_KEYS}
     mismatched_hashes = dict(matching_hashes)
     mismatched_hashes["rhiza_core_lib_source_sha256"] = "changed"

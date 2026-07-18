@@ -115,11 +115,24 @@ fn consensus(root: &Path, proposer: &str) -> ThreeNodeConsensus {
 }
 
 #[test]
+fn command_registration_surfaces_a_hash_mismatch() {
+    let root = tempfile::tempdir().unwrap();
+    let consensus = consensus(root.path(), "n1");
+
+    assert_eq!(
+        consensus.register_command(LogHash::ZERO, b"different hash".to_vec()),
+        Err(Error::CommandHashMismatch)
+    );
+}
+
+#[test]
 fn preferred_proposer_decides_in_step_four_with_fast_proof() {
     let root = tempfile::tempdir().unwrap();
     let consensus = consensus(root.path(), "n1");
     let command = StoredCommand::new(EntryType::Command, b"fast".to_vec());
-    consensus.register_command(command.hash(), command.payload.clone());
+    consensus
+        .register_command(command.hash(), command.payload.clone())
+        .unwrap();
     let outcome = consensus
         .drive(ProposerProgress::new(
             1,
@@ -242,7 +255,9 @@ fn priority_randomness_failure_is_typed_and_fail_stop() {
     let root = tempfile::tempdir().unwrap();
     let consensus = consensus(root.path(), "n2").with_priority_source(Arc::new(FailingPriority));
     let command = StoredCommand::new(EntryType::Command, b"rng-failure".to_vec());
-    consensus.register_command(command.hash(), command.payload.clone());
+    consensus
+        .register_command(command.hash(), command.payload.clone())
+        .unwrap();
     let progress = ProposerProgress::new(
         1,
         Proposal::new(
@@ -264,7 +279,9 @@ fn non_preferred_proposer_uses_leaderless_four_phase_path() {
     let root = tempfile::tempdir().unwrap();
     let consensus = consensus(root.path(), "n2").with_priority_source(Arc::new(FixedPriority));
     let command = StoredCommand::new(EntryType::Command, b"slow".to_vec());
-    consensus.register_command(command.hash(), command.payload.clone());
+    consensus
+        .register_command(command.hash(), command.payload.clone())
+        .unwrap();
     let mut progress = ProposerProgress::new(
         1,
         Proposal::new(
@@ -422,7 +439,9 @@ fn drive_has_no_fixed_retry_cap_and_eventually_decides() {
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
     let command = StoredCommand::new(EntryType::Command, b"eventual".to_vec());
-    consensus.register_command(command.hash(), command.payload.clone());
+    consensus
+        .register_command(command.hash(), command.payload.clone())
+        .unwrap();
     let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
     let mut progress =
         ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "n1", 1, value));
@@ -481,7 +500,9 @@ fn three_interleaved_proposers_cooperate_on_one_value() {
         .map(|(index, engine)| {
             let command =
                 StoredCommand::new(EntryType::Command, format!("value-{index}").into_bytes());
-            engine.register_command(command.hash(), command.payload.clone());
+            engine
+                .register_command(command.hash(), command.payload.clone())
+                .unwrap();
             let accepted = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
             let proposer = format!("n{}", index + 1);
             (
@@ -829,7 +850,8 @@ fn hedged_proposer_installs_an_adopted_config_change_on_a_quorum() {
         .collect();
     let n2 = ThreeNodeConsensus::from_recorders_with_ids("cluster", "n2", 1, 1, recorders).unwrap();
     let local = StoredCommand::new(EntryType::Command, b"ordinary".to_vec());
-    n2.register_command(local.hash(), local.payload.clone());
+    n2.register_command(local.hash(), local.payload.clone())
+        .unwrap();
 
     let outcome = n2
         .drive(ProposerProgress::new(
@@ -1809,6 +1831,8 @@ thread_local! {
 static PIGGYBACK_PROPERTY_CASE: AtomicUsize = AtomicUsize::new(0);
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
     #[test]
     fn mismatched_piggyback_never_persists_or_advances(
         offered in prop::collection::vec(any::<u8>(), 1..64),

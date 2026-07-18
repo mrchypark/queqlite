@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{hash_map, BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -32,6 +32,7 @@ const RECORDER_STATE_VERSION: u16 = 4;
 const CONFIGURATION_STATE_VERSION: u16 = 3;
 const RECORD_WORKER_QUEUE_CAPACITY: usize = 1;
 const PROOF_WORKER_QUEUE_CAPACITY: usize = 1;
+const CONTROL_WORKER_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -1123,7 +1124,8 @@ struct RecorderWal {
     frame_count: u64,
     byte_count: u64,
     slots: BTreeMap<Slot, Vec<u8>>,
-    commands: Vec<(LogHash, StoredCommand)>,
+    commands: HashMap<LogHash, StoredCommand>,
+    file: Option<fs::File>,
     failed: bool,
 }
 
@@ -1136,7 +1138,8 @@ impl Default for RecorderWal {
             frame_count: 0,
             byte_count: 0,
             slots: BTreeMap::new(),
-            commands: Vec::new(),
+            commands: HashMap::new(),
+            file: None,
             failed: false,
         }
     }
@@ -1732,31 +1735,36 @@ impl RecorderFileStore {
             .value
             .as_ref()
             .ok_or(Error::Rejected(RejectReason::InvalidRequest))?;
-        if request.command.as_ref().is_some_and(|command| {
-            AcceptedValue::from_command(
-                &self.cluster_id,
-                request.slot,
-                request.epoch,
-                request.config_id,
-                value.prev_hash,
-                command,
-            ) != *value
-        }) {
-            return Err(Error::Rejected(RejectReason::InvalidValue));
-        }
         let _guard = self
             .sync
             .lock()
             .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
         self.recover_intent()?;
         let configuration = self.configuration_state()?;
-        let change =
-            self.change_for_value_with_command_unlocked(value, request.command.as_ref())?;
+        let command = if let Some(command) = request.command.as_ref() {
+            self.validate_resolved_command_for_value(
+                request.slot,
+                configuration.config_id,
+                value,
+                command,
+            )?;
+            std::borrow::Cow::Borrowed(command)
+        } else {
+            std::borrow::Cow::Owned(self.command_for_value_unlocked(value)?)
+        };
+        let change = Self::change_for_command(&command)?;
         if !configuration.activated && change.is_none() {
             return Err(Error::Rejected(RejectReason::ActivationRequired));
         }
         self.validate_slot_gate(&configuration, request.slot, change.as_ref())?;
-        self.validate_value_with_command_unlocked(request.slot, value, request.command.as_ref())?;
+        if request.command.is_none() {
+            self.validate_resolved_command_for_value(
+                request.slot,
+                configuration.config_id,
+                value,
+                &command,
+            )?;
+        }
         let state = self.load_unlocked(request.slot, request.config_digest)?;
         if let Some(proof) = state.decision_proof() {
             return Ok(record_summary(
@@ -1900,9 +1908,6 @@ impl RecorderFileStore {
     }
 
     pub fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
-        if command.hash() != command_hash {
-            return Err(Error::CommandHashMismatch);
-        }
         let _guard = self
             .sync
             .lock()
@@ -1911,6 +1916,20 @@ impl RecorderFileStore {
     }
 
     fn store_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
+        if command.hash() != command_hash {
+            return Err(Error::CommandHashMismatch);
+        }
+        {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            match wal.commands.get(&command_hash) {
+                Some(existing) if existing == command => return Ok(()),
+                Some(_) => return Err(Error::CommandHashMismatch),
+                None => {}
+            }
+        }
         self.stage_command_unlocked(command_hash, command)?;
         self.sync_root()
     }
@@ -1918,7 +1937,7 @@ impl RecorderFileStore {
     fn stage_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
         let path = self.command_path(command_hash);
         if path.exists() {
-            return match self.fetch_command_unlocked(command_hash)? {
+            return match self.fetch_command_cache_unlocked(command_hash)? {
                 Some(existing) if existing == *command => Ok(()),
                 _ => Err(Error::CommandHashMismatch),
             };
@@ -1936,15 +1955,13 @@ impl RecorderFileStore {
     }
 
     fn load_unlocked(&self, slot: Slot, config_digest: LogHash) -> Result<RecorderSlotState> {
-        if let Some(bytes) = self
+        let wal = self
             .wal
             .lock()
-            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
-            .slots
-            .get(&slot)
-            .cloned()
-        {
-            let state = decode_recorder_state(&bytes)?;
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        if let Some(bytes) = wal.slots.get(&slot) {
+            let state = decode_recorder_state(bytes)?;
+            drop(wal);
             if state.cluster_id != self.cluster_id
                 || state.epoch != self.epoch
                 || state.config_id != self.current_config_id()
@@ -1954,6 +1971,7 @@ impl RecorderFileStore {
             }
             return Ok(state);
         }
+        drop(wal);
         let path = self.path(slot);
         if !path.exists() {
             return Ok(RecorderSlotState::new_with_digest(
@@ -2075,28 +2093,28 @@ impl RecorderFileStore {
                         "recorder WAL inline command hash mismatch".into(),
                     ));
                 }
-                upsert_wal_command(&mut replayed.commands, *hash, command.clone())?;
+                upsert_wal_command(&mut replayed.commands, *hash, command)?;
             }
             for value in recorder_state_values(&state) {
-                let command = replayed
-                    .commands
-                    .iter()
-                    .rev()
-                    .find(|(hash, _)| *hash == value.command_hash)
-                    .map(|(_, command)| command.clone())
-                    .or_else(|| {
-                        self.fetch_command_cache_unlocked(value.command_hash)
+                let cached_command;
+                let command = match replayed.commands.get(&value.command_hash) {
+                    Some(command) => command,
+                    None => {
+                        cached_command = self
+                            .fetch_command_cache_unlocked(value.command_hash)
                             .ok()
                             .flatten()
-                    })
-                    .ok_or(Error::CommandUnavailable)?;
+                            .ok_or(Error::CommandUnavailable)?;
+                        &cached_command
+                    }
+                };
                 if AcceptedValue::from_command(
                     &self.cluster_id,
                     frame.slot,
                     self.epoch,
                     next_configuration.config_id,
                     value.prev_hash,
-                    &command,
+                    command,
                 ) != *value
                 {
                     return Err(Error::Decode("recorder WAL value mismatch".into()));
@@ -2133,6 +2151,12 @@ impl RecorderFileStore {
                 .and_then(|_| sync_wal_metadata(&file))
                 .map_err(|error| Error::Io(error.to_string()))?;
         }
+        replayed.file = Some(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(|error| Error::Io(error.to_string()))?,
+        );
         replayed.byte_count = offset as u64;
         *self
             .wal
@@ -2244,18 +2268,14 @@ impl RecorderFileStore {
     }
 
     fn fetch_command_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
-        if let Some(command) = self
+        let wal = self
             .wal
             .lock()
-            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
-            .commands
-            .iter()
-            .rev()
-            .find(|(hash, _)| *hash == command_hash)
-            .map(|(_, command)| command.clone())
-        {
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        if let Some(command) = wal.commands.get(&command_hash).cloned() {
             return Ok(Some(command));
         }
+        drop(wal);
         self.fetch_command_cache_unlocked(command_hash)
     }
 
@@ -2264,6 +2284,8 @@ impl RecorderFileStore {
         if !path.exists() {
             return Ok(None);
         }
+        #[cfg(test)]
+        COMMAND_FILE_READS.with(|reads| reads.set(reads.get() + 1));
         let command =
             decode_stored_command(&fs::read(path).map_err(|err| Error::Io(err.to_string()))?)?;
         if command.hash() != command_hash {
@@ -2273,23 +2295,25 @@ impl RecorderFileStore {
     }
 
     fn validate_value_unlocked(&self, slot: Slot, value: &AcceptedValue) -> Result<()> {
-        self.validate_value_with_command_unlocked(slot, value, None)
+        let config_id = self.current_config_id();
+        let command = self.command_for_value_unlocked(value)?;
+        self.validate_resolved_command_for_value(slot, config_id, value, &command)
     }
 
-    fn validate_value_with_command_unlocked(
+    fn validate_resolved_command_for_value(
         &self,
         slot: Slot,
+        config_id: ConfigId,
         value: &AcceptedValue,
-        inline: Option<&StoredCommand>,
+        command: &StoredCommand,
     ) -> Result<()> {
-        let command = self.command_for_value_unlocked(value, inline)?;
         let expected = AcceptedValue::from_command(
             &self.cluster_id,
             slot,
             self.epoch,
-            self.current_config_id(),
+            config_id,
             value.prev_hash,
-            &command,
+            command,
         );
         if expected != *value {
             return Err(Error::Rejected(RejectReason::InvalidValue));
@@ -2298,42 +2322,21 @@ impl RecorderFileStore {
     }
 
     fn change_for_value_unlocked(&self, value: &AcceptedValue) -> Result<Option<ConfigChange>> {
-        self.change_for_value_with_command_unlocked(value, None)
+        let command = self.command_for_value_unlocked(value)?;
+        Self::change_for_command(&command)
     }
 
-    fn change_for_value_with_command_unlocked(
-        &self,
-        value: &AcceptedValue,
-        inline: Option<&StoredCommand>,
-    ) -> Result<Option<ConfigChange>> {
-        let command = self.command_for_value_unlocked(value, inline)?;
+    fn change_for_command(command: &StoredCommand) -> Result<Option<ConfigChange>> {
         if command.entry_type != EntryType::ConfigChange {
             return Ok(None);
         }
-        ConfigChange::recognize(&command)
+        ConfigChange::recognize(command)
             .map_err(|_| Error::Rejected(RejectReason::InvalidRequest))
             .map(Some)
     }
 
-    fn command_for_value_unlocked<'a>(
-        &self,
-        value: &AcceptedValue,
-        inline: Option<&'a StoredCommand>,
-    ) -> Result<std::borrow::Cow<'a, StoredCommand>> {
-        if let Some(command) = inline {
-            if command.hash() != value.command_hash {
-                return Err(Error::CommandHashMismatch);
-            }
-            if self
-                .fetch_command_unlocked(value.command_hash)?
-                .is_some_and(|existing| existing != *command)
-            {
-                return Err(Error::CommandHashMismatch);
-            }
-            return Ok(std::borrow::Cow::Borrowed(command));
-        }
+    fn command_for_value_unlocked(&self, value: &AcceptedValue) -> Result<StoredCommand> {
         self.fetch_command_unlocked(value.command_hash)?
-            .map(std::borrow::Cow::Owned)
             .ok_or(Error::CommandUnavailable)
     }
 
@@ -2709,7 +2712,7 @@ impl RecorderFileStore {
                 wal.last_digest,
             )
         };
-        let (frame, digest) = encode_wal_frame(
+        let (frame, digest, slot_bytes) = encode_wal_frame(
             generation,
             sequence,
             prev_digest,
@@ -2718,42 +2721,28 @@ impl RecorderFileStore {
             head,
             command,
         )?;
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(self.wal_path())
-            .map_err(|error| Error::Io(error.to_string()))?;
-        if let Err(error) = file.write_all(&frame) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
-            }
-            return Err(Error::Io(error.to_string()));
-        }
-        if let Err(error) = self.fail_seal_at(SealFaultPoint::AfterWalWrite) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
-            }
-            return Err(error);
-        }
-        if let Err(error) = sync_wal_append(&file) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
-            }
-            return Err(Error::Io(error.to_string()));
-        }
-        if let Err(error) = self.fail_seal_at(SealFaultPoint::AfterWalSync) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
-            }
-            return Err(error);
-        }
-        let slot_bytes = encode_recorder_state(slot_state)?;
         let mut wal = self
             .wal
             .lock()
             .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+        let append_result = (|| {
+            let file = wal
+                .file
+                .as_mut()
+                .ok_or_else(|| Error::Io("recorder WAL file is not open".into()))?;
+            file.write_all(&frame)
+                .map_err(|error| Error::Io(error.to_string()))?;
+            self.fail_seal_at(SealFaultPoint::AfterWalWrite)?;
+            sync_wal_append(file).map_err(|error| Error::Io(error.to_string()))?;
+            self.fail_seal_at(SealFaultPoint::AfterWalSync)
+        })();
+        if let Err(error) = append_result {
+            wal.failed = true;
+            return Err(error);
+        }
         wal.slots.insert(slot_state.slot(), slot_bytes);
         if let Some((hash, command)) = command {
-            upsert_wal_command(&mut wal.commands, hash, command.clone())?;
+            wal.commands.entry(hash).or_insert_with(|| command.clone());
         }
         wal.next_sequence = sequence
             .checked_add(1)
@@ -3001,10 +2990,10 @@ pub struct ThreeNodeConsensus {
     recorders: Vec<Arc<dyn RecorderRpc>>,
     record_workers: Vec<RecordWorker>,
     proof_workers: Vec<ProofWorker>,
+    control_workers: Vec<ControlWorker>,
     priority_source: Arc<dyn PrioritySource>,
     proposal_sequence: AtomicU64,
     legacy_tip: Mutex<SingleNodeState>,
-    background_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 struct RecordJob {
@@ -3062,25 +3051,29 @@ impl RecordWorker {
         })
     }
 
-    fn dispatch(&self, job: RecordJob) {
+    fn dispatch(&self, job: RecordJob) -> bool {
         self.pending.fetch_add(1, Ordering::Relaxed);
-        let failed = match &self.sender {
+        let (failed, saturated) = match &self.sender {
             Some(sender) => match sender.try_send(job) {
-                Ok(()) => None,
-                Err(std::sync::mpsc::TrySendError::Full(job)) => Some((
-                    job,
-                    Error::Io("recorder worker queue is temporarily full".into()),
-                )),
+                Ok(()) => (None, false),
+                Err(std::sync::mpsc::TrySendError::Full(job)) => (
+                    Some((
+                        job,
+                        Error::Io("recorder worker queue is temporarily full".into()),
+                    )),
+                    true,
+                ),
                 Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
-                    Some((job, Error::ProposeFailed))
+                    (Some((job, Error::ProposeFailed)), false)
                 }
             },
-            None => Some((job, Error::ProposeFailed)),
+            None => (Some((job, Error::ProposeFailed)), false),
         };
         if let Some((job, error)) = failed {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             let _ = job.result.send((job.index, Err(error)));
         }
+        saturated
     }
 
     fn is_idle(&self) -> bool {
@@ -3113,6 +3106,162 @@ struct ProofJob {
 
 struct ProofWorker {
     sender: Option<std::sync::mpsc::SyncSender<ProofJob>>,
+    handle: Option<thread::JoinHandle<()>>,
+    pending: Arc<AtomicUsize>,
+}
+
+enum ControlJob {
+    InstallProof {
+        index: usize,
+        proof: DecisionProof,
+        membership: Membership,
+        result: std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+    },
+    InspectProof {
+        index: usize,
+        slot: Slot,
+        result: std::sync::mpsc::SyncSender<(usize, Result<Option<DecisionProof>>)>,
+    },
+    LegacyInspect {
+        index: usize,
+        request: RecorderRequest,
+        result: std::sync::mpsc::SyncSender<(usize, Result<RecorderReply>)>,
+    },
+    InspectSummary {
+        index: usize,
+        slot: Slot,
+        result: std::sync::mpsc::SyncSender<(usize, Result<Option<RecordSummary>>)>,
+    },
+    StoreCommand {
+        index: usize,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+        result: std::sync::mpsc::SyncSender<(usize, Result<()>)>,
+    },
+    FetchCommand {
+        index: usize,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        result: std::sync::mpsc::SyncSender<(usize, Result<Option<StoredCommand>>)>,
+    },
+}
+
+impl ControlJob {
+    fn run(self, recorder: &dyn RecorderRpc) {
+        match self {
+            Self::InstallProof {
+                index,
+                proof,
+                membership,
+                result,
+            } => {
+                let reply = control_rpc(|| recorder.install_decision_proof(proof, &membership));
+                let _ = result.send((index, reply));
+            }
+            Self::InspectProof {
+                index,
+                slot,
+                result,
+            } => {
+                let reply = control_rpc(|| recorder.inspect_decision_proof(slot));
+                let _ = result.send((index, reply));
+            }
+            Self::LegacyInspect {
+                index,
+                request,
+                result,
+            } => {
+                let reply = control_rpc(|| recorder.call(request));
+                let _ = result.send((index, reply));
+            }
+            Self::InspectSummary {
+                index,
+                slot,
+                result,
+            } => {
+                let reply = control_rpc(|| recorder.inspect_record_summary(slot));
+                let _ = result.send((index, reply));
+            }
+            Self::StoreCommand {
+                index,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+                result,
+            } => {
+                let reply = control_rpc(|| {
+                    recorder.store_command_for(
+                        cluster_id,
+                        epoch,
+                        config_id,
+                        config_digest,
+                        command_hash,
+                        command,
+                    )
+                });
+                let _ = result.send((index, reply));
+            }
+            Self::FetchCommand {
+                index,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                result,
+            } => {
+                let reply = control_rpc(|| {
+                    recorder.fetch_command_for(
+                        cluster_id,
+                        epoch,
+                        config_id,
+                        config_digest,
+                        command_hash,
+                    )
+                });
+                let _ = result.send((index, reply));
+            }
+        }
+    }
+
+    fn fail(self, error: Error) {
+        match self {
+            Self::InstallProof { index, result, .. } | Self::StoreCommand { index, result, .. } => {
+                let _ = result.send((index, Err(error)));
+            }
+            Self::InspectProof { index, result, .. } => {
+                let _ = result.send((index, Err(error)));
+            }
+            Self::LegacyInspect { index, result, .. } => {
+                let _ = result.send((index, Err(error)));
+            }
+            Self::InspectSummary { index, result, .. } => {
+                let _ = result.send((index, Err(error)));
+            }
+            Self::FetchCommand { index, result, .. } => {
+                let _ = result.send((index, Err(error)));
+            }
+        }
+    }
+}
+
+fn control_rpc<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+        .unwrap_or(Err(Error::ProposeFailed))
+}
+
+struct ControlWorker {
+    sender: Option<std::sync::mpsc::SyncSender<ControlJob>>,
     handle: Option<thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
 }
@@ -3182,6 +3331,83 @@ impl ProofWorker {
 }
 
 impl Drop for ProofWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ControlDispatch {
+    Accepted,
+    Saturated,
+    Failed,
+}
+
+impl ControlWorker {
+    fn spawn(recorder: Arc<dyn RecorderRpc>) -> Result<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<ControlJob>(CONTROL_WORKER_QUEUE_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
+        let handle = thread::Builder::new()
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job.run(recorder.as_ref());
+                    worker_pending.fetch_sub(1, Ordering::Release);
+                }
+            })
+            .map_err(|error| Error::Io(error.to_string()))?;
+        Ok(Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            pending,
+        })
+    }
+
+    fn dispatch(&self, job: ControlJob) -> ControlDispatch {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        let (failed, outcome) = match &self.sender {
+            Some(sender) => match sender.try_send(job) {
+                Ok(()) => (None, ControlDispatch::Accepted),
+                Err(std::sync::mpsc::TrySendError::Full(job)) => (
+                    Some((
+                        job,
+                        Error::Io("recorder control worker queue is temporarily full".into()),
+                    )),
+                    ControlDispatch::Saturated,
+                ),
+                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                    (Some((job, Error::ProposeFailed)), ControlDispatch::Failed)
+                }
+            },
+            None => (Some((job, Error::ProposeFailed)), ControlDispatch::Failed),
+        };
+        if let Some((job, error)) = failed {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            job.fail(error);
+        }
+        outcome
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn control_quorum_reachable(successful: usize, saturated: usize, quorum: usize) -> bool {
+    successful.saturating_add(saturated) >= quorum
+}
+
+impl Drop for ControlWorker {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -3277,47 +3503,24 @@ impl Drop for ThreeNodeConsensus {
         for worker in &mut self.proof_workers {
             worker.shutdown();
         }
-        let handles = match self.background_threads.get_mut() {
-            Ok(handles) => std::mem::take(handles),
-            Err(poisoned) => std::mem::take(poisoned.into_inner()),
-        };
-        for handle in handles {
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+        for worker in &mut self.control_workers {
+            worker.shutdown();
         }
     }
 }
 
 impl ThreeNodeConsensus {
-    /// Waits up to `timeout` for accepted record and proof jobs plus quorum RPC
-    /// workers that outlived an early return. Returns `true` when every tracked
-    /// worker has finished. Best-effort proof jobs dropped because their queue
-    /// was full are not tracked.
+    /// Waits up to `timeout` for accepted recorder, proof, and control RPC jobs.
+    /// Returns `true` when all three worker sets are idle. Best-effort proof jobs
+    /// dropped because their queue was full are not tracked.
     /// Callers must first quiesce proposal admission and ensure no proposal
-    /// can still spawn or register workers; this only drains already tracked
-    /// workers.
+    /// can still dispatch jobs; this only drains already accepted jobs.
     pub fn finish_pending_rpcs(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            let background_empty = {
-                let mut handles = match self.background_threads.lock() {
-                    Ok(handles) => handles,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let mut index = 0;
-                while index < handles.len() {
-                    if handles[index].is_finished() {
-                        let _ = handles.swap_remove(index).join();
-                    } else {
-                        index += 1;
-                    }
-                }
-                handles.is_empty()
-            };
-            if background_empty
-                && self.record_workers.iter().all(RecordWorker::is_idle)
+            if self.record_workers.iter().all(RecordWorker::is_idle)
                 && self.proof_workers.iter().all(ProofWorker::is_idle)
+                && self.control_workers.iter().all(ControlWorker::is_idle)
             {
                 return true;
             }
@@ -3471,15 +3674,14 @@ impl ThreeNodeConsensus {
         proposer_id: impl Into<NodeId>,
         epoch: Epoch,
         config_id: ConfigId,
-        recorders: Vec<(NodeId, Box<dyn RecorderRpc>)>,
+        mut recorders: Vec<(NodeId, Box<dyn RecorderRpc>)>,
         next_index: LogIndex,
         last_hash: LogHash,
     ) -> Result<Self> {
         if next_index == 0 {
             return Err(Error::InvalidRecoveredTip);
         }
-        let mut recorders = recorders;
-        recorders.sort_by(|(left, _), (right, _)| left.cmp(right));
+        recorders.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let (recorder_ids, recorders): (Vec<_>, Vec<_>) = recorders.into_iter().unzip();
         let recorders: Vec<Arc<dyn RecorderRpc>> = recorders.into_iter().map(Arc::from).collect();
         let membership = FixedMembership::from_members(recorder_ids)?;
@@ -3497,6 +3699,11 @@ impl ThreeNodeConsensus {
             .iter()
             .map(|recorder| ProofWorker::spawn(Arc::clone(recorder), membership.clone()))
             .collect::<Result<Vec<_>>>()?;
+        let control_workers = recorders
+            .iter()
+            .cloned()
+            .map(ControlWorker::spawn)
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             cluster_id: cluster_id.into(),
             proposer_id: proposer_id.into(),
@@ -3507,13 +3714,13 @@ impl ThreeNodeConsensus {
             recorders,
             record_workers,
             proof_workers,
+            control_workers,
             priority_source: Arc::new(OsPrioritySource),
             proposal_sequence: AtomicU64::new(1),
             legacy_tip: Mutex::new(SingleNodeState {
                 next_index,
                 last_hash,
             }),
-            background_threads: Mutex::new(Vec::new()),
         })
     }
 
@@ -3522,11 +3729,16 @@ impl ThreeNodeConsensus {
         self
     }
 
-    pub fn register_command(&self, command_hash: LogHash, command_bytes: Vec<u8>) {
+    /// Stores command bytes on a recorder quorum after verifying their hash.
+    ///
+    /// [`Error::NoQuorum`] is retryable, including when bounded control-worker
+    /// queues are temporarily saturated.
+    pub fn register_command(&self, command_hash: LogHash, command_bytes: Vec<u8>) -> Result<()> {
         let command = StoredCommand::new(EntryType::Command, command_bytes);
-        if command.hash() == command_hash {
-            let _ = self.store_command_on_quorum(command_hash, &command);
+        if command.hash() != command_hash {
+            return Err(Error::CommandHashMismatch);
         }
+        self.store_command_on_quorum(command_hash, &command)
     }
 
     fn propose_next(&self, command: Command) -> Result<LogEntry> {
@@ -3753,6 +3965,13 @@ impl ThreeNodeConsensus {
         self.ensure_progress_command(&mut progress)?;
         let round = progress.step / 4;
         let phase = progress.step % 4;
+        if phase == 0 {
+            progress
+                .phase_zero_priorities
+                .retain(|(cached_round, _), _| *cached_round == round);
+        } else {
+            progress.phase_zero_priorities.clear();
+        }
         let command_targets: BTreeSet<_> = self
             .membership
             .members()
@@ -3771,15 +3990,20 @@ impl ThreeNodeConsensus {
                         if progress.step == 4 && self.proposer_id == self.membership.members()[0] {
                             ProposalPriority::MAX
                         } else {
-                            *progress
+                            match progress
                                 .phase_zero_priorities
                                 .entry((round, recorder_id.clone()))
-                                .or_insert(self.priority_source.sample(
-                                    progress.slot,
-                                    round,
-                                    &self.proposer_id,
-                                    recorder_id,
-                                )?)
+                            {
+                                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    *entry.insert(self.priority_source.sample(
+                                        progress.slot,
+                                        round,
+                                        &self.proposer_id,
+                                        recorder_id,
+                                    )?)
+                                }
+                            }
                         };
                 }
                 Ok(RecordRequest {
@@ -3837,6 +4061,7 @@ impl ThreeNodeConsensus {
                     progress.proposal = proposal.clone();
                 }
                 self.ensure_progress_command(&mut progress)?;
+                progress.phase_zero_priorities.clear();
                 return Ok(DriveOutcome::Progress(progress));
             }
         }
@@ -3930,6 +4155,7 @@ impl ThreeNodeConsensus {
         }
         self.ensure_progress_command(&mut progress)?;
         progress.step = progress.step.checked_add(1).ok_or(Error::ProposeFailed)?;
+        progress.phase_zero_priorities.clear();
         Ok(DriveOutcome::Progress(progress))
     }
 
@@ -3986,29 +4212,41 @@ impl ThreeNodeConsensus {
     fn install_decision_proof_quorum(&self, proof: DecisionProof) -> Result<()> {
         let membership = self.membership.clone();
         let quorum = membership.quorum_size();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for recorder in &self.recorders {
-            let recorder = Arc::clone(recorder);
-            let sender = sender.clone();
-            let proof = proof.clone();
-            let membership = membership.clone();
-            handles.push(thread::spawn(move || {
-                let installed = recorder.install_decision_proof(proof, &membership).is_ok();
-                let _ = sender.send(installed);
-            }));
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::InstallProof {
+                index,
+                proof: proof.clone(),
+                membership: membership.clone(),
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut installed = 0;
-        for success in receiver {
-            installed += usize::from(success);
+        let mut worker_failed = false;
+        for (_, result) in receiver {
+            match result {
+                Ok(()) => installed += 1,
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(_) => {}
+            }
             if installed >= quorum {
                 break;
             }
         }
-        self.track_background_threads(handles);
         if installed < quorum {
-            return Err(Error::NoQuorum);
+            return Err(
+                if worker_failed && !control_quorum_reachable(installed, saturated, quorum) {
+                    Error::ProposeFailed
+                } else {
+                    Error::NoQuorum
+                },
+            );
         }
         Ok(())
     }
@@ -4017,20 +4255,28 @@ impl ThreeNodeConsensus {
         let quorum = self.membership.quorum_size();
         let total = self.record_workers.len().min(requests.len());
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated_workers = vec![false; total];
         for (index, (worker, request)) in self.record_workers.iter().zip(requests).enumerate() {
-            worker.dispatch(RecordJob {
+            saturated_workers[index] = worker.dispatch(RecordJob {
                 index,
                 request,
                 result: sender.clone(),
             });
         }
         drop(sender);
-        let mut completed = 0;
+        let saturated = saturated_workers
+            .iter()
+            .filter(|saturated| **saturated)
+            .count();
+        let accepted = total.saturating_sub(saturated);
+        let mut accepted_completed = 0;
         let mut typed_errors = vec![None; total];
         let mut worker_failed = false;
         let mut replies = Vec::with_capacity(quorum);
         for (index, result) in receiver {
-            completed += 1;
+            if !saturated_workers[index] {
+                accepted_completed += 1;
+            }
             match result {
                 Ok(reply) => {
                     if !replies
@@ -4049,13 +4295,17 @@ impl ThreeNodeConsensus {
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Err(_) => {}
             }
-            if replies.len() + total.saturating_sub(completed) < quorum {
+            let accepted_remaining = accepted.saturating_sub(accepted_completed);
+            if replies.len() + saturated + accepted_remaining < quorum {
                 return match typed_errors.into_iter().flatten().next() {
                     Some(error) => Err(error),
                     None if worker_failed => Err(Error::ProposeFailed),
                     None => Ok(replies),
                 };
             }
+        }
+        if replies.len() + saturated >= quorum {
+            return Ok(replies);
         }
         match typed_errors.into_iter().flatten().next() {
             Some(error) => Err(error),
@@ -4081,35 +4331,44 @@ impl ThreeNodeConsensus {
 
     pub fn inspect_decision_proof_at(&self, slot: Slot) -> Result<Option<DecisionProof>> {
         let quorum = self.membership.quorum_size();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for (recorder_id, recorder) in self
-            .membership
-            .members()
-            .iter()
-            .cloned()
-            .zip(self.recorders.iter().cloned())
-        {
-            let sender = sender.clone();
-            handles.push(thread::spawn(move || {
-                let _ = sender.send((recorder_id, recorder.inspect_decision_proof(slot)));
-            }));
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::InspectProof {
+                index,
+                slot,
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut successful = BTreeSet::new();
         let mut proofs = Vec::new();
-        for (recorder_id, result) in receiver {
-            if let Ok(proof) = result {
-                successful.insert(recorder_id);
-                proofs.extend(proof);
-                if successful.len() >= quorum {
-                    break;
+        let mut worker_failed = false;
+        for (index, result) in receiver {
+            match result {
+                Ok(proof) => {
+                    successful.insert(self.membership.members()[index].clone());
+                    proofs.extend(proof);
                 }
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(_) => {}
+            }
+            if successful.len() >= quorum {
+                break;
             }
         }
-        self.track_background_threads(handles);
         if successful.len() < quorum {
-            return Err(Error::NoQuorum);
+            return Err(
+                if worker_failed && !control_quorum_reachable(successful.len(), saturated, quorum) {
+                    Error::ProposeFailed
+                } else {
+                    Error::NoQuorum
+                },
+            );
         }
         for proof in &proofs {
             if proof_cluster_id(proof) != self.cluster_id {
@@ -4184,37 +4443,43 @@ impl ThreeNodeConsensus {
         };
         let config_id = self.config_id;
         let config_digest = self.config_digest;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for (expected_id, recorder) in self
-            .membership
-            .members()
-            .iter()
-            .cloned()
-            .zip(self.recorders.iter().cloned())
-        {
-            let sender = sender.clone();
-            let request = request.clone();
-            handles.push(thread::spawn(move || {
-                let reply = recorder.call(request).ok().filter(|reply| {
-                    reply.recorder_id == expected_id
-                        && reply.slot == slot
-                        && reply.config_id == config_id
-                        && reply.config_digest == config_digest
-                });
-                let _ = sender.send(reply);
-            }));
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::LegacyInspect {
+                index,
+                request: request.clone(),
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut replies = Vec::with_capacity(quorum);
-        for reply in receiver.into_iter().flatten() {
-            replies.push(reply);
+        let mut worker_failed = false;
+        for (index, result) in receiver {
+            match result {
+                Ok(reply)
+                    if reply.recorder_id == self.membership.members()[index]
+                        && reply.slot == slot
+                        && reply.config_id == config_id
+                        && reply.config_digest == config_digest =>
+                {
+                    replies.push(reply);
+                }
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Ok(_) | Err(_) => {}
+            }
             if replies.len() >= quorum {
                 break;
             }
         }
-        self.track_background_threads(handles);
         if replies.len() < quorum {
+            if worker_failed && !control_quorum_reachable(replies.len(), saturated, quorum) {
+                return Err(Error::ProposeFailed);
+            }
             return Ok(CertifiedDecisionInspection::Unavailable);
         }
         if replies
@@ -4235,44 +4500,47 @@ impl ThreeNodeConsensus {
         let quorum = self.membership.quorum_size();
         let config_id = self.config_id;
         let config_digest = self.config_digest;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for (expected_id, recorder) in self
-            .membership
-            .members()
-            .iter()
-            .cloned()
-            .zip(self.recorders.iter().cloned())
-        {
-            let sender = sender.clone();
-            handles.push(thread::spawn(move || {
-                let summary = recorder.inspect_record_summary(slot).and_then(|summary| {
-                    if summary.as_ref().is_none_or(|summary| {
-                        summary.recorder_id == expected_id
-                            && summary.slot == slot
-                            && summary.config_id == config_id
-                            && summary.config_digest == config_digest
-                    }) {
-                        Ok(summary)
-                    } else {
-                        Err(Error::Rejected(RejectReason::InvalidRequest))
-                    }
-                });
-                let _ = sender.send(summary);
-            }));
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::InspectSummary {
+                index,
+                slot,
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut successful = 0;
         let mut summaries = Vec::new();
-        for summary in receiver.into_iter().flatten() {
-            successful += 1;
-            summaries.extend(summary);
+        let mut worker_failed = false;
+        for (index, result) in receiver {
+            match result {
+                Ok(summary)
+                    if summary.as_ref().is_none_or(|summary| {
+                        summary.recorder_id == self.membership.members()[index]
+                            && summary.slot == slot
+                            && summary.config_id == config_id
+                            && summary.config_digest == config_digest
+                    }) =>
+                {
+                    successful += 1;
+                    summaries.extend(summary);
+                }
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Ok(_) | Err(_) => {}
+            }
             if successful >= quorum {
                 break;
             }
         }
-        self.track_background_threads(handles);
         if successful < quorum {
+            if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
+                return Err(Error::ProposeFailed);
+            }
             return Ok(CertifiedDecisionInspection::Unavailable);
         }
         if summaries.is_empty() {
@@ -4425,42 +4693,46 @@ impl ThreeNodeConsensus {
         command_hash: LogHash,
         command: &StoredCommand,
     ) -> Result<()> {
-        let quorum = quorum_size(self.recorders.len());
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for recorder in &self.recorders {
-            let recorder = Arc::clone(recorder);
-            let command = command.clone();
-            let cluster_id = self.cluster_id.clone();
-            let epoch = self.epoch;
-            let config_id = self.config_id;
-            let config_digest = self.config_digest;
-            let sender = sender.clone();
-            handles.push(thread::spawn(move || {
-                let stored = recorder
-                    .store_command_for(
-                        cluster_id,
-                        epoch,
-                        config_id,
-                        config_digest,
-                        command_hash,
-                        command,
-                    )
-                    .is_ok();
-                let _ = sender.send(stored);
-            }));
+        let quorum = quorum_size(self.control_workers.len());
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::StoreCommand {
+                index,
+                cluster_id: self.cluster_id.clone(),
+                epoch: self.epoch,
+                config_id: self.config_id,
+                config_digest: self.config_digest,
+                command_hash,
+                command: command.clone(),
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut stored = 0;
-        for success in receiver {
-            stored += usize::from(success);
+        let mut worker_failed = false;
+        for (_, result) in receiver {
+            match result {
+                Ok(()) => stored += 1,
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(_) => {}
+            }
             if stored >= quorum {
                 break;
             }
         }
-        self.track_background_threads(handles);
         if stored < quorum {
-            return Err(Error::NoQuorum);
+            return Err(
+                if worker_failed && !control_quorum_reachable(stored, saturated, quorum) {
+                    Error::ProposeFailed
+                } else {
+                    Error::NoQuorum
+                },
+            );
         }
         Ok(())
     }
@@ -4470,69 +4742,63 @@ impl ThreeNodeConsensus {
         slot: Slot,
         value: &AcceptedValue,
     ) -> Result<Option<StoredCommand>> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut handles = Vec::with_capacity(self.recorders.len());
-        for recorder in &self.recorders {
-            let recorder = Arc::clone(recorder);
-            let sender = sender.clone();
-            let cluster_id = self.cluster_id.clone();
-            let command_hash = value.command_hash;
-            let epoch = self.epoch;
-            let config_id = self.config_id;
-            let config_digest = self.config_digest;
-            handles.push(thread::spawn(move || {
-                let fetched = recorder.fetch_command_for(
-                    cluster_id,
-                    epoch,
-                    config_id,
-                    config_digest,
-                    command_hash,
-                );
-                let _ = sender.send(fetched);
-            }));
+        let quorum = quorum_size(self.control_workers.len());
+        let total = self.control_workers.len();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let mut saturated = 0;
+        for (index, worker) in self.control_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::FetchCommand {
+                index,
+                cluster_id: self.cluster_id.clone(),
+                epoch: self.epoch,
+                config_id: self.config_id,
+                config_digest: self.config_digest,
+                command_hash: value.command_hash,
+                result: sender.clone(),
+            }) == ControlDispatch::Saturated
+            {
+                saturated += 1;
+            }
         }
         drop(sender);
         let mut mismatch = false;
-        for command in receiver.into_iter().filter_map(Result::ok).flatten() {
-            if command.hash() != value.command_hash {
-                continue;
+        let mut successful = 0;
+        let mut worker_failed = false;
+        for (_, result) in receiver {
+            match result {
+                Ok(command) => {
+                    successful += 1;
+                    if let Some(command) = command {
+                        if command.hash() != value.command_hash {
+                            continue;
+                        }
+                        let expected = AcceptedValue::from_command(
+                            &self.cluster_id,
+                            slot,
+                            self.epoch,
+                            self.config_id,
+                            value.prev_hash,
+                            &command,
+                        );
+                        if expected == *value {
+                            return Ok(Some(command));
+                        }
+                        mismatch = true;
+                    }
+                }
+                Err(Error::ProposeFailed) => worker_failed = true,
+                Err(_) => {}
             }
-            let expected = AcceptedValue::from_command(
-                &self.cluster_id,
-                slot,
-                self.epoch,
-                self.config_id,
-                value.prev_hash,
-                &command,
-            );
-            if expected == *value {
-                self.track_background_threads(handles);
-                return Ok(Some(command));
-            }
-            mismatch = true;
         }
-        self.track_background_threads(handles);
         if mismatch {
             Err(Error::Rejected(RejectReason::InvalidValue))
+        } else if successful < quorum && saturated > 0 {
+            Err(Error::NoQuorum)
+        } else if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
+            Err(Error::ProposeFailed)
         } else {
             Ok(None)
         }
-    }
-
-    fn track_background_threads(&self, handles: Vec<thread::JoinHandle<()>>) {
-        let mut background = match self.background_threads.lock() {
-            Ok(background) => background,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let mut index = 0;
-        while index < background.len() {
-            if background[index].is_finished() {
-                let _ = background.swap_remove(index).join();
-            } else {
-                index += 1;
-            }
-        }
-        background.extend(handles);
     }
 
     fn ensure_progress_command(&self, progress: &mut ProposerProgress) -> Result<()> {
@@ -4564,15 +4830,14 @@ impl ThreeNodeConsensus {
         value: &AcceptedValue,
         command: &StoredCommand,
     ) -> bool {
-        command.hash() == value.command_hash
-            && AcceptedValue::from_command(
-                &self.cluster_id,
-                slot,
-                self.epoch,
-                self.config_id,
-                value.prev_hash,
-                command,
-            ) == *value
+        AcceptedValue::from_command(
+            &self.cluster_id,
+            slot,
+            self.epoch,
+            self.config_id,
+            value.prev_hash,
+            command,
+        ) == *value
     }
 
     fn log_entry_from_value(
@@ -5443,6 +5708,9 @@ std::thread_local! {
     static LAST_FILE_SYNC_KIND: std::cell::Cell<Option<FileSyncKind>> = const {
         std::cell::Cell::new(None)
     };
+    static COMMAND_FILE_READS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -5517,6 +5785,16 @@ fn last_file_sync_kind() -> Option<FileSyncKind> {
     LAST_FILE_SYNC_KIND.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+fn reset_command_file_reads() {
+    COMMAND_FILE_READS.with(|reads| reads.set(0));
+}
+
+#[cfg(test)]
+fn command_file_reads() -> usize {
+    COMMAND_FILE_READS.with(std::cell::Cell::get)
+}
+
 const CONFIGURATION_HEAD_INTENT_MAGIC: &[u8; 4] = b"QCHI";
 
 fn encode_configuration_head_intent(configuration: &[u8], head: &[u8]) -> Vec<u8> {
@@ -5576,7 +5854,7 @@ fn encode_wal_frame(
     configuration: &ConfigurationState,
     head: &RecordedHeadProvenance,
     command: Option<(LogHash, &StoredCommand)>,
-) -> Result<(Vec<u8>, LogHash)> {
+) -> Result<(Vec<u8>, LogHash, Vec<u8>)> {
     let slot_bytes = encode_recorder_state(slot_state)?;
     let configuration_bytes = encode_configuration_state(configuration)?;
     let mut payload = Vec::new();
@@ -5608,7 +5886,7 @@ fn encode_wal_frame(
     frame.extend_from_slice(&payload);
     let digest = LogHash::digest(&[&frame]);
     frame.extend_from_slice(digest.as_bytes());
-    Ok((frame, digest))
+    Ok((frame, digest, slot_bytes))
 }
 
 fn decode_wal_frame(bytes: &[u8], offset: usize) -> Result<Option<(WalFrame, usize)>> {
@@ -5721,19 +5999,20 @@ fn decode_head_provenance(bytes: &[u8], cursor: &mut usize) -> Result<RecordedHe
 }
 
 fn upsert_wal_command(
-    commands: &mut Vec<(LogHash, StoredCommand)>,
+    commands: &mut HashMap<LogHash, StoredCommand>,
     hash: LogHash,
-    command: StoredCommand,
+    command: &StoredCommand,
 ) -> Result<()> {
-    if let Some((_, existing)) = commands.iter().find(|(existing, _)| *existing == hash) {
-        return if *existing == command {
-            Ok(())
-        } else {
+    match commands.entry(hash) {
+        hash_map::Entry::Occupied(existing) if existing.get() != command => {
             Err(Error::CommandHashMismatch)
-        };
+        }
+        hash_map::Entry::Occupied(_) => Ok(()),
+        hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(command.clone());
+            Ok(())
+        }
     }
-    commands.push((hash, command));
-    Ok(())
 }
 
 fn encode_recorded_head(
@@ -5847,7 +6126,7 @@ fn decode_recorded_head(
         value => {
             return Err(Error::Decode(format!(
                 "invalid recorder durable head provenance {value}"
-            )))
+            )));
         }
     };
     let wal_checkpoint = WalCheckpoint {
@@ -6107,17 +6386,23 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wal_frame, encode_wal_frame, last_file_sync_kind, reset_sync_counts, sync_counts,
-        sync_wal_append, sync_wal_metadata, AcceptedValue, ConfigChange, ConfigurationState,
-        Consensus, Error, FileSyncKind, Membership, Proposal, ProposalPriority, ProposerProgress,
-        RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderRpc,
-        RecorderSlotState, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        command_file_reads, decode_wal_frame, encode_stored_command, encode_wal_frame,
+        last_file_sync_kind, reset_command_file_reads, reset_sync_counts, sync_counts,
+        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, ConfigChange,
+        ConfigurationState, Consensus, ControlDispatch, ControlJob, DecisionProof, DriveOutcome,
+        Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
+        ProposerProgress, RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore,
+        RecorderRequest, RecorderRpc, RecorderSlotState, RecorderSummary, RejectReason,
+        SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
-        collections::HashSet,
-        sync::{mpsc, Arc, Mutex},
+        collections::{HashMap, HashSet},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Condvar, Mutex,
+        },
         thread,
         time::Duration,
     };
@@ -6175,6 +6460,97 @@ mod tests {
         }
     }
 
+    struct ThreadRecordingControlRecorder {
+        threads: Arc<Mutex<HashSet<thread::ThreadId>>>,
+    }
+
+    impl RecorderRpc for ThreadRecordingControlRecorder {
+        fn inspect_decision_proof(
+            &self,
+            _slot: u64,
+        ) -> super::Result<Option<super::DecisionProof>> {
+            self.threads.lock().unwrap().insert(thread::current().id());
+            Ok(None)
+        }
+    }
+
+    struct BlockingControlRecorder {
+        recorder_id: &'static str,
+        started: mpsc::SyncSender<u64>,
+        release_first: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct BlockingCommandStoreRecorder {
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct SuccessfulCommandStoreRecorder;
+
+    impl RecorderRpc for SuccessfulCommandStoreRecorder {
+        fn store_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingCommandStoreRecorder;
+
+    impl RecorderRpc for FailingCommandStoreRecorder {
+        fn store_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            Err(Error::ProposeFailed)
+        }
+    }
+
+    impl RecorderRpc for BlockingCommandStoreRecorder {
+        fn store_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+            _command: StoredCommand,
+        ) -> super::Result<()> {
+            self.started.send(()).unwrap();
+            let (released, condition) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    impl RecorderRpc for BlockingControlRecorder {
+        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+            Ok(record_summary(self.recorder_id, request))
+        }
+
+        fn inspect_decision_proof(&self, slot: u64) -> super::Result<Option<super::DecisionProof>> {
+            self.started.send(slot).unwrap();
+            if slot == 1 {
+                self.release_first.lock().unwrap().recv().unwrap();
+            }
+            Ok(None)
+        }
+    }
+
     struct BlockingRecorder {
         recorder_id: &'static str,
         started: mpsc::SyncSender<u64>,
@@ -6210,6 +6586,21 @@ mod tests {
         }
     }
 
+    struct RejectFromSlotRecorder {
+        recorder_id: &'static str,
+        reject_from: u64,
+    }
+
+    impl RecorderRpc for RejectFromSlotRecorder {
+        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+            if request.slot >= self.reject_from {
+                Err(Error::Rejected(RejectReason::InvalidRequest))
+            } else {
+                Ok(record_summary(self.recorder_id, request))
+            }
+        }
+    }
+
     struct PanickingRecorder;
 
     impl RecorderRpc for PanickingRecorder {
@@ -6218,11 +6609,142 @@ mod tests {
         }
     }
 
+    struct FailingFromSlotRecorder {
+        recorder_id: &'static str,
+        fail_from: u64,
+    }
+
+    impl RecorderRpc for FailingFromSlotRecorder {
+        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+            if request.slot >= self.fail_from {
+                Err(Error::ProposeFailed)
+            } else {
+                Ok(record_summary(self.recorder_id, request))
+            }
+        }
+    }
+
     struct AlwaysIoRecorder;
 
     impl RecorderRpc for AlwaysIoRecorder {
         fn record(&self, _request: RecordRequest) -> super::Result<RecordSummary> {
             Err(Error::Io("injected recorder unavailable".into()))
+        }
+    }
+
+    struct MissingCommandRecorder {
+        observed: mpsc::SyncSender<()>,
+    }
+
+    impl RecorderRpc for MissingCommandRecorder {
+        fn fetch_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            self.observed.send(()).unwrap();
+            Ok(None)
+        }
+    }
+
+    struct BlockingCommandRecorder {
+        started: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        command: StoredCommand,
+    }
+
+    struct AvailableCommandRecorder {
+        command: StoredCommand,
+    }
+
+    impl RecorderRpc for AvailableCommandRecorder {
+        fn fetch_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            Ok(Some(self.command.clone()))
+        }
+    }
+
+    struct FailingCommandFetchRecorder;
+
+    impl RecorderRpc for FailingCommandFetchRecorder {
+        fn fetch_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            Err(Error::ProposeFailed)
+        }
+    }
+
+    impl RecorderRpc for BlockingCommandRecorder {
+        fn fetch_command_for(
+            &self,
+            _cluster_id: String,
+            _epoch: u64,
+            _config_id: u64,
+            _config_digest: LogHash,
+            _command_hash: LogHash,
+        ) -> super::Result<Option<StoredCommand>> {
+            self.started.send(()).unwrap();
+            let _ = self.release.lock().unwrap().recv();
+            Ok(Some(self.command.clone()))
+        }
+    }
+
+    struct FailingPrioritySource;
+
+    impl PrioritySource for FailingPrioritySource {
+        fn sample(
+            &self,
+            _slot: u64,
+            _round: u64,
+            _proposer_id: &str,
+            _recorder_id: &str,
+        ) -> super::Result<ProposalPriority> {
+            Err(Error::RandomnessUnavailable("unexpected sample".into()))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingPrioritySource {
+        samples: AtomicUsize,
+    }
+
+    impl PrioritySource for CountingPrioritySource {
+        fn sample(
+            &self,
+            _slot: u64,
+            _round: u64,
+            _proposer_id: &str,
+            _recorder_id: &str,
+        ) -> super::Result<ProposalPriority> {
+            let sample = self.samples.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(ProposalPriority::from_u64(sample as u64))
+        }
+    }
+
+    struct CatchUpRecorder {
+        recorder_id: &'static str,
+        step: u64,
+    }
+
+    impl RecorderRpc for CatchUpRecorder {
+        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+            let mut summary = record_summary(self.recorder_id, request);
+            summary.step = self.step;
+            Ok(summary)
         }
     }
 
@@ -6242,6 +6764,161 @@ mod tests {
         assert_eq!(second.index, 2);
         assert_eq!(second.prev_hash, first.hash);
         assert_eq!(second.hash, second.recompute_hash());
+    }
+
+    #[test]
+    fn cached_phase_zero_priorities_do_not_resample_randomness() {
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "writer",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(SlotRecorder {
+                            recorder_id,
+                            reject_slot: None,
+                            observed: None,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+        .with_priority_source(Arc::new(FailingPrioritySource));
+        let command = StoredCommand::new(EntryType::Command, b"cached-priority".to_vec());
+        let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
+        let mut progress =
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "writer", 1, value))
+                .with_command(command);
+        progress.step = 0;
+        for recorder_id in ["n1", "n2", "n3"] {
+            progress
+                .phase_zero_priorities
+                .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
+        }
+
+        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+            panic!("phase zero quorum should advance progress");
+        };
+        assert!(progress.phase_zero_priorities.is_empty());
+    }
+
+    #[test]
+    fn phase_zero_priorities_are_stable_only_for_pending_retries_in_the_current_round() {
+        let source = Arc::new(CountingPrioritySource::default());
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "writer",
+            1,
+            1,
+            vec![
+                (
+                    "n1".into(),
+                    Box::new(SlotRecorder {
+                        recorder_id: "n1",
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                ("n2".into(), Box::new(AlwaysIoRecorder)),
+                ("n3".into(), Box::new(AlwaysIoRecorder)),
+            ],
+        )
+        .unwrap()
+        .with_priority_source(source.clone());
+        let command = StoredCommand::new(EntryType::Command, b"bounded-priorities".to_vec());
+        let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
+        let mut progress =
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "writer", 1, value))
+                .with_command(command);
+        progress.step = 0;
+
+        let DriveOutcome::Pending(mut progress) = consensus.drive(progress).unwrap() else {
+            panic!("one recorder reply should leave progress pending");
+        };
+        assert_eq!(progress.phase_zero_priorities.len(), 3);
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3);
+
+        let DriveOutcome::Pending(retry) = consensus.drive(progress.clone()).unwrap() else {
+            panic!("same-round retry should remain pending");
+        };
+        assert_eq!(retry.phase_zero_priorities, progress.phase_zero_priorities);
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3);
+
+        for round in 1..=64 {
+            progress.step = round * 4;
+            let DriveOutcome::Pending(next) = consensus.drive(progress).unwrap() else {
+                panic!("one recorder reply should leave progress pending");
+            };
+            assert_eq!(next.phase_zero_priorities.len(), 3);
+            assert!(next
+                .phase_zero_priorities
+                .keys()
+                .all(|(cached_round, _)| *cached_round == round));
+            progress = next;
+        }
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3 * 65);
+    }
+
+    #[test]
+    fn phase_zero_priorities_are_cleared_when_progress_catches_up() {
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "writer",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(CatchUpRecorder {
+                            recorder_id,
+                            step: 8,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+        .with_priority_source(Arc::new(FailingPrioritySource));
+        let command = StoredCommand::new(EntryType::Command, b"catch-up".to_vec());
+        let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
+        let mut progress =
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "writer", 1, value))
+                .with_command(command);
+        progress.step = 0;
+        for recorder_id in ["n1", "n2", "n3"] {
+            progress
+                .phase_zero_priorities
+                .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
+        }
+
+        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+            panic!("higher recorder steps should catch progress up");
+        };
+        assert_eq!(progress.step, 8);
+        assert!(progress.phase_zero_priorities.is_empty());
+    }
+
+    #[test]
+    fn wal_command_cache_rejects_same_hash_with_different_payload() {
+        let hash = LogHash::digest(&[b"forced-cache-key"]);
+        let first = StoredCommand::new(EntryType::Command, b"first".to_vec());
+        let second = StoredCommand::new(EntryType::Command, b"second".to_vec());
+        let mut commands = HashMap::new();
+
+        upsert_wal_command(&mut commands, hash, &first).unwrap();
+        upsert_wal_command(&mut commands, hash, &first).unwrap();
+        assert_eq!(
+            upsert_wal_command(&mut commands, hash, &second),
+            Err(Error::CommandHashMismatch)
+        );
+        assert_eq!(commands.len(), 1);
     }
 
     #[test]
@@ -6297,6 +6974,419 @@ mod tests {
             .unwrap();
 
         assert_eq!(sync_counts(), (1, 0));
+    }
+
+    #[test]
+    fn wal_durable_command_store_adds_no_sync_and_survives_proof_checkpoint_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"proof-worker-command".to_vec());
+        let command_hash = command.hash();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        let proposal = Proposal::new(ProposalPriority::MAX, "writer", 1, value);
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 8,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: ["n1", "n2"]
+                .into_iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.into(),
+                    slot: 8,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal,
+                command: Some(command.clone()),
+            })
+            .unwrap();
+
+        reset_sync_counts();
+        RecorderRpc::store_command_for(
+            &store,
+            "cluster".into(),
+            1,
+            1,
+            membership.digest(),
+            command_hash,
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(sync_counts(), (0, 0));
+        assert!(!store.command_path(command_hash).exists());
+
+        store
+            .install_decision_proof_record(proof.clone(), &membership)
+            .unwrap();
+        drop(store);
+
+        let reopened = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.fetch_command(command_hash).unwrap(),
+            Some(command.clone())
+        );
+        assert_eq!(reopened.load(8).unwrap().decision_proof(), Some(&proof));
+        reopened.checkpoint_wal_unlocked().unwrap();
+        assert!(reopened.command_path(command_hash).exists());
+        drop(reopened);
+
+        let checkpointed =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(
+            checkpointed.fetch_command(command_hash).unwrap(),
+            Some(command)
+        );
+        assert_eq!(checkpointed.load(8).unwrap().decision_proof(), Some(&proof));
+    }
+
+    #[test]
+    fn duplicate_command_file_store_keeps_the_root_directory_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"durable-command".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        reset_sync_counts();
+
+        store.store_command(command.hash(), command).unwrap();
+
+        assert_eq!(sync_counts(), (0, 1));
+    }
+
+    #[test]
+    fn direct_store_command_rejects_a_claimed_hash_without_creating_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"mismatched-hash".to_vec());
+        let claimed_hash = LogHash::digest(&[b"claimed-hash"]);
+
+        assert_eq!(
+            store.apply(RecorderRequest::StoreCommand {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                command_hash: claimed_hash,
+                command,
+            }),
+            Err(Error::CommandHashMismatch)
+        );
+        assert!(!store.command_path(claimed_hash).exists());
+    }
+
+    #[test]
+    fn wal_command_store_rejects_conflicting_bytes_without_syncing() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"expected".to_vec());
+        let conflicting = StoredCommand::new(EntryType::Command, b"conflicting".to_vec());
+        store
+            .wal
+            .lock()
+            .unwrap()
+            .commands
+            .insert(command.hash(), conflicting);
+        reset_sync_counts();
+
+        assert_eq!(
+            store.store_command(command.hash(), command.clone()),
+            Err(Error::CommandHashMismatch)
+        );
+        assert_eq!(sync_counts(), (0, 0));
+        assert!(!store.command_path(command.hash()).exists());
+    }
+
+    #[test]
+    fn prestored_command_resolution_revalidates_the_durable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"pre-stored-command".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        reset_command_file_reads();
+
+        for slot in [8, 9] {
+            let value = AcceptedValue::from_command("cluster", slot, 1, 1, LogHash::ZERO, &command);
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", slot, value),
+                    command: None,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(command_file_reads(), 2);
+    }
+
+    #[test]
+    fn commandless_record_rejects_a_prestored_command_replaced_while_open() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"pre-stored".to_vec());
+        let replacement = StoredCommand::new(EntryType::Command, b"replacement".to_vec());
+        let command_hash = command.hash();
+        store.store_command(command_hash, command.clone()).unwrap();
+        std::fs::write(
+            store.command_path(command_hash),
+            encode_stored_command(&replacement),
+        )
+        .unwrap();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+
+        assert_eq!(
+            store.record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value.clone()),
+                command: None,
+            }),
+            Err(Error::CommandHashMismatch)
+        );
+        assert_eq!(store.load(8).unwrap().isr.step(), 0);
+        drop(store);
+
+        let reopened = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: None,
+            }),
+            Err(Error::CommandHashMismatch)
+        );
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 0);
+    }
+
+    #[test]
+    fn duplicate_store_rejects_a_prestored_command_replaced_while_open() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"pre-stored".to_vec());
+        let replacement = StoredCommand::new(EntryType::Command, b"replacement".to_vec());
+        let command_hash = command.hash();
+        store.store_command(command_hash, command.clone()).unwrap();
+        std::fs::write(
+            store.command_path(command_hash),
+            encode_stored_command(&replacement),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.store_command(command_hash, command),
+            Err(Error::CommandHashMismatch)
+        );
+    }
+
+    #[test]
+    fn record_rejects_mismatched_inline_command_independent_of_prestored_command_state() {
+        for prestored in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            let expected = StoredCommand::new(EntryType::Command, b"expected".to_vec());
+            if prestored {
+                store
+                    .store_command(expected.hash(), expected.clone())
+                    .unwrap();
+            }
+            let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &expected);
+            let mismatched = StoredCommand::new(EntryType::Command, b"mismatched".to_vec());
+
+            assert_eq!(
+                store.record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 8,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                    command: Some(mismatched),
+                }),
+                Err(Error::Rejected(RejectReason::InvalidValue)),
+                "prestored={prestored}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_record_uses_the_bound_command_without_reading_the_durable_command_file() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"inline-hot-path".to_vec());
+        let command_hash = command.hash();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        std::fs::write(store.command_path(command_hash), b"corrupt cache entry").unwrap();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        reset_command_file_reads();
+
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: Some(command.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(command_file_reads(), 0);
+        assert_eq!(
+            store.fetch_command(command_hash).unwrap(),
+            Some(command.clone())
+        );
+        drop(store);
+
+        reset_command_file_reads();
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(command_file_reads(), 0);
+        assert_eq!(reopened.fetch_command(command_hash).unwrap(), Some(command));
+    }
+
+    #[test]
+    fn record_rejects_malformed_config_change_piggyback_as_invalid_value_before_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let expected = StoredCommand::new(EntryType::Command, b"expected".to_vec());
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &expected);
+        let malformed = StoredCommand::new(EntryType::ConfigChange, b"malformed".to_vec());
+
+        assert_eq!(
+            store.record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: Some(malformed),
+            }),
+            Err(Error::Rejected(RejectReason::InvalidValue))
+        );
     }
 
     #[test]
@@ -6637,7 +7727,7 @@ mod tests {
                 configuration.config_digest(),
             );
             let command = StoredCommand::new(EntryType::Command, payload);
-            let (encoded, digest) = encode_wal_frame(
+            let (encoded, digest, slot_bytes) = encode_wal_frame(
                 3,
                 sequence,
                 LogHash::ZERO,
@@ -6651,6 +7741,7 @@ mod tests {
             prop_assert_eq!(decoded.generation, 3);
             prop_assert_eq!(decoded.sequence, sequence);
             prop_assert_eq!(decoded.digest, digest);
+            prop_assert_eq!(decoded.slot_bytes, slot_bytes);
             prop_assert_eq!(decoded.command, Some((command.hash(), command)));
         }
     }
@@ -6792,10 +7883,68 @@ mod tests {
     }
 
     #[test]
-    fn saturated_minority_queue_does_not_delay_or_contaminate_later_broadcasts() {
-        let (started_tx, started_rx) = mpsc::sync_channel(2);
+    fn unsorted_explicit_recorder_ids_preserve_rpc_pairing_across_worker_paths() {
+        let recorders = ["n3", "n1", "n2"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(SlotRecorder {
+                        recorder_id,
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 1))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn repeated_control_operations_reuse_one_worker_thread_per_recorder() {
+        let seen: Vec<_> = (0..3)
+            .map(|_| Arc::new(Mutex::new(HashSet::new())))
+            .collect();
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .zip(&seen)
+            .map(|(recorder_id, threads)| {
+                (
+                    recorder_id.into(),
+                    Box::new(ThreadRecordingControlRecorder {
+                        threads: Arc::clone(threads),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        for slot in 1..=16 {
+            assert_eq!(consensus.inspect_decision_proof_at(slot).unwrap(), None);
+        }
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+
+        assert!(seen
+            .iter()
+            .all(|threads| threads.lock().unwrap().len() == 1));
+    }
+
+    #[test]
+    fn blocked_control_minority_does_not_delay_record_quorum() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let (reject_seen_tx, reject_seen_rx) = mpsc::sync_channel(1);
         let recorders = vec![
             (
                 "n1".into(),
@@ -6803,6 +7952,285 @@ mod tests {
                     recorder_id: "n1",
                     reject_slot: None,
                     observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(BlockingControlRecorder {
+                    recorder_id: "n2",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n3",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let replies = consensus
+            .record_broadcast(record_requests(&consensus, 1))
+            .unwrap();
+        assert_eq!(replies.len(), 2);
+
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn saturated_control_queue_does_not_contaminate_later_requests() {
+        let (started_tx, started_rx) = mpsc::sync_channel(4);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n1",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(BlockingControlRecorder {
+                    recorder_id: "n2",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n3",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(consensus.inspect_decision_proof_at(2).unwrap(), None);
+        assert_eq!(consensus.inspect_decision_proof_at(3).unwrap(), None);
+
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert_eq!(consensus.inspect_decision_proof_at(4).unwrap(), None);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(4));
+    }
+
+    #[test]
+    fn command_registration_returns_no_quorum_when_all_control_queues_are_full() {
+        let (started_tx, started_rx) = mpsc::sync_channel(3);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(BlockingCommandStoreRecorder {
+                        started: started_tx.clone(),
+                        release: Arc::clone(&release),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let first = StoredCommand::new(EntryType::Command, b"first".to_vec());
+        let registering = Arc::clone(&consensus);
+        let first_hash = first.hash();
+        let first_payload = first.payload.clone();
+        let registration =
+            thread::spawn(move || registering.register_command(first_hash, first_payload));
+
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        let queued = StoredCommand::new(EntryType::Command, b"queued".to_vec());
+        let (queued_tx, _queued_rx) = mpsc::sync_channel(3);
+        for (index, worker) in consensus.control_workers.iter().enumerate() {
+            worker.dispatch(ControlJob::StoreCommand {
+                index,
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: consensus.membership().digest(),
+                command_hash: queued.hash(),
+                command: queued.clone(),
+                result: queued_tx.clone(),
+            });
+        }
+
+        let saturated = StoredCommand::new(EntryType::Command, b"saturated".to_vec());
+        assert_eq!(
+            consensus.register_command(saturated.hash(), saturated.payload),
+            Err(Error::NoQuorum)
+        );
+
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        assert_eq!(registration.join().unwrap(), Ok(()));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn saturated_control_worker_keeps_command_quorum_retryable_after_worker_failure() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingCommandStoreRecorder {
+                    started: started_tx,
+                    release: Arc::clone(&release),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(SuccessfulCommandStoreRecorder) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(FailingCommandStoreRecorder) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let first = StoredCommand::new(EntryType::Command, b"first".to_vec());
+        let registering = Arc::clone(&consensus);
+        let registration =
+            thread::spawn(move || registering.register_command(first.hash(), first.payload));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let queued = StoredCommand::new(EntryType::Command, b"queued".to_vec());
+        let (queued_tx, _queued_rx) = mpsc::sync_channel(1);
+        consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
+            index: 0,
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: consensus.membership().digest(),
+            command_hash: queued.hash(),
+            command: queued,
+            result: queued_tx,
+        });
+
+        let retry = StoredCommand::new(EntryType::Command, b"retry".to_vec());
+        assert_eq!(
+            consensus.register_command(retry.hash(), retry.payload),
+            Err(Error::NoQuorum)
+        );
+
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        assert_eq!(registration.join().unwrap(), Ok(()));
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn control_worker_finish_and_drop_are_bounded() {
+        let new_consensus = || {
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let recorders = vec![
+                (
+                    "n1".into(),
+                    Box::new(SlotRecorder {
+                        recorder_id: "n1",
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n2".into(),
+                    Box::new(BlockingControlRecorder {
+                        recorder_id: "n2",
+                        started: started_tx,
+                        release_first: Mutex::new(release_rx),
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                (
+                    "n3".into(),
+                    Box::new(SlotRecorder {
+                        recorder_id: "n3",
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+            ];
+            (
+                ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders)
+                    .unwrap(),
+                started_rx,
+                release_tx,
+            )
+        };
+
+        let (consensus, started_rx, release_tx) = new_consensus();
+        let consensus = Arc::new(consensus);
+        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let finishing = Arc::clone(&consensus);
+        let finisher = thread::spawn(move || {
+            finished_tx
+                .send(finishing.finish_pending_rpcs(Duration::from_millis(10)))
+                .unwrap();
+        });
+        assert_eq!(finished_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        finisher.join().unwrap();
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+
+        let (consensus, started_rx, release_tx) = new_consensus();
+        assert_eq!(consensus.inspect_decision_proof_at(1).unwrap(), None);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(consensus);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(dropped, Ok(()));
+    }
+
+    #[test]
+    fn saturated_minority_queue_does_not_delay_or_contaminate_later_broadcasts() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (n1_seen_tx, n1_seen_rx) = mpsc::sync_channel(1);
+        let (reject_seen_tx, reject_seen_rx) = mpsc::sync_channel(1);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n1",
+                    reject_slot: None,
+                    observed: Some(n1_seen_tx),
                 }) as Box<dyn RecorderRpc>,
             ),
             (
@@ -6831,6 +8259,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
         assert_eq!(reject_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
 
         let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -6841,6 +8270,7 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(reject_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert_eq!(n1_seen_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
         assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         let (third_done_tx, third_done_rx) = mpsc::sync_channel(1);
@@ -6869,6 +8299,293 @@ mod tests {
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
         second.join().unwrap();
         third.join().unwrap();
+    }
+
+    #[test]
+    fn saturated_recorder_keeps_a_minority_rejection_retryable() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n1",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n2",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(RejectFromSlotRecorder {
+                    recorder_id: "n3",
+                    reject_from: 3,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 1))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 2))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let failure = (3..=514).find_map(|slot| {
+            let result = consensus.record_broadcast(record_requests(&consensus, slot));
+            match &result {
+                Ok(replies)
+                    if replies.len() == 1
+                        && replies[0].recorder_id == "n1"
+                        && replies[0].slot == slot =>
+                {
+                    None
+                }
+                _ => Some((slot, result)),
+            }
+        });
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert!(
+            failure.is_none(),
+            "a saturated recorder must keep minority rejection retryable: {failure:?}"
+        );
+    }
+
+    #[test]
+    fn saturated_recorder_keeps_quorum_reachable_when_another_worker_fails() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingRecorder {
+                    recorder_id: "n1",
+                    started: started_tx,
+                    release_first: Mutex::new(release_rx),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(FailingFromSlotRecorder {
+                    recorder_id: "n2",
+                    fail_from: 3,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(SlotRecorder {
+                    recorder_id: "n3",
+                    reject_slot: None,
+                    observed: None,
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 1))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
+        assert_eq!(
+            consensus
+                .record_broadcast(record_requests(&consensus, 2))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let third = consensus.record_broadcast(record_requests(&consensus, 3));
+        assert!(
+            matches!(third, Ok(ref replies) if replies.len() == 1 && replies[0].recorder_id == "n3"),
+            "a saturated healthy voter must keep the quorum retryable after a worker failure: {third:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+    }
+
+    #[test]
+    fn command_lookup_waits_for_valid_reply_after_quorum_reports_missing() {
+        let command = StoredCommand::new(EntryType::Command, b"available".to_vec());
+        let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        let (observed_tx, observed_rx) = mpsc::sync_channel(2);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(MissingCommandRecorder {
+                    observed: observed_tx.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(MissingCommandRecorder {
+                    observed: observed_tx,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(BlockingCommandRecorder {
+                    started: started_tx,
+                    release: Mutex::new(release_rx),
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let fetch = thread::spawn(move || {
+            done_tx
+                .send(consensus.fetch_verified_value(7, &value))
+                .unwrap();
+        });
+
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(Some(command))
+        );
+        fetch.join().unwrap();
+    }
+
+    #[test]
+    fn command_lookup_rejects_cryptographic_mismatch_despite_reachable_quorum() {
+        let command = StoredCommand::new(EntryType::Command, b"mismatched".to_vec());
+        let mut value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        value.entry_hash = LogHash::ZERO;
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(AvailableCommandRecorder {
+                    command: command.clone(),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(MissingCommandRecorder {
+                    observed: observed_tx,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(FailingCommandFetchRecorder) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+
+        assert_eq!(
+            consensus.fetch_verified_value(7, &value),
+            Err(Error::Rejected(RejectReason::InvalidValue))
+        );
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn command_lookup_returns_no_quorum_when_a_control_worker_queue_is_full() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let recorders = vec![
+            (
+                "n1".into(),
+                Box::new(BlockingCommandStoreRecorder {
+                    started: started_tx,
+                    release: Arc::clone(&release),
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n2".into(),
+                Box::new(MissingCommandRecorder {
+                    observed: observed_tx,
+                }) as Box<dyn RecorderRpc>,
+            ),
+            (
+                "n3".into(),
+                Box::new(FailingCommandFetchRecorder) as Box<dyn RecorderRpc>,
+            ),
+        ];
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let blocking = StoredCommand::new(EntryType::Command, b"blocking".to_vec());
+        let (blocking_tx, _blocking_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
+                index: 0,
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: consensus.membership().digest(),
+                command_hash: blocking.hash(),
+                command: blocking,
+                result: blocking_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let queued = StoredCommand::new(EntryType::Command, b"queued".to_vec());
+        let (queued_tx, _queued_rx) = mpsc::sync_channel(1);
+        assert!(matches!(
+            consensus.control_workers[0].dispatch(ControlJob::StoreCommand {
+                index: 0,
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: consensus.membership().digest(),
+                command_hash: queued.hash(),
+                command: queued,
+                result: queued_tx,
+            }),
+            ControlDispatch::Accepted
+        ));
+
+        let command = StoredCommand::new(EntryType::Command, b"missing".to_vec());
+        let value = AcceptedValue::from_command("cluster", 7, 1, 1, LogHash::ZERO, &command);
+        assert_eq!(
+            consensus.fetch_verified_value(7, &value),
+            Err(Error::NoQuorum)
+        );
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 
     #[test]
@@ -6987,44 +8704,5 @@ mod tests {
             consensus.record_broadcast(record_requests(&consensus, 1)),
             Err(Error::ProposeFailed)
         );
-    }
-
-    #[test]
-    fn pending_rpc_workers_are_tracked_and_drained_after_lock_poisoning() {
-        let root = tempfile::tempdir().unwrap();
-        let consensus = ThreeNodeConsensus::new(
-            "cluster",
-            "n1",
-            1,
-            1,
-            [
-                root.path().join("n1"),
-                root.path().join("n2"),
-                root.path().join("n3"),
-            ],
-        )
-        .unwrap();
-        thread::scope(|scope| {
-            assert!(scope
-                .spawn(|| {
-                    let _guard = consensus.background_threads.lock().unwrap();
-                    panic!("poison background worker lock");
-                })
-                .join()
-                .is_err());
-        });
-
-        let (release_tx, release_rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        });
-        started_rx.recv().unwrap();
-        consensus.track_background_threads(vec![worker]);
-
-        assert!(!consensus.finish_pending_rpcs(Duration::ZERO));
-        release_tx.send(()).unwrap();
-        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 }
