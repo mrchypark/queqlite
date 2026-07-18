@@ -110,12 +110,33 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
             ),
         )
         .unwrap();
+    assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
 
     let calls = calls.lock().unwrap();
-    let first_record = calls.iter().position(|call| *call == "record").unwrap();
-    assert!(calls[..first_record].contains(&"piggyback"));
-    assert!(calls.iter().all(|call| *call != "store"));
-    assert!(calls.iter().filter(|call| **call == "piggyback").count() >= 2);
+    let mut piggybacks = 0;
+    let mut records = 0;
+    for call in calls.iter() {
+        match *call {
+            "piggyback" => piggybacks += 1,
+            "record" => {
+                records += 1;
+                assert!(piggybacks >= records, "Record ran before its piggyback");
+            }
+            _ => {}
+        }
+    }
+    let first_store = calls.iter().position(|call| *call == "store").unwrap();
+    assert!(
+        calls[..first_store]
+            .iter()
+            .filter(|call| **call == "record")
+            .count()
+            >= 2,
+        "proof-store ran before the decision quorum"
+    );
+    assert_eq!(calls.iter().filter(|call| **call == "piggyback").count(), 3);
+    assert_eq!(calls.iter().filter(|call| **call == "record").count(), 3);
+    assert_eq!(calls.iter().filter(|call| **call == "store").count(), 3);
 }
 
 #[test]

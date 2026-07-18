@@ -184,6 +184,7 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send,
 {
+    let peers: Arc<[PeerConfig]> = peers.into();
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
     let mut tasks = tokio::task::JoinSet::new();
@@ -272,7 +273,7 @@ where
 async fn serve_postcard_rpc_connection<R, S>(
     mut stream: S,
     recorder: R,
-    peers: Vec<PeerConfig>,
+    peers: Arc<[PeerConfig]>,
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), String>
@@ -310,6 +311,7 @@ where
         "recorder postcard-rpc HELLO response",
     )
     .await?;
+    let authenticated_peer_id = hello.node_id;
 
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
@@ -366,10 +368,17 @@ where
             }
         };
         let call_recorder = recorder.clone();
+        let call_authenticated_peer_id = authenticated_peer_id.clone();
+        let call_peers = Arc::clone(&peers);
         calls.spawn(async move {
             let dispatched = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                super::dispatch(call_recorder, body)
+                super::dispatch(
+                    call_recorder,
+                    body,
+                    &call_authenticated_peer_id,
+                    &call_peers,
+                )
             });
             let response = match tokio::time::timeout(dispatch_timeout, dispatched).await {
                 Ok(Ok(response)) => response,
@@ -1403,7 +1412,7 @@ mod tests {
             serve_postcard_rpc_connection(
                 second,
                 IdentityRecorder,
-                peers(),
+                peers().into(),
                 7,
                 Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY)),
             )
@@ -1514,7 +1523,7 @@ mod tests {
             serve_postcard_rpc_connection(
                 stream,
                 IdentityRecorder,
-                peers(),
+                peers().into(),
                 7,
                 Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY)),
             )

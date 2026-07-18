@@ -19,8 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    peer_credentials_authenticated, valid_recorder_command, valid_recorder_record, PeerConfig,
-    DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES,
+    authenticated_proposer_admitted, peer_credentials_authenticated, valid_recorder_command,
+    valid_recorder_record, PeerConfig, DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES,
 };
 
 const WIRE_VERSION: u16 = 1;
@@ -290,6 +290,7 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send,
 {
+    let peers: Arc<[PeerConfig]> = peers.into();
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
     let reported_connection_error = Arc::new(AtomicBool::new(false));
@@ -351,7 +352,7 @@ where
 async fn serve_connection<R, S>(
     mut stream: S,
     recorder: R,
-    peers: Vec<PeerConfig>,
+    peers: Arc<[PeerConfig]>,
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), String>
@@ -422,6 +423,8 @@ where
             operation,
             permit,
             dispatch_deadline,
+            hello.node_id.clone(),
+            Arc::clone(&peers),
         )
         .await;
         write_value_async_with_timeout(
@@ -443,6 +446,8 @@ async fn dispatch_with_deadline<R>(
     operation: Operation,
     permit: tokio::sync::OwnedSemaphorePermit,
     deadline: Instant,
+    authenticated_peer_id: String,
+    peers: Arc<[PeerConfig]>,
 ) -> RecorderResponseBody
 where
     R: RecorderRpc + Send + Sync + 'static,
@@ -452,7 +457,7 @@ where
     }
     let dispatched = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        dispatch(recorder, body)
+        dispatch(recorder, body, &authenticated_peer_id, &peers)
     });
     match tokio::time::timeout_at(deadline.into(), dispatched).await {
         Ok(Ok(response)) => response,
@@ -490,7 +495,12 @@ fn response_operation(request: &RecorderRequestBody) -> Operation {
     }
 }
 
-fn dispatch<R: RecorderRpc>(recorder: R, request: RecorderRequestBody) -> RecorderResponseBody {
+fn dispatch<R: RecorderRpc>(
+    recorder: R,
+    request: RecorderRequestBody,
+    authenticated_peer_id: &str,
+    peers: &[PeerConfig],
+) -> RecorderResponseBody {
     match request {
         RecorderRequestBody::Identity => {
             RecorderResponseBody::Identity(RpcResult::from_result(recorder.recorder_id()))
@@ -527,7 +537,12 @@ fn dispatch<R: RecorderRpc>(recorder: R, request: RecorderRequestBody) -> Record
             recorder.fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash),
         )),
         RecorderRequestBody::Record(request) => {
-            let result = if !valid_recorder_record(&request) {
+            let result = if !valid_recorder_record(&request)
+                || !authenticated_proposer_admitted(
+                    authenticated_peer_id,
+                    &request.proposal.proposer_id,
+                    peers,
+                ) {
                 Err(Error::Rejected(RejectReason::InvalidRequest))
             } else {
                 recorder.record(request)
@@ -535,8 +550,16 @@ fn dispatch<R: RecorderRpc>(recorder: R, request: RecorderRequestBody) -> Record
             RecorderResponseBody::Record(RpcResult::from_result(result))
         }
         RecorderRequestBody::InstallDecisionProof { proof, members } => {
-            let result = Membership::from_voters(members)
-                .and_then(|membership| recorder.install_decision_proof(proof, &membership));
+            let result = if !authenticated_proposer_admitted(
+                authenticated_peer_id,
+                &proof.proposal().proposer_id,
+                peers,
+            ) {
+                Err(Error::Rejected(RejectReason::InvalidRequest))
+            } else {
+                Membership::from_voters(members)
+                    .and_then(|membership| recorder.install_decision_proof(proof, &membership))
+            };
             RecorderResponseBody::InstallDecisionProof(RpcResult::from_result(result))
         }
         RecorderRequestBody::InspectDecisionProof { slot } => {
@@ -1613,6 +1636,8 @@ mod tests {
             Operation::StoreCommand,
             permit,
             Instant::now() - Duration::from_millis(1),
+            "node-1".into(),
+            peers().into(),
         )
         .await;
 
@@ -1635,7 +1660,7 @@ mod tests {
             CountingMutation {
                 calls: Arc::clone(&calls),
             },
-            peers(),
+            peers().into(),
             7,
             slots,
         ));

@@ -31,6 +31,7 @@ pub type Priority = u128;
 const RECORDER_STATE_VERSION: u16 = 4;
 const CONFIGURATION_STATE_VERSION: u16 = 3;
 const RECORD_WORKER_QUEUE_CAPACITY: usize = 1;
+const PROOF_WORKER_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -2999,6 +3000,7 @@ pub struct ThreeNodeConsensus {
     membership: FixedMembership,
     recorders: Vec<Arc<dyn RecorderRpc>>,
     record_workers: Vec<RecordWorker>,
+    proof_workers: Vec<ProofWorker>,
     priority_source: Arc<dyn PrioritySource>,
     proposal_sequence: AtomicU64,
     legacy_tip: Mutex<SingleNodeState>,
@@ -3104,6 +3106,87 @@ impl Drop for RecordWorker {
     }
 }
 
+struct ProofJob {
+    proof: DecisionProof,
+    command: StoredCommand,
+}
+
+struct ProofWorker {
+    sender: Option<std::sync::mpsc::SyncSender<ProofJob>>,
+    handle: Option<thread::JoinHandle<()>>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl ProofWorker {
+    fn spawn(recorder: Arc<dyn RecorderRpc>, membership: Membership) -> Result<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<ProofJob>(PROOF_WORKER_QUEUE_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
+        let handle = thread::Builder::new()
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let (_, epoch, config_id, config_digest) = proof_context(&job.proof);
+                        let Some(value) = job.proof.proposal().value.as_ref() else {
+                            return;
+                        };
+                        if recorder
+                            .store_command_for(
+                                proof_cluster_id(&job.proof).to_owned(),
+                                epoch,
+                                config_id,
+                                config_digest,
+                                value.command_hash,
+                                job.command,
+                            )
+                            .is_ok()
+                        {
+                            let _ = recorder.install_decision_proof(job.proof, &membership);
+                        }
+                    }));
+                    worker_pending.fetch_sub(1, Ordering::Release);
+                }
+            })
+            .map_err(|error| Error::Io(error.to_string()))?;
+        Ok(Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            pending,
+        })
+    }
+
+    fn dispatch(&self, job: ProofJob) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        let accepted = self
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(job).is_ok());
+        if !accepted {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for ProofWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 pub trait PrioritySource: Send + Sync {
     fn sample(
         &self,
@@ -3191,6 +3274,9 @@ impl Drop for ThreeNodeConsensus {
         for worker in &mut self.record_workers {
             worker.shutdown();
         }
+        for worker in &mut self.proof_workers {
+            worker.shutdown();
+        }
         let handles = match self.background_threads.get_mut() {
             Ok(handles) => std::mem::take(handles),
             Err(poisoned) => std::mem::take(poisoned.into_inner()),
@@ -3204,8 +3290,10 @@ impl Drop for ThreeNodeConsensus {
 }
 
 impl ThreeNodeConsensus {
-    /// Waits up to `timeout` for quorum RPC workers that outlived an early
-    /// quorum return. Returns `true` when every tracked worker has finished.
+    /// Waits up to `timeout` for accepted record and proof jobs plus quorum RPC
+    /// workers that outlived an early return. Returns `true` when every tracked
+    /// worker has finished. Best-effort proof jobs dropped because their queue
+    /// was full are not tracked.
     /// Callers must first quiesce proposal admission and ensure no proposal
     /// can still spawn or register workers; this only drains already tracked
     /// workers.
@@ -3227,7 +3315,10 @@ impl ThreeNodeConsensus {
                 }
                 handles.is_empty()
             };
-            if background_empty && self.record_workers.iter().all(RecordWorker::is_idle) {
+            if background_empty
+                && self.record_workers.iter().all(RecordWorker::is_idle)
+                && self.proof_workers.iter().all(ProofWorker::is_idle)
+            {
                 return true;
             }
             if started.elapsed() >= timeout {
@@ -3387,6 +3478,8 @@ impl ThreeNodeConsensus {
         if next_index == 0 {
             return Err(Error::InvalidRecoveredTip);
         }
+        let mut recorders = recorders;
+        recorders.sort_by(|(left, _), (right, _)| left.cmp(right));
         let (recorder_ids, recorders): (Vec<_>, Vec<_>) = recorders.into_iter().unzip();
         let recorders: Vec<Arc<dyn RecorderRpc>> = recorders.into_iter().map(Arc::from).collect();
         let membership = FixedMembership::from_members(recorder_ids)?;
@@ -3400,6 +3493,10 @@ impl ThreeNodeConsensus {
                 RecordWorker::spawn(recorder_id, Arc::clone(recorder), config_id, config_digest)
             })
             .collect::<Result<Vec<_>>>()?;
+        let proof_workers = recorders
+            .iter()
+            .map(|recorder| ProofWorker::spawn(Arc::clone(recorder), membership.clone()))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             cluster_id: cluster_id.into(),
             proposer_id: proposer_id.into(),
@@ -3409,6 +3506,7 @@ impl ThreeNodeConsensus {
             membership,
             recorders,
             record_workers,
+            proof_workers,
             priority_source: Arc::new(OsPrioritySource),
             proposal_sequence: AtomicU64::new(1),
             legacy_tip: Mutex::new(SingleNodeState {
@@ -3866,6 +3964,19 @@ impl ThreeNodeConsensus {
                 .ok_or(Error::CommandUnavailable)?,
         };
         if command.entry_type != EntryType::ConfigChange && !transition_involved {
+            let Some((last_worker, other_workers)) = self.proof_workers.split_last() else {
+                return Err(Error::NoQuorum);
+            };
+            for worker in other_workers {
+                worker.dispatch(ProofJob {
+                    proof: proof.clone(),
+                    command: command.clone(),
+                });
+            }
+            last_worker.dispatch(ProofJob {
+                proof: proof.clone(),
+                command,
+            });
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;
