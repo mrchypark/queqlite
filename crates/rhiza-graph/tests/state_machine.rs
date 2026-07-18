@@ -4,15 +4,15 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
 };
 
 use rhiza_core::{EntryType, ExecutionProfile, LogEntry, LogHash, ReplicatedCommandEnvelope};
 use rhiza_graph::{
-    encode_replicated_graph_command, graph_materializer_fingerprint, restore_snapshot_file, Error,
-    GraphCommandResultV1, GraphCommandV1, GraphParameterValue, GraphResultValue, GraphValueV1,
-    LadybugStateMachine,
+    encode_replicated_graph_command, graph_materializer_fingerprint, restore_snapshot_file,
+    ApplyOutcome, Error, GraphCommandResultV1, GraphCommandV1, GraphParameterValue,
+    GraphResultValue, GraphValueV1, LadybugStateMachine,
 };
 
 fn entry(index: u64, prev_hash: LogHash, payload: Vec<u8>) -> LogEntry {
@@ -41,6 +41,20 @@ fn replicated(command: &GraphCommandV1) -> Vec<u8> {
     encode_replicated_graph_command(command).unwrap()
 }
 
+fn materialize(
+    state: &LadybugStateMachine,
+    index: u64,
+    prev_hash: LogHash,
+    request_payload: &[u8],
+) -> (LogEntry, ApplyOutcome) {
+    let effect = state
+        .prepare_graph_effect(request_payload, index - 1, prev_hash)
+        .unwrap();
+    let entry = entry(index, prev_hash, effect);
+    let outcome = state.apply_entry(&entry).unwrap();
+    (entry, outcome)
+}
+
 #[test]
 fn apply_atomically_materializes_document_request_and_log_tip() {
     let dir = tempfile::tempdir().unwrap();
@@ -53,9 +67,7 @@ fn apply_atomically_materializes_document_request_and_log_tip() {
     )
     .unwrap();
     let payload = replicated(&command);
-    let entry = entry(1, LogHash::ZERO, payload.clone());
-
-    let outcome = state.apply_entry(&entry).unwrap();
+    let (entry, outcome) = materialize(&state, 1, LogHash::ZERO, &payload);
 
     assert_eq!(outcome.applied_index(), 1);
     assert_eq!(outcome.applied_hash(), entry.hash);
@@ -85,8 +97,7 @@ fn read_only_query_returns_parameterized_rows_and_the_same_atomic_tip() {
         GraphValueV1::String("hello".into()),
     )
     .unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    let (entry, _) = materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let parameters = BTreeMap::from([(
         "id".to_owned(),
         GraphParameterValue::String("document-1".into()),
@@ -133,9 +144,7 @@ fn concurrent_document_reads_return_value_index_and_hash_from_one_snapshot() {
         LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
             .unwrap(),
     );
-    let mut entries = Vec::new();
-    let mut expected_hashes = vec![LogHash::ZERO];
-    let mut previous = LogHash::ZERO;
+    let mut requests = Vec::new();
     for index in 1..=64 {
         let command = GraphCommandV1::put_document(
             format!("request-{index}"),
@@ -143,14 +152,11 @@ fn concurrent_document_reads_return_value_index_and_hash_from_one_snapshot() {
             GraphValueV1::U64(index),
         )
         .unwrap();
-        let next = entry(index, previous, replicated(&command));
-        previous = next.hash;
-        expected_hashes.push(next.hash);
-        entries.push(next);
+        requests.push(replicated(&command));
     }
-    state.apply_entry(&entries[0]).unwrap();
+    let (first, _) = materialize(&state, 1, LogHash::ZERO, &requests[0]);
 
-    let expected_hashes = Arc::new(expected_hashes);
+    let expected_hashes = Arc::new(Mutex::new(vec![LogHash::ZERO, first.hash]));
     let start = Arc::new(Barrier::new(5));
     let done = Arc::new(AtomicBool::new(false));
     let observations = Arc::new(AtomicUsize::new(0));
@@ -158,10 +164,19 @@ fn concurrent_document_reads_return_value_index_and_hash_from_one_snapshot() {
         let writer_state = Arc::clone(&state);
         let writer_start = Arc::clone(&start);
         let writer_done = Arc::clone(&done);
+        let writer_hashes = Arc::clone(&expected_hashes);
         scope.spawn(move || {
             writer_start.wait();
-            for entry in &entries[1..] {
-                writer_state.apply_entry(entry).unwrap();
+            let mut previous = first.hash;
+            for (offset, request) in requests[1..].iter().enumerate() {
+                let index = offset as u64 + 2;
+                let effect = writer_state
+                    .prepare_graph_effect(request, index - 1, previous)
+                    .unwrap();
+                let next = entry(index, previous, effect);
+                writer_hashes.lock().unwrap().push(next.hash);
+                writer_state.apply_entry(&next).unwrap();
+                previous = next.hash;
                 std::thread::yield_now();
             }
             writer_done.store(true, Ordering::Release);
@@ -183,7 +198,7 @@ fn concurrent_document_reads_return_value_index_and_hash_from_one_snapshot() {
                     let (value, index, hash) =
                         reader_state.get_document_with_tip("document-1").unwrap();
                     assert_eq!(value, Some(GraphValueV1::U64(index)));
-                    assert_eq!(hash, reader_hashes[index as usize]);
+                    assert_eq!(hash, reader_hashes.lock().unwrap()[index as usize]);
                     let query = reader_state
                         .query_read_only(
                             "MATCH (v:RhizaDocument) WHERE v.id = $id RETURN v.u64_value LIMIT 1",
@@ -197,7 +212,10 @@ fn concurrent_document_reads_return_value_index_and_hash_from_one_snapshot() {
                         query.rows,
                         [vec![GraphResultValue::U64(query.applied_index)]]
                     );
-                    assert_eq!(query.hash, reader_hashes[query.applied_index as usize]);
+                    assert_eq!(
+                        query.hash,
+                        reader_hashes.lock().unwrap()[query.applied_index as usize]
+                    );
                     reader_observations.fetch_add(1, Ordering::Relaxed);
                     if reader_done.load(Ordering::Acquire) {
                         break;
@@ -223,8 +241,7 @@ fn snapshot_exclusively_drains_concurrent_readers_and_reopens_the_database() {
         GraphValueV1::String("value".into()),
     )
     .unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    let (entry, _) = materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let entry_hash = entry.hash;
     let start = Arc::new(Barrier::new(9));
 
@@ -308,9 +325,7 @@ fn read_only_query_accepts_labeled_patterns_functions_and_clauses_supported_by_l
         GraphValueV1::String("value".into()),
     )
     .unwrap();
-    state
-        .apply_entry(&entry(1, LogHash::ZERO, replicated(&command)))
-        .unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
 
     let supported = [
         "MATCH (d:RhizaDocument) RETURN upper(d.string_value) AS value LIMIT 1",
@@ -352,8 +367,7 @@ fn read_only_query_allows_clause_words_as_parameter_names() {
         GraphValueV1::String("context".into()),
     )
     .unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let parameters = BTreeMap::from([
         (
             "delete".to_owned(),
@@ -387,9 +401,7 @@ fn read_only_query_allows_wide_and_function_projections_with_byte_and_row_bounds
             .unwrap();
     let command =
         GraphCommandV1::put_document("wide-query", "document-1", GraphValueV1::I64(7)).unwrap();
-    state
-        .apply_entry(&entry(1, LogHash::ZERO, replicated(&command)))
-        .unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let projections = std::iter::repeat_n("v.id", 5)
         .collect::<Vec<_>>()
         .join(", ");
@@ -452,13 +464,10 @@ fn read_only_query_supports_joins_sorts_operators_literals_and_whole_nodes() {
             .unwrap();
     let first =
         GraphCommandV1::put_document("general-1", "document-1", GraphValueV1::I64(1)).unwrap();
-    let first_entry = entry(1, LogHash::ZERO, replicated(&first));
-    state.apply_entry(&first_entry).unwrap();
+    let (first_entry, _) = materialize(&state, 1, LogHash::ZERO, &replicated(&first));
     let second =
         GraphCommandV1::put_document("general-2", "document-2", GraphValueV1::I64(2)).unwrap();
-    state
-        .apply_entry(&entry(2, first_entry.hash, replicated(&second)))
-        .unwrap();
+    materialize(&state, 2, first_entry.hash, &replicated(&second));
     let supported = [
         "MATCH (v:RhizaDocument), (x:RhizaDocument) RETURN v.id, x.id ORDER BY v.id, x.id LIMIT 2",
         "MATCH (v:RhizaDocument) RETURN v LIMIT 1",
@@ -508,8 +517,7 @@ fn read_only_query_v1_allows_bounded_property_predicates_and_scalar_projections(
         GraphValueV1::String("safe".into()),
     )
     .unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let parameters = BTreeMap::from([(
         "id".into(),
         GraphParameterValue::String("document-safe".into()),
@@ -592,8 +600,7 @@ fn read_only_query_lexer_ignores_keywords_inside_comments_and_strings() {
     let command =
         GraphCommandV1::put_document("lexer-request", "lexer-document", GraphValueV1::I64(1))
             .unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
 
     let result = state
         .query_read_only(
@@ -619,11 +626,9 @@ fn read_only_query_enforces_row_byte_parameter_and_timeout_limits() {
         GraphParameterValue::String("bounded".into()),
     )]);
     let first = GraphCommandV1::put_document("limit-1", "limit-1", GraphValueV1::I64(1)).unwrap();
-    let first_entry = entry(1, LogHash::ZERO, replicated(&first));
-    state.apply_entry(&first_entry).unwrap();
+    let (first_entry, _) = materialize(&state, 1, LogHash::ZERO, &replicated(&first));
     let second = GraphCommandV1::put_document("limit-2", "limit-2", GraphValueV1::I64(2)).unwrap();
-    let second_entry = entry(2, first_entry.hash, replicated(&second));
-    state.apply_entry(&second_entry).unwrap();
+    materialize(&state, 2, first_entry.hash, &replicated(&second));
 
     assert!(matches!(
         state.query_read_only(
@@ -673,8 +678,7 @@ fn document_projection_round_trips_every_supported_scalar_type() {
         let id = format!("document-{index}");
         let command =
             GraphCommandV1::put_document(format!("request-{index}"), &id, value.clone()).unwrap();
-        let entry = entry(index, previous, replicated(&command));
-        state.apply_entry(&entry).unwrap();
+        let (entry, _) = materialize(&state, index, previous, &replicated(&command));
         previous = entry.hash;
 
         assert_eq!(state.get_document(&id).unwrap(), Some(value));
@@ -690,25 +694,19 @@ fn duplicate_request_replays_result_and_conflicting_payload_is_rejected() {
     let first =
         GraphCommandV1::put_document("request-1", "document-1", GraphValueV1::I64(1)).unwrap();
     let first_payload = replicated(&first);
-    let first_entry = entry(1, LogHash::ZERO, first_payload.clone());
-    state.apply_entry(&first_entry).unwrap();
-
-    let replay_entry = entry(2, first_entry.hash, first_payload);
-    let replay = state.apply_entry(&replay_entry).unwrap();
-    assert_eq!(
-        replay.result(),
-        Some(&GraphCommandResultV1::PutDocument { created: true })
-    );
-    assert_eq!(replay.applied_index(), 2);
+    let (first_entry, _) = materialize(&state, 1, LogHash::ZERO, &first_payload);
+    assert!(matches!(
+        state.prepare_graph_effect(&first_payload, 1, first_entry.hash),
+        Err(Error::InvalidCommand(_))
+    ));
 
     let conflict =
         GraphCommandV1::put_document("request-1", "document-1", GraphValueV1::I64(2)).unwrap();
-    let conflict_entry = entry(3, replay_entry.hash, replicated(&conflict));
     assert!(matches!(
-        state.apply_entry(&conflict_entry),
+        state.prepare_graph_effect(&replicated(&conflict), 1, first_entry.hash),
         Err(Error::RequestConflict { .. })
     ));
-    assert_eq!(state.applied_index().unwrap(), 2);
+    assert_eq!(state.applied_index().unwrap(), 1);
     assert_eq!(
         state.get_document("document-1").unwrap(),
         Some(GraphValueV1::I64(1))
@@ -723,12 +721,10 @@ fn delete_reports_observable_existence_and_is_idempotent_by_request() {
             .unwrap();
     let put =
         GraphCommandV1::put_document("put-1", "document-1", GraphValueV1::Bool(true)).unwrap();
-    let put_entry = entry(1, LogHash::ZERO, replicated(&put));
-    state.apply_entry(&put_entry).unwrap();
+    let (put_entry, _) = materialize(&state, 1, LogHash::ZERO, &replicated(&put));
 
     let delete = GraphCommandV1::delete_document("delete-1", "document-1").unwrap();
-    let delete_entry = entry(2, put_entry.hash, replicated(&delete));
-    let outcome = state.apply_entry(&delete_entry).unwrap();
+    let (_, outcome) = materialize(&state, 2, put_entry.hash, &replicated(&delete));
     assert_eq!(
         outcome.result(),
         Some(&GraphCommandResultV1::DeleteDocument { existed: true })
@@ -745,8 +741,7 @@ fn checkpoint_snapshot_rebinds_only_node_identity_and_restores_exact_state() {
     let command =
         GraphCommandV1::put_document("request-1", "document-1", GraphValueV1::U64(9)).unwrap();
     let payload = replicated(&command);
-    let entry = entry(1, LogHash::ZERO, payload.clone());
-    state.apply_entry(&entry).unwrap();
+    let (entry, _) = materialize(&state, 1, LogHash::ZERO, &payload);
 
     let snapshot = state.create_snapshot(1).unwrap();
     assert_eq!(snapshot.cluster_id(), "cluster-1");
@@ -784,8 +779,7 @@ fn snapshot_and_restore_reject_checkpoint_wal_sidecars() {
     let state = LadybugStateMachine::open(&source, "cluster-1", "node-1", 7, 3).unwrap();
     let command =
         GraphCommandV1::put_document("request-1", "document-1", GraphValueV1::U64(9)).unwrap();
-    let entry = entry(1, LogHash::ZERO, replicated(&command));
-    state.apply_entry(&entry).unwrap();
+    materialize(&state, 1, LogHash::ZERO, &replicated(&command));
     let snapshot = state.create_snapshot(1).unwrap();
 
     let source_checkpoint_wal = appended_suffix(&source, ".wal.checkpoint");

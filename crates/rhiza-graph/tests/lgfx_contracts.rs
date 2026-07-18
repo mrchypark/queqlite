@@ -49,6 +49,7 @@ fn effect_for(
     let chunks = diff_closed_ladybug_files(base, target).unwrap();
     LadybugFileEffectV1 {
         cluster_id: "cluster-1".into(),
+        epoch: 7,
         configuration_id: 3,
         recovery_generation: 4,
         base_log_index,
@@ -71,6 +72,7 @@ fn effect_for(
 fn dummy_effect(chunks: Vec<LadybugFileChunkV1>) -> LadybugFileEffectV1 {
     let mut effect = LadybugFileEffectV1 {
         cluster_id: "cluster-1".into(),
+        epoch: 7,
         configuration_id: 3,
         recovery_generation: 4,
         base_log_index: 0,
@@ -107,6 +109,17 @@ fn lgfx_envelope_roundtrips_through_one_bounded_canonical_encoding() {
 }
 
 #[test]
+fn lgfx_rejects_unknown_result_encoding_version() {
+    let mut effect = dummy_effect(vec![LadybugFileChunkV1 {
+        chunk_index: 0,
+        after_image: vec![7; LGFX_CHUNK_BYTES],
+    }]);
+    effect.result_encoding_version = 2;
+
+    assert!(matches!(effect.encode(), Err(Error::InvalidEntry(_))));
+}
+
+#[test]
 fn lgfx_decoder_rejects_corruption_truncation_oversize_and_noncanonical_bytes() {
     let encoded = dummy_effect(vec![LadybugFileChunkV1 {
         chunk_index: 0,
@@ -136,7 +149,7 @@ fn lgfx_decoder_rejects_corruption_truncation_oversize_and_noncanonical_bytes() 
     ));
 
     let mut noncanonical = encoded;
-    let configuration_offset = LGFX_V1_MAGIC.len() + 1 + "cluster-1".len();
+    let configuration_offset = LGFX_V1_MAGIC.len() + 1 + "cluster-1".len() + 1;
     assert_eq!(noncanonical[configuration_offset], 3);
     noncanonical[configuration_offset] = 0x83;
     noncanonical.insert(configuration_offset + 1, 0);
@@ -366,7 +379,7 @@ fn native_wal_replay_restores_logical_graph_state() {
     replay_native_ladybug_wal(&base, &replayed, &capture.wal_payload).unwrap();
     assert_clean(&replayed);
     let recovered = open_lgfx_readback(&replayed, "cluster-1", "node-1", 7, 3).unwrap();
-    assert_representative_state(&recovered, &entry);
+    assert_representative_state(&recovered);
 }
 
 #[test]
@@ -383,7 +396,7 @@ fn clean_lgfx_reopen_preserves_bytes_and_logical_state() {
     let before = fs::read(&applied).unwrap();
 
     let reopened = open_lgfx_readback(&applied, "cluster-1", "node-1", 7, 3).unwrap();
-    assert_representative_state(&reopened, &entry);
+    assert_representative_state(&reopened);
     drop(reopened);
 
     assert_clean(&applied);
@@ -484,8 +497,6 @@ fn sequential_lgfx_effects_chain_from_the_exact_prior_target() {
         Some(GraphValueV1::U64(2))
     );
     assert_eq!(reopened.get_document("gone").unwrap(), None);
-    assert_eq!(reopened.applied_index().unwrap(), 2);
-    assert_eq!(reopened.applied_hash().unwrap(), second.hash);
 }
 
 fn representative_entry() -> LogEntry {
@@ -502,14 +513,12 @@ fn representative_entry() -> LogEntry {
     )
 }
 
-fn assert_representative_state(state: &LadybugStateMachine, entry: &LogEntry) {
+fn assert_representative_state(state: &LadybugStateMachine) {
     assert_eq!(
         state.get_document("kept").unwrap(),
         Some(GraphValueV1::U64(2))
     );
     assert_eq!(state.get_document("deleted").unwrap(), None);
-    assert_eq!(state.applied_index().unwrap(), 1);
-    assert_eq!(state.applied_hash().unwrap(), entry.hash);
 }
 
 fn file_digest(path: &Path) -> LogHash {

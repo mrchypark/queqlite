@@ -5,7 +5,7 @@ use rhiza_graph::{
 };
 
 #[test]
-fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
+fn ordered_client_batch_is_materialized_as_sequential_lgfx_effects_with_distinct_receipts() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let first =
@@ -16,17 +16,19 @@ fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
             .unwrap();
     let first_payload = encode_replicated_graph_command(&first).unwrap();
     let second_payload = encode_replicated_graph_command(&second).unwrap();
-    let entry = entry(
-        1,
-        LogHash::ZERO,
-        encode_replicated_graph_batch(&[first, second]).unwrap(),
-    );
+    let first_effect = state
+        .prepare_graph_effect(&first_payload, 0, LogHash::ZERO)
+        .unwrap();
+    let first_entry = entry(1, LogHash::ZERO, first_effect);
+    let first_outcome = state.apply_entry(&first_entry).unwrap();
+    let second_effect = state
+        .prepare_graph_effect(&second_payload, 1, first_entry.hash)
+        .unwrap();
+    let second_entry = entry(2, first_entry.hash, second_effect);
+    let second_outcome = state.apply_entry(&second_entry).unwrap();
 
-    let outcome = state.apply_entry(&entry).unwrap();
-
-    assert_eq!(outcome.applied_index(), 1);
-    assert_eq!(outcome.applied_hash(), entry.hash);
-    assert_eq!(outcome.result(), None);
+    assert_eq!(first_outcome.applied_index(), 1);
+    assert_eq!(second_outcome.applied_index(), 2);
     assert_eq!(
         state.get_document("document").unwrap(),
         Some(GraphValueV1::String("two".into()))
@@ -40,9 +42,9 @@ fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
         .unwrap()
         .unwrap();
     assert_eq!(first.original_log_index(), 1);
-    assert_eq!(second.original_log_index(), 1);
-    assert_eq!(first.original_log_hash(), entry.hash);
-    assert_eq!(second.original_log_hash(), entry.hash);
+    assert_eq!(second.original_log_index(), 2);
+    assert_eq!(first.original_log_hash(), first_entry.hash);
+    assert_eq!(second.original_log_hash(), second_entry.hash);
     assert_eq!(
         first.result(),
         &GraphCommandResultV1::PutDocument { created: true }
@@ -54,17 +56,17 @@ fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
 }
 
 #[test]
-fn request_conflict_rolls_back_every_member_and_the_applied_tip() {
+fn request_conflict_is_rejected_during_sequential_preparation_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let original =
         GraphCommandV1::put_document("existing", "stable", GraphValueV1::String("one".into()))
             .unwrap();
-    let original_entry = entry(
-        1,
-        LogHash::ZERO,
-        encode_replicated_graph_command(&original).unwrap(),
-    );
+    let original_payload = encode_replicated_graph_command(&original).unwrap();
+    let original_effect = state
+        .prepare_graph_effect(&original_payload, 0, LogHash::ZERO)
+        .unwrap();
+    let original_entry = entry(1, LogHash::ZERO, original_effect);
     state.apply_entry(&original_entry).unwrap();
     let new = GraphCommandV1::put_document("new", "new", GraphValueV1::U64(7)).unwrap();
     let new_payload = encode_replicated_graph_command(&new).unwrap();
@@ -74,14 +76,10 @@ fn request_conflict_rolls_back_every_member_and_the_applied_tip() {
         GraphValueV1::String("different".into()),
     )
     .unwrap();
-    let conflicting_entry = entry(
-        2,
-        original_entry.hash,
-        encode_replicated_graph_batch(&[new, conflict]).unwrap(),
-    );
+    let conflict_payload = encode_replicated_graph_command(&conflict).unwrap();
 
     assert!(matches!(
-        state.apply_entry(&conflicting_entry),
+        state.prepare_graph_effect(&conflict_payload, 1, original_entry.hash),
         Err(Error::RequestConflict { request_id, .. }) if request_id == "existing"
     ));
 

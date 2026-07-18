@@ -7,8 +7,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -16,12 +16,15 @@ use std::{
 
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use rhiza_core::{
-    EntryType, ExecutionProfile, LogEntry, LogHash, LogIndex, ReplicatedCommandEnvelope,
+    ConfigurationState, EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
+    ReplicatedCommandEnvelope,
 };
 use tempfile::NamedTempFile;
 
+mod control;
 mod lgfx;
 
+pub use control::{ControlIdentity, ControlStore, PendingApply, RequestReceipt};
 pub use lgfx::{
     apply_lgfx_to_exact_base, capture_graph_entry_native_wal, diff_closed_ladybug_files,
     lgfx_chunks_digest, open_lgfx_readback, replay_native_ladybug_wal, CapturedNativeLadybugWal,
@@ -31,12 +34,20 @@ pub use lgfx::{
 const COMMAND_MAGIC: &[u8; 6] = b"RHGC\0\x01";
 const BATCH_COMMAND_MAGIC: &[u8; 6] = b"RHGB\0\x01";
 const RESULT_MAGIC: &[u8; 6] = b"RHGR\0\x01";
-const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-ladybug-snapshot-v1\0";
+const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-ladybug-snapshot-v2\0";
 const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"RHGS";
-const SNAPSHOT_WIRE_VERSION: u16 = 1;
+const SNAPSHOT_WIRE_VERSION: u16 = 2;
+const RESTORE_INTENT_MAGIC: &[u8] = b"RHIZA-GRAPH-RESTORE\0\x01";
+const RESTORE_INTENT_HASHES: usize = 4;
+const RESTORE_INTENT_BYTES: usize =
+    RESTORE_INTENT_MAGIC.len() + 1 + 32 * RESTORE_INTENT_HASHES + 32;
 const MATERIALIZER_DOMAIN: &[u8] = b"rhiza-graph-materializer-v1\0";
 const SCHEMA_VERSION: &str = "1";
 const MAX_REQUEST_ID_BYTES: usize = 256;
+const MAX_RHGS_ID_BYTES: usize = 256;
+const MAX_RHGS_DB_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_RHGS_CONTROL_BYTES: usize = control::MAX_CONTROL_SNAPSHOT_BYTES;
+const MAX_RHGS_V2_BYTES: usize = MAX_RHGS_DB_BYTES + MAX_RHGS_CONTROL_BYTES + 1024 * 1024;
 const MAX_DOCUMENT_ID_BYTES: usize = 1024;
 const MAX_STRING_BYTES: usize = 256 * 1024;
 const MAX_BLOB_BYTES: usize = 4096;
@@ -54,23 +65,6 @@ const LADYBUG_CONVERSION_ERROR_PREFIX: &str = "Conversion exception:";
 const BATCH_COMMAND_VERSION: u16 = 2;
 const BATCH_REQUEST_ID: &str = "__rhiza_graph_batch_v1";
 pub const MAX_GRAPH_BATCH_MEMBERS: usize = 64;
-
-const CREATE_META_TABLE: &str = r#"
-CREATE NODE TABLE IF NOT EXISTS __RhizaMeta(
-    key STRING PRIMARY KEY,
-    value STRING
-)
-"#;
-
-const CREATE_REQUEST_TABLE: &str = r#"
-CREATE NODE TABLE IF NOT EXISTS __RhizaRequest(
-    request_id STRING PRIMARY KEY,
-    command_hash STRING,
-    original_log_index UINT64,
-    original_log_hash STRING,
-    result BLOB
-)
-"#;
 
 const CREATE_DOCUMENT_TABLE: &str = r#"
 CREATE NODE TABLE IF NOT EXISTS RhizaDocument(
@@ -649,6 +643,7 @@ pub struct LadybugSnapshot {
     materializer_fingerprint: LogHash,
     digest: LogHash,
     db_bytes: Vec<u8>,
+    replicated_control: Vec<u8>,
 }
 
 impl LadybugSnapshot {
@@ -692,14 +687,22 @@ impl LadybugSnapshot {
         &self.db_bytes
     }
 
+    pub fn replicated_control(&self) -> &[u8] {
+        &self.replicated_control
+    }
+
     fn recompute_digest(&self) -> LogHash {
-        let cluster_id = length_prefixed(self.cluster_id.as_bytes());
-        let created_by = length_prefixed(self.created_by.as_bytes());
+        let cluster_id_length = (self.cluster_id.len() as u64).to_be_bytes();
+        let created_by_length = (self.created_by.len() as u64).to_be_bytes();
         let database_length = u64::try_from(self.db_bytes.len()).expect("usize fits in u64");
+        let control_length =
+            u64::try_from(self.replicated_control.len()).expect("usize fits in u64");
         LogHash::digest(&[
             SNAPSHOT_DOMAIN,
-            &cluster_id,
-            &created_by,
+            &cluster_id_length,
+            self.cluster_id.as_bytes(),
+            &created_by_length,
+            self.created_by.as_bytes(),
             &self.epoch.to_be_bytes(),
             &self.config_id.to_be_bytes(),
             &self.storage_version.to_be_bytes(),
@@ -708,6 +711,8 @@ impl LadybugSnapshot {
             self.materializer_fingerprint.as_bytes(),
             &database_length.to_be_bytes(),
             &self.db_bytes,
+            &control_length.to_be_bytes(),
+            &self.replicated_control,
         ])
     }
 }
@@ -715,24 +720,32 @@ impl LadybugSnapshot {
 /// Encodes a complete Ladybug snapshot as one canonical, versioned archive object.
 pub fn encode_snapshot(snapshot: &LadybugSnapshot) -> Result<Vec<u8>> {
     validate_snapshot_envelope(snapshot)?;
+    let capacity = rhgs_encoded_len(snapshot)?;
+    ensure_rhgs_total_bound(capacity)?;
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(SNAPSHOT_WIRE_MAGIC);
-    encoded.extend_from_slice(&SNAPSHOT_WIRE_VERSION.to_be_bytes());
-    encode_snapshot_bytes(&mut encoded, snapshot.cluster_id.as_bytes());
-    encode_snapshot_bytes(&mut encoded, snapshot.created_by.as_bytes());
-    encoded.extend_from_slice(&snapshot.epoch.to_be_bytes());
-    encoded.extend_from_slice(&snapshot.config_id.to_be_bytes());
-    encoded.extend_from_slice(&snapshot.applied_index.to_be_bytes());
-    encoded.extend_from_slice(snapshot.applied_hash.as_bytes());
-    encoded.extend_from_slice(&snapshot.storage_version.to_be_bytes());
-    encoded.extend_from_slice(snapshot.materializer_fingerprint.as_bytes());
-    encoded.extend_from_slice(snapshot.digest.as_bytes());
-    encode_snapshot_bytes(&mut encoded, &snapshot.db_bytes);
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::ResourceExhausted("RHGS v2 allocation failed".into()))?;
+    try_extend_rhgs(&mut encoded, SNAPSHOT_WIRE_MAGIC)?;
+    try_extend_rhgs(&mut encoded, &SNAPSHOT_WIRE_VERSION.to_be_bytes())?;
+    encode_snapshot_bytes(&mut encoded, snapshot.cluster_id.as_bytes())?;
+    encode_snapshot_bytes(&mut encoded, snapshot.created_by.as_bytes())?;
+    try_extend_rhgs(&mut encoded, &snapshot.epoch.to_be_bytes())?;
+    try_extend_rhgs(&mut encoded, &snapshot.config_id.to_be_bytes())?;
+    try_extend_rhgs(&mut encoded, &snapshot.applied_index.to_be_bytes())?;
+    try_extend_rhgs(&mut encoded, snapshot.applied_hash.as_bytes())?;
+    try_extend_rhgs(&mut encoded, &snapshot.storage_version.to_be_bytes())?;
+    try_extend_rhgs(&mut encoded, snapshot.materializer_fingerprint.as_bytes())?;
+    try_extend_rhgs(&mut encoded, snapshot.digest.as_bytes())?;
+    encode_snapshot_bytes(&mut encoded, &snapshot.db_bytes)?;
+    encode_snapshot_bytes(&mut encoded, &snapshot.replicated_control)?;
+    ensure_rhgs_total_bound(encoded.len())?;
     Ok(encoded)
 }
 
 /// Decodes and verifies a canonical Ladybug snapshot archive object.
 pub fn decode_snapshot(encoded: &[u8]) -> Result<LadybugSnapshot> {
+    ensure_rhgs_total_bound(encoded.len())?;
     let mut decoder = SnapshotDecoder::new(encoded);
     if decoder.take(SNAPSHOT_WIRE_MAGIC.len())? != SNAPSHOT_WIRE_MAGIC {
         return Err(Error::InvalidSnapshot(
@@ -746,8 +759,8 @@ pub fn decode_snapshot(encoded: &[u8]) -> Result<LadybugSnapshot> {
         )));
     }
     let snapshot = LadybugSnapshot {
-        cluster_id: decoder.string()?,
-        created_by: decoder.string()?,
+        cluster_id: decoder.string(MAX_RHGS_ID_BYTES, "cluster id")?,
+        created_by: decoder.string(MAX_RHGS_ID_BYTES, "source node id")?,
         epoch: decoder.u64()?,
         config_id: decoder.u64()?,
         applied_index: decoder.u64()?,
@@ -755,7 +768,14 @@ pub fn decode_snapshot(encoded: &[u8]) -> Result<LadybugSnapshot> {
         storage_version: decoder.u64()?,
         materializer_fingerprint: LogHash::from_bytes(decoder.array()?),
         digest: LogHash::from_bytes(decoder.array()?),
-        db_bytes: decoder.bytes()?.to_vec(),
+        db_bytes: try_copy_bounded(
+            decoder.bytes(MAX_RHGS_DB_BYTES, "Ladybug database")?,
+            "RHGS v2 Ladybug database",
+        )?,
+        replicated_control: try_copy_bounded(
+            decoder.bytes(MAX_RHGS_CONTROL_BYTES, "replicated graph control")?,
+            "RHGS v2 replicated graph control",
+        )?,
     };
     if !decoder.is_empty() {
         return Err(Error::InvalidSnapshot(
@@ -767,9 +787,24 @@ pub fn decode_snapshot(encoded: &[u8]) -> Result<LadybugSnapshot> {
 }
 
 fn validate_snapshot_envelope(snapshot: &LadybugSnapshot) -> Result<()> {
-    if snapshot.cluster_id.is_empty() || snapshot.created_by.is_empty() {
+    if snapshot.cluster_id.is_empty()
+        || snapshot.cluster_id.len() > MAX_RHGS_ID_BYTES
+        || snapshot.created_by.is_empty()
+        || snapshot.created_by.len() > MAX_RHGS_ID_BYTES
+        || snapshot.epoch == 0
+    {
         return Err(Error::InvalidSnapshot(
-            "snapshot identity contains an empty cluster or source node".into(),
+            "snapshot identity must contain bounded cluster and source node ids".into(),
+        ));
+    }
+    if snapshot.db_bytes.len() > MAX_RHGS_DB_BYTES {
+        return Err(Error::ResourceExhausted(
+            "RHGS v2 Ladybug database exceeds bound".into(),
+        ));
+    }
+    if snapshot.replicated_control.len() > MAX_RHGS_CONTROL_BYTES {
+        return Err(Error::ResourceExhausted(
+            "RHGS v2 replicated graph control exceeds bound".into(),
         ));
     }
     if snapshot.storage_version != lbug::get_storage_version() {
@@ -792,13 +827,56 @@ fn validate_snapshot_envelope(snapshot: &LadybugSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn encode_snapshot_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
-    encoded.extend_from_slice(
-        &u64::try_from(value.len())
-            .expect("usize fits in u64")
-            .to_be_bytes(),
-    );
+fn rhgs_encoded_len(snapshot: &LadybugSnapshot) -> Result<usize> {
+    [
+        SNAPSHOT_WIRE_MAGIC.len(),
+        2,
+        8,
+        snapshot.cluster_id.len(),
+        8,
+        snapshot.created_by.len(),
+        8,
+        8,
+        8,
+        32,
+        8,
+        32,
+        32,
+        8,
+        snapshot.db_bytes.len(),
+        8,
+        snapshot.replicated_control.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, value| total.checked_add(value))
+    .ok_or_else(|| Error::ResourceExhausted("RHGS v2 size overflows".into()))
+}
+
+fn encode_snapshot_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    try_extend_rhgs(encoded, &(value.len() as u64).to_be_bytes())?;
+    try_extend_rhgs(encoded, value)
+}
+
+fn try_extend_rhgs(encoded: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let next = encoded
+        .len()
+        .checked_add(value.len())
+        .ok_or_else(|| Error::ResourceExhausted("RHGS v2 size overflows".into()))?;
+    ensure_rhgs_total_bound(next)?;
+    encoded
+        .try_reserve(value.len())
+        .map_err(|_| Error::ResourceExhausted("RHGS v2 allocation failed".into()))?;
     encoded.extend_from_slice(value);
+    Ok(())
+}
+
+fn try_copy_bounded(value: &[u8], label: &str) -> Result<Vec<u8>> {
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(value.len())
+        .map_err(|_| Error::ResourceExhausted(format!("{label} allocation failed")))?;
+    copied.extend_from_slice(value);
+    Ok(copied)
 }
 
 struct SnapshotDecoder<'a> {
@@ -836,16 +914,28 @@ impl<'a> SnapshotDecoder<'a> {
         Ok(u64::from_be_bytes(self.array()?))
     }
 
-    fn bytes(&mut self) -> Result<&'a [u8]> {
+    fn bytes(&mut self, maximum: usize, label: &str) -> Result<&'a [u8]> {
         let length = usize::try_from(self.u64()?).map_err(|_| {
             Error::InvalidSnapshot("snapshot envelope length exceeds this platform".into())
         })?;
+        if length > maximum {
+            return Err(Error::ResourceExhausted(format!(
+                "RHGS v2 {label} exceeds bound"
+            )));
+        }
         self.take(length)
     }
 
-    fn string(&mut self) -> Result<String> {
-        String::from_utf8(self.bytes()?.to_vec())
-            .map_err(|_| Error::InvalidSnapshot("snapshot identity is not valid UTF-8".into()))
+    fn string(&mut self, maximum: usize, label: &str) -> Result<String> {
+        let bytes = self.bytes(maximum, label)?;
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| Error::InvalidSnapshot("snapshot identity is not valid UTF-8".into()))?;
+        let mut copied = String::new();
+        copied
+            .try_reserve_exact(value.len())
+            .map_err(|_| Error::ResourceExhausted(format!("RHGS v2 {label} allocation failed")))?;
+        copied.push_str(value);
+        Ok(copied)
     }
 
     const fn is_empty(&self) -> bool {
@@ -853,12 +943,20 @@ impl<'a> SnapshotDecoder<'a> {
     }
 }
 
+fn ensure_rhgs_total_bound(length: usize) -> Result<()> {
+    if length > MAX_RHGS_V2_BYTES {
+        return Err(Error::ResourceExhausted(
+            "RHGS v2 envelope exceeds bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct Identity {
     cluster_id: String,
     node_id: String,
     epoch: u64,
-    config_id: u64,
 }
 
 /// Authoritative LadybugDB materialized state guarded by a single local writer.
@@ -867,6 +965,7 @@ pub struct LadybugStateMachine {
     identity: Identity,
     database: RwLock<Option<Database>>,
     writer: Mutex<()>,
+    control: ControlStore,
 }
 
 impl LadybugStateMachine {
@@ -879,19 +978,145 @@ impl LadybugStateMachine {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         ensure_parent(&path)?;
-        let identity = Identity {
-            cluster_id: cluster_id.into(),
-            node_id: node_id.into(),
-            epoch,
-            config_id,
-        };
-        let database = open_database(&path)?;
-        initialize_or_validate(&database, &identity)?;
-        Ok(Self {
+        Self::open_with_configuration(
             path,
-            identity,
-            database: RwLock::new(Some(database)),
+            cluster_id,
+            node_id,
+            epoch,
+            ConfigurationState::active(config_id, LogHash::ZERO),
+        )
+    }
+
+    pub fn open_with_configuration(
+        path: impl AsRef<Path>,
+        cluster_id: &str,
+        node_id: &str,
+        epoch: u64,
+        configuration_state: ConfigurationState,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        ensure_parent(&path)?;
+        recover_interrupted_snapshot_publish(&path)?;
+        let control_path = control_sidecar_path(&path);
+        match (path_present(&path)?, path_present(&control_path)?) {
+            (false, false) => Self::create_new(
+                &path,
+                cluster_id,
+                node_id,
+                epoch,
+                configuration_state,
+            ),
+            (true, true) => Self::open_existing_pair(&path, cluster_id, node_id, epoch),
+            (true, false) => Err(Error::IdentityMismatch(
+                "graph control sidecar is missing; restore an RHGS v2 snapshot instead of auto-migrating"
+                    .into(),
+            )),
+            (false, true) => Err(Error::IdentityMismatch(
+                "canonical Ladybug database is missing beside its graph control sidecar".into(),
+            )),
+        }
+    }
+
+    fn create_new(
+        path: &Path,
+        cluster_id: &str,
+        node_id: &str,
+        epoch: u64,
+        configuration_state: ConfigurationState,
+    ) -> Result<Self> {
+        let control_path = control_sidecar_path(path);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(io_error)?;
+        let mut owns_control = false;
+        let created = (|| {
+            let identity = Identity {
+                cluster_id: cluster_id.into(),
+                node_id: node_id.into(),
+                epoch,
+            };
+            let database = open_database(path)?;
+            let connection = Connection::new(&database).map_err(ladybug_error)?;
+            connection
+                .query(CREATE_DOCUMENT_TABLE)
+                .map_err(ladybug_error)?;
+            connection.query("CHECKPOINT").map_err(ladybug_error)?;
+            drop(connection);
+            drop(database);
+            reject_legacy_database(path)?;
+            let digest = lgfx::file_digest(path)?;
+            let control = ControlStore::create(
+                &control_path,
+                &ControlIdentity::new(
+                    cluster_id,
+                    node_id,
+                    epoch,
+                    configuration_state,
+                    1,
+                    graph_materializer_fingerprint(),
+                    digest,
+                ),
+            )?;
+            owns_control = true;
+            Ok(Self {
+                path: path.to_path_buf(),
+                identity,
+                database: RwLock::new(Some(open_database(path)?)),
+                writer: Mutex::new(()),
+                control,
+            })
+        })();
+        if created.is_err() {
+            remove_sidecars(path);
+            let _ = fs::remove_file(path);
+            if owns_control {
+                let _ = fs::remove_file(control_path);
+            }
+        }
+        created
+    }
+
+    fn open_existing_pair(
+        path: &Path,
+        cluster_id: &str,
+        node_id: &str,
+        epoch: u64,
+    ) -> Result<Self> {
+        require_regular_file(path, "canonical Ladybug database")?;
+        require_regular_file(
+            &control_sidecar_path(path),
+            "canonical graph control sidecar",
+        )?;
+        reject_legacy_database(path)?;
+        let control = ControlStore::open_existing(control_sidecar_path(path))?;
+        validate_control_database_pair(path, &control)?;
+        let persisted = control.identity()?;
+        if persisted.cluster_id() != cluster_id {
+            return Err(Error::IdentityMismatch("cluster_id".into()));
+        }
+        if persisted.node_id() != node_id {
+            return Err(Error::IdentityMismatch("node_id".into()));
+        }
+        if persisted.epoch() != epoch {
+            return Err(Error::IdentityMismatch("epoch".into()));
+        }
+        if persisted.materializer_fingerprint() != graph_materializer_fingerprint() {
+            return Err(Error::IdentityMismatch(
+                "graph materializer fingerprint".into(),
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity: Identity {
+                cluster_id: cluster_id.into(),
+                node_id: node_id.into(),
+                epoch,
+            },
+            database: RwLock::new(Some(open_database(path)?)),
             writer: Mutex::new(()),
+            control,
         })
     }
 
@@ -901,42 +1126,55 @@ impl LadybugStateMachine {
                 "hash does not match entry contents".into(),
             ));
         }
-        let commands = (entry.entry_type == EntryType::Command)
-            .then(|| decode_replicated_graph_commands(&entry.payload))
-            .transpose()?
-            .unwrap_or_default();
         let _writer = self
             .writer
             .lock()
             .map_err(|_| Error::Ladybug("state machine writer lock is poisoned".into()))?;
-        // The lifecycle lock protects replacement/close of the Database handle.
-        // Normal writes are serialized by `writer`, but may share the stable
-        // handle with readers and rely on Ladybug's transaction isolation.
-        let guard = self.read_database()?;
-        let database = guard.as_ref().ok_or(Error::Closed)?;
-        let connection = Connection::new(database).map_err(ladybug_error)?;
-        transaction(&connection, || {
-            self.apply_in_transaction(&connection, entry, &commands)
-        })
+        self.apply_lgfx_entry(entry)
     }
 
     pub fn applied_index(&self) -> Result<LogIndex> {
-        let guard = self.read_database()?;
-        let database = guard.as_ref().ok_or(Error::Closed)?;
-        let connection = Connection::new(database).map_err(ladybug_error)?;
-        meta_u64(&connection, "applied_index")
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        Ok(self.control.applied_tip()?.index())
     }
 
     pub fn applied_hash(&self) -> Result<LogHash> {
-        let guard = self.read_database()?;
-        let database = guard.as_ref().ok_or(Error::Closed)?;
-        let connection = Connection::new(database).map_err(ladybug_error)?;
-        meta_hash(&connection, "applied_hash")
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        Ok(self.control.applied_tip()?.hash())
+    }
+
+    pub fn materialized_tip(&self) -> Result<LogAnchor> {
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        self.control.applied_tip()
+    }
+
+    pub fn configuration_state_value(&self) -> Result<ConfigurationState> {
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        self.control.configuration_state()
+    }
+
+    pub fn canonical_db_digest(&self) -> Result<LogHash> {
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        self.close_database_cleanly()?;
+        let digest = lgfx::file_digest(&self.path);
+        let reopen = self.reopen_database();
+        match (digest, reopen) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(digest), Ok(())) => Ok(digest),
+        }
     }
 
     /// Safe read boundary for the fixed document projection. No raw Cypher is accepted.
     pub fn get_document(&self, id: &str) -> Result<Option<GraphValueV1>> {
         validate_nonempty_bytes("document id", id, MAX_DOCUMENT_ID_BYTES)?;
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
@@ -950,20 +1188,14 @@ impl LadybugStateMachine {
         id: &str,
     ) -> Result<(Option<GraphValueV1>, LogIndex, LogHash)> {
         validate_nonempty_bytes("document id", id, MAX_DOCUMENT_ID_BYTES)?;
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
-        if let Some((value, applied_index, applied_hash)) = document_with_tip(&connection, id)? {
-            return Ok((Some(value), applied_index, applied_hash));
-        }
-        read_transaction(&connection, || {
-            if let Some((value, applied_index, applied_hash)) = document_with_tip(&connection, id)?
-            {
-                return Ok((Some(value), applied_index, applied_hash));
-            }
-            let (applied_index, applied_hash) = materialized_tip(&connection)?;
-            Ok((None, applied_index, applied_hash))
-        })
+        let value = document(&connection, id)?;
+        let tip = self.control.applied_tip()?;
+        Ok((value, tip.index(), tip.hash()))
     }
 
     /// Executes one admitted read-only Cypher statement and returns rows with the
@@ -989,6 +1221,8 @@ impl LadybugStateMachine {
         let admitted = admit_read_only_query(statement, parameters, max_rows, max_bytes)?;
         validate_query_parameter_contract(parameters, &admitted.referenced_parameters)?;
         let parameters = query_parameters(parameters)?;
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
@@ -1047,12 +1281,12 @@ impl LadybugStateMachine {
                     .collect::<Result<Vec<_>>>()?;
                 rows.push(row);
             }
-            let (applied_index, hash) = materialized_tip(&connection)?;
+            let tip = self.control.applied_tip()?;
             Ok(GraphQueryResult {
                 columns,
                 rows,
-                applied_index,
-                hash,
+                applied_index: tip.index(),
+                hash: tip.hash(),
             })
         })
     }
@@ -1068,22 +1302,123 @@ impl LadybugStateMachine {
                 "request id does not match the encoded graph command".into(),
             ));
         }
-        let guard = self.read_database()?;
-        let database = guard.as_ref().ok_or(Error::Closed)?;
-        let connection = Connection::new(database).map_err(ladybug_error)?;
-        matching_request(&connection, request_id, command_payload)
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        let request_digest = LogHash::digest(&[command_payload]);
+        self.control
+            .lookup_request(request_id, request_digest)?
+            .map(|receipt| {
+                Ok(RequestRecord {
+                    original_log_index: receipt.original_anchor().index(),
+                    original_log_hash: receipt.original_anchor().hash(),
+                    result: GraphCommandResultV1::decode(receipt.result_blob())?,
+                })
+            })
+            .transpose()
     }
 
-    /// Drains crate-owned operations, checkpoints, closes Ladybug, copies the
-    /// single database file, and reopens it before returning.
+    /// Materializes one semantic RHGC request against a closed clone without
+    /// changing the authoritative database or control sidecar.
+    pub fn prepare_graph_effect(
+        &self,
+        request_payload: &[u8],
+        base_index: LogIndex,
+        base_hash: LogHash,
+    ) -> Result<Vec<u8>> {
+        let command = decode_replicated_graph_command(request_payload)?;
+        let _writer = self.lock_writer()?;
+        self.ensure_no_pending_apply()?;
+        let tip = self.control.applied_tip()?;
+        if tip != LogAnchor::new(base_index, base_hash) {
+            return Err(Error::InvalidEntry(
+                "LGFX preparation base does not match the materialized tip".into(),
+            ));
+        }
+        let request_digest = LogHash::digest(&[request_payload]);
+        if self
+            .control
+            .lookup_request(command.request_id(), request_digest)?
+            .is_some()
+        {
+            return Err(Error::InvalidCommand(
+                "graph request was already materialized; use its receipt".into(),
+            ));
+        }
+        let identity = self.control.identity()?;
+        let base_artifact = NamedTempFile::new_in(parent_dir(&self.path)).map_err(io_error)?;
+        let staging_artifact = NamedTempFile::new_in(parent_dir(&self.path)).map_err(io_error)?;
+        let base_path = base_artifact.path();
+        let staging_path = staging_artifact.path();
+
+        self.close_database_cleanly()?;
+        let prepared = (|| {
+            fs::copy(&self.path, base_path).map_err(io_error)?;
+            File::open(base_path)
+                .and_then(|file| file.sync_all())
+                .map_err(io_error)?;
+            fs::copy(base_path, staging_path).map_err(io_error)?;
+            let staging = open_database(staging_path)?;
+            let connection = Connection::new(&staging).map_err(ladybug_error)?;
+            let result = transaction(&connection, || apply_command(&connection, &command))?;
+            connection.query("CHECKPOINT").map_err(ladybug_error)?;
+            drop(connection);
+            drop(staging);
+            ensure_clean_database(staging_path)?;
+            let actual_base_digest = lgfx::file_digest(base_path)?;
+            if actual_base_digest != identity.user_db_digest() {
+                return Err(Error::InvalidEntry(
+                    "closed Ladybug base digest does not match graph control".into(),
+                ));
+            }
+            let chunks = diff_closed_ladybug_files(base_path, staging_path)?;
+            let effect = LadybugFileEffectV1 {
+                cluster_id: identity.cluster_id().to_owned(),
+                epoch: identity.epoch(),
+                configuration_id: identity.configuration_state().config_id(),
+                recovery_generation: identity.recovery_generation(),
+                base_log_index: base_index,
+                base_log_hash: base_hash,
+                base_db_digest: actual_base_digest,
+                base_file_bytes: fs::metadata(base_path).map_err(io_error)?.len(),
+                target_db_digest: lgfx::file_digest(staging_path)?,
+                target_file_bytes: fs::metadata(staging_path).map_err(io_error)?.len(),
+                storage_version: lbug::get_storage_version(),
+                materializer_fingerprint: graph_materializer_fingerprint(),
+                request_id: command.request_id().to_owned(),
+                request_digest,
+                result_encoding_version: 1,
+                bounded_result: result.encode(),
+                chunks_digest: lgfx_chunks_digest(&chunks),
+                chunks,
+            };
+            effect.encode()
+        })();
+        let reopen = self.reopen_database();
+        match (prepared, reopen) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(effect), Ok(())) => Ok(effect),
+        }
+    }
+
+    /// Drains crate-owned operations, closes Ladybug, copies the clean database
+    /// file plus replicated control state, and reopens it before returning.
     pub fn create_snapshot(&self, target: LogIndex) -> Result<LadybugSnapshot> {
         let _writer = self
             .writer
             .lock()
             .map_err(|_| Error::Ladybug("state machine writer lock is poisoned".into()))?;
+        self.ensure_no_pending_apply()?;
+        let tip = self.control.applied_tip()?;
+        if tip.index() != target {
+            return Err(Error::InvalidSnapshot(format!(
+                "snapshot target {target} does not match applied index {}",
+                tip.index()
+            )));
+        }
         let mut guard = self.write_database()?;
         let checkpoint_wal = ladybug_sidecar(&self.path, ".wal.checkpoint");
-        if checkpoint_wal.exists() {
+        if path_present(&checkpoint_wal)? {
             return Err(Error::InvalidSnapshot(format!(
                 "checkpoint found stale sidecar file {}",
                 checkpoint_wal.display()
@@ -1091,20 +1426,13 @@ impl LadybugStateMachine {
         }
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
-        let applied_index = meta_u64(&connection, "applied_index")?;
-        if applied_index != target {
-            return Err(Error::InvalidSnapshot(format!(
-                "snapshot target {target} does not match applied index {applied_index}"
-            )));
-        }
-        let applied_hash = meta_hash(&connection, "applied_hash")?;
-        connection.query("CHECKPOINT").map_err(ladybug_error)?;
+        let applied_index = tip.index();
+        let applied_hash = tip.hash();
         drop(connection);
-
         let database = guard.take().ok_or(Error::Closed)?;
         drop(database);
         for sidecar in ladybug_sidecars(&self.path) {
-            if sidecar.exists() {
+            if path_present(&sidecar)? {
                 let reopened = open_database(&self.path)?;
                 *guard = Some(reopened);
                 return Err(Error::InvalidSnapshot(format!(
@@ -1113,75 +1441,66 @@ impl LadybugStateMachine {
                 )));
             }
         }
-        let read_result = fs::read(&self.path).map_err(io_error);
+        let read_result =
+            read_bounded_file(&self.path, MAX_RHGS_DB_BYTES, "RHGS v2 Ladybug database");
         *guard = Some(open_database(&self.path)?);
         let db_bytes = read_result?;
+        if LogHash::digest(&[&db_bytes]) != self.control.user_db_digest()? {
+            return Err(Error::InvalidSnapshot(
+                "canonical Ladybug digest does not match graph control".into(),
+            ));
+        }
         let storage_version = lbug::get_storage_version();
+        let control_identity = self.control.identity()?;
         let mut snapshot = LadybugSnapshot {
             cluster_id: self.identity.cluster_id.clone(),
             created_by: self.identity.node_id.clone(),
             epoch: self.identity.epoch,
-            config_id: self.identity.config_id,
+            config_id: control_identity.configuration_state().config_id(),
             applied_index,
             applied_hash,
             storage_version,
             materializer_fingerprint: graph_materializer_fingerprint(),
             digest: LogHash::ZERO,
             db_bytes,
+            replicated_control: self.control.export_replicated_snapshot()?,
         };
         snapshot.digest = snapshot.recompute_digest();
         Ok(snapshot)
     }
 
-    fn apply_in_transaction(
-        &self,
-        connection: &Connection<'_>,
-        entry: &LogEntry,
-        commands: &[DecodedGraphCommand],
-    ) -> Result<ApplyOutcome> {
-        validate_identity(connection, &self.identity)?;
+    fn apply_lgfx_entry(&self, entry: &LogEntry) -> Result<ApplyOutcome> {
+        let identity = self.control.identity()?;
         if entry.cluster_id != self.identity.cluster_id {
             return Err(Error::IdentityMismatch("cluster_id".into()));
         }
         if entry.epoch != self.identity.epoch {
             return Err(Error::IdentityMismatch("epoch".into()));
         }
-        if entry.config_id != self.identity.config_id {
-            return Err(Error::IdentityMismatch("config_id".into()));
-        }
-
-        let current_index = meta_u64(connection, "applied_index")?;
-        let current_hash = meta_hash(connection, "applied_hash")?;
-        if entry.index == current_index {
-            if entry.hash != current_hash {
+        let tip = self.control.applied_tip()?;
+        if entry.index == tip.index() {
+            if entry.hash != tip.hash() {
                 return Err(Error::InvalidEntry(
                     "current index was reapplied with a different hash".into(),
                 ));
             }
-            let mut results = Vec::with_capacity(commands.len());
-            for member in commands {
-                results.push(
-                    matching_request(
-                        connection,
-                        member.command.request_id(),
-                        &member.individual_payload,
-                    )?
-                    .ok_or_else(|| {
-                        Error::InvalidEntry(
-                            "applied graph command is missing its request record".into(),
-                        )
-                    })?
-                    .result,
-                );
-            }
-            let result = (results.len() == 1).then(|| results.remove(0));
+            let result = if entry.entry_type == EntryType::Command {
+                let effect = decode_lgfx_command(&entry.payload)?;
+                self.control
+                    .lookup_request(&effect.request_id, effect.request_digest)?
+                    .map(|receipt| GraphCommandResultV1::decode(receipt.result_blob()))
+                    .transpose()?
+            } else {
+                None
+            };
             return Ok(ApplyOutcome {
-                applied_index: current_index,
-                applied_hash: current_hash,
+                applied_index: tip.index(),
+                applied_hash: tip.hash(),
                 result,
             });
         }
-        let expected = current_index
+        let expected = tip
+            .index()
             .checked_add(1)
             .ok_or_else(|| Error::InvalidEntry("applied index is exhausted".into()))?;
         if entry.index != expected {
@@ -1190,49 +1509,156 @@ impl LadybugStateMachine {
                 entry.index
             )));
         }
-        if entry.prev_hash != current_hash {
+        if entry.prev_hash != tip.hash() {
             return Err(Error::InvalidEntry(
                 "prev_hash does not match the materialized graph tip".into(),
             ));
         }
 
-        let result = match entry.entry_type {
-            EntryType::Command => {
-                let mut results = Vec::with_capacity(commands.len());
-                for member in commands {
-                    if let Some(record) = matching_request(
-                        connection,
-                        member.command.request_id(),
-                        &member.individual_payload,
-                    )? {
-                        results.push(record.result);
-                    } else {
-                        let result = apply_command(connection, &member.command)?;
-                        record_request(
-                            connection,
-                            &member.command,
-                            &member.individual_payload,
-                            entry,
-                            &result,
-                        )?;
-                        results.push(result);
-                    }
-                }
-                (results.len() == 1).then(|| results.remove(0))
+        let current_configuration = self.control.configuration_state()?;
+        let next_configuration = current_configuration
+            .validate_entry(entry)
+            .map_err(|error| Error::InvalidEntry(error.to_string()))?;
+        let base = LogAnchor::new(tip.index(), tip.hash());
+        let target = LogAnchor::new(entry.index, entry.hash);
+        let result = if entry.entry_type == EntryType::Command {
+            let effect = decode_lgfx_command(&entry.payload)?;
+            validate_lgfx_identity(&effect, &identity, &current_configuration)?;
+            if effect.base_log_index != tip.index() || effect.base_log_hash != tip.hash() {
+                return Err(Error::InvalidEntry(
+                    "LGFX effect base does not match the graph tip".into(),
+                ));
             }
-            EntryType::ConfigChange
-            | EntryType::SnapshotBarrier
-            | EntryType::SnapshotPublished
-            | EntryType::Noop => None,
+            let result = GraphCommandResultV1::decode(&effect.bounded_result)?;
+            if result.encode() != effect.bounded_result {
+                return Err(Error::InvalidEntry(
+                    "LGFX result is not canonically encoded".into(),
+                ));
+            }
+            if self
+                .control
+                .lookup_request(&effect.request_id, effect.request_digest)?
+                .is_some()
+            {
+                return Err(Error::InvalidEntry(
+                    "LGFX request receipt already belongs to an earlier entry".into(),
+                ));
+            }
+            let pending = PendingApply::new(
+                base,
+                target,
+                effect.base_db_digest,
+                effect.target_db_digest,
+                effect.target_file_bytes,
+            );
+            self.control.begin_pending(&pending)?;
+            self.install_lgfx_effect(&effect)?;
+            let receipt = RequestReceipt::new(
+                &effect.request_id,
+                effect.request_digest,
+                target,
+                effect.bounded_result.clone(),
+            );
+            self.control
+                .commit_applied(&pending, &next_configuration, Some(&receipt))?;
+            Some(result)
+        } else {
+            match entry.entry_type {
+                EntryType::Noop if !entry.payload.is_empty() => {
+                    return Err(Error::InvalidEntry("Noop payload must be empty".into()))
+                }
+                EntryType::Noop
+                | EntryType::ConfigChange
+                | EntryType::SnapshotBarrier
+                | EntryType::SnapshotPublished => {}
+                EntryType::Command => unreachable!(),
+            }
+            let digest = self.control.user_db_digest()?;
+            let bytes = fs::metadata(&self.path).map_err(io_error)?.len();
+            let pending = PendingApply::new(base, target, digest, digest, bytes);
+            self.control.begin_pending(&pending)?;
+            self.control
+                .commit_applied(&pending, &next_configuration, None)?;
+            None
         };
-
-        set_meta(connection, "applied_index", &entry.index.to_string())?;
-        set_meta(connection, "applied_hash", &entry.hash.to_hex())?;
         Ok(ApplyOutcome {
             applied_index: entry.index,
             applied_hash: entry.hash,
             result,
         })
+    }
+
+    fn install_lgfx_effect(&self, effect: &LadybugFileEffectV1) -> Result<()> {
+        self.close_database_cleanly()?;
+        let install = (|| {
+            let digest = lgfx::file_digest(&self.path)?;
+            if digest == effect.target_db_digest {
+                let actual_bytes = fs::metadata(&self.path).map_err(io_error)?.len();
+                if actual_bytes != effect.target_file_bytes {
+                    return Err(Error::InvalidEntry(
+                        "canonical Ladybug target size does not match LGFX target_file_bytes"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            }
+            if digest != effect.base_db_digest {
+                return Err(Error::InvalidEntry(
+                    "canonical Ladybug digest matches neither LGFX base nor target".into(),
+                ));
+            }
+            let temp_dir = tempfile::tempdir_in(parent_dir(&self.path)).map_err(io_error)?;
+            let target = temp_dir.path().join("target.lbug");
+            apply_lgfx_to_exact_base(&self.path, &target, effect)?;
+            let verify = open_database(&target)?;
+            let connection = Connection::new(&verify).map_err(ladybug_error)?;
+            connection.query("RETURN 1").map_err(ladybug_error)?;
+            drop(connection);
+            drop(verify);
+            ensure_clean_database(&target)?;
+            fs::rename(&target, &self.path).map_err(io_error)?;
+            sync_parent(parent_dir(&self.path))
+        })();
+        let reopen = self.reopen_database();
+        match (install, reopen) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn close_database_cleanly(&self) -> Result<()> {
+        let mut guard = self.write_database()?;
+        guard.as_ref().ok_or(Error::Closed)?;
+        drop(guard.take().ok_or(Error::Closed)?);
+        ensure_clean_database(&self.path)
+    }
+
+    fn reopen_database(&self) -> Result<()> {
+        let reopened = open_database(&self.path)?;
+        let mut guard = self.write_database()?;
+        if guard.is_some() {
+            return Err(Error::Ladybug(
+                "refusing to replace an open Ladybug database".into(),
+            ));
+        }
+        *guard = Some(reopened);
+        Ok(())
+    }
+
+    fn ensure_no_pending_apply(&self) -> Result<()> {
+        if self.control.pending()?.is_some() {
+            return Err(Error::InvalidEntry(
+                "canonical graph state is unavailable while an LGFX apply is pending".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.writer
+            .lock()
+            .map_err(|_| Error::Ladybug("state machine writer lock is poisoned".into()))
     }
 
     fn read_database(&self) -> Result<RwLockReadGuard<'_, Option<Database>>> {
@@ -1274,7 +1700,6 @@ fn decode_replicated_graph_command(payload: &[u8]) -> Result<GraphCommandV1> {
 
 struct DecodedGraphCommand {
     command: GraphCommandV1,
-    individual_payload: Vec<u8>,
 }
 
 fn decode_replicated_graph_commands(payload: &[u8]) -> Result<Vec<DecodedGraphCommand>> {
@@ -1289,10 +1714,7 @@ fn decode_replicated_graph_commands(payload: &[u8]) -> Result<Vec<DecodedGraphCo
     match envelope.command_version() {
         1 => {
             let command = decode_replicated_graph_command(payload)?;
-            Ok(vec![DecodedGraphCommand {
-                command,
-                individual_payload: payload.to_vec(),
-            }])
+            Ok(vec![DecodedGraphCommand { command }])
         }
         BATCH_COMMAND_VERSION => {
             if envelope.request_id() != BATCH_REQUEST_ID {
@@ -1323,11 +1745,7 @@ fn decode_replicated_graph_commands(payload: &[u8]) -> Result<Vec<DecodedGraphCo
                         command.request_id()
                     )));
                 }
-                let individual_payload = encode_replicated_graph_command(&command)?;
-                commands.push(DecodedGraphCommand {
-                    command,
-                    individual_payload,
-                });
+                commands.push(DecodedGraphCommand { command });
             }
             if !decoder.is_empty() {
                 return Err(Error::Codec("trailing graph batch command bytes".into()));
@@ -1352,38 +1770,68 @@ pub fn restore_snapshot_file(
     snapshot: &LadybugSnapshot,
     target_node_id: &str,
 ) -> Result<()> {
-    if target_node_id.is_empty() {
-        return Err(Error::InvalidSnapshot("target node id is empty".into()));
-    }
-    if snapshot.recompute_digest() != snapshot.digest {
+    if target_node_id.is_empty() || target_node_id.len() > MAX_RHGS_ID_BYTES {
         return Err(Error::InvalidSnapshot(
-            "snapshot digest does not match its contents".into(),
+            "target node id must contain 1..=256 bytes".into(),
         ));
     }
-    if snapshot.storage_version != lbug::get_storage_version() {
-        return Err(Error::InvalidSnapshot(format!(
-            "storage version {} does not match local {}",
-            snapshot.storage_version,
-            lbug::get_storage_version()
-        )));
-    }
-    if snapshot.materializer_fingerprint != graph_materializer_fingerprint() {
-        return Err(Error::InvalidSnapshot(
-            "materializer fingerprint does not match this binary".into(),
-        ));
-    }
+    validate_snapshot_envelope(snapshot)?;
+    control::validate_replicated_snapshot_source(
+        &snapshot.replicated_control,
+        &snapshot.created_by,
+    )?;
     let path = path.as_ref();
     ensure_parent(path)?;
-    if path.exists()
-        || ladybug_sidecars(path)
-            .iter()
-            .any(|sidecar| sidecar.exists())
-    {
-        return Err(Error::InvalidSnapshot(
-            "restore target or a Ladybug sidecar already exists".into(),
-        ));
+    let intent_path = restore_intent_path(path);
+    let expected_preparing = RestoreIntent {
+        phase: RestorePhase::Preparing,
+        db_digest: LogHash::digest(&[&snapshot.db_bytes]),
+        control_digest: LogHash::ZERO,
+        snapshot_digest: snapshot.digest,
+        target_node_digest: LogHash::digest(&[target_node_id.as_bytes()]),
+    };
+    let control_path = control_sidecar_path(path);
+    let staging_db = restore_staging_db_path(path);
+    let staging_control = restore_staging_control_path(path);
+    let parent = parent_dir(path);
+    if path_present(&intent_path)? {
+        let intent = read_restore_intent(&intent_path)?;
+        if intent.snapshot_digest != snapshot.digest
+            || intent.target_node_digest != LogHash::digest(&[target_node_id.as_bytes()])
+            || intent.db_digest != expected_preparing.db_digest
+        {
+            return Err(Error::InvalidSnapshot(
+                "an interrupted restore belongs to a different snapshot or target node".into(),
+            ));
+        }
+        match intent.phase {
+            RestorePhase::Staged => {
+                recover_interrupted_snapshot_publish(path)?;
+                return Ok(());
+            }
+            RestorePhase::Preparing => {
+                cleanup_owned_restore_staging(&staging_db, &staging_control, parent)?;
+            }
+        }
+    } else {
+        if path_present(path)?
+            || path_present(&control_path)?
+            || path_present(&staging_db)?
+            || path_present(&staging_control)?
+        {
+            return Err(Error::InvalidSnapshot(
+                "RHGS v2 restore target, staging, and graph control must not exist".into(),
+            ));
+        }
+        for sidecar in ladybug_sidecars(path) {
+            if path_present(&sidecar)? {
+                return Err(Error::InvalidSnapshot(
+                    "RHGS v2 restore Ladybug sidecars must not exist".into(),
+                ));
+            }
+        }
+        write_restore_intent(&intent_path, &expected_preparing)?;
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = NamedTempFile::new_in(parent).map_err(io_error)?;
     temporary.write_all(&snapshot.db_bytes).map_err(io_error)?;
     temporary.as_file().sync_all().map_err(io_error)?;
@@ -1396,12 +1844,9 @@ pub fn restore_snapshot_file(
         }
     };
     let validation = (|| {
-        validate_snapshot_database(&database, snapshot, &snapshot.created_by)?;
-        rebind_snapshot_node(&database, target_node_id)?;
-        validate_snapshot_database(&database, snapshot, target_node_id)?;
         let connection = Connection::new(&database).map_err(invalid_snapshot_ladybug_error)?;
         connection
-            .query("CHECKPOINT")
+            .query("RETURN 1")
             .map_err(invalid_snapshot_ladybug_error)?;
         Ok(())
     })();
@@ -1411,7 +1856,7 @@ pub fn restore_snapshot_file(
     }
     validation?;
     for sidecar in ladybug_sidecars(&temporary_path) {
-        if sidecar.exists() {
+        if path_present(&sidecar)? {
             remove_sidecars(&temporary_path);
             return Err(Error::InvalidSnapshot(
                 "snapshot validation left a Ladybug sidecar".into(),
@@ -1419,84 +1864,492 @@ pub fn restore_snapshot_file(
         }
     }
     temporary.as_file().sync_all().map_err(io_error)?;
-    temporary.persist_noclobber(path).map_err(|error| {
+    temporary.persist_noclobber(&staging_db).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-            Error::InvalidSnapshot("restore target already exists".into())
+            Error::InvalidSnapshot("restore database staging already exists".into())
         } else {
             io_error(error.error)
         }
     })?;
-    if let Err(error) = File::open(path).and_then(|file| file.sync_all()) {
-        remove_failed_install(path, parent);
-        return Err(io_error(error));
-    }
-    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
-        remove_failed_install(path, parent);
-        return Err(io_error(error));
-    }
-    Ok(())
-}
-
-fn validate_snapshot_database(
-    database: &Database,
-    snapshot: &LadybugSnapshot,
-    expected_node_id: &str,
-) -> Result<()> {
-    let connection = Connection::new(database).map_err(invalid_snapshot_ladybug_error)?;
-    for (key, expected) in [
-        ("cluster_id", snapshot.cluster_id.as_str()),
-        ("node_id", expected_node_id),
-        ("schema_version", SCHEMA_VERSION),
-    ] {
-        let actual = get_meta(&connection, key)
-            .map_err(invalid_snapshot_error)?
-            .ok_or_else(|| Error::InvalidSnapshot(format!("missing metadata {key}")))?;
-        if actual != expected {
-            return Err(Error::InvalidSnapshot(format!(
-                "metadata {key} does not match the snapshot identity"
-            )));
-        }
-    }
-    for (key, expected) in [
-        ("epoch", snapshot.epoch),
-        ("config_id", snapshot.config_id),
-        ("applied_index", snapshot.applied_index),
-    ] {
-        let actual = meta_u64(&connection, key).map_err(invalid_snapshot_error)?;
-        if actual != expected {
-            return Err(Error::InvalidSnapshot(format!(
-                "metadata {key} does not match the snapshot identity"
-            )));
-        }
-    }
-    if meta_hash(&connection, "applied_hash").map_err(invalid_snapshot_error)?
-        != snapshot.applied_hash
+    let staged = (|| {
+        let control = ControlStore::create(
+            &staging_control,
+            &ControlIdentity::new(
+                &snapshot.cluster_id,
+                target_node_id,
+                snapshot.epoch,
+                ConfigurationState::active(snapshot.config_id, LogHash::ZERO),
+                1,
+                snapshot.materializer_fingerprint,
+                LogHash::digest(&[&snapshot.db_bytes]),
+            ),
+        )
+        .map_err(invalid_snapshot_error)?;
+        control
+            .import_replicated_snapshot(&snapshot.replicated_control, &snapshot.created_by)
+            .map_err(invalid_snapshot_error)?;
+        drop(control);
+        require_regular_file(&staging_control, "staged graph control")?;
+        File::open(&staging_control)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+        Ok(())
+    })();
+    staged?;
+    if LogHash::digest(&[&snapshot.db_bytes])
+        != ControlStore::open_existing(&staging_control)?.user_db_digest()?
     {
         return Err(Error::InvalidSnapshot(
-            "metadata applied_hash does not match the snapshot identity".into(),
+            "RHGS v2 database digest does not match replicated graph control".into(),
         ));
     }
-    let fingerprint = get_meta(&connection, "materializer_fingerprint")
-        .map_err(invalid_snapshot_error)?
-        .ok_or_else(|| Error::InvalidSnapshot("missing materializer fingerprint".into()))?;
-    if fingerprint != snapshot.materializer_fingerprint.to_hex() {
+    let control = ControlStore::open_existing(&staging_control)?;
+    let control_identity = control.identity()?;
+    let tip = control.applied_tip()?;
+    if control_identity.cluster_id() != snapshot.cluster_id
+        || control_identity.epoch() != snapshot.epoch
+        || control_identity.node_id() != target_node_id
+        || control_identity.configuration_state().config_id() != snapshot.config_id
+        || tip != LogAnchor::new(snapshot.applied_index, snapshot.applied_hash)
+        || control_identity.materializer_fingerprint() != snapshot.materializer_fingerprint
+    {
+        drop(control);
         return Err(Error::InvalidSnapshot(
-            "inner materializer fingerprint does not match the snapshot envelope".into(),
+            "RHGS v2 envelope does not match replicated graph control".into(),
         ));
     }
-    Ok(())
+    drop(control);
+    let intent = RestoreIntent {
+        phase: RestorePhase::Staged,
+        db_digest: lgfx::file_digest(&staging_db)?,
+        control_digest: lgfx::file_digest(&staging_control)?,
+        snapshot_digest: snapshot.digest,
+        target_node_digest: LogHash::digest(&[target_node_id.as_bytes()]),
+    };
+    require_regular_file(&intent_path, "graph restore intent")?;
+    replace_restore_intent(&intent_path, &intent)?;
+    recover_interrupted_snapshot_publish(path)
 }
 
-fn rebind_snapshot_node(database: &Database, target_node_id: &str) -> Result<()> {
-    let connection = Connection::new(database).map_err(invalid_snapshot_ladybug_error)?;
-    transaction(&connection, || {
-        set_meta(&connection, "node_id", target_node_id)
-    })
-    .map_err(invalid_snapshot_error)
+fn cleanup_owned_restore_staging(database: &Path, control: &Path, parent: &Path) -> Result<()> {
+    for path in [
+        database.to_path_buf(),
+        control.to_path_buf(),
+        append_path_suffix(control, "-journal"),
+        append_path_suffix(control, "-wal"),
+        append_path_suffix(control, "-shm"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidSnapshot(format!(
+                    "owned restore staging path is unexpectedly a directory: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => fs::remove_file(&path).map_err(io_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    sync_parent(parent)
 }
 
 fn open_database(path: &Path) -> Result<Database> {
-    Database::new(path, ladybug_system_config()).map_err(ladybug_error)
+    let database = Database::new(path, ladybug_system_config().auto_checkpoint(false))
+        .map_err(ladybug_error)?;
+    let connection = Connection::new(&database).map_err(ladybug_error)?;
+    connection
+        .query("CALL force_checkpoint_on_close=false")
+        .map_err(ladybug_error)?;
+    drop(connection);
+    Ok(database)
+}
+
+fn control_sidecar_path(path: &Path) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".control");
+    PathBuf::from(sidecar)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RestoreIntent {
+    phase: RestorePhase,
+    db_digest: LogHash,
+    control_digest: LogHash,
+    snapshot_digest: LogHash,
+    target_node_digest: LogHash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestorePhase {
+    Preparing,
+    Staged,
+}
+
+fn restore_staging_db_path(path: &Path) -> PathBuf {
+    append_path_suffix(path, ".restore.db")
+}
+
+fn restore_staging_control_path(path: &Path) -> PathBuf {
+    append_path_suffix(path, ".restore.control")
+}
+
+fn restore_intent_path(path: &Path) -> PathBuf {
+    append_path_suffix(path, ".restore.intent")
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn write_restore_intent(path: &Path, intent: &RestoreIntent) -> Result<()> {
+    persist_restore_intent(path, intent, true)
+}
+
+fn replace_restore_intent(path: &Path, intent: &RestoreIntent) -> Result<()> {
+    persist_restore_intent(path, intent, false)
+}
+
+fn persist_restore_intent(path: &Path, intent: &RestoreIntent, create_new: bool) -> Result<()> {
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(RESTORE_INTENT_BYTES)
+        .map_err(|_| Error::ResourceExhausted("restore intent allocation failed".into()))?;
+    encoded.extend_from_slice(RESTORE_INTENT_MAGIC);
+    encoded.push(match intent.phase {
+        RestorePhase::Preparing => 0,
+        RestorePhase::Staged => 1,
+    });
+    encoded.extend_from_slice(intent.db_digest.as_bytes());
+    encoded.extend_from_slice(intent.control_digest.as_bytes());
+    encoded.extend_from_slice(intent.snapshot_digest.as_bytes());
+    encoded.extend_from_slice(intent.target_node_digest.as_bytes());
+    let digest = LogHash::digest(&[&encoded]);
+    encoded.extend_from_slice(digest.as_bytes());
+    debug_assert_eq!(encoded.len(), RESTORE_INTENT_BYTES);
+    let parent = parent_dir(path);
+    let mut temporary = NamedTempFile::new_in(parent).map_err(io_error)?;
+    temporary.write_all(&encoded).map_err(io_error)?;
+    temporary.as_file().sync_all().map_err(io_error)?;
+    if create_new {
+        temporary.persist_noclobber(path).map_err(|error| {
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::InvalidSnapshot("restore intent already exists".into())
+            } else {
+                io_error(error.error)
+            }
+        })?;
+    } else {
+        temporary
+            .persist(path)
+            .map_err(|error| io_error(error.error))?;
+    }
+    sync_parent(parent)
+}
+
+fn read_restore_intent(path: &Path) -> Result<RestoreIntent> {
+    require_regular_file(path, "graph restore intent")?;
+    let encoded = read_bounded_file(path, RESTORE_INTENT_BYTES, "graph restore intent")?;
+    if encoded.len() != RESTORE_INTENT_BYTES || !encoded.starts_with(RESTORE_INTENT_MAGIC) {
+        return Err(Error::InvalidSnapshot(
+            "invalid graph restore intent magic or length".into(),
+        ));
+    }
+    let payload_end = encoded.len() - 32;
+    if LogHash::digest(&[&encoded[..payload_end]])
+        != LogHash::from_bytes(encoded[payload_end..].try_into().expect("length checked"))
+    {
+        return Err(Error::InvalidSnapshot(
+            "graph restore intent digest mismatch".into(),
+        ));
+    }
+    let phase = match encoded[RESTORE_INTENT_MAGIC.len()] {
+        0 => RestorePhase::Preparing,
+        1 => RestorePhase::Staged,
+        value => {
+            return Err(Error::InvalidSnapshot(format!(
+                "invalid graph restore intent phase {value}"
+            )))
+        }
+    };
+    let mut offset = RESTORE_INTENT_MAGIC.len() + 1;
+    let mut hash = || {
+        let value = LogHash::from_bytes(
+            encoded[offset..offset + 32]
+                .try_into()
+                .expect("fixed intent length"),
+        );
+        offset += 32;
+        value
+    };
+    let intent = RestoreIntent {
+        phase,
+        db_digest: hash(),
+        control_digest: hash(),
+        snapshot_digest: hash(),
+        target_node_digest: hash(),
+    };
+    if intent.phase == RestorePhase::Preparing && intent.control_digest != LogHash::ZERO {
+        return Err(Error::InvalidSnapshot(
+            "preparing restore intent must not claim a control digest".into(),
+        ));
+    }
+    Ok(intent)
+}
+
+fn recover_interrupted_snapshot_publish(path: &Path) -> Result<()> {
+    let intent_path = restore_intent_path(path);
+    if !path_present(&intent_path)? {
+        if path_present(&restore_staging_db_path(path))?
+            || path_present(&restore_staging_control_path(path))?
+        {
+            return Err(Error::InvalidSnapshot(
+                "orphan graph restore staging exists without a durable ownership intent".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let intent = read_restore_intent(&intent_path)?;
+    if intent.phase == RestorePhase::Preparing {
+        return Err(Error::InvalidSnapshot(
+            "graph restore preparation is incomplete; retry restore_snapshot_file with the same snapshot and target node"
+                .into(),
+        ));
+    }
+    let control_path = control_sidecar_path(path);
+    let staging_db = restore_staging_db_path(path);
+    let staging_control = restore_staging_control_path(path);
+    validate_restore_copy(path, &staging_db, intent.db_digest, "Ladybug database")?;
+    validate_restore_copy(
+        &control_path,
+        &staging_control,
+        intent.control_digest,
+        "graph control",
+    )?;
+    let parent = parent_dir(path);
+    publish_restore_file(
+        &staging_control,
+        &control_path,
+        intent.control_digest,
+        "graph control",
+    )?;
+    sync_parent(parent)?;
+    publish_restore_file(&staging_db, path, intent.db_digest, "Ladybug database")?;
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(io_error)?;
+    File::open(&control_path)
+        .and_then(|file| file.sync_all())
+        .map_err(io_error)?;
+    sync_parent(parent)?;
+    require_file_digest(path, intent.db_digest, "published Ladybug database")?;
+    require_file_digest(
+        &control_path,
+        intent.control_digest,
+        "published graph control",
+    )?;
+    if path_present(&staging_db)? {
+        require_regular_file(&staging_db, "staged Ladybug database")?;
+        fs::remove_file(&staging_db).map_err(io_error)?;
+    }
+    if path_present(&staging_control)? {
+        require_regular_file(&staging_control, "staged graph control")?;
+        fs::remove_file(&staging_control).map_err(io_error)?;
+    }
+    sync_parent(parent)?;
+    fs::remove_file(&intent_path).map_err(io_error)?;
+    sync_parent(parent)
+}
+
+fn validate_restore_copy(
+    canonical: &Path,
+    staging: &Path,
+    expected: LogHash,
+    label: &str,
+) -> Result<()> {
+    if path_present(canonical)? {
+        require_file_digest(canonical, expected, &format!("published {label}"))
+    } else if path_present(staging)? {
+        require_file_digest(staging, expected, &format!("staged {label}"))
+    } else {
+        Err(Error::InvalidSnapshot(format!(
+            "restore intent is missing both published and staged {label}"
+        )))
+    }
+}
+
+fn publish_restore_file(
+    staging: &Path,
+    canonical: &Path,
+    expected: LogHash,
+    label: &str,
+) -> Result<()> {
+    if path_present(canonical)? {
+        return require_file_digest(canonical, expected, &format!("published {label}"));
+    }
+    require_file_digest(staging, expected, &format!("staged {label}"))?;
+    fs::hard_link(staging, canonical).map_err(io_error)?;
+    require_file_digest(canonical, expected, &format!("published {label}"))
+}
+
+fn require_file_digest(path: &Path, expected: LogHash, label: &str) -> Result<()> {
+    require_regular_file(path, label)?;
+    if lgfx::file_digest(path)? != expected {
+        return Err(Error::InvalidSnapshot(format!(
+            "{label} digest does not match restore intent"
+        )));
+    }
+    Ok(())
+}
+
+fn path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+fn require_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::IdentityMismatch(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum: usize, label: &str) -> Result<Vec<u8>> {
+    require_regular_file(path, label)?;
+    let length = usize::try_from(fs::symlink_metadata(path).map_err(io_error)?.len())
+        .map_err(|_| Error::ResourceExhausted(format!("{label} length exceeds platform")))?;
+    if length > maximum {
+        return Err(Error::ResourceExhausted(format!(
+            "{label} exceeds {maximum} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| Error::ResourceExhausted(format!("{label} allocation failed")))?;
+    bytes.resize(length, 0);
+    let mut file = File::open(path).map_err(io_error)?;
+    file.read_exact(&mut bytes).map_err(io_error)?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing).map_err(io_error)? != 0 {
+        return Err(Error::InvalidSnapshot(format!(
+            "{label} grew while it was being read"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
+}
+
+fn ensure_clean_database(path: &Path) -> Result<()> {
+    for sidecar in ladybug_sidecars(path) {
+        if path_present(&sidecar)? {
+            return Err(Error::InvalidEntry(format!(
+                "Ladybug database is not closed cleanly: {}",
+                sidecar.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_legacy_database(path: &Path) -> Result<()> {
+    ensure_clean_database(path)?;
+    let database = open_database(path)?;
+    let connection = Connection::new(&database).map_err(ladybug_error)?;
+    for table in ["__RhizaMeta", "__RhizaRequest"] {
+        if connection
+            .query(&format!("MATCH (n:{table}) RETURN n LIMIT 1"))
+            .is_ok()
+        {
+            return Err(Error::IdentityMismatch(format!(
+                "legacy table {table} requires RHGS v2 snapshot bootstrap"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_database_pair(path: &Path, control: &ControlStore) -> Result<()> {
+    let digest = lgfx::file_digest(path)?;
+    if let Some(pending) = control.pending()? {
+        let tip = control.applied_tip()?;
+        if pending.base() != tip
+            || pending.base_db_digest() != control.user_db_digest()?
+            || pending.entry().index()
+                != tip
+                    .index()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::InvalidEntry("pending LGFX index is exhausted".into()))?
+        {
+            return Err(Error::InvalidEntry(
+                "pending LGFX intent does not extend committed graph control".into(),
+            ));
+        }
+        if digest == pending.base_db_digest() {
+            return Ok(());
+        }
+        if digest == pending.target_db_digest()
+            && fs::metadata(path).map_err(io_error)?.len() == pending.target_file_bytes()
+        {
+            return Ok(());
+        }
+        return Err(Error::InvalidEntry(
+            "pending LGFX database digest matches neither base nor target".into(),
+        ));
+    }
+    if digest != control.user_db_digest()? {
+        return Err(Error::InvalidEntry(
+            "canonical Ladybug digest does not match graph control".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_lgfx_command(payload: &[u8]) -> Result<LadybugFileEffectV1> {
+    if !payload.starts_with(LGFX_V1_MAGIC) {
+        return Err(Error::InvalidCommand(
+            "LGFX-only graph apply requires an LGFX v1 command payload".into(),
+        ));
+    }
+    LadybugFileEffectV1::decode(payload)
+}
+
+fn validate_lgfx_identity(
+    effect: &LadybugFileEffectV1,
+    identity: &ControlIdentity,
+    configuration: &ConfigurationState,
+) -> Result<()> {
+    if effect.cluster_id != identity.cluster_id()
+        || effect.epoch != identity.epoch()
+        || effect.configuration_id != configuration.config_id()
+        || effect.recovery_generation != identity.recovery_generation()
+        || effect.storage_version != lbug::get_storage_version()
+        || effect.materializer_fingerprint != identity.materializer_fingerprint()
+    {
+        return Err(Error::InvalidEntry(
+            "LGFX identity, storage version, or materializer fingerprint mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ladybug_system_config() -> SystemConfig {
@@ -1510,72 +2363,6 @@ fn ladybug_system_config_with_limits(buffer_pool_size: u64, max_num_threads: u64
         .enable_multi_writes(false)
         .throw_on_wal_replay_failure(true)
         .enable_checksums(true)
-}
-
-fn initialize_or_validate(database: &Database, identity: &Identity) -> Result<()> {
-    let connection = Connection::new(database).map_err(ladybug_error)?;
-    transaction(&connection, || {
-        connection.query(CREATE_META_TABLE).map_err(ladybug_error)?;
-        connection
-            .query(CREATE_REQUEST_TABLE)
-            .map_err(ladybug_error)?;
-        connection
-            .query(CREATE_DOCUMENT_TABLE)
-            .map_err(ladybug_error)?;
-        if get_meta(&connection, "cluster_id")?.is_none() {
-            for key in [
-                "node_id",
-                "epoch",
-                "config_id",
-                "applied_index",
-                "applied_hash",
-                "schema_version",
-                "materializer_fingerprint",
-            ] {
-                if get_meta(&connection, key)?.is_some() {
-                    return Err(Error::IdentityMismatch(
-                        "partially initialized metadata".into(),
-                    ));
-                }
-            }
-            create_meta(&connection, "cluster_id", &identity.cluster_id)?;
-            create_meta(&connection, "node_id", &identity.node_id)?;
-            create_meta(&connection, "epoch", &identity.epoch.to_string())?;
-            create_meta(&connection, "config_id", &identity.config_id.to_string())?;
-            create_meta(&connection, "applied_index", "0")?;
-            create_meta(&connection, "applied_hash", &LogHash::ZERO.to_hex())?;
-            create_meta(&connection, "schema_version", SCHEMA_VERSION)?;
-            create_meta(
-                &connection,
-                "materializer_fingerprint",
-                &graph_materializer_fingerprint().to_hex(),
-            )?;
-        }
-        validate_identity(&connection, identity)
-    })
-}
-
-fn validate_identity(connection: &Connection<'_>, identity: &Identity) -> Result<()> {
-    validate_meta(connection, "cluster_id", &identity.cluster_id)?;
-    validate_meta(connection, "node_id", &identity.node_id)?;
-    validate_meta(connection, "epoch", &identity.epoch.to_string())?;
-    validate_meta(connection, "config_id", &identity.config_id.to_string())?;
-    validate_meta(connection, "schema_version", SCHEMA_VERSION)?;
-    validate_meta(
-        connection,
-        "materializer_fingerprint",
-        &graph_materializer_fingerprint().to_hex(),
-    )
-}
-
-fn validate_meta(connection: &Connection<'_>, key: &str, expected: &str) -> Result<()> {
-    let actual = get_meta(connection, key)?
-        .ok_or_else(|| Error::IdentityMismatch(format!("missing {key}")))?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(Error::IdentityMismatch(key.into()))
-    }
 }
 
 fn transaction<T>(connection: &Connection<'_>, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -3533,54 +4320,6 @@ fn document(connection: &Connection<'_>, id: &str) -> Result<Option<GraphValueV1
     Ok(Some(decode_document(&row)?))
 }
 
-fn document_with_tip(
-    connection: &Connection<'_>,
-    id: &str,
-) -> Result<Option<(GraphValueV1, LogIndex, LogHash)>> {
-    let rows = execute(
-        connection,
-        "MATCH (d:RhizaDocument), (m:__RhizaMeta) WHERE d.id = $id AND m.key IN ['applied_index', 'applied_hash'] RETURN d.kind, d.bool_value, d.i64_value, d.u64_value, d.f64_value, d.string_value, d.bytes_value, m.key, m.value",
-        vec![("id", Value::String(id.into()))],
-    )?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() != 2 || rows.iter().any(|row| row.len() != 9) {
-        return Err(Error::Ladybug(
-            "document and tip lookup returned wrong shape".into(),
-        ));
-    }
-    let value = decode_document(&rows[0][..7])?;
-    let mut applied_index = None;
-    let mut applied_hash = None;
-    for row in rows {
-        if decode_document(&row[..7])? != value {
-            return Err(Error::Ladybug(
-                "document and tip lookup returned inconsistent documents".into(),
-            ));
-        }
-        let key = expect_string(&row[7], "metadata key")?;
-        let metadata_value = expect_string(&row[8], "metadata value")?;
-        match key.as_str() {
-            "applied_index" => applied_index = Some(metadata_value),
-            "applied_hash" => applied_hash = Some(metadata_value),
-            _ => {
-                return Err(Error::Ladybug(
-                    "document and tip lookup returned an unexpected key".into(),
-                ))
-            }
-        }
-    }
-    let applied_index = applied_index
-        .ok_or_else(|| Error::IdentityMismatch("missing applied_index".into()))?
-        .parse()
-        .map_err(|_| Error::IdentityMismatch("applied_index".into()))?;
-    let applied_hash = parse_hash(
-        &applied_hash.ok_or_else(|| Error::IdentityMismatch("missing applied_hash".into()))?,
-    )?;
-    Ok(Some((value, applied_index, applied_hash)))
-}
-
 fn decode_document(row: &[Value]) -> Result<GraphValueV1> {
     if row.len() != 7 {
         return Err(Error::Ladybug(
@@ -3606,152 +4345,6 @@ fn decode_document(row: &[Value]) -> Result<GraphValueV1> {
         }
     };
     Ok(value)
-}
-
-fn record_request(
-    connection: &Connection<'_>,
-    command: &GraphCommandV1,
-    command_payload: &[u8],
-    entry: &LogEntry,
-    result: &GraphCommandResultV1,
-) -> Result<()> {
-    execute(
-        connection,
-        "CREATE (r:__RhizaRequest {request_id: $request_id, command_hash: $command_hash, original_log_index: $original_log_index, original_log_hash: $original_log_hash, result: $result})",
-        vec![
-            ("request_id", Value::String(command.request_id.clone())),
-            (
-                "command_hash",
-                Value::String(command_digest(command_payload).to_hex()),
-            ),
-            ("original_log_index", Value::UInt64(entry.index)),
-            ("original_log_hash", Value::String(entry.hash.to_hex())),
-            ("result", Value::Blob(result.encode())),
-        ],
-    )?;
-    Ok(())
-}
-
-fn matching_request(
-    connection: &Connection<'_>,
-    request_id: &str,
-    command_payload: &[u8],
-) -> Result<Option<RequestRecord>> {
-    let rows = execute(
-        connection,
-        "MATCH (r:__RhizaRequest) WHERE r.request_id = $request_id RETURN r.command_hash, r.original_log_index, r.original_log_hash, r.result",
-        vec![("request_id", Value::String(request_id.into()))],
-    )?;
-    let Some(row) = one_or_none(rows, "request lookup")? else {
-        return Ok(None);
-    };
-    if row.len() != 4 {
-        return Err(Error::Ladybug("request lookup returned wrong shape".into()));
-    }
-    let stored_digest = expect_string(&row[0], "command_hash")?;
-    let original_log_index = expect_u64(&row[1], "original_log_index")?;
-    let original_log_hash = parse_hash(&expect_string(&row[2], "original_log_hash")?)?;
-    if stored_digest != command_digest(command_payload).to_hex() {
-        return Err(Error::RequestConflict {
-            request_id: request_id.into(),
-            original_log_index,
-            original_log_hash,
-        });
-    }
-    let result = GraphCommandResultV1::decode(&expect_blob(&row[3], "result")?)?;
-    Ok(Some(RequestRecord {
-        original_log_index,
-        original_log_hash,
-        result,
-    }))
-}
-
-fn command_digest(payload: &[u8]) -> LogHash {
-    LogHash::digest(&[b"rhiza-graph-command-digest-v1\0", payload])
-}
-
-fn get_meta(connection: &Connection<'_>, key: &str) -> Result<Option<String>> {
-    let rows = execute(
-        connection,
-        "MATCH (m:__RhizaMeta) WHERE m.key = $key RETURN m.value",
-        vec![("key", Value::String(key.into()))],
-    )?;
-    one_or_none(rows, "metadata lookup")?
-        .map(|row| {
-            row.first()
-                .ok_or_else(|| Error::Ladybug("metadata lookup returned an empty row".into()))
-                .and_then(|value| expect_string(value, "metadata value"))
-        })
-        .transpose()
-}
-
-fn create_meta(connection: &Connection<'_>, key: &str, value: &str) -> Result<()> {
-    execute(
-        connection,
-        "CREATE (m:__RhizaMeta {key: $key, value: $value})",
-        vec![
-            ("key", Value::String(key.into())),
-            ("value", Value::String(value.into())),
-        ],
-    )?;
-    Ok(())
-}
-
-fn set_meta(connection: &Connection<'_>, key: &str, value: &str) -> Result<()> {
-    if get_meta(connection, key)?.is_none() {
-        return Err(Error::IdentityMismatch(format!("missing {key}")));
-    }
-    execute(
-        connection,
-        "MATCH (m:__RhizaMeta) WHERE m.key = $key SET m.value = $value",
-        vec![
-            ("key", Value::String(key.into())),
-            ("value", Value::String(value.into())),
-        ],
-    )?;
-    Ok(())
-}
-
-fn meta_u64(connection: &Connection<'_>, key: &str) -> Result<u64> {
-    get_meta(connection, key)?
-        .ok_or_else(|| Error::IdentityMismatch(format!("missing {key}")))?
-        .parse()
-        .map_err(|_| Error::IdentityMismatch(key.into()))
-}
-
-fn meta_hash(connection: &Connection<'_>, key: &str) -> Result<LogHash> {
-    parse_hash(
-        &get_meta(connection, key)?
-            .ok_or_else(|| Error::IdentityMismatch(format!("missing {key}")))?,
-    )
-}
-
-fn materialized_tip(connection: &Connection<'_>) -> Result<(LogIndex, LogHash)> {
-    let rows = execute(
-        connection,
-        "MATCH (i:__RhizaMeta), (h:__RhizaMeta) WHERE i.key = 'applied_index' AND h.key = 'applied_hash' RETURN i.value, h.value",
-        vec![],
-    )?;
-    let row = one_or_none(rows, "materialized tip lookup")?
-        .ok_or_else(|| Error::IdentityMismatch("missing materialized tip".into()))?;
-    decode_materialized_tip(&row)
-}
-
-fn decode_materialized_tip(row: &[Value]) -> Result<(LogIndex, LogHash)> {
-    if row.len() != 2 {
-        return Err(Error::Ladybug(
-            "materialized tip lookup returned wrong shape".into(),
-        ));
-    }
-    let applied_index = expect_string(&row[0], "applied_index")?
-        .parse()
-        .map_err(|_| Error::IdentityMismatch("applied_index".into()))?;
-    let applied_hash = parse_hash(&expect_string(&row[1], "applied_hash")?)?;
-    Ok((applied_index, applied_hash))
-}
-
-fn parse_hash(value: &str) -> Result<LogHash> {
-    LogHash::from_hex(value).ok_or_else(|| Error::Ladybug("stored log hash is invalid".into()))
 }
 
 fn execute(
@@ -3907,17 +4500,6 @@ fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn length_prefixed(value: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(8 + value.len());
-    encoded.extend_from_slice(
-        &u64::try_from(value.len())
-            .expect("usize fits in u64")
-            .to_be_bytes(),
-    );
-    encoded.extend_from_slice(value);
-    encoded
-}
-
 fn ladybug_sidecars(path: &Path) -> [PathBuf; 4] {
     [".wal", ".wal.checkpoint", ".shadow", ".tmp"].map(|suffix| ladybug_sidecar(path, suffix))
 }
@@ -3932,12 +4514,6 @@ fn remove_sidecars(path: &Path) {
     for sidecar in ladybug_sidecars(path) {
         let _ = fs::remove_file(sidecar);
     }
-}
-
-fn remove_failed_install(path: &Path, parent: &Path) {
-    let _ = fs::remove_file(path);
-    remove_sidecars(path);
-    let _ = File::open(parent).and_then(|directory| directory.sync_all());
 }
 
 fn ladybug_error(error: lbug::Error) -> Error {
@@ -3990,6 +4566,7 @@ fn invalid_snapshot_ladybug_error(error: lbug::Error) -> Error {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     fn snapshot_fixture() -> (tempfile::TempDir, LadybugSnapshot) {
         let dir = tempfile::tempdir().unwrap();
@@ -4017,7 +4594,7 @@ mod snapshot_tests {
         let encoded = encode_snapshot(&snapshot).unwrap();
 
         let mut unknown_version = encoded.clone();
-        unknown_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        unknown_version[4..6].copy_from_slice(&3_u16.to_be_bytes());
         assert!(matches!(
             decode_snapshot(&unknown_version),
             Err(Error::InvalidSnapshot(message)) if message.contains("version")
@@ -4065,6 +4642,313 @@ mod snapshot_tests {
             Err(Error::InvalidSnapshot(_))
         ));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_lengths_before_allocating_fields() {
+        let (_dir, snapshot) = snapshot_fixture();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+
+        let mut oversized_identity = encoded.clone();
+        oversized_identity[6..14].copy_from_slice(&((MAX_RHGS_ID_BYTES + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&oversized_identity),
+            Err(Error::ResourceExhausted(_))
+        ));
+
+        let mut decoder = SnapshotDecoder::new(&encoded);
+        decoder.take(SNAPSHOT_WIRE_MAGIC.len()).unwrap();
+        decoder.u16().unwrap();
+        decoder.bytes(MAX_RHGS_ID_BYTES, "cluster id").unwrap();
+        decoder.bytes(MAX_RHGS_ID_BYTES, "source node id").unwrap();
+        decoder.u64().unwrap();
+        decoder.u64().unwrap();
+        decoder.u64().unwrap();
+        decoder.take(32).unwrap();
+        decoder.u64().unwrap();
+        decoder.take(32).unwrap();
+        decoder.take(32).unwrap();
+        let db_length_offset = decoder.offset;
+        let mut oversized_db = encoded.clone();
+        oversized_db[db_length_offset..db_length_offset + 8]
+            .copy_from_slice(&((MAX_RHGS_DB_BYTES as u64) + 1).to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&oversized_db),
+            Err(Error::ResourceExhausted(_))
+        ));
+
+        let db_length = u64::from_be_bytes(
+            encoded[db_length_offset..db_length_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let control_length_offset = db_length_offset + 8 + db_length;
+        let mut oversized_control = encoded.clone();
+        oversized_control[control_length_offset..control_length_offset + 8]
+            .copy_from_slice(&((MAX_RHGS_CONTROL_BYTES as u64) + 1).to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&oversized_control),
+            Err(Error::ResourceExhausted(_))
+        ));
+
+        let mut truncated_db = encoded;
+        let declared = u64::from_be_bytes(
+            truncated_db[db_length_offset..db_length_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        truncated_db[db_length_offset..db_length_offset + 8]
+            .copy_from_slice(&(declared + 1).to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&truncated_db),
+            Err(Error::InvalidSnapshot(message)) if message.contains("truncated")
+        ));
+
+        assert!(matches!(
+            ensure_rhgs_total_bound(MAX_RHGS_V2_BYTES + 1),
+            Err(Error::ResourceExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_outer_source_node_that_differs_from_replicated_control() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.created_by = "forged-source".into();
+        snapshot.digest = snapshot.recompute_digest();
+        let target = dir.path().join("source-mismatch.lbug");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(message)) if message.contains("source node")
+        ));
+        assert!(!target.exists());
+        assert!(!control_sidecar_path(&target).exists());
+        assert!(!restore_intent_path(&target).exists());
+    }
+
+    fn recreate_interrupted_restore(
+        target: &Path,
+        snapshot: &LadybugSnapshot,
+        keep_db: bool,
+        keep_control: bool,
+    ) {
+        let db_stage = restore_staging_db_path(target);
+        let control = control_sidecar_path(target);
+        let control_stage = restore_staging_control_path(target);
+        fs::copy(target, &db_stage).unwrap();
+        fs::copy(&control, &control_stage).unwrap();
+        let intent = RestoreIntent {
+            phase: RestorePhase::Staged,
+            db_digest: lgfx::file_digest(target).unwrap(),
+            control_digest: lgfx::file_digest(&control).unwrap(),
+            snapshot_digest: snapshot.digest,
+            target_node_digest: LogHash::digest(&[b"node-2"]),
+        };
+        write_restore_intent(&restore_intent_path(target), &intent).unwrap();
+        if !keep_db {
+            fs::remove_file(target).unwrap();
+        }
+        if !keep_control {
+            fs::remove_file(control).unwrap();
+        }
+    }
+
+    fn write_preparing_intent(target: &Path, snapshot: &LadybugSnapshot) {
+        write_restore_intent(
+            &restore_intent_path(target),
+            &RestoreIntent {
+                phase: RestorePhase::Preparing,
+                db_digest: LogHash::digest(&[snapshot.db_bytes()]),
+                control_digest: LogHash::ZERO,
+                snapshot_digest: snapshot.digest(),
+                target_node_digest: LogHash::digest(&[b"node-2"]),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preparing_restore_states_fail_closed_on_startup_and_same_retry_rebuilds_staging() {
+        for phase in ["intent-only", "database-only", "staging-pair"] {
+            let (dir, snapshot) = snapshot_fixture();
+            let target = dir.path().join(format!("{phase}.lbug"));
+
+            if phase == "staging-pair" {
+                restore_snapshot_file(&target, &snapshot, "node-2").unwrap();
+                fs::rename(&target, restore_staging_db_path(&target)).unwrap();
+                fs::rename(
+                    control_sidecar_path(&target),
+                    restore_staging_control_path(&target),
+                )
+                .unwrap();
+            }
+            write_preparing_intent(&target, &snapshot);
+            if phase == "database-only" {
+                fs::write(restore_staging_db_path(&target), snapshot.db_bytes()).unwrap();
+            }
+
+            assert!(matches!(
+                LadybugStateMachine::open(&target, "cluster-1", "node-2", 7, 3),
+                Err(Error::InvalidSnapshot(message)) if message.contains("preparation is incomplete")
+            ));
+            assert!(!target.exists());
+            assert!(!control_sidecar_path(&target).exists());
+
+            restore_snapshot_file(&target, &snapshot, "node-2").unwrap();
+            LadybugStateMachine::open(&target, "cluster-1", "node-2", 7, 3).unwrap();
+            assert!(!restore_intent_path(&target).exists());
+        }
+    }
+
+    #[test]
+    fn orphan_restore_staging_without_intent_never_becomes_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("orphan.lbug");
+        fs::write(restore_staging_db_path(&target), b"orphan").unwrap();
+
+        assert!(matches!(
+            LadybugStateMachine::open(&target, "cluster-1", "node-2", 7, 3),
+            Err(Error::InvalidSnapshot(message)) if message.contains("orphan")
+        ));
+        assert!(!target.exists());
+        assert!(!control_sidecar_path(&target).exists());
+    }
+
+    #[test]
+    fn startup_recovers_every_durable_restore_publish_crash_state() {
+        for (keep_db, keep_control) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (dir, snapshot) = snapshot_fixture();
+            let target = dir.path().join("restored.lbug");
+            restore_snapshot_file(&target, &snapshot, "node-2").unwrap();
+            recreate_interrupted_restore(&target, &snapshot, keep_db, keep_control);
+
+            let restored = LadybugStateMachine::open(&target, "cluster-1", "node-2", 7, 3).unwrap();
+            assert_eq!(restored.materialized_tip().unwrap().index(), 0);
+            assert!(!restore_intent_path(&target).exists());
+            assert!(!restore_staging_db_path(&target).exists());
+            assert!(!restore_staging_control_path(&target).exists());
+        }
+    }
+
+    #[test]
+    fn retrying_the_same_interrupted_restore_completes_without_clobbering() {
+        let (dir, snapshot) = snapshot_fixture();
+        let target = dir.path().join("restored.lbug");
+        restore_snapshot_file(&target, &snapshot, "node-2").unwrap();
+        recreate_interrupted_restore(&target, &snapshot, false, true);
+
+        restore_snapshot_file(&target, &snapshot, "node-2").unwrap();
+        LadybugStateMachine::open(&target, "cluster-1", "node-2", 7, 3).unwrap();
+    }
+
+    #[test]
+    fn fresh_create_reservation_has_one_owner_and_loser_does_not_cleanup_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("race.lbug"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                LadybugStateMachine::create_new(
+                    &path,
+                    "cluster-1",
+                    "node-1",
+                    7,
+                    ConfigurationState::active(3, LogHash::ZERO),
+                )
+                .is_ok()
+            }));
+        }
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        LadybugStateMachine::open(&*path, "cluster-1", "node-1", 7, 3).unwrap();
+    }
+
+    #[test]
+    fn fresh_create_failure_preserves_a_control_file_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned-cleanup.lbug");
+        let control_path = control_sidecar_path(&path);
+        ControlStore::create(
+            &control_path,
+            &ControlIdentity::new(
+                "other-cluster",
+                "other-node",
+                9,
+                ConfigurationState::active(1, LogHash::ZERO),
+                1,
+                graph_materializer_fingerprint(),
+                LogHash::ZERO,
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&control_path).unwrap();
+
+        assert!(LadybugStateMachine::create_new(
+            &path,
+            "cluster-1",
+            "node-1",
+            7,
+            ConfigurationState::active(3, LogHash::ZERO),
+        )
+        .is_err());
+        assert_eq!(fs::read(&control_path).unwrap(), before);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_and_open_reject_symlink_targets_and_sidecars_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, snapshot) = snapshot_fixture();
+        let referent = dir.path().join("referent");
+        fs::write(&referent, b"do-not-touch").unwrap();
+        let target = dir.path().join("symlink.lbug");
+        symlink(&referent, &target).unwrap();
+        assert!(restore_snapshot_file(&target, &snapshot, "node-2").is_err());
+        assert_eq!(fs::read(&referent).unwrap(), b"do-not-touch");
+
+        fs::remove_file(&target).unwrap();
+        let wal = ladybug_sidecar(&target, ".wal");
+        symlink(&referent, &wal).unwrap();
+        assert!(restore_snapshot_file(&target, &snapshot, "node-2").is_err());
+        assert_eq!(fs::read(&referent).unwrap(), b"do-not-touch");
+    }
+
+    #[test]
+    fn lgfx_target_digest_fast_path_still_requires_target_file_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.lbug");
+        let state = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let command =
+            GraphCommandV1::put_document("request-1", "doc", GraphValueV1::U64(1)).unwrap();
+        let request = encode_replicated_graph_command(&command).unwrap();
+        let mut effect = LadybugFileEffectV1::decode(
+            &state
+                .prepare_graph_effect(&request, 0, LogHash::ZERO)
+                .unwrap(),
+        )
+        .unwrap();
+        state.close_database_cleanly().unwrap();
+        let installed = dir.path().join("installed.lbug");
+        apply_lgfx_to_exact_base(&path, &installed, &effect).unwrap();
+        fs::rename(installed, &path).unwrap();
+        state.reopen_database().unwrap();
+        effect.target_file_bytes += LGFX_CHUNK_BYTES as u64;
+
+        assert!(matches!(
+            state.install_lgfx_effect(&effect),
+            Err(Error::InvalidEntry(message)) if message.contains("target size")
+        ));
     }
 }
 
@@ -4147,7 +5031,7 @@ mod query_tests {
     }
 
     #[test]
-    fn lifecycle_reader_does_not_block_normal_apply() {
+    fn physical_lgfx_install_waits_for_a_lifecycle_reader_before_replacing_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let state = std::sync::Arc::new(
             LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
@@ -4159,7 +5043,10 @@ mod query_tests {
             GraphValueV1::String("value".into()),
         )
         .unwrap();
-        let payload = encode_replicated_graph_command(&command).unwrap();
+        let request = encode_replicated_graph_command(&command).unwrap();
+        let payload = state
+            .prepare_graph_effect(&request, 0, LogHash::ZERO)
+            .unwrap();
         let hash = LogEntry::calculate_hash(
             "cluster-1",
             1,
@@ -4185,12 +5072,15 @@ mod query_tests {
         std::thread::scope(|scope| {
             let state = std::sync::Arc::clone(&state);
             scope.spawn(move || applied_tx.send(state.apply_entry(&entry)).unwrap());
+            assert!(applied_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err());
+            drop(lifecycle_reader);
             applied_rx
                 .recv_timeout(std::time::Duration::from_secs(3))
-                .expect("normal apply must not wait for a lifecycle reader")
+                .expect("LGFX install must continue after the lifecycle reader exits")
                 .unwrap();
         });
-        drop(lifecycle_reader);
 
         assert_eq!(
             state.get_document("document-1").unwrap(),
@@ -4926,21 +5816,10 @@ mod query_tests {
 
     #[test]
     fn admission_stops_amplified_results_before_native_materialization() {
-        let database =
-            Database::in_memory(ladybug_system_config_with_limits(8 * 1024 * 1024, 1)).unwrap();
-        let identity = Identity {
-            cluster_id: "cluster-1".into(),
-            node_id: "node-1".into(),
-            epoch: 7,
-            config_id: 3,
-        };
-        initialize_or_validate(&database, &identity).unwrap();
-        let state = LadybugStateMachine {
-            path: PathBuf::from(":memory:"),
-            identity,
-            database: RwLock::new(Some(database)),
-            writer: Mutex::new(()),
-        };
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
 
         let error = state
             .query_read_only(

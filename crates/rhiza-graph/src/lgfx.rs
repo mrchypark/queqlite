@@ -13,14 +13,15 @@ use std::{
 };
 
 use lbug::{Connection, Database};
-use rhiza_core::{LogEntry, LogHash, LogIndex};
+use rhiza_core::{ConfigurationState, LogEntry, LogHash, LogIndex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::{
-    ensure_parent, initialize_or_validate, io_error, ladybug_error, ladybug_sidecar,
-    ladybug_sidecars, ladybug_system_config, Error, Identity, LadybugStateMachine, Result,
+    apply_command, control_sidecar_path, decode_replicated_graph_commands, ensure_parent, io_error,
+    ladybug_error, ladybug_sidecar, ladybug_sidecars, ladybug_system_config, path_present,
+    transaction, ControlIdentity, ControlStore, Error, Identity, LadybugStateMachine, Result,
 };
 
 pub const LGFX_V1_MAGIC: &[u8; 6] = b"LGFX\0\x01";
@@ -43,6 +44,7 @@ pub struct LadybugFileChunkV1 {
 #[serde(deny_unknown_fields)]
 pub struct LadybugFileEffectV1 {
     pub cluster_id: String,
+    pub epoch: u64,
     pub configuration_id: u64,
     pub recovery_generation: u64,
     pub base_log_index: LogIndex,
@@ -65,8 +67,11 @@ impl LadybugFileEffectV1 {
     pub fn validate(&self) -> Result<()> {
         validate_nonempty_bounded("cluster_id", &self.cluster_id, MAX_ID_BYTES)?;
         validate_nonempty_bounded("request_id", &self.request_id, MAX_ID_BYTES)?;
-        if self.result_encoding_version == 0 {
-            return invalid("result encoding version must be non-zero");
+        if self.epoch == 0 || self.recovery_generation == 0 {
+            return invalid("epoch and recovery generation must be positive");
+        }
+        if self.result_encoding_version != 1 {
+            return invalid("result encoding version must be 1");
         }
         validate_file_length("base", self.base_file_bytes)?;
         validate_file_length("target", self.target_file_bytes)?;
@@ -240,7 +245,7 @@ pub fn apply_lgfx_to_exact_base(
         return invalid("base file does not match the effect identity");
     }
     require_clean(target_path)?;
-    if target_path.exists() {
+    if path_present(target_path)? {
         return invalid("target database already exists");
     }
     ensure_parent(target_path)?;
@@ -288,22 +293,33 @@ pub struct CapturedNativeLadybugWal {
 pub fn capture_graph_entry_native_wal(
     base_path: impl AsRef<Path>,
     staging_path: impl AsRef<Path>,
-    cluster_id: &str,
-    node_id: &str,
-    epoch: u64,
-    config_id: u64,
+    _cluster_id: &str,
+    _node_id: &str,
+    _epoch: u64,
+    _config_id: u64,
     entry: &LogEntry,
 ) -> Result<CapturedNativeLadybugWal> {
     let base_path = base_path.as_ref();
     let staging_path = staging_path.as_ref();
     let base_digest = clone_clean_base(base_path, staging_path)?;
-    let state = open_feasibility_state(staging_path, cluster_id, node_id, epoch, config_id)?;
-    state.apply_entry(entry)?;
+    let commands = decode_replicated_graph_commands(&entry.payload)?;
+    let database = Database::new(staging_path, ladybug_system_config().auto_checkpoint(false))
+        .map_err(ladybug_error)?;
+    let connection = Connection::new(&database).map_err(ladybug_error)?;
+    connection
+        .query("CALL force_checkpoint_on_close=false")
+        .map_err(ladybug_error)?;
+    transaction(&connection, || {
+        for member in &commands {
+            apply_command(&connection, &member.command)?;
+        }
+        Ok(())
+    })?;
     if file_digest(staging_path)? != base_digest {
         return invalid("staging data file changed before native WAL capture");
     }
     for suffix in [".wal.checkpoint", ".shadow", ".tmp"] {
-        if ladybug_sidecar(staging_path, suffix).exists() {
+        if path_present(&ladybug_sidecar(staging_path, suffix))? {
             return invalid(format!("staging created forbidden sidecar {suffix}"));
         }
     }
@@ -312,13 +328,9 @@ pub fn capture_graph_entry_native_wal(
         return invalid("staging did not produce a committed native WAL");
     }
     let wal_digest = LogHash::digest(&[&wal_payload]);
-    {
-        let guard = state.read_database()?;
-        let database = guard.as_ref().ok_or(Error::Closed)?;
-        let connection = Connection::new(database).map_err(ladybug_error)?;
-        connection.query("CHECKPOINT").map_err(ladybug_error)?;
-    }
-    drop(state);
+    connection.query("CHECKPOINT").map_err(ladybug_error)?;
+    drop(connection);
+    drop(database);
     require_clean(staging_path)?;
     Ok(CapturedNativeLadybugWal {
         target_db_digest: file_digest(staging_path)?,
@@ -389,7 +401,6 @@ fn open_feasibility_state(
         cluster_id: cluster_id.into(),
         node_id: node_id.into(),
         epoch,
-        config_id,
     };
     let database = Database::new(path, ladybug_system_config().auto_checkpoint(false))
         .map_err(ladybug_error)?;
@@ -398,12 +409,28 @@ fn open_feasibility_state(
         .query("CALL force_checkpoint_on_close=false")
         .map_err(ladybug_error)?;
     drop(setting);
-    initialize_or_validate(&database, &identity)?;
+    let control = if path_present(&control_sidecar_path(path))? {
+        ControlStore::open_existing(control_sidecar_path(path))?
+    } else {
+        ControlStore::create(
+            control_sidecar_path(path),
+            &ControlIdentity::new(
+                cluster_id,
+                node_id,
+                epoch,
+                ConfigurationState::active(config_id, LogHash::ZERO),
+                1,
+                super::graph_materializer_fingerprint(),
+                file_digest(path)?,
+            ),
+        )?
+    };
     Ok(LadybugStateMachine {
         path: path.to_path_buf(),
         identity,
         database: RwLock::new(Some(database)),
         writer: Mutex::new(()),
+        control,
     })
 }
 
@@ -453,6 +480,22 @@ fn validate_file_length(name: &str, length: u64) -> Result<()> {
 }
 
 fn require_clean(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return invalid(format!(
+                "Ladybug database is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::Io(format!(
+                "cannot inspect Ladybug database {}: {error}",
+                path.display()
+            )));
+        }
+    }
     for sidecar in ladybug_sidecars(path) {
         match fs::symlink_metadata(&sidecar) {
             Ok(_) => {
@@ -476,7 +519,7 @@ fn file_length(path: &Path) -> Result<u64> {
         .map_err(io_error)
 }
 
-fn file_digest(path: &Path) -> Result<LogHash> {
+pub(crate) fn file_digest(path: &Path) -> Result<LogHash> {
     let mut file = File::open(path).map_err(io_error)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
