@@ -1390,7 +1390,7 @@ async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
 }
 
 enum RawState {
-    Sql(SqliteStateMachine),
+    Sql(Box<SqliteStateMachine>),
     Graph(LadybugStateMachine),
     Kv(RedbStateMachine),
 }
@@ -1409,6 +1409,7 @@ impl RawTarget {
         let state = match profile {
             Profile::Sql => {
                 SqliteStateMachine::open(root.join("raw/sql.db"), &cluster_id, "node-1", 1, 1)
+                    .map(Box::new)
                     .map(RawState::Sql)
                     .map_err(|error| error.to_string())?
             }
