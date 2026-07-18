@@ -7,24 +7,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rhiza_core::{Command, CommandKind, EntryType, LogEntry, LogHash, StoredCommand};
+use rhiza_core::{
+    Command, CommandKind, ConfigChange, ConfigurationState, EntryType, LogEntry, LogHash,
+    StoredCommand,
+};
 use rhiza_log::{FileLogStore, LogStore};
 use rhiza_node::{
     catch_up_missing_entries, log_peer_router, node_router, node_router_with_limits,
     node_rpc_router_for_generation, node_rpc_router_with_limits, recorder_router, AckMode,
     ClientErrorResponse, ConfigError, FetchLogError, FetchLogRequest, FetchLogResponse,
     HttpLogPeer, HttpRecorderClient, InMemoryLogPeer, LogPeer, NodeConfig, NodeError, NodeRuntime,
-    PeerConfig, ReadConsistency, ReadRequest, SqlExecuteRequest, SqlExecuteResponse, WriteRequest,
-    DEFAULT_WRITER_BATCH_MAX, DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_COMMAND_BYTES,
-    MAX_FETCH_ENTRIES, MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH,
-    RECORDER_IDENTITY_PATH, RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
+    PeerConfig, ReadConsistency, ReadRequest, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
+    DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_FETCH_ENTRIES, MAX_HTTP_BODY_BYTES,
+    NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
+    RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
 };
 use rhiza_quepaxa::{
     AcceptedSummary, Ballot, DecisionProof, DecisionRecord, FixedMembership, IsrState, Membership,
     RecordRequest, RecordSummary, RecorderFileStore, RecorderReply, RecorderRequest, RecorderRpc,
     ThreeNodeConsensus,
 };
-use rhiza_sql::{encode_sql_command, encode_write_batch, SqlCommand, SqlStatement, SqlValue};
+use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V1_MAGIC};
 
 fn test_config_digest() -> LogHash {
     FixedMembership::new(["node-1", "node-2", "node-3"])
@@ -232,10 +235,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
         .propose_at(
             2,
             schema.hash,
-            Command::new(
-                CommandKind::Deterministic,
-                b"put\tforeign-winner\tmarker\twon".to_vec(),
-            ),
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
         )
         .unwrap();
     let committed = runtime
@@ -256,7 +256,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(b"QEFX\0\x01"));
+        .starts_with(QWAL_V1_MAGIC));
     assert_eq!(
         runtime
             .query_sql(
@@ -381,12 +381,13 @@ fn startup_replays_qlog_ahead_of_sqlite() {
         1,
     )
     .unwrap();
-    log.append(&entry(
-        1,
-        LogHash::ZERO,
-        b"put\trequest-1\talpha\tfrom-qlog",
-    ))
-    .unwrap();
+    let entry = first_qwal_put_entry(
+        &dir.path().join("prepared-qwal"),
+        "request-1",
+        "alpha",
+        "from-qlog",
+    );
+    log.append(&entry).unwrap();
 
     let runtime = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
 
@@ -406,14 +407,17 @@ fn startup_recovers_quorum_decision_without_qlog_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());
     let decided_consensus = consensus(dir.path());
+    let prepared = first_qwal_put_entry(
+        &dir.path().join("prepared-qwal"),
+        "request-1",
+        "alpha",
+        "recovered",
+    );
     let decided = decided_consensus
         .propose_at(
             1,
             LogHash::ZERO,
-            Command::new(
-                CommandKind::Deterministic,
-                b"put\trequest-1\talpha\trecovered".to_vec(),
-            ),
+            Command::new(CommandKind::Deterministic, prepared.payload),
         )
         .unwrap();
 
@@ -428,7 +432,37 @@ fn startup_recovers_quorum_decision_without_qlog_exactly_once() {
 }
 
 #[test]
-fn startup_accepts_peer_candidate_only_when_consensus_committed_exact_entry() {
+fn startup_rejects_non_qwal_sql_decision_before_mutating_qlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let decided_consensus = consensus(dir.path());
+    decided_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(
+                CommandKind::Deterministic,
+                b"put\tlegacy-request\talpha\tlegacy".to_vec(),
+            ),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        NodeRuntime::open(node_config(dir.path()), decided_consensus, &[]),
+        Err(NodeError::Invariant(message)) if message.contains("QWAL")
+    ));
+    let log = FileLogStore::open_with_configuration(
+        dir.path().join("consensus/log"),
+        "rhiza:sql:cluster-a",
+        1,
+        ConfigurationState::active(1, test_config_digest()),
+    )
+    .unwrap();
+    assert_eq!(log.last_index().unwrap(), None);
+    assert_eq!(log.read(1).unwrap(), None);
+}
+
+#[test]
+fn startup_rejects_non_qwal_peer_winner_before_mutating_qlog() {
     let dir = tempfile::tempdir().unwrap();
     let decided_consensus = consensus(dir.path());
     let decided = decided_consensus
@@ -437,8 +471,85 @@ fn startup_accepts_peer_candidate_only_when_consensus_committed_exact_entry() {
             LogHash::ZERO,
             Command::new(
                 CommandKind::Deterministic,
-                b"put\trequest-candidate\talpha\tverified".to_vec(),
+                b"put\tlegacy-request\talpha\tlegacy".to_vec(),
             ),
+        )
+        .unwrap();
+    let peer = OneResponsePeer::new(vec![decided]);
+
+    assert!(matches!(
+        NodeRuntime::open(node_config(dir.path()), decided_consensus, &[&peer]),
+        Err(NodeError::Invariant(message)) if message.contains("QWAL")
+    ));
+    let log = FileLogStore::open_with_configuration(
+        dir.path().join("consensus/log"),
+        "rhiza:sql:cluster-a",
+        1,
+        ConfigurationState::active(1, test_config_digest()),
+    )
+    .unwrap();
+    assert_eq!(log.last_index().unwrap(), None);
+    assert_eq!(log.read(1).unwrap(), None);
+}
+
+#[test]
+fn startup_replays_qlog_config_change_ahead_of_sqlite_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    drop(NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap());
+
+    let log = FileLogStore::open_with_configuration(
+        dir.path().join("consensus/log"),
+        "rhiza:sql:cluster-a",
+        1,
+        ConfigurationState::active(1, test_config_digest()),
+    )
+    .unwrap();
+    let command = ConfigChange::stop(1, test_config_digest()).to_stored_command();
+    let stop = LogEntry {
+        cluster_id: "rhiza:sql:cluster-a".into(),
+        epoch: 1,
+        config_id: 1,
+        index: 1,
+        entry_type: command.entry_type,
+        payload: command.payload,
+        prev_hash: LogHash::ZERO,
+        hash: LogHash::ZERO,
+    };
+    let stop = LogEntry {
+        hash: stop.recompute_hash(),
+        ..stop
+    };
+    log.append(&stop).unwrap();
+    drop(log);
+
+    let runtime = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+    assert_eq!(runtime.applied_index().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .configuration_state()
+            .unwrap()
+            .stop()
+            .map(|anchor| (anchor.index(), anchor.hash())),
+        Some((1, stop.hash))
+    );
+}
+
+#[test]
+fn startup_accepts_peer_candidate_only_when_consensus_committed_exact_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let decided_consensus = consensus(dir.path());
+    let prepared = first_qwal_put_entry(
+        &dir.path().join("prepared-qwal"),
+        "request-candidate",
+        "alpha",
+        "verified",
+    );
+    let decided = decided_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::Deterministic, prepared.payload),
         )
         .unwrap();
     let peer = OneResponsePeer::new(vec![decided.clone()]);
@@ -1311,13 +1422,11 @@ async fn authenticated_http_write_and_read_use_runtime() {
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_sql_requests_share_one_entry_and_replay_distinct_returning_results() {
+#[test]
+fn sql_batch_commits_individual_qwal_entries_and_replays_results() {
     let dir = tempfile::tempdir().unwrap();
-    let config = node_config(dir.path())
-        .with_writer_batching(8, Duration::from_millis(20))
-        .unwrap();
-    let runtime = Arc::new(NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap());
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
     runtime
         .execute_sql(SqlCommand {
             request_id: "batch-setup".into(),
@@ -1327,25 +1436,7 @@ async fn concurrent_sql_requests_share_one_entry_and_replay_distinct_returning_r
             }],
         })
         .unwrap();
-    let recorder = RecorderFileStore::new_with_id(
-        dir.path().join("batch-recorder"),
-        "node-1",
-        "rhiza:sql:cluster-a",
-        1,
-        1,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let served_runtime = runtime.clone();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, node_router(served_runtime, recorder))
-            .await
-            .unwrap();
-    });
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/v1/sql/execute");
-    let request = |request_id: &str, value: &str| SqlExecuteRequest {
+    let request = |request_id: &str, value: &str| SqlCommand {
         request_id: request_id.into(),
         statements: vec![SqlStatement {
             sql: "INSERT INTO batched(value) VALUES (?1) RETURNING id, value".into(),
@@ -1353,82 +1444,58 @@ async fn concurrent_sql_requests_share_one_entry_and_replay_distinct_returning_r
         }],
     };
 
-    let first = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&request("sql-batch-a", "alpha"))
-        .send();
-    let second = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&request("sql-batch-b", "beta"))
-        .send();
-    let (first, second) = tokio::join!(first, second);
-    let first = first.unwrap().json::<SqlExecuteResponse>().await.unwrap();
-    let second = second.unwrap().json::<SqlExecuteResponse>().await.unwrap();
+    let commands = [
+        request("sql-batch-a", "alpha"),
+        request("sql-batch-b", "beta"),
+    ];
+    let results = runtime.execute_sql_batch(commands.to_vec()).unwrap();
+    let first = results[0].as_ref().unwrap();
+    let second = results[1].as_ref().unwrap();
 
-    assert_eq!(first.applied_index, second.applied_index);
-    assert_eq!(first.hash, second.hash);
+    let mut applied = [first.applied_index, second.applied_index];
+    applied.sort_unstable();
+    assert_eq!(applied, [2, 3]);
+    assert_ne!(first.hash, second.hash);
+    for index in applied {
+        assert!(runtime
+            .log_store()
+            .read(index)
+            .unwrap()
+            .unwrap()
+            .payload
+            .starts_with(QWAL_V1_MAGIC));
+    }
     assert_eq!(first.results.len(), 1);
     assert_eq!(second.results.len(), 1);
     assert_ne!(first.results[0].returning, second.results[0].returning);
 
     let last_index = runtime.log_store().last_index().unwrap();
-    let replay = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&request("sql-batch-a", "alpha"))
-        .send()
-        .await
+    let replay = runtime
+        .execute_sql_batch(vec![commands[0].clone()])
         .unwrap()
-        .json::<SqlExecuteResponse>()
-        .await
+        .remove(0)
         .unwrap();
-    assert_eq!(replay, first);
+    assert_eq!(&replay, first);
     assert_eq!(runtime.log_store().last_index().unwrap(), last_index);
 
     let duplicate = request("sql-batch-duplicate", "gamma");
-    let duplicate_first = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&duplicate)
-        .send();
-    let duplicate_second = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&duplicate)
-        .send();
-    let (duplicate_first, duplicate_second) = tokio::join!(duplicate_first, duplicate_second);
-    let duplicate_first = duplicate_first
-        .unwrap()
-        .json::<SqlExecuteResponse>()
-        .await
+    let duplicate_results = runtime
+        .execute_sql_batch(vec![duplicate.clone(), duplicate])
         .unwrap();
-    let duplicate_second = duplicate_second
-        .unwrap()
-        .json::<SqlExecuteResponse>()
-        .await
-        .unwrap();
+    let duplicate_first = duplicate_results[0].as_ref().unwrap();
+    let duplicate_second = duplicate_results[1].as_ref().unwrap();
     assert_eq!(duplicate_first, duplicate_second);
     assert_eq!(
         runtime.log_store().last_index().unwrap(),
         last_index.map(|index| index + 1)
     );
-    server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn sql_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
+#[test]
+fn four_member_sql_batch_commits_four_exact_base_qwal_entries() {
     let dir = tempfile::tempdir().unwrap();
-    let config = node_config(dir.path())
-        .with_writer_batching(4, Duration::from_millis(50))
-        .unwrap();
-    let runtime = Arc::new(NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap());
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
     runtime
         .execute_sql(SqlCommand {
             request_id: "byte-cap-setup".into(),
@@ -1439,23 +1506,7 @@ async fn sql_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
             }],
         })
         .unwrap();
-    let recorder = RecorderFileStore::new_with_id(
-        dir.path().join("byte-cap-recorder"),
-        "node-1",
-        "rhiza:sql:cluster-a",
-        1,
-        1,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let served_runtime = Arc::clone(&runtime);
-    let server = tokio::spawn(async move {
-        axum::serve(listener, node_router(served_runtime, recorder))
-            .await
-            .unwrap();
-    });
-    let value = "x".repeat(64 * 1024);
+    let value = "x".repeat(1024);
     let commands = (0..4)
         .map(|ordinal| SqlCommand {
             request_id: format!("byte-cap-{ordinal}"),
@@ -1465,88 +1516,39 @@ async fn sql_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
             }],
         })
         .collect::<Vec<_>>();
-    let payloads = commands
+    let results = runtime.execute_sql_batch(commands.clone()).unwrap();
+    let responses = commands
         .iter()
-        .map(encode_sql_command)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(payloads
-        .iter()
-        .all(|payload| payload.len() <= MAX_COMMAND_BYTES));
-    assert!(encode_write_batch(&payloads).unwrap().len() > MAX_COMMAND_BYTES);
-    assert!(encode_write_batch(&payloads[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
-
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/v1/sql/execute");
-    let mut requests = tokio::task::JoinSet::new();
-    for command in commands.clone() {
-        let client = client.clone();
-        let url = url.clone();
-        requests.spawn(async move {
-            let response = client
-                .post(url)
-                .header(VERSION_HEADER, PROTOCOL_VERSION)
-                .bearer_auth("client-token")
-                .json(&SqlExecuteRequest {
-                    request_id: command.request_id.clone(),
-                    statements: command.statements.clone(),
-                })
-                .send()
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = response.text().await.unwrap();
-            assert!(
-                status.is_success(),
-                "SQL write failed with {status}: {body}"
-            );
-            (
-                command.request_id,
-                serde_json::from_str::<SqlExecuteResponse>(&body).unwrap(),
-            )
-        });
-    }
-    let mut responses = HashMap::new();
-    while let Some(response) = requests.join_next().await {
-        let (request_id, response) = response.unwrap();
-        responses.insert(request_id, response);
-    }
+        .map(|command| command.request_id.clone())
+        .zip(results)
+        .map(|(request_id, result)| (request_id, result.unwrap()))
+        .collect::<HashMap<_, _>>();
 
     let mut indices = responses
         .values()
         .map(|response| response.applied_index)
         .collect::<Vec<_>>();
     indices.sort_unstable();
-    indices.dedup();
-    assert_eq!(indices, [2, 3]);
-    let mut requests_per_index = HashMap::new();
-    for response in responses.values() {
-        *requests_per_index
-            .entry(response.applied_index)
-            .or_insert(0usize) += 1;
+    assert_eq!(indices, [2, 3, 4, 5]);
+    for index in &indices {
+        assert!(runtime
+            .log_store()
+            .read(*index)
+            .unwrap()
+            .unwrap()
+            .payload
+            .starts_with(QWAL_V1_MAGIC));
     }
-    let mut chunk_sizes = requests_per_index.into_values().collect::<Vec<_>>();
-    chunk_sizes.sort_unstable();
-    assert_eq!(chunk_sizes, [1, 3]);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(5));
 
     for command in commands {
         let original = responses.get(&command.request_id).unwrap();
         assert_eq!(original.results[0].rows_affected, 1);
         assert_eq!(original.results[0].returning, None);
-        let replay = client
-            .post(&url)
-            .header(VERSION_HEADER, PROTOCOL_VERSION)
-            .bearer_auth("client-token")
-            .json(&SqlExecuteRequest {
-                request_id: command.request_id,
-                statements: command.statements,
-            })
-            .send()
-            .await
+        let replay = runtime
+            .execute_sql_batch(vec![command])
             .unwrap()
-            .json::<SqlExecuteResponse>()
-            .await
+            .remove(0)
             .unwrap();
         assert_eq!(&replay, original);
     }
@@ -1566,17 +1568,14 @@ async fn sql_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
             .map(|ordinal| vec![SqlValue::Integer(ordinal)])
             .collect::<Vec<_>>()
     );
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
-    server.abort();
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(5));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_sql_member_does_not_prevent_a_valid_request_in_the_same_window() {
+#[test]
+fn failed_sql_member_does_not_prevent_a_valid_request_in_the_same_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let config = node_config(dir.path())
-        .with_writer_batching(8, Duration::from_millis(20))
-        .unwrap();
-    let runtime = Arc::new(NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap());
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
     runtime
         .execute_sql(SqlCommand {
             request_id: "partial-setup".into(),
@@ -1595,24 +1594,7 @@ async fn failed_sql_member_does_not_prevent_a_valid_request_in_the_same_window()
             }],
         })
         .unwrap();
-    let recorder = RecorderFileStore::new_with_id(
-        dir.path().join("partial-recorder"),
-        "node-1",
-        "rhiza:sql:cluster-a",
-        1,
-        1,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, node_router(runtime, recorder))
-            .await
-            .unwrap();
-    });
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/v1/sql/execute");
-    let request = |request_id: &str, value: &str| SqlExecuteRequest {
+    let request = |request_id: &str, value: &str| SqlCommand {
         request_id: request_id.into(),
         statements: vec![SqlStatement {
             sql: "INSERT INTO partial(value) VALUES (?1)".into(),
@@ -1620,24 +1602,18 @@ async fn failed_sql_member_does_not_prevent_a_valid_request_in_the_same_window()
         }],
     };
 
-    let invalid = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&request("partial-invalid", "existing"))
-        .send();
-    let valid = client
-        .post(&url)
-        .header(VERSION_HEADER, PROTOCOL_VERSION)
-        .bearer_auth("client-token")
-        .json(&request("partial-valid", "fresh"))
-        .send();
-    let (invalid, valid) = tokio::join!(invalid, valid);
+    let results = runtime
+        .execute_sql_batch(vec![
+            request("partial-invalid", "existing"),
+            request("partial-valid", "fresh"),
+        ])
+        .unwrap();
 
-    assert_eq!(invalid.unwrap().status(), reqwest::StatusCode::BAD_REQUEST);
-    let valid = valid.unwrap();
-    assert!(valid.status().is_success());
-    server.abort();
+    assert!(matches!(
+        results[0],
+        Err(NodeError::InvalidSqlStatement { .. }) | Err(NodeError::InvalidRequest(_))
+    ));
+    assert_eq!(results[1].as_ref().unwrap().applied_index, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1986,6 +1962,23 @@ fn consensus_named(root: &Path, recorder_dir: &str) -> Arc<ThreeNodeConsensus> {
         )
         .unwrap(),
     )
+}
+
+fn first_qwal_put_entry(root: &Path, request_id: &str, key: &str, value: &str) -> LogEntry {
+    let state = SqliteStateMachine::open(
+        root.join("db.sqlite"),
+        "rhiza:sql:cluster-a",
+        "qwal-preparer",
+        1,
+        1,
+    )
+    .unwrap();
+    let request_payload = format!("put\t{request_id}\t{key}\t{value}").into_bytes();
+    let payload = state
+        .prepare_put_effect(request_id, key, value, &request_payload, 0, LogHash::ZERO)
+        .unwrap();
+    assert!(payload.starts_with(QWAL_V1_MAGIC));
+    entry(1, LogHash::ZERO, &payload)
 }
 
 fn entry(index: u64, prev_hash: LogHash, payload: &[u8]) -> LogEntry {

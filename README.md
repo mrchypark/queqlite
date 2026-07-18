@@ -241,21 +241,32 @@ each statement, including statement-level `rows_affected` and bounded typed
 replays the original result rather than executing the SQL again.
 
 `/v1/sql/query` accepts one read-only statement and supports `local`, applied-
-index, and quorum read-barrier consistency. QSQL v2 effect replication uses
-QEFX v1: SQLite session changesets are generated against the exact qlog base
-index and hash, and carry the request digest, persisted result, and executor
-fingerprint. If another command wins the proposed slot, the effect is
-regenerated against the new exact base. Effects are capped at 256 KiB and are
-applied with conflict-abort semantics; this is bounded effect replication, not
-unrestricted arbitrary SQLite effect replication.
+index, and quorum read-barrier consistency. QSQL v2 is only the client request
+encoding. Replication uses QWAL v1: the request runs once on an exact-base
+staging copy, and the qlog carries canonical final page images bound to the
+base index, hash, database digest, request digest, persisted result, and
+executor fingerprint. If another command wins the proposed slot, the effect
+is regenerated from the new base. Inline effects are capped at 256 KiB.
 
 Read-only SQL runs only against the selected local materialization, so it may
 use nondeterministic and runtime-introspection functions such as `random()`,
-`datetime('now')`, and `sqlite_version()`. Replicated writes still reject
-nondeterministic functions and other inputs that could make replicas diverge.
+`datetime('now')`, and `sqlite_version()`. Replicated writes may also use
+nondeterministic SQLite functions because only the winning staging result is
+replicated; followers never execute the SQL again.
 Read execution is interrupted after five seconds; a timeout returns retryable
 `503 resource_exhausted`, releases the SQLite connection, and does not change
 node readiness.
+
+Queries otherwise support SQLite's broad read families, including standalone
+`VALUES`, `SELECT`/`EXPLAIN QUERY PLAN`, recursive CTEs, window functions, and
+JSON scalar and table-valued functions. Direct `PRAGMA` queries are limited to
+observational names: `foreign_key_check`, `foreign_key_list`, `index_info`,
+`index_list`, `index_xinfo`, `integrity_check`, `quick_check`, `table_info`,
+`table_list`, and `table_xinfo` may take an argument; `application_id`,
+`collation_list`, `compile_options`, `data_version`, `encoding`,
+`freelist_count`, `function_list`, `module_list`, `page_count`, `pragma_list`,
+`schema_version`, and `user_version` are no-argument only. Assignments,
+`database_list`, and other unlisted pragmas are rejected.
 
 SQL parameters and result cells preserve SQLite `null`, `integer`, `real`,
 `text`, and `blob` types. For example:
@@ -278,18 +289,21 @@ rhiza sql query --url http://127.0.0.1:8080 \
 
 Atomic multi-statement batches use the same authenticated JSON RPC directly.
 The SQL runtime preflights a batch against the current agreed state before
-proposing it, then deterministically replays the encoded SQL and parameters on
-every node. SQL that can make replicas diverge or escape the state-machine
-boundary is rejected: nondeterministic time/random/change-counter functions,
-direct `__rhiza_*` access, `PRAGMA`, `ATTACH`/`DETACH`, TEMP objects, virtual
-tables, and explicit transaction/savepoint control. Direct statement-replay
-`RETURNING` is rejected. `RETURNING` is admitted only when a complete QEFX
-changeset can be generated and validated. DDL, tables without a complete
-supported primary key/schema, triggers, foreign keys, and indirect changes
-cannot use QEFX; they fall back to deterministic statement replay only for
-non-RETURNING requests. A
-`RETURNING` request in any of those cases fails closed. Query responses are
-bounded by server row and byte limits.
+proposing it, then replicates the resulting QWAL page effect. DDL, triggers,
+foreign-key cascades, ROWID/AUTOINCREMENT behavior, nondeterministic functions,
+indirect changes, and bounded `RETURNING` results are supported. Operations
+that escape the state-machine boundary remain rejected: direct `__rhiza_*`
+access, replicated-write `PRAGMA`, `ATTACH`/`DETACH`, TEMP objects, virtual
+tables, extension loading, and explicit transaction/savepoint control. Query
+and `RETURNING` responses are bounded by server row and byte limits.
+
+SQLite storage is QWAL-only. A canonical user database must be paired with its
+mandatory `.control` sidecar; legacy `__rhiza_meta` databases and old
+QSQL/QEFX/qlog histories are not upgraded or dual-decoded. Upgrade by stopping
+the old writers and bootstrapping every voter from one trusted QSNP snapshot.
+The recording VFS currently runs in staging shadow/audit mode, while full
+closed-file page diff and target digest verification remain the correctness
+path.
 
 Recovery metadata uses QANC v3 and binds the recovery generation,
 configuration state, snapshot identity, and executor fingerprint. A mismatch

@@ -597,9 +597,10 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     drop(source);
 
     let restored_dir = root.path().join("restored");
-    let tip = restore_checkpoint_to_fresh_data_dir(archive.clone(), &restored_dir)
-        .await
-        .unwrap();
+    let tip =
+        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "node-1")
+            .await
+            .unwrap();
     assert_eq!(tip.index(), second.applied_index);
     assert_eq!(tip.hash(), second.hash);
     assert_ne!(tip.hash(), first.hash);
@@ -627,12 +628,17 @@ async fn restore_roundtrip_replays_normally_through_node_runtime() {
     restore_checkpoint_to_fresh_data_dir_for_node(archive, &other_node_dir, "node-2")
         .await
         .unwrap();
-    let other = SqliteStateMachine::open(
+    let other = SqliteStateMachine::open_with_configuration(
         other_node_dir.join("sqlite/db.sqlite"),
         "rhiza:sql:cluster-a",
         "node-2",
         1,
-        1,
+        ConfigurationState::active(
+            1,
+            Membership::new(["node-1", "node-2", "node-3"])
+                .unwrap()
+                .digest(),
+        ),
     )
     .unwrap();
     assert_eq!(other.applied_index_value().unwrap(), second.applied_index);
@@ -726,9 +732,10 @@ async fn checkpoint_compact_publishes_format2_and_restores_snapshot_with_exact_s
         .await
         .unwrap();
     let restored_dir = root.path().join("restored");
-    let tip = restore_checkpoint_to_fresh_data_dir(archive.clone(), &restored_dir)
-        .await
-        .unwrap();
+    let tip =
+        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &restored_dir, "node-1")
+            .await
+            .unwrap();
     assert_eq!(tip.index(), second.applied_index);
     let restored_checkpoint = archive.restore_checkpoint_v2().await.unwrap();
     assert_eq!(restored_checkpoint.snapshot().unwrap().anchor(), &anchor);
@@ -936,7 +943,7 @@ async fn stopped_checkpoint_compact_publishes_and_restores_the_stop_snapshot() {
     assert_eq!(anchor.compacted(), &expected);
     assert!(!anchor.configuration_state().is_active());
     let restored_dir = root.path().join("restored");
-    restore_checkpoint_to_fresh_data_dir(archive, &restored_dir)
+    restore_checkpoint_to_fresh_data_dir_for_node(archive, &restored_dir, "node-1")
         .await
         .unwrap();
     let restored = runtime(restored_dir);

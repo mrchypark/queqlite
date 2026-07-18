@@ -19,7 +19,7 @@ use rhiza_archive::{
 #[cfg(any(feature = "graph", feature = "kv"))]
 use rhiza_core::SnapshotIdentity;
 use rhiza_core::{
-    ConfigurationState, ExecutionProfile, LogAnchor, LogHash, LogIndex, RecoveryAnchor,
+    ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -869,6 +869,8 @@ fn install_restored_checkpoint(
     remove_generic_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     let tip = *restored.tip();
+    let profile = snapshot_profile(identity.cluster_id())?;
+    validate_restored_suffix(profile, restored.suffix())?;
     let staging = create_restore_staging_dir(data_dir)?;
     let result = (|| -> Result<(), DurabilityError> {
         if let Some(snapshot) = restored.snapshot() {
@@ -914,6 +916,17 @@ fn install_restored_checkpoint(
     Ok(tip)
 }
 
+fn validate_restored_suffix(
+    profile: ExecutionProfile,
+    suffix: &[LogEntry],
+) -> Result<(), DurabilityError> {
+    for entry in suffix {
+        crate::validate_profile_entry_shape(profile, entry)
+            .map_err(DurabilityError::SnapshotVerification)?;
+    }
+    Ok(())
+}
+
 fn install_profile_snapshot(
     identity: &CheckpointIdentity,
     snapshot: &rhiza_archive::RestoredCheckpointSnapshot,
@@ -931,16 +944,13 @@ fn install_profile_snapshot(
                     })?,
                 )?;
                 let path = staging.join("sqlite/db.sqlite");
-                match target_node_id {
-                    Some(node_id) => restore_recovery_snapshot_file(
-                        path,
-                        snapshot.bytes(),
-                        snapshot.anchor(),
-                        node_id,
+                let node_id = target_node_id.ok_or_else(|| {
+                    DurabilityError::SnapshotVerification(
+                        "SQLite QWAL snapshot restore requires a target node_id".into(),
                     )
-                    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string())),
-                    None => install_snapshot_bytes(&path, snapshot.bytes()),
-                }
+                })?;
+                restore_recovery_snapshot_file(path, snapshot.bytes(), snapshot.anchor(), node_id)
+                    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))
             }
             #[cfg(not(feature = "sql"))]
             Err(DurabilityError::SnapshotVerification(
@@ -1138,19 +1148,6 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
         requires_recorder_install: true,
         _lock: lock,
     })
-}
-
-#[cfg(feature = "sql")]
-fn install_snapshot_bytes(path: &Path, bytes: &[u8]) -> Result<(), DurabilityError> {
-    let parent = path.parent().expect("SQLite restore path has a parent");
-    fs::create_dir_all(parent)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    sync_directory(parent)
 }
 
 fn create_restore_staging_dir(data_dir: &Path) -> Result<PathBuf, DurabilityError> {
@@ -1486,9 +1483,10 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::{
         completed_successor_identity_matches, mark_durable_state, observe_durable_tip,
-        snapshot_profile, CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth,
-        ExecutionProfile, LogHash, PendingLag,
+        snapshot_profile, validate_restored_suffix, CheckpointTip, CoordinatorState,
+        DurabilityError, DurabilityHealth, ExecutionProfile, LogHash, PendingLag,
     };
+    use rhiza_core::{EntryType, LogEntry};
     use std::sync::{Arc, Barrier, Mutex};
 
     #[test]
@@ -1510,6 +1508,34 @@ mod tests {
             Err(DurabilityError::SnapshotVerification(_))
         ));
         assert!(snapshot_profile("rhiza:graph:").is_err());
+    }
+
+    #[test]
+    fn sqlite_restore_suffix_rejects_legacy_commands_during_preflight() {
+        let payload = b"put\tlegacy\tkey\tvalue".to_vec();
+        let entry = LogEntry {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            index: 1,
+            entry_type: EntryType::Command,
+            prev_hash: LogHash::ZERO,
+            hash: LogEntry::calculate_hash(
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                1,
+                EntryType::Command,
+                LogHash::ZERO,
+                &payload,
+            ),
+            payload,
+        };
+
+        assert!(matches!(
+            validate_restored_suffix(ExecutionProfile::Sqlite, &[entry]),
+            Err(DurabilityError::SnapshotVerification(message)) if message.contains("QWAL")
+        ));
     }
 
     fn successor_receipt(index: u64, hash_byte: char, generation: u64) -> Vec<u8> {

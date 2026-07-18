@@ -568,7 +568,7 @@ async fn sql_http_returning_replay_preserves_typed_result_without_duplicate_row(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sql_http_returning_effect_rejects_ddl_without_committing_the_batch() {
+async fn sql_http_qwal_commits_ddl_and_returning_as_one_atomic_command() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(&root.path().join("node"));
     let (addr, server) = serve(node_router(runtime.clone(), recorder(root.path()))).await;
@@ -592,27 +592,30 @@ async fn sql_http_returning_effect_rejects_ddl_without_committing_the_batch() {
         },
     )
     .await;
-    assert_client_error(
-        response,
-        reqwest::StatusCode::BAD_REQUEST,
-        "invalid_request",
-        false,
-        Some(1),
-    )
-    .await;
-    assert_eq!(runtime.applied_index().unwrap(), 0);
-    assert!(runtime
-        .query_sql(
-            &SqlStatement {
-                sql: "SELECT name FROM sqlite_schema WHERE name = 'rejected'".into(),
-                parameters: vec![],
-            },
-            ReadConsistency::Local,
-            1,
-        )
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(response.status().is_success());
+    let response = response.json::<SqlExecuteResponse>().await.unwrap();
+    assert_eq!(response.applied_index, 1);
+    assert_eq!(response.results.len(), 2);
+    assert_eq!(response.results[1].rows_affected, 1);
+    assert_eq!(
+        response.results[1].returning.as_ref().unwrap().rows,
+        [vec![SqlValue::Integer(1)]]
+    );
+    assert_eq!(runtime.applied_index().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT id, value FROM rejected".into(),
+                    parameters: vec![],
+                },
+                ReadConsistency::Local,
+                1,
+            )
+            .unwrap()
+            .rows,
+        [vec![SqlValue::Integer(1), SqlValue::Text("x".into())]]
+    );
     server.abort();
 }
 

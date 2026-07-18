@@ -57,6 +57,11 @@ async fn restart_accepts_sqlite_at_anchor_and_replays_retained_tail() {
     let second = runtime.write("request-2", "beta", "two").unwrap();
     drop(runtime);
 
+    std::fs::rename(
+        config.data_dir().join("sqlite"),
+        config.data_dir().join("sqlite-before-restore"),
+    )
+    .unwrap();
     restore_snapshot_file(
         config.data_dir().join("sqlite/db.sqlite"),
         snapshot.snapshot(),

@@ -61,9 +61,10 @@ use rhiza_quepaxa::{
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{
-    encode_sql_command, restore_snapshot_file, RecoverySnapshot, RequestConflict, RequestOutcome,
-    SqlCommand, SqlCommandResult, SqlEffectPreparation, SqlQueryResult, SqlStatement, SqlValue,
-    SqliteStateMachine, MAX_SQL_STATEMENTS,
+    decode_qwal_v1, encode_put_request, encode_sql_command, restore_snapshot_file,
+    RecoverySnapshot, RequestConflict, RequestOutcome, SqlCommand, SqlCommandResult,
+    SqlEffectPreparation, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
+    MAX_SQL_STATEMENTS, QWAL_V1_MAGIC,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -841,7 +842,7 @@ enum QueuedOperation {
     #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
     Unavailable,
     #[cfg(feature = "sql")]
-    KeyValue,
+    KeyValue { key: String, value: String },
     #[cfg(feature = "sql")]
     Sql(SqlCommand),
     #[cfg(feature = "graph")]
@@ -1671,7 +1672,9 @@ fn valid_recorder_command(command: &StoredCommand) -> bool {
 }
 
 fn valid_recorder_record(request: &RecordRequest) -> bool {
-    !request.cluster_id.is_empty() && request.cluster_id.len() <= MAX_REQUEST_ID_BYTES
+    !request.cluster_id.is_empty()
+        && request.cluster_id.len() <= MAX_REQUEST_ID_BYTES
+        && request.command.as_ref().is_none_or(valid_recorder_command)
 }
 
 fn authenticated_proposer_admitted(
@@ -1789,7 +1792,10 @@ async fn handle_write(
         Err(error) => return node_error_response(error),
     };
     let request_id = request.request_id.clone();
-    let operation = QueuedOperation::KeyValue;
+    let operation = QueuedOperation::KeyValue {
+        key: request.key,
+        value: request.value,
+    };
     coordinate_write(state, permit, request_id, payload, operation).await
 }
 
@@ -4614,29 +4620,22 @@ impl Materializer {
         }
     }
 
-    fn open(config: &NodeConfig, config_id: u64) -> Result<Self, NodeError> {
+    fn open(
+        config: &NodeConfig,
+        configuration_state: &ConfigurationState,
+    ) -> Result<Self, NodeError> {
         match config.execution_profile() {
             ExecutionProfile::Sqlite => {
                 #[cfg(feature = "sql")]
                 {
                     let path = config.data_dir().join("sqlite/db.sqlite");
-                    let state = if path.exists() {
-                        SqliteStateMachine::open(
-                            path,
-                            config.cluster_id(),
-                            config.node_id(),
-                            config.epoch(),
-                            config_id,
-                        )
-                    } else {
-                        SqliteStateMachine::open_with_configuration(
-                            path,
-                            config.cluster_id(),
-                            config.node_id(),
-                            config.epoch(),
-                            config.configuration_state().clone(),
-                        )
-                    }
+                    let state = SqliteStateMachine::open_with_configuration(
+                        path,
+                        config.cluster_id(),
+                        config.node_id(),
+                        config.epoch(),
+                        configuration_state.clone(),
+                    )
                     .map_err(|error| NodeError::Storage(error.to_string()))?;
                     Ok(Self::Sql(Box::new(state)))
                 }
@@ -4653,7 +4652,7 @@ impl Materializer {
                         config.cluster_id(),
                         config.node_id(),
                         config.epoch(),
-                        config_id,
+                        configuration_state.config_id(),
                     )
                     .map(Arc::new)
                     .map(Self::Graph)
@@ -4672,7 +4671,7 @@ impl Materializer {
                         config.cluster_id(),
                         config.node_id(),
                         config.epoch(),
-                        config_id,
+                        configuration_state.config_id(),
                     )
                     .map(Arc::new)
                     .map(Self::Kv)
@@ -4842,11 +4841,10 @@ impl NodeRuntime {
             config.log_initial_configuration.clone(),
         )
         .map_err(|error| NodeError::Storage(error.to_string()))?;
-        let persisted_config_id = log_store
+        let persisted_configuration = log_store
             .configuration_state()
-            .map_err(|error| NodeError::Storage(error.to_string()))?
-            .config_id();
-        let materializer = Materializer::open(&config, persisted_config_id)?;
+            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        let materializer = Materializer::open(&config, &persisted_configuration)?;
         reconcile_local_storage(&config, &log_store, &materializer)?;
         recover_peer_candidates(
             &config,
@@ -4882,7 +4880,7 @@ impl NodeRuntime {
     ) -> Result<WriteResponse, NodeError> {
         let payload = canonical_put(request_id, key, value)?;
         let _commit = self.lock_commit()?;
-        self.execute_payload_locked(request_id, payload, None)
+        self.execute_put_payload_locked(request_id, key, value, payload)
             .map(|outcome| outcome.response)
     }
 
@@ -5191,9 +5189,10 @@ impl NodeRuntime {
 
     /// Executes an ordered, non-atomic batch of SQL commands.
     ///
-    /// Valid commands may share one QuePaxa log entry. Per-command conflicts remain isolated in
-    /// the returned vector, whose order and length match `commands`. The whole vector is validated
-    /// before the first write attempt, so an outer `Err` guarantees that nothing was attempted.
+    /// Each newly applied command is prepared and committed as its own exact-base QWAL entry.
+    /// Per-command conflicts remain isolated in the returned vector, whose order and length match
+    /// `commands`. The whole vector is validated before the first write attempt, so an outer `Err`
+    /// guarantees that nothing was attempted.
     #[cfg(feature = "sql")]
     pub fn execute_sql_batch(
         &self,
@@ -5272,139 +5271,9 @@ impl NodeRuntime {
             return members.into_iter().map(|_| Err(error.clone())).collect();
         }
 
-        let mut results = vec![None; members.len()];
-        let mut pending = Vec::new();
-        for (index, member) in members.iter().enumerate() {
-            match self.check_request(&member.request_id, &member.payload) {
-                Ok(Some(outcome)) => {
-                    results[index] = Some(self.member_response(member, outcome));
-                }
-                Ok(None) => pending.push(index),
-                Err(error) => results[index] = Some(Err(error)),
-            }
-        }
-
-        while !pending.is_empty() {
-            if pending.len() == 1 {
-                let index = pending[0];
-                results[index] = Some(self.execute_single_member_locked(&members[index]));
-                break;
-            }
-            let (last_index, last_hash) = match self.ensure_materialized_tip() {
-                Ok(tip) => tip,
-                Err(error) => {
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            let original_payloads = pending
-                .iter()
-                .map(|index| members[*index].payload.clone())
-                .collect::<Vec<_>>();
-            let prepared_prefix = {
-                let sqlite = match self.lock_sqlite() {
-                    Ok(sqlite) => sqlite,
-                    Err(error) => {
-                        for index in pending.drain(..) {
-                            results[index] = Some(Err(error.clone()));
-                        }
-                        break;
-                    }
-                };
-                sqlite.prepare_write_batch_prefix(
-                    &original_payloads,
-                    last_index,
-                    last_hash,
-                    MAX_COMMAND_BYTES,
-                )
-            };
-            let (proposal_count, proposal_payload) = match prepared_prefix {
-                Ok(Some((proposal_count, proposal_payload))) if proposal_count >= 2 => {
-                    (proposal_count, proposal_payload)
-                }
-                Ok(Some(_)) | Ok(None) => {
-                    let index = pending.remove(0);
-                    results[index] = Some(self.execute_single_member_locked(&members[index]));
-                    continue;
-                }
-                Err(_) => {
-                    for index in pending.drain(..) {
-                        results[index] = Some(self.execute_single_member_locked(&members[index]));
-                    }
-                    break;
-                }
-            };
-            let proposed_indices = pending[..proposal_count].to_vec();
-            let slot = match last_index.checked_add(1) {
-                Some(slot) => slot,
-                None => {
-                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            let entry = match self.consensus.propose_at_cancellable(
-                slot,
-                last_hash,
-                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
-                &self.operation_cancelled,
-            ) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    let error = self.map_consensus_error(error);
-                    for index in pending.drain(..) {
-                        results[index] = Some(Err(error.clone()));
-                    }
-                    break;
-                }
-            };
-            if let Err(error) = self.persist_entry(&entry, slot, last_hash) {
-                for index in pending.drain(..) {
-                    results[index] = Some(Err(error.clone()));
-                }
-                break;
-            }
-
-            let mut remaining = Vec::new();
-            for index in pending.drain(..) {
-                let member = &members[index];
-                match self.check_request(&member.request_id, &member.payload) {
-                    Ok(Some(outcome)) => {
-                        results[index] = Some(self.member_response(member, outcome));
-                    }
-                    Ok(None) => remaining.push(index),
-                    Err(error) => results[index] = Some(Err(error)),
-                }
-            }
-            if entry.entry_type == EntryType::Command
-                && entry.payload == proposal_payload
-                && remaining
-                    .iter()
-                    .any(|index| proposed_indices.contains(index))
-            {
-                let error = self.latch(NodeError::Invariant(
-                    "committed write batch did not record every request".into(),
-                ));
-                for index in remaining.drain(..) {
-                    results[index] = Some(Err(error.clone()));
-                }
-            }
-            pending = remaining;
-        }
-
-        results
-            .into_iter()
-            .map(|result| {
-                result.unwrap_or_else(|| {
-                    Err(self.latch(NodeError::Invariant(
-                        "writer batch omitted a request result".into(),
-                    )))
-                })
-            })
+        members
+            .iter()
+            .map(|member| self.execute_single_member_locked(member))
             .collect()
     }
 
@@ -5832,7 +5701,7 @@ impl NodeRuntime {
                 .mutate_kv_payload_locked(command, member.payload.clone())
                 .map(ClientWriteResponse::Kv),
             #[cfg(feature = "sql")]
-            QueuedOperation::KeyValue | QueuedOperation::Sql(_) => {
+            QueuedOperation::KeyValue { .. } | QueuedOperation::Sql(_) => {
                 Err(NodeError::ExecutionProfileMismatch {
                     expected: self.config.execution_profile,
                     actual: ExecutionProfile::Sqlite,
@@ -5854,31 +5723,14 @@ impl NodeRuntime {
                         outcome.sql_result,
                     ))
                 })
-        } else if matches!(member.operation, QueuedOperation::KeyValue) {
-            self.execute_payload_locked(&member.request_id, member.payload.clone(), None)
+        } else if let QueuedOperation::KeyValue { key, value } = &member.operation {
+            self.execute_put_payload_locked(&member.request_id, key, value, member.payload.clone())
                 .map(|outcome| ClientWriteResponse::KeyValue(outcome.response))
         } else {
             Err(NodeError::ExecutionProfileMismatch {
                 expected: ExecutionProfile::Sqlite,
                 actual: self.config.execution_profile,
             })
-        }
-    }
-
-    #[cfg(feature = "sql")]
-    fn member_response(
-        &self,
-        member: &RuntimeBatchMember,
-        outcome: RequestOutcome,
-    ) -> Result<ClientWriteResponse, NodeError> {
-        if matches!(member.operation, QueuedOperation::Sql(_)) {
-            let result = self.replay_sql_result(&member.request_id, &member.payload, outcome)?;
-            Ok(ClientWriteResponse::Sql(sql_execute_response(
-                write_response(outcome),
-                result,
-            )))
-        } else {
-            Ok(ClientWriteResponse::KeyValue(write_response(outcome)))
         }
     }
 
@@ -5946,13 +5798,20 @@ impl NodeRuntime {
     ) -> Result<Vec<u8>, NodeError> {
         let sqlite = self.lock_sqlite()?;
         match sqlite.prepare_sql_effect(command, request_payload, base_index, base_hash) {
+            Ok(SqlEffectPreparation::Effect(payload)) if !payload.starts_with(QWAL_V1_MAGIC) => {
+                Err(self.latch(NodeError::Invariant(
+                    "SQLite materializer prepared a non-QWAL SQL proposal".into(),
+                )))
+            }
             Ok(SqlEffectPreparation::Effect(payload)) if payload.len() <= MAX_COMMAND_BYTES => {
                 Ok(payload)
             }
-            Ok(SqlEffectPreparation::Effect(_)) => Err(NodeError::InvalidRequest(format!(
+            Ok(SqlEffectPreparation::Effect(_)) => Err(NodeError::ResourceExhausted(format!(
                 "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
             ))),
-            Ok(SqlEffectPreparation::StatementReplay) => Ok(request_payload.to_vec()),
+            Err(rhiza_sql::Error::ResourceExhausted(message)) => {
+                Err(NodeError::ResourceExhausted(message))
+            }
             Err(error) => {
                 let message = error.to_string();
                 let statement_index = first_invalid_sql_statement(command, |prefix| {
@@ -5975,29 +5834,39 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "sql")]
-    fn execute_payload_locked(
+    fn execute_put_payload_locked(
         &self,
         request_id: &str,
+        key: &str,
+        value: &str,
         payload: Vec<u8>,
-        sql: Option<&SqlCommand>,
     ) -> Result<ExecutedPayload, NodeError> {
         self.ensure_ready()?;
         self.ensure_writes_active()?;
 
         if let Some(outcome) = self.check_request(request_id, &payload)? {
-            let sql_result = if sql.is_some() {
-                self.replay_sql_result(request_id, &payload, outcome)?
-            } else {
-                None
-            };
             return Ok(ExecutedPayload {
                 response: write_response(outcome),
-                sql_result,
+                sql_result: None,
             });
         }
 
         loop {
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
+            let proposal_payload = self
+                .lock_sqlite()?
+                .prepare_put_effect(request_id, key, value, &payload, last_index, last_hash)
+                .map_err(|error| self.map_sqlite_error(error))?;
+            if !proposal_payload.starts_with(QWAL_V1_MAGIC) {
+                return Err(self.latch(NodeError::Invariant(
+                    "SQLite materializer prepared a non-QWAL legacy put proposal".into(),
+                )));
+            }
+            if proposal_payload.len() > MAX_COMMAND_BYTES {
+                return Err(NodeError::ResourceExhausted(format!(
+                    "SQLite QWAL effect exceeds {MAX_COMMAND_BYTES} bytes"
+                )));
+            }
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
             })?;
@@ -6006,21 +5875,21 @@ impl NodeRuntime {
                 .propose_at_cancellable(
                     slot,
                     last_hash,
-                    Command::new(CommandKind::Deterministic, payload.clone()),
+                    Command::new(CommandKind::Deterministic, proposal_payload.clone()),
                     &self.operation_cancelled,
                 )
                 .map_err(|error| self.map_consensus_error(error))?;
-            let sql_result = self.persist_entry(&entry, slot, last_hash)?;
+            self.persist_entry(&entry, slot, last_hash)?;
 
             if let Some(outcome) = self.check_request(request_id, &payload)? {
                 return Ok(ExecutedPayload {
                     response: write_response(outcome),
-                    sql_result: sql.is_some().then_some(sql_result).flatten(),
+                    sql_result: None,
                 });
             }
-            if entry.entry_type == EntryType::Command && entry.payload == payload {
+            if entry.entry_type == EntryType::Command && entry.payload == proposal_payload {
                 return Err(self.latch(NodeError::Invariant(
-                    "committed request was not recorded by SQLite".into(),
+                    "committed legacy put request was not recorded by SQLite QWAL".into(),
                 )));
             }
         }
@@ -7119,13 +6988,15 @@ pub fn rehydrate_recorder_after_checkpoint(
 mod tests {
     use axum::http::HeaderValue;
 
-    use rhiza_core::{ExecutionProfile, LogHash};
+    use rhiza_core::{EntryType, ExecutionProfile, LogHash, StoredCommand};
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
     #[cfg(feature = "kv")]
     use rhiza_kv::KvCommandV1;
     use rhiza_log::LogStore as _;
-    use rhiza_quepaxa::ThreeNodeConsensus;
+    use rhiza_quepaxa::{
+        AcceptedValue, Membership, Proposal, ProposalPriority, RecordRequest, ThreeNodeConsensus,
+    };
     use std::sync::Arc;
 
     #[cfg(any(feature = "graph", feature = "kv"))]
@@ -7134,9 +7005,9 @@ mod tests {
     use super::with_graph_client_permit;
     use super::{
         client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
-        Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand, SqlQueryResponse,
-        SqlStatement, SqlValue, MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL,
-        VERSION_HEADER,
+        valid_recorder_record, Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand,
+        SqlQueryResponse, SqlStatement, SqlValue, MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES,
+        PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
     };
     use super::{NodeConfig, NodeRuntime, NodeService};
 
@@ -7147,6 +7018,39 @@ mod tests {
         headers.insert("authorization", HeaderValue::from_static("Bearer "));
 
         assert!(!client_authenticated(&headers, ""));
+    }
+
+    #[test]
+    fn recorder_record_rejects_oversized_inline_command() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(
+            EntryType::Command,
+            vec![0_u8; MAX_COMMAND_BYTES.saturating_add(1)],
+        );
+        let request = RecordRequest {
+            cluster_id: "rhiza:sql:node-unit-test".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            slot: 1,
+            step: 1,
+            proposal: Proposal::new(
+                ProposalPriority::MAX,
+                "n1",
+                1,
+                AcceptedValue::from_command(
+                    "rhiza:sql:node-unit-test",
+                    1,
+                    1,
+                    1,
+                    LogHash::ZERO,
+                    &command,
+                ),
+            ),
+            command: Some(command),
+        };
+
+        assert!(!valid_recorder_record(&request));
     }
 
     #[test]
@@ -7556,7 +7460,26 @@ mod tests {
     }
 
     #[test]
-    fn sql_batch_preserves_order_coalesces_and_retries_exactly() {
+    fn legacy_put_endpoint_commits_qwal_instead_of_raw_put_payload() {
+        let (_dir, runtime) = sql_test_runtime();
+
+        let response = runtime.write("legacy-put", "key", "value").unwrap();
+
+        let entry = runtime
+            .log_store()
+            .read(response.applied_index)
+            .unwrap()
+            .unwrap();
+        assert!(entry.payload.starts_with(b"QWAL\0\x01"));
+        assert!(!entry.payload.starts_with(b"put\t"));
+        assert_eq!(
+            runtime.read("key", ReadConsistency::Local).unwrap().value,
+            Some("value".into())
+        );
+    }
+
+    #[test]
+    fn sql_batch_preserves_order_commits_individual_qwal_effects_and_retries_exactly() {
         let (_dir, runtime) = sql_test_runtime();
         runtime
             .execute_sql(SqlCommand {
@@ -7586,7 +7509,11 @@ mod tests {
         let log_index = runtime.log_store().last_index().unwrap();
         let replay = runtime.execute_sql_batch(commands).unwrap();
 
-        assert_eq!(first_indices, vec![2, 2, 2]);
+        assert_eq!(first_indices, vec![2, 3, 4]);
+        for index in 1..=4 {
+            let entry = runtime.log_store().read(index).unwrap().unwrap();
+            assert!(entry.payload.starts_with(b"QWAL\0\x01"));
+        }
         assert_eq!(
             replay
                 .iter()
@@ -7595,6 +7522,33 @@ mod tests {
             first_indices
         );
         assert_eq!(runtime.log_store().last_index().unwrap(), log_index);
+    }
+
+    #[test]
+    fn sql_effect_over_qlog_limit_is_resource_exhausted() {
+        let (_dir, runtime) = sql_test_runtime();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE large_effect(value BLOB NOT NULL)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+
+        let error = runtime
+            .execute_sql(SqlCommand {
+                request_id: "large-effect".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO large_effect(value) VALUES (randomblob(400000))".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, NodeError::ResourceExhausted(_)));
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
     }
 
     #[test]
@@ -7828,12 +7782,9 @@ fn canonical_put(request_id: &str, key: &str, value: &str) -> Result<Vec<u8>, No
     validate_field("request_id", request_id, MAX_REQUEST_ID_BYTES, false)?;
     validate_key(key)?;
     validate_field("value", value, MAX_VALUE_BYTES, true)?;
-    let payload = format!("put\t{request_id}\t{key}\t{value}").into_bytes();
-    if payload.len() > MAX_COMMAND_BYTES {
-        return Err(NodeError::InvalidRequest(format!(
-            "command exceeds {MAX_COMMAND_BYTES} bytes"
-        )));
-    }
+    let payload = encode_put_request(request_id, key, value)
+        .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+    validate_command_size(&payload)?;
     Ok(payload)
 }
 
@@ -8175,6 +8126,8 @@ fn validate_runtime_entry(
     expected_prev_hash: LogHash,
 ) -> Result<(), NodeError> {
     validate_entry_envelope(config, entry, expected_index, expected_prev_hash)?;
+    validate_profile_entry_shape(config.execution_profile(), entry)
+        .map_err(NodeError::Invariant)?;
     configuration_state
         .validate_entry(entry)
         .map_err(|error| NodeError::Reconciliation(error.to_string()))?;
@@ -8230,6 +8183,19 @@ fn validate_entry_shape(entry: &LogEntry) -> Result<(), String> {
     }
 }
 
+pub(crate) fn validate_profile_entry_shape(
+    _profile: ExecutionProfile,
+    entry: &LogEntry,
+) -> Result<(), String> {
+    validate_entry_shape(entry)?;
+    #[cfg(feature = "sql")]
+    if _profile == ExecutionProfile::Sqlite && entry.entry_type == EntryType::Command {
+        decode_qwal_v1(&entry.payload)
+            .map_err(|error| format!("SQLite command is not canonical QWAL v1: {error}"))?;
+    }
+    Ok(())
+}
+
 fn startup_consensus_error(error: rhiza_quepaxa::Error) -> NodeError {
     match error {
         rhiza_quepaxa::Error::NoQuorum
@@ -8278,17 +8244,29 @@ pub async fn run_e2e(config: E2eConfig) -> Result<E2eReport, Box<dyn std::error:
             recorder_dir.join("node-3"),
         ],
     )?;
-    let base_entry = consensus.propose(Command::new(
-        CommandKind::Deterministic,
-        b"put\talpha\tbravo".to_vec(),
-    ))?;
+    let base_request = canonical_put("e2e-base", "alpha", "bravo")?;
+    let base_effect = db.prepare_put_effect(
+        "e2e-base",
+        "alpha",
+        "bravo",
+        &base_request,
+        0,
+        LogHash::ZERO,
+    )?;
+    let base_entry = consensus.propose(Command::new(CommandKind::Deterministic, base_effect))?;
     db.apply_entry(&base_entry)?;
     let snapshot = db.create_snapshot(base_entry.index)?;
 
-    let tail_entry = consensus.propose(Command::new(
-        CommandKind::Deterministic,
-        b"put\talpha\tcharlie".to_vec(),
-    ))?;
+    let tail_request = canonical_put("e2e-tail", "alpha", "charlie")?;
+    let tail_effect = db.prepare_put_effect(
+        "e2e-tail",
+        "alpha",
+        "charlie",
+        &tail_request,
+        base_entry.index,
+        base_entry.hash,
+    )?;
+    let tail_entry = consensus.propose(Command::new(CommandKind::Deterministic, tail_effect))?;
     let segment_path = write_segment_file(&log_dir, std::slice::from_ref(&tail_entry))?;
     let segment = rhiza_log::SegmentFile::new(
         IndexRange::new(tail_entry.index, tail_entry.index)?,
