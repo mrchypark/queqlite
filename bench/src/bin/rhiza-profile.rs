@@ -28,7 +28,7 @@ use serde::Serialize;
 const KEYSPACE: u64 = 256;
 const RAW_RESULT_BYTES: usize = 1024 * 1024;
 const RAW_GRAPH_TIMEOUT_MS: u64 = 5_000;
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 4;
 type RecorderSet = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -150,10 +150,13 @@ impl Layer {
         }
     }
 
-    const fn durability(self) -> &'static str {
+    const fn durability(self, profile: Profile) -> &'static str {
         match self {
+            Self::Handle | Self::Runtime if matches!(profile, Profile::Kv) => {
+                "Recorder quorum durability plus one atomic redb commit containing the KV state and full qlog entry; file qlog is a buffered rehydratable mirror"
+            }
             Self::Handle | Self::Runtime => {
-                "RecorderFileStore local fsync plus local qlog/materializer"
+                "Recorder quorum durability plus durable local qlog and materializer"
             }
             Self::Raw => "materializer-native local commit only",
             Self::Qwal => {
@@ -627,7 +630,7 @@ struct SqlWritePhaseSamples {
     precheck_classification: PhaseSamples,
     qwal_prepare: PhaseSamples,
     consensus_propose: PhaseSamples,
-    local_qlog_append_sync: PhaseSamples,
+    local_qlog_mirror_append: PhaseSamples,
     sql_materializer_apply: PhaseSamples,
     response_other_total: PhaseSamples,
     total_service: PhaseSamples,
@@ -658,7 +661,7 @@ impl SqlWritePhaseSamples {
                 .saturating_add(sample.precheck_classification_us)
                 .saturating_add(sample.qwal_prepare_us)
                 .saturating_add(sample.consensus_propose_us)
-                .saturating_add(sample.local_qlog_append_sync_us)
+                .saturating_add(sample.local_qlog_mirror_append_us)
                 .saturating_add(sample.sql_materializer_apply_us)
                 .saturating_add(sample.response_other_total_us);
             if named_total != sample.total_service_us {
@@ -676,8 +679,8 @@ impl SqlWritePhaseSamples {
                 .record(sample.precheck_classification_us);
             self.qwal_prepare.record(sample.qwal_prepare_us);
             self.consensus_propose.record(sample.consensus_propose_us);
-            self.local_qlog_append_sync
-                .record(sample.local_qlog_append_sync_us);
+            self.local_qlog_mirror_append
+                .record(sample.local_qlog_mirror_append_us);
             self.sql_materializer_apply
                 .record(sample.sql_materializer_apply_us);
             self.response_other_total
@@ -701,8 +704,8 @@ impl SqlWritePhaseSamples {
             .merge(other.precheck_classification);
         self.qwal_prepare.merge(other.qwal_prepare);
         self.consensus_propose.merge(other.consensus_propose);
-        self.local_qlog_append_sync
-            .merge(other.local_qlog_append_sync);
+        self.local_qlog_mirror_append
+            .merge(other.local_qlog_mirror_append);
         self.sql_materializer_apply
             .merge(other.sql_materializer_apply);
         self.response_other_total.merge(other.response_other_total);
@@ -719,7 +722,7 @@ impl SqlWritePhaseSamples {
                 precheck_classification: self.precheck_classification.metrics(),
                 qwal_prepare: self.qwal_prepare.metrics(),
                 consensus_propose: self.consensus_propose.metrics(),
-                local_qlog_append_sync: self.local_qlog_append_sync.metrics(),
+                local_qlog_mirror_append: self.local_qlog_mirror_append.metrics(),
                 sql_materializer_apply: self.sql_materializer_apply.metrics(),
                 response_other_total: self.response_other_total.metrics(),
                 total_service: self.total_service.metrics(),
@@ -834,7 +837,7 @@ struct SqlWritePhaseMetrics {
     precheck_classification: PhaseMetrics,
     qwal_prepare: PhaseMetrics,
     consensus_propose: PhaseMetrics,
-    local_qlog_append_sync: PhaseMetrics,
+    local_qlog_mirror_append: PhaseMetrics,
     sql_materializer_apply: PhaseMetrics,
     response_other_total: PhaseMetrics,
     total_service: PhaseMetrics,
@@ -962,7 +965,7 @@ async fn run(config: Config) -> Result<Report, String> {
             value_bytes: config.value_bytes,
             read_consistency: config.read_consistency.report(),
             consensus: config.layer.consensus(),
-            durability: config.layer.durability(),
+            durability: config.layer.durability(config.profile),
             sql_write_profile: config.sql_write_profile,
         },
         measurement: samples.metrics(elapsed, qlog_entries),
@@ -3054,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_sql_profile_reports_validated_phase_histograms() {
+    fn schema_v4_sql_profile_reports_validated_phase_histograms() {
         let mut samples = SqlWritePhaseSamples::default();
         samples
             .record_snapshot(
@@ -3068,7 +3071,7 @@ mod tests {
             .unwrap();
 
         let metrics = samples.metrics().unwrap();
-        assert_eq!(REPORT_SCHEMA_VERSION, 3);
+        assert_eq!(REPORT_SCHEMA_VERSION, 4);
         assert_eq!(metrics.sample_count, 1);
         assert_eq!(metrics.member_count, 4);
         assert_eq!(metrics.dropped_samples, 0);
@@ -3084,7 +3087,7 @@ mod tests {
             40
         );
         assert_eq!(
-            json["phase_latency_us"]["local_qlog_append_sync"]["latency_us"]["p95"],
+            json["phase_latency_us"]["local_qlog_mirror_append"]["latency_us"]["p95"],
             50
         );
     }
@@ -3123,7 +3126,7 @@ mod tests {
             precheck_classification_us: 20,
             qwal_prepare_us: 30,
             consensus_propose_us: 40,
-            local_qlog_append_sync_us: 50,
+            local_qlog_mirror_append_us: 50,
             sql_materializer_apply_us: 60,
             response_other_total_us: 70,
             total_service_us: 280,

@@ -209,3 +209,52 @@ public batch calls with zero failures. SQL used 101–102 qlog entries; KV used
 The loaded-host IQR/median was 5.84% for SQL and 19.55% for KV, so the values
 remain diagnostic. Structurally, both group commit paths filled their 1,024
 member physical cap and preserved exact accounting.
+
+## KV single-durable-commit follow-up — 2026-07-20
+
+KV now persists the full `LogEntry`, receipts, data changes, and applied tip in
+one atomic redb `Immediate` transaction. The file qlog remains a buffered
+serving/catch-up mirror; startup rehydrates a missing mirror from redb and
+validates the same hash chain. The materializer fingerprint is domain v3 and
+this remains a clean-install-only breaking change.
+
+The paired diagnostic alternated the exact pre-change binary
+(`49be48e8cf917cb10ef6f3f1b8ab398224e9c4097f6ae926684dd86913e880f2`) and
+post-change binary
+(`1a44239aa959acf8747302159cfce1a2d1d59182044585b4661ad196e3d31eea`) on the
+same host. Raw JSON is in the ignored local directory
+`target/rhiza-bench/kv-unified-durable-commit/`.
+
+| KV workload | Before median | After median | Change | Qlog entries |
+| --- | ---: | ---: | ---: | ---: |
+| batch 1, c4, 2,000 writes | 301.33 ops/s | 395.01 ops/s | +31.09% | 501–503 |
+| batch 256, c4, 102,400 writes | 41,949.14 ops/s | 46,883.09 ops/s | +11.76% | 100–101 |
+
+Every run completed all logical writes with zero errors. The identical qlog
+counts show that the improvement did not come from greater group density; it
+isolates the removed local qlog sync. The host was not established as idle, so
+these remain paired diagnostic results rather than release claims.
+
+## SQL single-durable-intent follow-up — 2026-07-20
+
+SQL now stores the complete `LogEntry` in the generation-4 control-sidecar
+transaction that already durably records the QWAL physical-apply intent. The
+file qlog is a buffered serving/catch-up mirror; startup rehydrates a lost
+mirror from the sidecar. Strict ACK still waits for Recorder quorum, pending
+intent durability, physical database apply, and the final control commit. The
+change removes only the independent file-qlog sync. Verified checkpoint
+compaction bounds the embedded log after the file-qlog anchor is durable.
+
+The paired diagnostic alternated the same pre-change binary used above
+(`49be48e8cf917cb10ef6f3f1b8ab398224e9c4097f6ae926684dd86913e880f2`) and
+the SQL/KV structural-change binary
+(`a8a4568718a5385da076f60b4fe79c37860c9540cd204943b0b54ca3b1213a91`).
+
+| SQL workload | Before median | After median | Change | Qlog entries |
+| --- | ---: | ---: | ---: | ---: |
+| batch 1, c4, 2,000 writes | 159.09 ops/s | 192.90 ops/s | +21.26% | 500–502 |
+| batch 256, c4, 102,400 writes | 19,291.41 ops/s | 19,762.86 ops/s | +2.44% | 100–101 |
+
+Every run completed all logical writes with zero errors. The unchanged qlog
+density isolates the removed sync. The batch-256 pair had a common low third
+run on the loaded host, so the median is diagnostic rather than release-grade.

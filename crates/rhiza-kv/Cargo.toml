@@ -9,5 +9,6 @@ description = "redb materialized state machine for rhiza kv"
 
 [dependencies]
 rhiza-core = { path = "../rhiza-core" }
+rhiza-log = { path = "../rhiza-log" }
 redb = "=4.1.0"
 tempfile.workspace = true

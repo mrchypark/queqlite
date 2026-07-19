@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS __rhiza_kv (
 const SQL_COMMAND_V2_MAGIC: &[u8] = b"QSQL\0\x02";
 const SQL_RESULT_V1_MAGIC: &[u8] = b"QRES\0\x01";
 const QWAL_SNAPSHOT_V2_MAGIC: &[u8] = b"QSNP\0\x03";
-const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v2-policy-v4";
+const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v2-policy-v5-embedded-qlog";
 const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v2;wal_autocheckpoint=0;canonical_synchronous=FULL;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
 pub const MAX_SQL_STATEMENTS: usize = 64;
 pub const MAX_SQL_PARAMETERS: usize = 999;
@@ -680,16 +680,16 @@ impl SqliteStateMachine {
             }
             let digest = self.control.user_db_digest()?;
             if entry.entry_type == EntryType::Noop && next_configuration == current_configuration {
-                self.control.commit_metadata_only_entry(
+                self.control.commit_metadata_only_entry_with_log(
                     base_anchor,
-                    entry_anchor,
+                    entry,
                     &current_configuration,
                     digest,
                 )?;
             } else {
                 let bytes = fs::metadata(&self.path).map_err(io_error)?.len();
                 let pending = PendingApply::new(base_anchor, entry_anchor, digest, digest, bytes);
-                self.control.begin_pending(&pending)?;
+                self.control.begin_pending_with_entry(&pending, entry)?;
                 self.control
                     .commit_applied(&pending, &next_configuration, &[])?;
             }
@@ -754,7 +754,7 @@ impl SqliteStateMachine {
             effect.target_db_digest,
             effect.target_file_bytes,
         );
-        self.control.begin_pending(&pending)?;
+        self.control.begin_pending_with_entry(&pending, entry)?;
         self.install_qwal_effect(&effect, &entry.payload, &pending)?;
         self.control
             .commit_applied(&pending, &next_configuration, &receipts)?;
@@ -1482,6 +1482,18 @@ impl SqliteStateMachine {
 
     pub fn configuration_state_value(&self) -> Result<ConfigurationState> {
         self.control.configuration_state()
+    }
+
+    pub fn embedded_log_entries(
+        &self,
+        from_index: LogIndex,
+        through_index: LogIndex,
+    ) -> Result<Vec<LogEntry>> {
+        self.control.embedded_log_entries(from_index, through_index)
+    }
+
+    pub fn compact_embedded_log_before(&self, anchor_index: LogIndex) -> Result<()> {
+        self.control.compact_embedded_log_before(anchor_index)
     }
 
     pub fn canonical_db_digest(&self) -> Result<LogHash> {

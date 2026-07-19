@@ -263,9 +263,18 @@ that winner, rechecks stored receipts, and prepares the remaining requests from
 the new exact base. An effect that exceeds the 512 KiB command cap is retried
 with a halved prefix until it fits or one command alone is rejected. Receipt and
 request-ID duplicate validation uses pre-sized `HashSet`s in one pass rather
-than rescanning every preceding member. QWAL v2, the current generation-3
-control sidecar, and generation-3 `QSNP` snapshots require a clean installation:
+than rescanning every preceding member. QWAL v2, the current generation-4
+control sidecar, and generation-4 `QSNP` snapshots require a clean installation:
 older files and payloads fail closed, with no migration or rolling dual decoder.
+
+Strict SQL writes insert the complete qlog entry into the FULL-synchronous
+control-sidecar transaction that already makes the physical-apply intent
+durable. The file qlog is therefore a buffered serving/catch-up mirror and is
+rehydrated from the control sidecar after a crash. ACK still waits for Recorder
+quorum, the durable pending intent, physical SQLite apply, and the durable
+control commit; only the redundant file-qlog sync is removed. Verified
+checkpoint compaction deletes the corresponding embedded prefix only after the
+serving qlog has durably installed its compaction anchor.
 
 Read-only SQL runs only against the selected local materialization, so it may
 use nondeterministic and runtime-introspection functions such as `random()`,
@@ -474,8 +483,13 @@ most 64 public calls and 32 MiB of canonical member bytes. The default 500
 microsecond quiet period restarts when another call arrives, but a hard deadline
 of four quiet periods bounds collection latency. The queue drains at most 1,024
 members into one active group.
-The internal replicated KV batch uses wire command version 3, while the redb
-materializer fingerprint is domain v2.
+The internal replicated KV batch uses wire command version 3. The redb
+materializer fingerprint is domain v3: one `Immediate` redb transaction stores
+the full qlog entry, request receipts, data changes, and applied tip. The file
+qlog is a buffered serving/catch-up mirror and is rehydrated from redb after a
+crash, so strict KV writes do not pay a second local qlog sync.
+Verified checkpoint compaction removes the embedded prefix only after the file
+qlog has durably installed the same compaction anchor.
 
 One encoded qlog command remains capped at 512 KiB. If a flattened group is too
 large, Rhiza proposes the largest ordered prefix that fits and continues from
@@ -489,7 +503,7 @@ uses the direct writer batch path and does not enqueue a second time in the
 internal KV group queue. Graph continues to use only this HTTP writer batching
 path and is outside the KV group-commit result below.
 
-KV wire-batch v3 and materializer-domain v2 are a clean-install breaking
+KV wire-batch v3 and materializer-domain v3 are a clean-install breaking
 boundary. Older KV materializer fingerprints and snapshots fail closed; there
 is no in-place migration or rolling dual decoder.
 

@@ -230,11 +230,18 @@ KV public calls are capped at 256 members. Direct runtime and embedded
 500µs quiet period that restarts on arrival and a 2ms hard deadline at the
 default setting; one active group contains at most 1,024 members. The
 wire batch is command version 3 and the redb materializer fingerprint uses
-domain v2, so this is a clean-install breaking boundary. The 512 KiB replicated
-command ceiling still applies: an oversized flattened group is emitted as the
-largest fitting ordered prefixes. HTTP writes use their existing async writer
-batch directly and do not enter the KV queue a second time. Graph is not part of
-this KV group-commit path.
+domain v3, so this is a clean-install breaking boundary. One `Immediate` redb
+transaction durably stores the full qlog entry with the KV state, receipts, and
+applied tip. The file qlog is a buffered serving mirror and can be rehydrated
+from redb, removing its separate hot-path sync without weakening strict ACK.
+SQL uses the same serving-mirror pattern: its generation-4 FULL-synchronous
+control-sidecar transaction stores the full qlog entry with the durable pending
+apply intent. Both profiles remove embedded prefixes only after a verified
+checkpoint and durable file-qlog compaction anchor.
+The 512 KiB replicated command ceiling still applies: an oversized flattened
+group is emitted as the largest fitting ordered prefixes. HTTP writes use their
+existing async writer batch directly and do not enter the KV queue a second
+time. Graph is not part of this KV group-commit path.
 
 For runtime writes, `qlog_entries` and `logical_operations_per_qlog` expose
 coalescing efficiency. SQL QWAL reports `qwal_prepare_latency_us`,
@@ -243,6 +250,8 @@ to whole-call latency. A QWAL v2 SQL batch is ordered and non-atomic: successful
 members share one qlog entry and one anchor, while member savepoints isolate
 failures. An all-failed batch creates no qlog entry. Retry an indeterminate
 batch as the whole unchanged vector with the same request IDs.
+Profile report schema v4 names the buffered SQL mirror cost
+`phase_latency_us.local_qlog_mirror_append`; it is not a durability sync.
 
 The current release evidence is under
 `target/rhiza-bench/write-v3-group-window-idle/20260719T032700/` (an ignored

@@ -173,6 +173,24 @@ fn runtime_commit_persists_qlog_and_sqlite_and_survives_reopen() {
 }
 
 #[test]
+fn sql_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+
+    let committed = runtime.write("request-1", "alpha", "one").unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
+    let reopened = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+    let read = reopened.read("alpha", ReadConsistency::Local).unwrap();
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert_eq!((read.applied_index, read.hash), (1, committed.hash));
+}
+
+#[test]
 fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());

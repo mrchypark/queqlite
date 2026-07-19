@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
+use rhiza_core::{ConfigurationState, LogAnchor, LogEntry, LogHash};
 use rusqlite::{
     params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Transaction,
     TransactionBehavior,
@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{ApplyProgress, Error, RequestConflict, RequestOutcome, Result};
 
-const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x03";
-const CONTROL_SCHEMA_VERSION: u64 = 3;
-const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x03";
+const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x04";
+const CONTROL_SCHEMA_VERSION: u64 = 4;
+const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x04";
 const MAX_RESULT_BLOB_BYTES: usize = super::MAX_SQL_EFFECT_BYTES;
 const SQLITE_VARIABLE_LIMIT: usize = 999;
 const RECEIPT_LOOKUP_CHUNK_SIZE: usize = SQLITE_VARIABLE_LIMIT;
@@ -48,6 +48,10 @@ const CREATE_PENDING_APPLY_SQL: &str = r#"CREATE TABLE pending_apply (
     target_db_digest BLOB NOT NULL CHECK(length(target_db_digest) = 32),
     target_file_bytes INTEGER NOT NULL CHECK(target_file_bytes >= 0)
 );"#;
+const CREATE_EMBEDDED_LOG_SQL: &str = r#"CREATE TABLE embedded_qlog (
+    log_index INTEGER PRIMARY KEY CHECK(log_index > 0),
+    entry_bytes BLOB NOT NULL
+) WITHOUT ROWID;"#;
 
 const REQUIRED_META_KEYS: [&str; 10] = [
     "magic",
@@ -82,6 +86,10 @@ const PENDING_APPLY_COLUMNS: &[ExpectedColumn] = &[
     ("base_db_digest", "BLOB", true, 0),
     ("target_db_digest", "BLOB", true, 0),
     ("target_file_bytes", "INTEGER", true, 0),
+];
+const EMBEDDED_LOG_COLUMNS: &[ExpectedColumn] = &[
+    ("log_index", "INTEGER", true, 1),
+    ("entry_bytes", "BLOB", true, 0),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +344,8 @@ impl ControlStore {
             .map_err(sqlite_error)?;
         tx.execute_batch(CREATE_PENDING_APPLY_SQL)
             .map_err(sqlite_error)?;
+        tx.execute_batch(CREATE_EMBEDDED_LOG_SQL)
+            .map_err(sqlite_error)?;
         put_meta(&tx, "magic", CONTROL_MAGIC)?;
         put_u64(&tx, "schema_version", CONTROL_SCHEMA_VERSION)?;
         put_meta(&tx, "cluster_id", identity.cluster_id.as_bytes())?;
@@ -446,6 +456,117 @@ impl ControlStore {
         tx.commit().map_err(sqlite_error)
     }
 
+    /// Atomically makes the physical-apply intent and its complete local qlog entry durable.
+    pub fn begin_pending_with_entry(&self, pending: &PendingApply, entry: &LogEntry) -> Result<()> {
+        if LogAnchor::new(entry.index, entry.hash) != pending.entry
+            || entry.recompute_hash() != entry.hash
+        {
+            return Err(Error::InvalidEntry(
+                "embedded qlog entry does not match the pending apply".into(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        insert_or_validate_embedded_entry(&tx, entry)?;
+        if let Some(existing) = pending_from(&tx)? {
+            return if existing == *pending {
+                tx.commit().map_err(sqlite_error)
+            } else {
+                Err(Error::InvalidEntry(
+                    "a different physical apply is already pending".into(),
+                ))
+            };
+        }
+        let tip = meta_anchor(&tx, "applied_tip")?;
+        let db_digest = meta_hash(&tx, "user_db_digest")?;
+        if pending.base != tip || pending.base_db_digest != db_digest {
+            return Err(Error::InvalidEntry(
+                "pending apply does not match the committed base".into(),
+            ));
+        }
+        if pending.entry.index()
+            != tip
+                .index()
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidEntry("applied index is exhausted".into()))?
+        {
+            return Err(Error::InvalidEntry(
+                "pending apply entry is not the next slot".into(),
+            ));
+        }
+        insert_pending(&tx, pending)?;
+        tx.commit().map_err(sqlite_error)
+    }
+
+    /// Returns a contiguous interval from the qlog embedded in the control sidecar.
+    pub fn embedded_log_entries(
+        &self,
+        from_index: u64,
+        through_index: u64,
+    ) -> Result<Vec<LogEntry>> {
+        if from_index > through_index {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT log_index,entry_bytes FROM embedded_qlog
+                 WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![u64_to_sql(from_index)?, u64_to_sql(through_index)?],
+                |row| Ok((u64_from_sql(row.get(0)?)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(sqlite_error)?;
+        let cluster_id = meta_text(&self.conn, "cluster_id")?;
+        let mut expected = from_index;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (index, encoded) = row.map_err(sqlite_error)?;
+            if index != expected {
+                return Err(Error::InvalidEntry(format!(
+                    "embedded qlog is missing index {expected}"
+                )));
+            }
+            let entry = decode_embedded_log_entry(&encoded, &cluster_id)?;
+            if entry.index != index {
+                return Err(Error::InvalidEntry(
+                    "embedded qlog key does not match its entry index".into(),
+                ));
+            }
+            entries.push(entry);
+            expected = expected
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidEntry("embedded qlog index overflow".into()))?;
+        }
+        if expected <= through_index {
+            return Err(Error::InvalidEntry(format!(
+                "embedded qlog is missing index {expected}"
+            )));
+        }
+        Ok(entries)
+    }
+
+    /// Removes embedded qlog entries before a verified checkpoint anchor.
+    pub fn compact_embedded_log_before(&self, anchor_index: u64) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        let applied_index = meta_anchor(&tx, "applied_tip")?.index();
+        if anchor_index > applied_index {
+            return Err(Error::InvalidEntry(format!(
+                "cannot compact embedded qlog before anchor {anchor_index} beyond applied index {applied_index}"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM embedded_qlog WHERE log_index < ?1",
+            [u64_to_sql(anchor_index)?],
+        )
+        .map_err(sqlite_error)?;
+        tx.commit().map_err(sqlite_error)
+    }
+
     pub fn pending(&self) -> Result<Option<PendingApply>> {
         pending_from(&self.conn)
     }
@@ -524,6 +645,39 @@ impl ControlStore {
                 "metadata-only tip compare-and-swap affected an unexpected row count".into(),
             ));
         }
+        tx.commit().map_err(sqlite_error)
+    }
+
+    pub fn commit_metadata_only_entry_with_log(
+        &self,
+        expected_base: LogAnchor,
+        entry: &LogEntry,
+        expected_configuration: &ConfigurationState,
+        expected_user_db_digest: LogHash,
+    ) -> Result<()> {
+        let entry_anchor = LogAnchor::new(entry.index, entry.hash);
+        let expected_entry_index = expected_base
+            .index()
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidEntry("applied index is exhausted".into()))?;
+        if entry.index != expected_entry_index || entry.recompute_hash() != entry.hash {
+            return Err(Error::InvalidEntry(
+                "metadata-only embedded entry is invalid or not the next slot".into(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        if pending_from(&tx)?.is_some()
+            || meta_anchor(&tx, "applied_tip")? != expected_base
+            || meta_configuration(&tx)? != *expected_configuration
+            || meta_hash(&tx, "user_db_digest")? != expected_user_db_digest
+        {
+            return Err(Error::InvalidEntry(
+                "metadata-only embedded commit does not match the committed base".into(),
+            ));
+        }
+        insert_or_validate_embedded_entry(&tx, entry)?;
+        put_anchor(&tx, "applied_tip", entry_anchor)?;
         tx.commit().map_err(sqlite_error)
     }
 
@@ -686,6 +840,8 @@ impl ControlStore {
         put_anchor(&tx, "applied_tip", snapshot.applied_tip)?;
         tx.execute("DELETE FROM pending_apply", [])
             .map_err(sqlite_error)?;
+        tx.execute("DELETE FROM embedded_qlog", [])
+            .map_err(sqlite_error)?;
         tx.commit().map_err(sqlite_error)
     }
 
@@ -719,13 +875,18 @@ impl ControlStore {
                 CREATE_PENDING_APPLY_SQL,
                 PENDING_APPLY_COLUMNS,
             ),
+            (
+                "embedded_qlog",
+                CREATE_EMBEDDED_LOG_SQL,
+                EMBEDDED_LOG_COLUMNS,
+            ),
         ] {
             validate_table_schema(&self.conn, table, expected_sql, expected_columns)?;
         }
         let unexpected_objects: i64 = self.conn.query_row(
             "SELECT count(*) FROM sqlite_schema
              WHERE name NOT LIKE 'sqlite_%'
-               AND (type <> 'table' OR name NOT IN ('control_meta','request_receipts','pending_apply'))",
+               AND (type <> 'table' OR name NOT IN ('control_meta','request_receipts','pending_apply','embedded_qlog'))",
             [],
             |row| row.get(0),
         ).map_err(sqlite_error)?;
@@ -1085,6 +1246,55 @@ fn insert_pending(conn: &Connection, value: &PendingApply) -> Result<()> {
     Ok(())
 }
 
+fn insert_or_validate_embedded_entry(conn: &Connection, entry: &LogEntry) -> Result<()> {
+    let cluster_id = meta_text(conn, "cluster_id")?;
+    let epoch = meta_u64(conn, "epoch")?;
+    let configuration = meta_configuration(conn)?;
+    if entry.cluster_id != cluster_id
+        || entry.epoch != epoch
+        || configuration.validate_entry(entry).is_err()
+    {
+        return Err(Error::InvalidEntry(
+            "embedded qlog entry identity is invalid".into(),
+        ));
+    }
+    let index = u64_to_sql(entry.index)?;
+    let existing = conn
+        .query_row(
+            "SELECT entry_bytes FROM embedded_qlog WHERE log_index=?1",
+            params![index],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(existing) = existing {
+        if decode_embedded_log_entry(&existing, &cluster_id)? == *entry {
+            return Ok(());
+        }
+        return Err(Error::InvalidEntry(
+            "embedded qlog index already contains another entry".into(),
+        ));
+    }
+    let encoded = rhiza_log::encode_segment(std::slice::from_ref(entry));
+    conn.execute(
+        "INSERT INTO embedded_qlog(log_index,entry_bytes) VALUES(?1,?2)",
+        params![index, encoded],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn decode_embedded_log_entry(encoded: &[u8], cluster_id: &str) -> Result<LogEntry> {
+    let entries = rhiza_log::decode_segment_for_cluster(encoded, cluster_id)
+        .map_err(|error| Error::InvalidEntry(error.to_string()))?;
+    let [entry] = entries.as_slice() else {
+        return Err(Error::InvalidEntry(
+            "embedded qlog value must contain exactly one entry".into(),
+        ));
+    };
+    Ok(entry.clone())
+}
+
 fn pending_from(conn: &Connection) -> Result<Option<PendingApply>> {
     conn.query_row(
         "SELECT base_index,base_hash,entry_index,entry_hash,base_db_digest,target_db_digest,target_file_bytes FROM pending_apply WHERE singleton=1",
@@ -1306,12 +1516,12 @@ mod tests {
     }
 
     #[test]
-    fn v3_control_and_snapshot_reject_v2_without_migration() {
+    fn v4_control_and_snapshot_reject_v3_without_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sqlite.control");
         let store = ControlStore::create(&path, &identity("node-a")).unwrap();
         let mut old_snapshot = store.export_replicated_snapshot().unwrap();
-        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 2;
+        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 3;
         assert!(matches!(
             store.import_replicated_snapshot(&old_snapshot),
             Err(Error::InvalidSnapshot(_))
@@ -1321,7 +1531,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE control_meta SET value=?1 WHERE key='schema_version'",
-            [2_u64.to_be_bytes().as_slice()],
+            [3_u64.to_be_bytes().as_slice()],
         )
         .unwrap();
         drop(conn);
@@ -1329,6 +1539,59 @@ mod tests {
             ControlStore::open_existing_unchecked(&path),
             Err(Error::Sqlite(message)) if message.contains("version")
         ));
+    }
+
+    #[test]
+    fn verified_checkpoint_compaction_removes_only_the_covered_embedded_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let configuration = identity("node-a").configuration_state().clone();
+        let entry = |index, prev_hash| {
+            let hash = LogEntry::calculate_hash(
+                "cluster",
+                index,
+                7,
+                configuration.config_id(),
+                rhiza_core::EntryType::Noop,
+                prev_hash,
+                &[],
+            );
+            LogEntry {
+                cluster_id: "cluster".into(),
+                epoch: 7,
+                config_id: configuration.config_id(),
+                index,
+                entry_type: rhiza_core::EntryType::Noop,
+                payload: Vec::new(),
+                prev_hash,
+                hash,
+            }
+        };
+        let first = entry(1, LogHash::ZERO);
+        let second = entry(2, first.hash);
+        store
+            .commit_metadata_only_entry_with_log(
+                LogAnchor::new(0, LogHash::ZERO),
+                &first,
+                &configuration,
+                hash(b"base-db"),
+            )
+            .unwrap();
+        store
+            .commit_metadata_only_entry_with_log(
+                LogAnchor::new(1, first.hash),
+                &second,
+                &configuration,
+                hash(b"base-db"),
+            )
+            .unwrap();
+
+        store.compact_embedded_log_before(2).unwrap();
+
+        assert_eq!(store.embedded_log_entries(2, 2).unwrap(), [second]);
+        assert!(store.embedded_log_entries(1, 1).is_err());
+        assert!(store.compact_embedded_log_before(3).is_err());
     }
 
     #[test]

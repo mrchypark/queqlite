@@ -577,6 +577,9 @@ impl CheckpointCoordinator {
             ));
         }
         runtime.log_store.compact_prefix(&anchor)?;
+        runtime
+            .compact_embedded_log_before(anchor.compacted().index())
+            .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
         self.mark_durable(CheckpointTip::new(
             anchor.compacted().index(),
             anchor.compacted().hash(),

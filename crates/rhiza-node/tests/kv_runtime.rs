@@ -55,6 +55,30 @@ fn kv_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
 }
 
 #[test]
+fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_config(dir.path());
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+
+    let written = runtime
+        .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+        .unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
+    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
+
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+    let read = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+    assert_eq!(read.value, Some(b"value".to_vec()));
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (written.applied_index(), written.hash())
+    );
+}
+
+#[test]
 fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = NodeRuntime::open(

@@ -2055,6 +2055,7 @@ version = "0.1.0"
 dependencies = [
  "redb",
  "rhiza-core",
+ "rhiza-log",
  "tempfile",
 ]
 
@@ -2126,6 +2127,7 @@ dependencies = [
  "fallible-streaming-iterator",
  "postcard",
  "rhiza-core",
+ "rhiza-log",
  "rusqlite",
  "serde",
  "serde_json",

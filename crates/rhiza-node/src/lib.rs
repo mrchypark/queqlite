@@ -174,7 +174,7 @@ pub struct SqlWriteProfileSample {
     pub precheck_classification_us: u64,
     pub qwal_prepare_us: u64,
     pub consensus_propose_us: u64,
-    pub local_qlog_append_sync_us: u64,
+    pub local_qlog_mirror_append_us: u64,
     pub sql_materializer_apply_us: u64,
     pub response_other_total_us: u64,
     pub total_service_us: u64,
@@ -5866,7 +5866,7 @@ trait SqlWritePhaseProfile {
     fn add_precheck_classification(&mut self, mark: Self::Mark);
     fn add_qwal_prepare(&mut self, mark: Self::Mark);
     fn add_consensus_propose(&mut self, mark: Self::Mark);
-    fn add_local_qlog_append_sync(&mut self, mark: Self::Mark);
+    fn add_local_qlog_mirror_append(&mut self, mark: Self::Mark);
     fn add_sql_materializer_apply(&mut self, mark: Self::Mark);
     fn record_success(&mut self, batch_member_count: usize);
 }
@@ -5894,7 +5894,7 @@ impl SqlWritePhaseProfile for DisabledSqlWritePhaseProfile {
     fn add_consensus_propose(&mut self, (): ()) {}
 
     #[inline]
-    fn add_local_qlog_append_sync(&mut self, (): ()) {}
+    fn add_local_qlog_mirror_append(&mut self, (): ()) {}
 
     #[inline]
     fn add_sql_materializer_apply(&mut self, (): ()) {}
@@ -5911,7 +5911,7 @@ struct EnabledSqlWritePhaseProfile {
     precheck_classification: Duration,
     qwal_prepare: Duration,
     consensus_propose: Duration,
-    local_qlog_append_sync: Duration,
+    local_qlog_mirror_append: Duration,
     sql_materializer_apply: Duration,
 }
 
@@ -5925,7 +5925,7 @@ impl EnabledSqlWritePhaseProfile {
             precheck_classification: Duration::ZERO,
             qwal_prepare: Duration::ZERO,
             consensus_propose: Duration::ZERO,
-            local_qlog_append_sync: Duration::ZERO,
+            local_qlog_mirror_append: Duration::ZERO,
             sql_materializer_apply: Duration::ZERO,
         }
     }
@@ -5936,7 +5936,7 @@ impl EnabledSqlWritePhaseProfile {
         self.precheck_classification = Duration::ZERO;
         self.qwal_prepare = Duration::ZERO;
         self.consensus_propose = Duration::ZERO;
-        self.local_qlog_append_sync = Duration::ZERO;
+        self.local_qlog_mirror_append = Duration::ZERO;
         self.sql_materializer_apply = Duration::ZERO;
     }
 }
@@ -5966,8 +5966,8 @@ impl SqlWritePhaseProfile for EnabledSqlWritePhaseProfile {
         self.consensus_propose += mark.elapsed();
     }
 
-    fn add_local_qlog_append_sync(&mut self, mark: Instant) {
-        self.local_qlog_append_sync += mark.elapsed();
+    fn add_local_qlog_mirror_append(&mut self, mark: Instant) {
+        self.local_qlog_mirror_append += mark.elapsed();
     }
 
     fn add_sql_materializer_apply(&mut self, mark: Instant) {
@@ -5980,13 +5980,13 @@ impl SqlWritePhaseProfile for EnabledSqlWritePhaseProfile {
         let precheck_classification_us = duration_as_u64_micros(self.precheck_classification);
         let qwal_prepare_us = duration_as_u64_micros(self.qwal_prepare);
         let consensus_propose_us = duration_as_u64_micros(self.consensus_propose);
-        let local_qlog_append_sync_us = duration_as_u64_micros(self.local_qlog_append_sync);
+        let local_qlog_mirror_append_us = duration_as_u64_micros(self.local_qlog_mirror_append);
         let sql_materializer_apply_us = duration_as_u64_micros(self.sql_materializer_apply);
         let named_us = commit_lock_wait_us
             .saturating_add(precheck_classification_us)
             .saturating_add(qwal_prepare_us)
             .saturating_add(consensus_propose_us)
-            .saturating_add(local_qlog_append_sync_us)
+            .saturating_add(local_qlog_mirror_append_us)
             .saturating_add(sql_materializer_apply_us);
         self.observer.record(SqlWriteProfileSample {
             batch_member_count,
@@ -5994,7 +5994,7 @@ impl SqlWritePhaseProfile for EnabledSqlWritePhaseProfile {
             precheck_classification_us,
             qwal_prepare_us,
             consensus_propose_us,
-            local_qlog_append_sync_us,
+            local_qlog_mirror_append_us,
             sql_materializer_apply_us,
             response_other_total_us: total_service_us.saturating_sub(named_us),
             total_service_us,
@@ -8375,6 +8375,27 @@ impl NodeRuntime {
         coordinator.checkpoint_compact(self).await
     }
 
+    pub(crate) fn compact_embedded_log_before(
+        &self,
+        anchor_index: LogIndex,
+    ) -> Result<(), NodeError> {
+        let materializer = self.lock_materializer()?;
+        match &*materializer {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Materializer::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
+            Materializer::Sql(sql) => sql
+                .compact_embedded_log_before(anchor_index)
+                .map_err(|error| self.map_sqlite_error(error)),
+            #[cfg(feature = "kv")]
+            Materializer::Kv(kv) => kv
+                .compact_embedded_log_before(anchor_index)
+                .map_err(|error| NodeError::Storage(error.to_string())),
+            #[cfg(feature = "graph")]
+            Materializer::Graph(_) => Ok(()),
+        }
+    }
+
     #[cfg(feature = "sql")]
     pub fn verify_snapshot_publication(
         &self,
@@ -8430,7 +8451,8 @@ impl NodeRuntime {
         }
         self.log_store
             .compact_prefix(anchor)
-            .map_err(|error| NodeError::Storage(error.to_string()))
+            .map_err(|error| NodeError::Storage(error.to_string()))?;
+        self.compact_embedded_log_before(anchor.compacted().index())
     }
 
     pub fn is_ready(&self) -> bool {
@@ -8951,9 +8973,20 @@ impl NodeRuntime {
             expected_prev_hash,
         )
         .map_err(|error| self.latch(error))?;
-        self.log_store
-            .append(entry)
-            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        if matches!(
+            self.config.execution_profile,
+            ExecutionProfile::Sqlite | ExecutionProfile::Kv
+        ) {
+            // SQL/KV embed the complete entry in their durable materializer state. The file qlog
+            // remains a buffered serving mirror and is rehydrated on startup.
+            self.log_store
+                .append_batch_buffered(std::slice::from_ref(entry))
+                .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        } else {
+            self.log_store
+                .append(entry)
+                .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        }
         self.lock_materializer()?
             .apply_entry(entry)
             .map_err(|error| self.latch(NodeError::Invariant(error)))
@@ -8980,9 +9013,9 @@ impl NodeRuntime {
         let qlog_mark = profile.mark();
         let append_result = self
             .log_store
-            .append(entry)
+            .append_batch_buffered(std::slice::from_ref(entry))
             .map_err(|error| self.latch(NodeError::Storage(error.to_string())));
-        profile.add_local_qlog_append_sync(qlog_mark);
+        profile.add_local_qlog_mirror_append(qlog_mark);
         append_result?;
 
         let materializer_mark = profile.mark();
@@ -10798,7 +10831,7 @@ mod tests {
                 .saturating_add(sample.precheck_classification_us)
                 .saturating_add(sample.qwal_prepare_us)
                 .saturating_add(sample.consensus_propose_us)
-                .saturating_add(sample.local_qlog_append_sync_us)
+                .saturating_add(sample.local_qlog_mirror_append_us)
                 .saturating_add(sample.sql_materializer_apply_us)
                 .saturating_add(sample.response_other_total_us)
         );
@@ -11928,10 +11961,10 @@ fn reconcile_local_storage(
     log_store: &FileLogStore,
     materializer: &Materializer,
 ) -> Result<(), NodeError> {
-    let log_state = log_store
+    let mut log_state = log_store
         .logical_state()
         .map_err(|error| NodeError::Storage(error.to_string()))?;
-    let log_last_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
+    let mut log_last_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
     let applied_index = materializer
         .applied_index()
         .map_err(|error| NodeError::Storage(error.to_string()))?;
@@ -11952,6 +11985,33 @@ fn reconcile_local_storage(
         }
         if applied_index < anchor.compacted().index() {
             return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())));
+        }
+    }
+    if applied_index > log_last_index {
+        let entries = match materializer {
+            #[cfg(feature = "sql")]
+            Materializer::Sql(sql) => Some(
+                sql.embedded_log_entries(log_last_index.saturating_add(1), applied_index)
+                    .map_err(|error| NodeError::Reconciliation(error.to_string()))?,
+            ),
+            #[cfg(feature = "kv")]
+            Materializer::Kv(kv) => Some(
+                kv.embedded_log_entries(log_last_index.saturating_add(1), applied_index)
+                    .map_err(|error| NodeError::Reconciliation(error.to_string()))?,
+            ),
+            #[cfg(feature = "graph")]
+            Materializer::Graph(_) => None,
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Materializer::Unavailable => None,
+        };
+        if let Some(entries) = entries {
+            log_store
+                .append_batch(&entries)
+                .map_err(|error| NodeError::Storage(error.to_string()))?;
+            log_state = log_store
+                .logical_state()
+                .map_err(|error| NodeError::Storage(error.to_string()))?;
+            log_last_index = log_state.tip.as_ref().map_or(0, |tip| tip.index());
         }
     }
     if applied_index > log_last_index {
