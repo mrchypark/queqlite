@@ -199,10 +199,11 @@ cargo test --manifest-path bench/Cargo.toml
 without HTTP. Every run preloads the same 256 bounded keys and measures a fixed
 number of operations. Handle and runtime writes use a local QuePaxa instance
 backed by three file-based Recorder voters; raw excludes consensus. Reads use
-local consistency, so they deliberately exclude a consensus read barrier. The
-stable JSON report records these boundaries, the exact Git state,
-host/toolchain provenance, errors, throughput, and p50/p95/p99/p99.9/max latency
-in microseconds.
+local consistency by default. Pass `--read-consistency read-barrier` on handle
+or runtime read workloads to include a consensus read barrier. The stable JSON
+report records the selected graph-read consistency, these boundaries, the exact
+Git state, host/toolchain provenance, errors, throughput, and
+p50/p95/p99/p99.9/max latency in microseconds.
 
 Build once, then run each profile under the same operation count, payload, and
 concurrency. `native-read` is a supplemental bounded ordered query for SQL and
@@ -219,7 +220,14 @@ coalescing ratio is visible. Per-command latency is the enclosing batch response
 latency. Retry an indeterminate batch as the whole unchanged vector with the
 same request IDs.
 
+Graph builds require the compatibility-safe VFS core from
+`feature/bitpacking-int64-min`, pinned by CI:
+
 ```sh
+git clone https://github.com/mrchypark/ladybug target/ladybug-source
+git -C target/ladybug-source checkout f95c0700b841fad79a842b819a7b1721b53569b3
+export LBUG_SOURCE_DIR="$PWD/target/ladybug-source"
+export LBUG_RUST_BUILD_FROM_SOURCE=1
 cargo build --release --locked --manifest-path bench/Cargo.toml \
   --bin rhiza-profile
 
@@ -249,6 +257,9 @@ for batch_size in 1 2 4 8 16 32 64; do
     > "target/rhiza-bench/profile/kv-write-batch-${batch_size}.json"
 done
 ```
+
+For a sparse-VFS A/B comparison, build the control and candidate against the
+same Ladybug core checkout; otherwise the result also measures a core change.
 
 Run on an otherwise idle machine. Each invocation uses a fresh temporary data
 directory, and reports from a dirty worktree remain useful locally but should

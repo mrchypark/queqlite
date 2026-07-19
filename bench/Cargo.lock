@@ -1308,9 +1308,8 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lbug"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a3c31a30c93756dcdf76fadb3d35ea237ad750a530d49cf4bce8ee073092c8"
+version = "0.18.0"
+source = "git+https://github.com/mrchypark/ladybug-rust?branch=feature%2Fcustom-filesystem#6c9601f559fd59fd66864d4d345149ada9dcc187"
 dependencies = [
  "cmake",
  "cxx",
@@ -2063,7 +2062,11 @@ name = "rhiza-graph"
 version = "0.1.0"
 dependencies = [
  "lbug",
+ "postcard",
  "rhiza-core",
+ "rusqlite",
+ "serde",
+ "sha2",
  "tempfile",
 ]
 

@@ -66,6 +66,37 @@ enum Workload {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+enum BenchmarkReadConsistency {
+    Local,
+    ReadBarrier,
+}
+
+impl BenchmarkReadConsistency {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "read-barrier" => Ok(Self::ReadBarrier),
+            _ => Err("--read-consistency must be local or read-barrier".into()),
+        }
+    }
+
+    const fn runtime(self) -> ReadConsistency {
+        match self {
+            Self::Local => ReadConsistency::Local,
+            Self::ReadBarrier => ReadConsistency::ReadBarrier,
+        }
+    }
+
+    const fn limitation(self) -> &'static str {
+        match self {
+            Self::Local => "local reads exclude a consensus read barrier",
+            Self::ReadBarrier => "read barriers use in-process consensus",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum Layer {
     Handle,
     Runtime,
@@ -146,6 +177,7 @@ struct Config {
     warmup: u64,
     concurrency: usize,
     value_bytes: usize,
+    read_consistency: BenchmarkReadConsistency,
 }
 
 impl Config {
@@ -159,6 +191,7 @@ impl Config {
         let mut warmup = 100;
         let mut concurrency = 1;
         let mut value_bytes = 128;
+        let mut read_consistency = BenchmarkReadConsistency::Local;
         let mut index = 0;
         while index < values.len() {
             let flag = &values[index];
@@ -176,6 +209,9 @@ impl Config {
                 "--warmup" => warmup = parse_u64_allow_zero(next()?, flag)?,
                 "--concurrency" => concurrency = parse_usize(next()?, flag)?,
                 "--value-bytes" => value_bytes = parse_usize(next()?, flag)?,
+                "--read-consistency" => {
+                    read_consistency = BenchmarkReadConsistency::parse(next()?)?
+                }
                 "--help" | "-h" => return Err(usage()),
                 _ => return Err(format!("unknown option: {flag}\n\n{}", usage())),
             }
@@ -195,6 +231,17 @@ impl Config {
         if layer == Layer::Consensus && workload != Workload::Write {
             return Err("--layer consensus supports only --workload write".into());
         }
+        if read_consistency == BenchmarkReadConsistency::ReadBarrier {
+            if profile != Profile::Graph {
+                return Err("--read-consistency read-barrier requires --profile graph".into());
+            }
+            if workload == Workload::Write {
+                return Err("--read-consistency read-barrier requires a read workload".into());
+            }
+            if layer == Layer::Raw {
+                return Err("--layer raw does not support --read-consistency read-barrier".into());
+            }
+        }
         if !matches!(batch_size, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
             return Err("--batch-size must be 1, 2, 4, 8, 16, 32, or 64".into());
         }
@@ -213,6 +260,7 @@ impl Config {
             warmup,
             concurrency,
             value_bytes,
+            read_consistency,
         })
     }
 }
@@ -248,7 +296,8 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
 fn usage() -> String {
     "usage: rhiza-profile --profile sql|graph|kv --workload write|get|document-get|native-read \
      [--layer handle|runtime|raw|consensus] [--operations N] [--warmup N] [--concurrency N] \
-     [--batch-size 1|2|4|8|16|32|64] [--value-bytes N]"
+     [--batch-size 1|2|4|8|16|32|64] [--value-bytes N] \
+     [--read-consistency local|read-barrier]"
         .into()
 }
 
@@ -374,7 +423,7 @@ struct ReportConfig {
     concurrency: usize,
     keyspace: u64,
     value_bytes: usize,
-    read_consistency: &'static str,
+    read_consistency: BenchmarkReadConsistency,
     consensus: &'static str,
     durability: &'static str,
 }
@@ -479,7 +528,7 @@ async fn run(config: Config) -> Result<Report, String> {
             concurrency: config.concurrency,
             keyspace: KEYSPACE,
             value_bytes: config.value_bytes,
-            read_consistency: "local",
+            read_consistency: config.read_consistency,
             consensus: config.layer.consensus(),
             durability: config.layer.durability(),
         },
@@ -488,7 +537,7 @@ async fn run(config: Config) -> Result<Report, String> {
             "single process on one host",
             "excludes HTTP serialization and transport",
             "excludes node-to-node network latency",
-            "local reads exclude a consensus read barrier",
+            config.read_consistency.limitation(),
             "excludes remote checkpoint upload",
         ],
     })
@@ -773,9 +822,9 @@ fn operate_runtime(
             request_id,
             config.value_bytes,
         ),
-        Workload::Get => get_one_runtime(runtime, config.profile, key_index),
-        Workload::DocumentGet => get_graph_document_runtime(runtime, config.profile, key_index),
-        Workload::NativeRead => native_read_runtime(runtime, config.profile),
+        Workload::Get => get_one_runtime(runtime, config, key_index),
+        Workload::DocumentGet => get_graph_document_runtime(runtime, config, key_index),
+        Workload::NativeRead => native_read_runtime(runtime, config),
     }
 }
 
@@ -857,9 +906,9 @@ fn write_batch_runtime(
     }
 }
 
-fn get_one_runtime(runtime: &NodeRuntime, profile: Profile, key_index: u64) -> Result<(), String> {
+fn get_one_runtime(runtime: &NodeRuntime, config: &Config, key_index: u64) -> Result<(), String> {
     let key = key(key_index);
-    let present = match profile {
+    let present = match config.profile {
         Profile::Sql => {
             runtime
                 .query_sql(
@@ -881,7 +930,7 @@ fn get_one_runtime(runtime: &NodeRuntime, profile: Profile, key_index: u64) -> R
                     "MATCH (d:RhizaDocument) WHERE d.id = $id \
                  RETURN d.string_value AS value LIMIT 1",
                     &BTreeMap::from([("id".into(), GraphParameterValue::String(key))]),
-                    ReadConsistency::Local,
+                    config.read_consistency.runtime(),
                     1,
                 )
                 .map_err(|error| error.to_string())?
@@ -904,14 +953,14 @@ fn get_one_runtime(runtime: &NodeRuntime, profile: Profile, key_index: u64) -> R
 
 fn get_graph_document_runtime(
     runtime: &NodeRuntime,
-    profile: Profile,
+    config: &Config,
     key_index: u64,
 ) -> Result<(), String> {
-    if profile != Profile::Graph {
+    if config.profile != Profile::Graph {
         return Err("document get requires graph profile".into());
     }
     if runtime
-        .get_graph_document(&key(key_index), ReadConsistency::Local)
+        .get_graph_document(&key(key_index), config.read_consistency.runtime())
         .map_err(|error| error.to_string())?
         .value
         .is_some()
@@ -922,8 +971,8 @@ fn get_graph_document_runtime(
     }
 }
 
-fn native_read_runtime(runtime: &NodeRuntime, profile: Profile) -> Result<(), String> {
-    let rows = match profile {
+fn native_read_runtime(runtime: &NodeRuntime, config: &Config) -> Result<(), String> {
+    let rows = match config.profile {
         Profile::Sql => runtime
             .query_sql(
                 &SqlStatement {
@@ -940,7 +989,7 @@ fn native_read_runtime(runtime: &NodeRuntime, profile: Profile) -> Result<(), St
             .query_graph(
                 "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
                 &BTreeMap::new(),
-                ReadConsistency::Local,
+                config.read_consistency.runtime(),
                 16,
             )
             .map_err(|error| error.to_string())?
@@ -977,9 +1026,9 @@ async fn operate(
             )
             .await
         }
-        Workload::Get => get_one(target, config.profile, key_index).await,
-        Workload::DocumentGet => get_graph_document(target, config.profile, key_index).await,
-        Workload::NativeRead => native_read(target, config.profile).await,
+        Workload::Get => get_one(target, config, key_index).await,
+        Workload::DocumentGet => get_graph_document(target, config, key_index).await,
+        Workload::NativeRead => native_read(target, config).await,
     }
 }
 
@@ -1211,9 +1260,10 @@ where
         .map_err(|error| error.to_string())
 }
 
-async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<(), String> {
+async fn get_one(target: &Target, config: &Config, key_index: u64) -> Result<(), String> {
     let key = key(key_index);
-    match profile {
+    let graph_read_consistency = config.read_consistency.runtime();
+    match config.profile {
         Profile::Sql => {
             let statement = SqlStatement {
                 sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
@@ -1245,7 +1295,7 @@ async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<()
             let parameters = BTreeMap::from([("id".into(), GraphParameterValue::String(key))]);
             let rows = match target {
                 Target::Handle(handle) => handle
-                    .query_graph(statement, parameters, ReadConsistency::Local, 1)
+                    .query_graph(statement, parameters, graph_read_consistency, 1)
                     .await
                     .map_err(|error| error.to_string())?
                     .rows
@@ -1253,7 +1303,7 @@ async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<()
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
                         runtime
-                            .query_graph(statement, &parameters, ReadConsistency::Local, 1)
+                            .query_graph(statement, &parameters, graph_read_consistency, 1)
                             .map(|result| result.rows.len())
                     })
                     .await?
@@ -1291,16 +1341,17 @@ async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<()
 
 async fn get_graph_document(
     target: &Target,
-    profile: Profile,
+    config: &Config,
     key_index: u64,
 ) -> Result<(), String> {
-    if profile != Profile::Graph {
+    if config.profile != Profile::Graph {
         return Err("document get requires graph profile".into());
     }
     let id = key(key_index);
+    let graph_read_consistency = config.read_consistency.runtime();
     let present = match target {
         Target::Handle(handle) => handle
-            .get_graph_document(id, ReadConsistency::Local)
+            .get_graph_document(id, graph_read_consistency)
             .await
             .map_err(|error| error.to_string())?
             .value
@@ -1308,7 +1359,7 @@ async fn get_graph_document(
         Target::Runtime(runtime) => {
             runtime_call(runtime, move |runtime| {
                 runtime
-                    .get_graph_document(&id, ReadConsistency::Local)
+                    .get_graph_document(&id, graph_read_consistency)
                     .map(|result| result.value.is_some())
             })
             .await?
@@ -1321,8 +1372,9 @@ async fn get_graph_document(
     }
 }
 
-async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
-    let rows = match profile {
+async fn native_read(target: &Target, config: &Config) -> Result<(), String> {
+    let graph_read_consistency = config.read_consistency.runtime();
+    let rows = match config.profile {
         Profile::Sql => {
             let statement = SqlStatement {
                 sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
@@ -1350,7 +1402,7 @@ async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
             let parameters = BTreeMap::new();
             match target {
                 Target::Handle(handle) => handle
-                    .query_graph(statement, parameters, ReadConsistency::Local, 16)
+                    .query_graph(statement, parameters, graph_read_consistency, 16)
                     .await
                     .map_err(|error| error.to_string())?
                     .rows
@@ -1358,7 +1410,7 @@ async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
                         runtime
-                            .query_graph(statement, &parameters, ReadConsistency::Local, 16)
+                            .query_graph(statement, &parameters, graph_read_consistency, 16)
                             .map(|result| result.rows.len())
                     })
                     .await?
@@ -1844,7 +1896,51 @@ mod tests {
                 warmup: 0,
                 concurrency: 4,
                 value_bytes: 64,
+                read_consistency: BenchmarkReadConsistency::Local,
             }
+        );
+    }
+
+    #[test]
+    fn config_defaults_to_local_and_parses_read_barrier() {
+        let local =
+            Config::parse(["--profile", "graph", "--workload", "get"].map(str::to_owned)).unwrap();
+        assert_eq!(local.read_consistency, BenchmarkReadConsistency::Local);
+
+        let read_barrier = Config::parse(
+            [
+                "--profile",
+                "graph",
+                "--workload",
+                "get",
+                "--read-consistency",
+                "read-barrier",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            read_barrier.read_consistency,
+            BenchmarkReadConsistency::ReadBarrier
+        );
+    }
+
+    #[test]
+    fn read_barrier_rejects_workloads_and_layers_that_cannot_apply_it() {
+        for args in [
+            "--profile sql --workload get --read-consistency read-barrier",
+            "--profile graph --workload write --read-consistency read-barrier",
+            "--profile graph --workload get --layer raw --read-consistency read-barrier",
+        ] {
+            assert!(Config::parse(args.split_whitespace().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn read_consistency_uses_cli_spelling_in_json() {
+        assert_eq!(
+            serde_json::to_value(BenchmarkReadConsistency::ReadBarrier).unwrap(),
+            "read-barrier"
         );
     }
 
