@@ -7,8 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 description = "LadybugDB materialized state machine for rhiza graph"
 
+[features]
+default = []
+vfs = ["lbug/vfs"]
+
 [dependencies]
-lbug = "=0.18.1"
+lbug = { git = "https://github.com/mrchypark/ladybug-rust", branch = "feature/custom-filesystem" }
 postcard.workspace = true
 rhiza-core = { path = "../rhiza-core" }
 rusqlite.workspace = true

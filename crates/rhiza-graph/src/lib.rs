@@ -21,8 +21,13 @@ use rhiza_core::{
 };
 use tempfile::NamedTempFile;
 
+#[cfg(feature = "vfs")]
+use tracking_file_system::{DirtyTracker, TrackingFileSystem};
+
 mod control;
 mod lgfx;
+#[cfg(feature = "vfs")]
+mod tracking_file_system;
 
 pub use control::{ControlIdentity, ControlStore, PendingApply, RequestReceipt};
 pub use lgfx::{
@@ -1384,9 +1389,16 @@ impl LadybugStateMachine {
             File::open(base_path)
                 .and_then(|file| file.sync_all())
                 .map_err(io_error)?;
+            // Base-snapshot/staging copies and closed-file digests remain O(file
+            // size). VFS dirty tracking narrows only the LGFX comparison reads.
             fs::copy(base_path, staging_path).map_err(io_error)?;
+            #[cfg(feature = "vfs")]
+            let (staging, tracker) = open_tracking_database(staging_path)?;
+            #[cfg(not(feature = "vfs"))]
             let staging = open_database(staging_path)?;
             let connection = Connection::new(&staging).map_err(ladybug_error)?;
+            #[cfg(feature = "vfs")]
+            tracker.reset();
             let result = transaction(&connection, || apply_command(&connection, &command))?;
             connection.query("CHECKPOINT").map_err(ladybug_error)?;
             drop(connection);
@@ -1398,10 +1410,32 @@ impl LadybugStateMachine {
                     "closed Ladybug base digest does not match graph control".into(),
                 ));
             }
+            let base_file_bytes = fs::metadata(base_path).map_err(io_error)?.len();
+            let target_db_digest = lgfx::file_digest(staging_path)?;
+            let target_file_bytes = fs::metadata(staging_path).map_err(io_error)?.len();
             let chunks = if first_graph_command {
                 lgfx::full_closed_ladybug_file(staging_path)?
             } else {
-                diff_closed_ladybug_files(base_path, staging_path)?
+                #[cfg(feature = "vfs")]
+                {
+                    let dirty = tracker.dirty_snapshot();
+                    if dirty.needs_full_diff(
+                        target_db_digest != actual_base_digest
+                            || target_file_bytes != base_file_bytes,
+                    ) {
+                        diff_closed_ladybug_files(base_path, staging_path)?
+                    } else {
+                        lgfx::diff_closed_ladybug_file_chunks(
+                            base_path,
+                            staging_path,
+                            &dirty.chunk_indices,
+                        )?
+                    }
+                }
+                #[cfg(not(feature = "vfs"))]
+                {
+                    diff_closed_ladybug_files(base_path, staging_path)?
+                }
             };
             let effect = LadybugFileEffectV1 {
                 cluster_id: identity.cluster_id().to_owned(),
@@ -1411,9 +1445,9 @@ impl LadybugStateMachine {
                 base_log_index: base_index,
                 base_log_hash: base_hash,
                 base_db_digest: actual_base_digest,
-                base_file_bytes: fs::metadata(base_path).map_err(io_error)?.len(),
-                target_db_digest: lgfx::file_digest(staging_path)?,
-                target_file_bytes: fs::metadata(staging_path).map_err(io_error)?.len(),
+                base_file_bytes,
+                target_db_digest,
+                target_file_bytes,
                 storage_version: lbug::get_storage_version(),
                 materializer_fingerprint: graph_materializer_fingerprint(),
                 request_id: command.request_id().to_owned(),
@@ -2131,6 +2165,23 @@ fn open_database(path: &Path) -> Result<Database> {
         .map_err(ladybug_error)?;
     drop(connection);
     Ok(database)
+}
+
+#[cfg(feature = "vfs")]
+fn open_tracking_database(path: &Path) -> Result<(Database, DirtyTracker)> {
+    let (file_system, tracker) = TrackingFileSystem::new(path);
+    let database = Database::new_with_file_system(
+        path,
+        ladybug_system_config().auto_checkpoint(false),
+        Box::new(file_system),
+    )
+    .map_err(ladybug_error)?;
+    let connection = Connection::new(&database).map_err(ladybug_error)?;
+    connection
+        .query("CALL force_checkpoint_on_close=false")
+        .map_err(ladybug_error)?;
+    drop(connection);
+    Ok((database, tracker))
 }
 
 fn control_sidecar_path(path: &Path) -> PathBuf {
@@ -5119,6 +5170,134 @@ mod snapshot_tests {
             state.install_lgfx_effect(&effect, false),
             Err(Error::InvalidEntry(message)) if message.contains("target size")
         ));
+    }
+
+    #[cfg(feature = "vfs")]
+    #[test]
+    fn steady_state_lgfx_diff_reads_only_tracked_candidate_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.lbug");
+        let state = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let first = GraphCommandV1::put_document("request-1", "doc", GraphValueV1::U64(1)).unwrap();
+        let first_request = encode_replicated_graph_command(&first).unwrap();
+        let first_effect = state
+            .prepare_graph_effect(&first_request, 0, LogHash::ZERO)
+            .unwrap();
+        let first_hash = LogEntry::calculate_hash(
+            "cluster-1",
+            1,
+            7,
+            3,
+            EntryType::Command,
+            LogHash::ZERO,
+            &first_effect,
+        );
+        state
+            .apply_entry(&LogEntry {
+                cluster_id: "cluster-1".into(),
+                epoch: 7,
+                config_id: 3,
+                index: 1,
+                entry_type: EntryType::Command,
+                payload: first_effect,
+                prev_hash: LogHash::ZERO,
+                hash: first_hash,
+            })
+            .unwrap();
+
+        let update =
+            GraphCommandV1::put_document("request-2", "doc", GraphValueV1::U64(2)).unwrap();
+        let update_request = encode_replicated_graph_command(&update).unwrap();
+        lgfx::reset_diff_scan_metrics();
+        let encoded_effect = state
+            .prepare_graph_effect(&update_request, 1, first_hash)
+            .unwrap();
+        let effect = LadybugFileEffectV1::decode(&encoded_effect).unwrap();
+        let metrics = lgfx::diff_scan_metrics();
+
+        assert_eq!(metrics.full_target_bytes_read, 0);
+        assert_eq!(metrics.full_base_bytes_read, 0);
+        assert!(metrics.sparse_candidate_chunks > 0);
+        assert_eq!(
+            metrics.sparse_target_bytes_read,
+            metrics.sparse_candidate_chunks * LGFX_CHUNK_BYTES as u64
+        );
+        assert!(metrics.sparse_base_bytes_read <= metrics.sparse_target_bytes_read);
+        assert!(metrics.sparse_target_bytes_read < effect.target_file_bytes);
+        assert!(
+            metrics.sparse_base_bytes_read + metrics.sparse_target_bytes_read
+                < effect.target_file_bytes * 2
+        );
+        assert!(effect.chunks.len() as u64 <= metrics.sparse_candidate_chunks);
+    }
+
+    #[cfg(feature = "vfs")]
+    #[test]
+    fn shrink_then_regrow_falls_back_and_applies_the_zeroed_suffix() {
+        use lbug::{FileSystem, LockMode, OpenOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.lbug");
+        let target = dir.path().join("target.lbug");
+        let installed = dir.path().join("installed.lbug");
+        let file_bytes = LGFX_CHUNK_BYTES * 3;
+        fs::write(&base, vec![0x5a; file_bytes]).unwrap();
+        fs::copy(&base, &target).unwrap();
+
+        let (file_system, tracker) = TrackingFileSystem::new(&target);
+        tracker.reset();
+        let handle = file_system
+            .open(
+                target.to_str().unwrap(),
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    create_or_truncate: false,
+                    temporary: false,
+                    lock: LockMode::None,
+                },
+            )
+            .unwrap();
+        handle.truncate(LGFX_CHUNK_BYTES as u64).unwrap();
+        handle.truncate(file_bytes as u64).unwrap();
+        handle.sync().unwrap();
+        drop(handle);
+
+        let dirty = tracker.dirty_snapshot();
+        let target_changed =
+            lgfx::file_digest(&base).unwrap() != lgfx::file_digest(&target).unwrap();
+        let chunks = if dirty.needs_full_diff(target_changed) {
+            diff_closed_ladybug_files(&base, &target).unwrap()
+        } else {
+            lgfx::diff_closed_ladybug_file_chunks(&base, &target, &dirty.chunk_indices).unwrap()
+        };
+        let effect = LadybugFileEffectV1 {
+            cluster_id: "cluster-1".into(),
+            epoch: 7,
+            configuration_id: 3,
+            recovery_generation: 1,
+            base_log_index: 0,
+            base_log_hash: LogHash::ZERO,
+            base_db_digest: lgfx::file_digest(&base).unwrap(),
+            base_file_bytes: file_bytes as u64,
+            target_db_digest: lgfx::file_digest(&target).unwrap(),
+            target_file_bytes: file_bytes as u64,
+            storage_version: lbug::get_storage_version(),
+            materializer_fingerprint: graph_materializer_fingerprint(),
+            request_id: "shrink-regrow".into(),
+            request_digest: LogHash::digest(&[b"shrink-regrow"]),
+            result_encoding_version: 1,
+            bounded_result: b"result".to_vec(),
+            chunks_digest: lgfx_chunks_digest(&chunks),
+            chunks,
+        };
+
+        apply_lgfx_to_exact_base(&base, &installed, &effect).unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), fs::read(&target).unwrap());
+        assert!(fs::read(&installed).unwrap()[LGFX_CHUNK_BYTES..]
+            .iter()
+            .all(|byte| *byte == 0));
     }
 }
 

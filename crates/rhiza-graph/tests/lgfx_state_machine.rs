@@ -5,6 +5,8 @@ use std::{
 
 use rhiza_core::LogAnchor;
 use rhiza_core::{ConfigChange, ConfigurationState, EntryType, LogEntry, LogHash};
+#[cfg(feature = "vfs")]
+use rhiza_graph::diff_closed_ladybug_files;
 use rhiza_graph::{
     apply_lgfx_to_exact_base, decode_snapshot, encode_replicated_graph_command, encode_snapshot,
     graph_materializer_fingerprint, lgfx_chunks_digest, restore_snapshot_file, ControlIdentity,
@@ -104,6 +106,53 @@ fn assert_pair_unchanged(
     assert!(state.apply_entry(entry).is_err());
     assert_eq!(fs::read(path).unwrap(), before_db);
     assert_eq!(fs::read(control_path(path)).unwrap(), before_control);
+}
+
+#[cfg(feature = "vfs")]
+fn assert_sparse_effect_matches_full_closed_file_diff(
+    directory: &Path,
+    base: &Path,
+    encoded: &[u8],
+) {
+    let effect = LadybugFileEffectV1::decode(encoded).unwrap();
+    let target = directory.join(format!("target-{}.lbug", effect.base_log_index + 1));
+    apply_lgfx_to_exact_base(base, &target, &effect).unwrap();
+    assert_eq!(
+        effect.chunks,
+        diff_closed_ladybug_files(base, &target).unwrap()
+    );
+    fs::remove_file(target).unwrap();
+}
+
+#[cfg(feature = "vfs")]
+#[test]
+fn dirty_chunk_effects_match_full_diff_for_insert_update_and_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.lbug");
+    let state = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+    let (_, bootstrap) = command("bootstrap", "seed", 1);
+    let bootstrap = state
+        .prepare_graph_effect(&bootstrap, 0, LogHash::ZERO)
+        .unwrap();
+    let bootstrap_entry = lgfx_entry(1, LogHash::ZERO, bootstrap);
+    state.apply_entry(&bootstrap_entry).unwrap();
+
+    let commands = [
+        GraphCommandV1::put_document("insert", "document", GraphValueV1::U64(7)).unwrap(),
+        GraphCommandV1::put_document("update", "document", GraphValueV1::U64(9)).unwrap(),
+        GraphCommandV1::delete_document("delete", "document").unwrap(),
+    ];
+    let mut previous = bootstrap_entry.hash;
+    for (index, command) in (2_u64..).zip(commands) {
+        let request = encode_replicated_graph_command(&command).unwrap();
+        let encoded = state
+            .prepare_graph_effect(&request, index - 1, previous)
+            .unwrap();
+        assert_sparse_effect_matches_full_closed_file_diff(dir.path(), &path, &encoded);
+        let entry = lgfx_entry(index, previous, encoded);
+        state.apply_entry(&entry).unwrap();
+        previous = entry.hash;
+    }
 }
 
 #[test]

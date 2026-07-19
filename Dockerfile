@@ -9,16 +9,31 @@ RUN apt-get update \
         build-essential \
         clang \
         cmake \
+        git \
         libclang-dev \
         libssl-dev \
         pkg-config \
         python3 \
     && rm -rf /var/lib/apt/lists/*
-ENV LBUG_BUILD_FROM_SOURCE=1
+ARG LBUG_SOURCE_REPOSITORY=https://github.com/mrchypark/ladybug.git
+ARG LBUG_SOURCE_REF=f95c0700b841fad79a842b819a7b1721b53569b3
+RUN case "$RHIZA_PROFILE" in \
+      graph|all) \
+        git init /opt/ladybug \
+        && git -C /opt/ladybug remote add origin "$LBUG_SOURCE_REPOSITORY" \
+        && git -C /opt/ladybug fetch --depth=1 origin "$LBUG_SOURCE_REF" \
+        && git -C /opt/ladybug checkout --detach FETCH_HEAD \
+        && rm -rf /opt/ladybug/.git \
+        ;; \
+    esac
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,id=rhiza-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rhiza-cargo-target,target=/src/target,sharing=locked \
+    if [ "$RHIZA_PROFILE" = graph ] || [ "$RHIZA_PROFILE" = all ]; then \
+      export LBUG_SOURCE_DIR=/opt/ladybug; \
+      export LBUG_RUST_BUILD_FROM_SOURCE=1; \
+    fi; \
     case "$RHIZA_PROFILE" in \
       sql|graph|kv) \
         cargo build --release --locked -p rhiza-cli --bin rhiza \

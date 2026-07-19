@@ -17,6 +17,13 @@ jobs:
         profile: [sql, graph, kv, all]
     steps:
       - uses: actions/checkout@v4
+      - name: Check out Ladybug source for VFS builds
+        if: matrix.profile == 'graph' || matrix.profile == 'all'
+        uses: actions/checkout@v4
+        with:
+          repository: mrchypark/ladybug
+          ref: f95c0700b841fad79a842b819a7b1721b53569b3
+          path: ladybug-source
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -24,19 +31,27 @@ jobs:
         env:
           RHIZA_PROFILE: ${{ matrix.profile }}
         run: |
+          if [ "$RHIZA_PROFILE" = graph ] || [ "$RHIZA_PROFILE" = all ]; then
+            export LBUG_SOURCE_DIR="$GITHUB_WORKSPACE/ladybug-source"
+            export LBUG_RUST_BUILD_FROM_SOURCE=1
+          fi
           case "$RHIZA_PROFILE" in
             sql|graph|kv) cargo_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc") ;;
             all) cargo_features=(--all-features) ;;
             *) exit 64 ;;
           esac
           cargo check --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
+          if [ "$RHIZA_PROFILE" = graph ]; then
+            cargo tree --locked -p rhiza-cli -e features "${cargo_features[@]}" -i lbug \
+              | grep -F 'lbug feature "vfs"'
+          fi
           if [ "$RHIZA_PROFILE" != all ]; then
             dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-dependencies.txt"
             cargo tree --locked -p rhiza-cli -e normal "${cargo_features[@]}" \
               --prefix none --format '{p}' > "$dependency_tree"
             case "$RHIZA_PROFILE" in
               sql) forbidden=(rhiza-graph lbug rhiza-kv redb) ;;
-              graph) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-kv redb) ;;
+              graph) forbidden=(rhiza-sql rhiza-kv redb) ;;
               kv) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-graph lbug) ;;
             esac
             for dependency in "${forbidden[@]}"; do
@@ -92,8 +107,17 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    env:
+      LBUG_SOURCE_DIR: ${{ github.workspace }}/ladybug-source
+      LBUG_RUST_BUILD_FROM_SOURCE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Check out Ladybug source for VFS builds
+        uses: actions/checkout@v4
+        with:
+          repository: mrchypark/ladybug
+          ref: f95c0700b841fad79a842b819a7b1721b53569b3
+          path: ladybug-source
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

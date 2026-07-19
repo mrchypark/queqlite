@@ -12,6 +12,9 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
+#[cfg(feature = "vfs")]
+use std::collections::BTreeSet;
+
 use lbug::{Connection, Database};
 use rhiza_core::{ConfigurationState, LogEntry, LogHash, LogIndex};
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,47 @@ pub const MAX_LGFX_V1_BYTES: usize = 256 * 1024;
 
 const MAX_ID_BYTES: usize = 256;
 const CHUNK_DIGEST_DOMAIN: &[u8] = b"rhiza-ladybug-file-chunks-v1\0";
+
+#[cfg(all(test, feature = "vfs"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DiffScanMetrics {
+    pub(crate) full_target_bytes_read: u64,
+    pub(crate) full_base_bytes_read: u64,
+    pub(crate) sparse_candidate_chunks: u64,
+    pub(crate) sparse_target_bytes_read: u64,
+    pub(crate) sparse_base_bytes_read: u64,
+}
+
+#[cfg(all(test, feature = "vfs"))]
+thread_local! {
+    static DIFF_SCAN_METRICS: std::cell::Cell<DiffScanMetrics> =
+        const { std::cell::Cell::new(DiffScanMetrics {
+            full_target_bytes_read: 0,
+            full_base_bytes_read: 0,
+            sparse_candidate_chunks: 0,
+            sparse_target_bytes_read: 0,
+            sparse_base_bytes_read: 0,
+        }) };
+}
+
+#[cfg(all(test, feature = "vfs"))]
+pub(crate) fn reset_diff_scan_metrics() {
+    DIFF_SCAN_METRICS.set(DiffScanMetrics::default());
+}
+
+#[cfg(all(test, feature = "vfs"))]
+pub(crate) fn diff_scan_metrics() -> DiffScanMetrics {
+    DIFF_SCAN_METRICS.get()
+}
+
+#[cfg(all(test, feature = "vfs"))]
+fn record_diff_scan(update: impl FnOnce(&mut DiffScanMetrics)) {
+    DIFF_SCAN_METRICS.with(|metrics| {
+        let mut current = metrics.get();
+        update(&mut current);
+        metrics.set(current);
+    });
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -212,9 +256,17 @@ pub fn diff_closed_ladybug_files(
     for chunk_index in 0..target_chunks {
         let mut target_chunk = vec![0; LGFX_CHUNK_BYTES];
         target.read_exact(&mut target_chunk).map_err(io_error)?;
+        #[cfg(all(test, feature = "vfs"))]
+        record_diff_scan(|metrics| {
+            metrics.full_target_bytes_read += LGFX_CHUNK_BYTES as u64;
+        });
         let changed = if chunk_index < base_chunks {
             let mut base_chunk = [0; LGFX_CHUNK_BYTES];
             base.read_exact(&mut base_chunk).map_err(io_error)?;
+            #[cfg(all(test, feature = "vfs"))]
+            record_diff_scan(|metrics| {
+                metrics.full_base_bytes_read += LGFX_CHUNK_BYTES as u64;
+            });
             base_chunk.as_slice() != target_chunk
         } else {
             true
@@ -222,6 +274,83 @@ pub fn diff_closed_ladybug_files(
         if changed {
             captured_bytes = captured_bytes
                 .checked_add(target_chunk.len())
+                .ok_or_else(|| Error::ResourceExhausted("LGFX diff bytes overflow".into()))?;
+            if captured_bytes > MAX_LGFX_V1_BYTES {
+                return exhausted("LGFX changed chunks exceed the envelope bound");
+            }
+            chunks.push(LadybugFileChunkV1 {
+                chunk_index,
+                after_image: target_chunk,
+            });
+        }
+    }
+    Ok(chunks)
+}
+
+/// Produces the same canonical changed chunk images as the full diff while
+/// reading only tracked target chunks plus every newly grown chunk.
+///
+/// This only removes the O(file size) comparison scan. Graph effect preparation
+/// still makes full-file base-snapshot and staging copies and hashes the full
+/// closed base and target files; this slice is not a zero-copy or
+/// incremental-digest implementation.
+#[cfg(feature = "vfs")]
+pub(crate) fn diff_closed_ladybug_file_chunks(
+    base_path: impl AsRef<Path>,
+    target_path: impl AsRef<Path>,
+    dirty_chunks: &BTreeSet<u64>,
+) -> Result<Vec<LadybugFileChunkV1>> {
+    let base_path = base_path.as_ref();
+    let target_path = target_path.as_ref();
+    require_clean(base_path)?;
+    require_clean(target_path)?;
+    let base_len = file_length(base_path)?;
+    let target_len = file_length(target_path)?;
+    validate_file_length("base", base_len)?;
+    validate_file_length("target", target_len)?;
+    let base_chunks = base_len / LGFX_CHUNK_BYTES as u64;
+    let target_chunks = target_len / LGFX_CHUNK_BYTES as u64;
+    let mut candidates = dirty_chunks
+        .range(..target_chunks)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    candidates.extend(base_chunks..target_chunks);
+
+    let mut base = File::open(base_path).map_err(io_error)?;
+    let mut target = File::open(target_path).map_err(io_error)?;
+    let mut chunks = Vec::new();
+    for chunk_index in candidates {
+        #[cfg(all(test, feature = "vfs"))]
+        record_diff_scan(|metrics| {
+            metrics.sparse_candidate_chunks += 1;
+        });
+        let offset = chunk_index
+            .checked_mul(LGFX_CHUNK_BYTES as u64)
+            .ok_or_else(|| Error::ResourceExhausted("LGFX chunk offset overflows".into()))?;
+        target.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        let mut target_chunk = vec![0; LGFX_CHUNK_BYTES];
+        target.read_exact(&mut target_chunk).map_err(io_error)?;
+        #[cfg(all(test, feature = "vfs"))]
+        record_diff_scan(|metrics| {
+            metrics.sparse_target_bytes_read += LGFX_CHUNK_BYTES as u64;
+        });
+        let changed = if chunk_index < base_chunks {
+            base.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+            let mut base_chunk = [0; LGFX_CHUNK_BYTES];
+            base.read_exact(&mut base_chunk).map_err(io_error)?;
+            #[cfg(all(test, feature = "vfs"))]
+            record_diff_scan(|metrics| {
+                metrics.sparse_base_bytes_read += LGFX_CHUNK_BYTES as u64;
+            });
+            base_chunk.as_slice() != target_chunk
+        } else {
+            true
+        };
+        if changed {
+            let captured_bytes = chunks
+                .len()
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(LGFX_CHUNK_BYTES))
                 .ok_or_else(|| Error::ResourceExhausted("LGFX diff bytes overflow".into()))?;
             if captured_bytes > MAX_LGFX_V1_BYTES {
                 return exhausted("LGFX changed chunks exceed the envelope bound");
@@ -628,4 +757,36 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 
 fn exhausted<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::ResourceExhausted(message.into()))
+}
+
+#[cfg(all(test, feature = "vfs"))]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn dirty_diff_matches_full_diff_across_growth_and_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base.lbug");
+        let grown = directory.path().join("grown.lbug");
+        let shrunk = directory.path().join("shrunk.lbug");
+        let mut base_bytes = vec![1; LGFX_CHUNK_BYTES * 2];
+        fs::write(&base, &base_bytes).unwrap();
+        let mut grown_bytes = base_bytes.clone();
+        grown_bytes[LGFX_CHUNK_BYTES - 1] = 2;
+        grown_bytes.extend(vec![3; LGFX_CHUNK_BYTES]);
+        fs::write(&grown, grown_bytes).unwrap();
+
+        assert_eq!(
+            diff_closed_ladybug_file_chunks(&base, &grown, &BTreeSet::from([0])).unwrap(),
+            diff_closed_ladybug_files(&base, &grown).unwrap()
+        );
+
+        base_bytes.truncate(LGFX_CHUNK_BYTES);
+        fs::write(&shrunk, base_bytes).unwrap();
+        assert_eq!(
+            diff_closed_ladybug_file_chunks(&base, &shrunk, &BTreeSet::new()).unwrap(),
+            diff_closed_ladybug_files(&base, &shrunk).unwrap()
+        );
+    }
 }

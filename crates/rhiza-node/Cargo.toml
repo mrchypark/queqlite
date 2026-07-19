@@ -8,7 +8,7 @@ repository.workspace = true
 [features]
 default = ["sql"]
 sql = ["dep:rhiza-sql"]
-graph = ["dep:rhiza-graph"]
+graph = ["dep:rhiza-graph", "rhiza-graph/vfs"]
 kv = ["dep:rhiza-kv"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
 

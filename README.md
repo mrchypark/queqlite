@@ -84,6 +84,23 @@ For normal deployment, select the scoped image matching the required profile;
 for example, use `RHIZA_IMAGE=rhiza-sql:dev` together with
 `RHIZA_EXECUTION_PROFILE=sql`.
 
+Local Cargo builds that enable `graph` or `--all-features` also enable the
+Ladybug custom-filesystem API and therefore require the Ladybug source pinned
+by CI and the Dockerfile. Check out that revision once and set the source-build
+environment for graph/all commands only:
+
+```bash
+git clone --branch feature/bitpacking-int64-min --single-branch \
+  https://github.com/mrchypark/ladybug.git ladybug-source
+git -C ladybug-source checkout f95c0700b841fad79a842b819a7b1721b53569b3
+export LBUG_SOURCE_DIR="$PWD/ladybug-source"
+export LBUG_RUST_BUILD_FROM_SOURCE=1
+cargo build -p rhiza-cli --no-default-features --features graph
+# Or: cargo build -p rhiza-cli --all-features
+```
+
+SQL-only and KV-only Cargo builds do not need this checkout or environment.
+
 ## Embedded Rust API
 
 The `rhiza` crate exposes the SQL, graph, and KV profiles through one embedded
