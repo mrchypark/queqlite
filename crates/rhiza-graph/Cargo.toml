@@ -8,7 +8,7 @@ rust-version.workspace = true
 description = "LadybugDB materialized state machine for rhiza graph"
 
 [dependencies]
-lbug = "=0.18.1"
+lbug = { git = "https://github.com/mrchypark/ladybug-rust", branch = "feature/custom-filesystem" }
 rhiza-core = { path = "../rhiza-core" }
 tempfile.workspace = true
 
