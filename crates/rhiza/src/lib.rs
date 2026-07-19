@@ -10,9 +10,9 @@ use std::{
     time::Duration,
 };
 
-use rhiza_node::{
-    confirm_write_durability, run_read_operation, ConfigError, NodeConfig, NodeRuntime, NodeService,
-};
+#[cfg(feature = "kv")]
+use rhiza_node::run_read_operation;
+use rhiza_node::{confirm_write_durability, ConfigError, NodeConfig, NodeRuntime, NodeService};
 use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},

@@ -18,9 +18,7 @@ use rhiza::{
 };
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{
-    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderReply,
-};
+use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn executes_and_queries_sql_with_in_process_recorders() {
@@ -75,7 +73,7 @@ async fn executes_and_queries_sql_with_in_process_recorders() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn embedded_sql_batch_commits_qwal_entries_in_order_and_retries_unchanged_vector() {
+async fn embedded_sql_batch_shares_one_qwal_anchor_and_retries_unchanged_vector() {
     let root = tempfile::tempdir().unwrap();
     let rhiza = Rhiza::open(config(root.path())).await.unwrap();
     let handle = rhiza.handle();
@@ -104,13 +102,15 @@ async fn embedded_sql_batch_commits_qwal_entries_in_order_and_retries_unchanged_
 
     assert_eq!(first, replay);
     assert!(first.iter().all(Result::is_ok));
-    assert_eq!(
-        first
-            .iter()
-            .map(|result| result.as_ref().unwrap().applied_index)
-            .collect::<Vec<_>>(),
-        [2, 3, 4]
-    );
+    let anchors = first
+        .iter()
+        .map(|result| {
+            let result = result.as_ref().unwrap();
+            (result.applied_index, result.hash)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(anchors[0].0, 2);
+    assert!(anchors.iter().all(|anchor| *anchor == anchors[0]));
     rhiza.shutdown().await.unwrap();
 }
 
@@ -679,11 +679,39 @@ struct BlockingRecorder {
 }
 
 impl RecorderRpc for BlockingRecorder {
-    fn call(
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.inner.recorder_id()
+    }
+
+    fn store_command_for(
         &self,
-        request: rhiza_quepaxa::RecorderRequest,
-    ) -> rhiza_quepaxa::Result<RecorderReply> {
-        self.inner.call(request)
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: rhiza_core::LogHash,
+        command_hash: rhiza_core::LogHash,
+        command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.inner.store_command_for(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: rhiza_core::LogHash,
+        command_hash: rhiza_core::LogHash,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        self.inner
+            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
@@ -706,10 +734,6 @@ impl RecorderRpc for BlockingRecorder {
 
     fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         self.inner.inspect_record_summary(slot)
-    }
-
-    fn uses_typed_protocol(&self) -> bool {
-        true
     }
 }
 

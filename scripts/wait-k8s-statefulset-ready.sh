@@ -40,15 +40,14 @@ resource_json() {
 }
 
 ready_now() {
-  statefulset_json="$(resource_json statefulset "$name")" || return 1
-  update_revision="$(jq -er '.status.updateRevision | select(type == "string" and length > 0)' \
-    <<< "$statefulset_json")" || return 1
-  jq -e --argjson replicas "$replicas" '
+  update_revision="$(resource_json statefulset "$name" | \
+    jq -er '.status.updateRevision | select(type == "string" and length > 0)')" || return 1
+  resource_json statefulset "$name" | jq -e --argjson replicas "$replicas" '
     .metadata.generation != null and
     (.status.observedGeneration // 0) >= .metadata.generation and
     .spec.replicas == $replicas and
     (.status.readyReplicas // 0) == $replicas
-  ' <<< "$statefulset_json" >/dev/null || return 1
+  ' >/dev/null || return 1
 
   for ((ordinal=0; ordinal<replicas; ordinal++)); do
     resource_json pod "${name}-${ordinal}" | jq -e \

@@ -14,7 +14,10 @@ use postcard_rpc::{
     Endpoint,
 };
 use rhiza_core::{LogHash, StoredCommand};
-use rhiza_quepaxa::{DecisionProof, Error, Membership, RecordRequest, RecordSummary, RecorderRpc};
+use rhiza_quepaxa::{
+    DecisionProof, Error, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
+    RecordSummary, RecorderRpc,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::{
@@ -23,10 +26,13 @@ use super::{
     RecorderResponseBody, RecorderTlsClientConfig, RecorderTlsServerConfig, CALL_TIMEOUT,
     CONNECT_TIMEOUT, MAX_SERVER_CONNECTIONS, WIRE_VERSION,
 };
-use crate::{validate_recorder_tcp_endpoint, PeerConfig, DEFAULT_PEER_CONCURRENCY};
+use crate::{
+    map_quorum_record_transport_error, validate_recorder_tcp_endpoint, PeerConfig,
+    DEFAULT_PEER_CONCURRENCY, QUORUM_RECORD_REQUEST_TIMEOUT, READ_FENCE_REQUEST_TIMEOUT,
+};
 
 const POSTCARD_RPC_WIRE_VERSION: u16 = WIRE_VERSION + 1;
-const POSTCARD_RPC_TLS_ALPN: &[u8] = b"rhiza-recorder-prpc/1";
+const POSTCARD_RPC_TLS_ALPN: &[u8] = b"rhiza-recorder-prpc/3";
 const LANE_IN_FLIGHT: usize = 8;
 const BRIDGE_DEPTH: usize = 128;
 
@@ -74,6 +80,12 @@ endpoint!(
     OpaqueRequest,
     OpaqueResponse,
     "rhiza/recorder/private/v2/inspect-record-summary"
+);
+endpoint!(
+    ObserveReadFenceEndpoint,
+    OpaqueRequest,
+    OpaqueResponse,
+    "rhiza/recorder/private/v3/read-fence"
 );
 
 #[derive(Clone)]
@@ -431,7 +443,7 @@ async fn write_raw_frame<W: AsyncWrite + Unpin>(
 fn operation_for_key(key: VarKey) -> Option<Operation> {
     // The generated postcard-rpc dispatcher also installs its standard ICD
     // endpoints and awaits blocking handlers inline. This private protocol must
-    // expose exactly these seven endpoints and keep reading while operations run,
+    // expose exactly these eight endpoints and keep reading while operations run,
     // so a small key dispatcher is the narrower, concurrently correct fit.
     [
         Operation::Identity,
@@ -441,6 +453,7 @@ fn operation_for_key(key: VarKey) -> Option<Operation> {
         Operation::InstallDecisionProof,
         Operation::InspectDecisionProof,
         Operation::InspectRecordSummary,
+        Operation::ObserveReadFence,
     ]
     .into_iter()
     .find(|operation| key == VarKey::Key8(request_key(*operation)))
@@ -455,6 +468,7 @@ fn request_key(operation: Operation) -> postcard_rpc::Key {
         Operation::InstallDecisionProof => InstallDecisionProofEndpoint::REQ_KEY,
         Operation::InspectDecisionProof => InspectDecisionProofEndpoint::REQ_KEY,
         Operation::InspectRecordSummary => InspectRecordSummaryEndpoint::REQ_KEY,
+        Operation::ObserveReadFence => ObserveReadFenceEndpoint::REQ_KEY,
     }
 }
 
@@ -467,6 +481,7 @@ fn response_key(operation: Operation) -> postcard_rpc::Key {
         Operation::InstallDecisionProof => InstallDecisionProofEndpoint::RESP_KEY,
         Operation::InspectDecisionProof => InspectDecisionProofEndpoint::RESP_KEY,
         Operation::InspectRecordSummary => InspectRecordSummaryEndpoint::RESP_KEY,
+        Operation::ObserveReadFence => ObserveReadFenceEndpoint::RESP_KEY,
     }
 }
 
@@ -687,7 +702,16 @@ impl TcpPostcardRpcRecorderClient {
         body: RecorderRequestBody,
         consensus: bool,
     ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
-        let deadline = Instant::now() + self.call_timeout;
+        self.exchange_with_timeout(body, consensus, self.call_timeout)
+    }
+
+    fn exchange_with_timeout(
+        &self,
+        body: RecorderRequestBody,
+        consensus: bool,
+        timeout: Duration,
+    ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
+        let deadline = Instant::now() + timeout.min(self.call_timeout);
         let operation = response_operation(&body);
         let (reply, receive) = mpsc::sync_channel(1);
         let lane = if consensus {
@@ -916,6 +940,7 @@ async fn send_endpoint(
                 .send_resp::<InspectRecordSummaryEndpoint>(request)
                 .await
         }
+        Operation::ObserveReadFence => client.send_resp::<ObserveReadFenceEndpoint>(request).await,
     }
 }
 
@@ -1083,10 +1108,18 @@ impl RecorderRpc for TcpPostcardRpcRecorderClient {
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        match self.exchange(RecorderRequestBody::Record(request), true)? {
+        let response = self
+            .exchange_with_timeout(
+                RecorderRequestBody::Record(request),
+                true,
+                QUORUM_RECORD_REQUEST_TIMEOUT,
+            )
+            .map_err(map_quorum_record_transport_error)?;
+        match response {
             RecorderResponseBody::Record(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
+        .map_err(map_quorum_record_transport_error)
     }
 
     fn install_decision_proof(
@@ -1120,8 +1153,22 @@ impl RecorderRpc for TcpPostcardRpcRecorderClient {
         }
     }
 
-    fn uses_typed_protocol(&self) -> bool {
+    fn supports_context_read_fence(&self) -> bool {
         true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        match self.exchange_with_timeout(
+            RecorderRequestBody::ObserveReadFence(request),
+            false,
+            READ_FENCE_REQUEST_TIMEOUT,
+        )? {
+            RecorderResponseBody::ObserveReadFence(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
     }
 }
 
@@ -1259,6 +1306,8 @@ mod tests {
 
     #[test]
     fn endpoint_keys_are_unique_and_version_fenced() {
+        assert_eq!(POSTCARD_RPC_WIRE_VERSION, 4);
+        assert_eq!(POSTCARD_RPC_TLS_ALPN, b"rhiza-recorder-prpc/3");
         let keys = [
             IdentityEndpoint::REQ_KEY,
             StoreCommandEndpoint::REQ_KEY,
@@ -1267,6 +1316,7 @@ mod tests {
             InstallDecisionProofEndpoint::REQ_KEY,
             InspectDecisionProofEndpoint::REQ_KEY,
             InspectRecordSummaryEndpoint::REQ_KEY,
+            ObserveReadFenceEndpoint::REQ_KEY,
         ];
         for (index, key) in keys.iter().enumerate() {
             assert!(!keys[..index].contains(key));
@@ -1314,6 +1364,83 @@ mod tests {
                 .is_none()
         );
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postcard_rpc_read_fence_uses_the_short_control_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = TcpPostcardRpcRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            client.observe_read_fence(ReadFenceRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        blackhole.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postcard_rpc_record_transport_failure_releases_the_quorum_attempt_promptly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = TcpPostcardRpcRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            client.record(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+                step: 1,
+                proposal: rhiza_quepaxa::Proposal::nil(),
+                command: None,
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(Error::ProposeFailed)));
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        blackhole.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

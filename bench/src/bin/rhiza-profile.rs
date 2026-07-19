@@ -16,16 +16,19 @@ use rhiza::{
     SqlStatement, SqlValue,
 };
 use rhiza_core::{Command as ConsensusCommand, CommandKind, EntryType, LogEntry, LogHash};
-use rhiza_graph::{encode_replicated_graph_command, LadybugStateMachine};
+use rhiza_graph::{encode_replicated_graph_command, GraphResultValue, LadybugStateMachine};
 use rhiza_kv::{encode_replicated_kv_command, KvCommandV1, RedbStateMachine};
-use rhiza_node::{NodeConfig, NodeRuntime};
+use rhiza_node::{NodeConfig, NodeRuntime, SqlWriteProfileSnapshot, SqlWriteProfiler};
 use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
-use rhiza_sql::{encode_sql_command, SqliteStateMachine};
+use rhiza_sql::{
+    encode_sql_command, SqlBatchMember, SqlBatchPreparation, SqliteStateMachine, QWAL_V2_MAGIC,
+};
 use serde::Serialize;
 
 const KEYSPACE: u64 = 256;
 const RAW_RESULT_BYTES: usize = 1024 * 1024;
 const RAW_GRAPH_TIMEOUT_MS: u64 = 5_000;
+const REPORT_SCHEMA_VERSION: u32 = 3;
 type RecorderSet = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -65,11 +68,43 @@ enum Workload {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkReadConsistency {
+    Local,
+    ReadBarrier,
+}
+
+impl BenchmarkReadConsistency {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "read_barrier" => Ok(Self::ReadBarrier),
+            _ => Err("--consistency must be local or read_barrier".into()),
+        }
+    }
+
+    const fn runtime(self) -> ReadConsistency {
+        match self {
+            Self::Local => ReadConsistency::Local,
+            Self::ReadBarrier => ReadConsistency::ReadBarrier,
+        }
+    }
+
+    const fn report(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::ReadBarrier => "read_barrier",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Layer {
     Handle,
     Runtime,
     Raw,
+    Qwal,
     Consensus,
 }
 
@@ -79,8 +114,9 @@ impl Layer {
             "handle" => Ok(Self::Handle),
             "runtime" => Ok(Self::Runtime),
             "raw" => Ok(Self::Raw),
+            "qwal" => Ok(Self::Qwal),
             "consensus" => Ok(Self::Consensus),
-            _ => Err("--layer must be handle, runtime, raw, or consensus".into()),
+            _ => Err("--layer must be handle, runtime, raw, qwal, or consensus".into()),
         }
     }
 
@@ -93,6 +129,9 @@ impl Layer {
             Self::Raw => {
                 "direct materializer reads; writes encode a command, construct LogEntry, and apply it"
             }
+            Self::Qwal => {
+                "SQLite QWAL v2 batch encode, effect preparation, LogEntry construction, and materializer apply"
+            }
             Self::Consensus => {
                 "generic ThreeNodeConsensus::propose_at with deterministic payload; selected profile is not exercised; excludes qlog and materializer"
             }
@@ -104,7 +143,7 @@ impl Layer {
             Self::Handle | Self::Runtime => {
                 "in-process QuePaxa with three file-backed RecorderRpc voters"
             }
-            Self::Raw => {
+            Self::Raw | Self::Qwal => {
                 "excluded; writes include command encode, LogEntry construction, and materializer apply"
             }
             Self::Consensus => "in-process QuePaxa with three file-backed RecorderRpc voters",
@@ -117,6 +156,9 @@ impl Layer {
                 "RecorderFileStore local fsync plus local qlog/materializer"
             }
             Self::Raw => "materializer-native local commit only",
+            Self::Qwal => {
+                "local QWAL v2 batch preparation and SQLite materializer apply; excludes consensus and qlog"
+            }
             Self::Consensus => {
                 "three RecorderFileStore voter commits; excludes local qlog and materializer"
             }
@@ -146,6 +188,8 @@ struct Config {
     warmup: u64,
     concurrency: usize,
     value_bytes: usize,
+    read_consistency: BenchmarkReadConsistency,
+    sql_write_profile: bool,
 }
 
 impl Config {
@@ -159,9 +203,17 @@ impl Config {
         let mut warmup = 100;
         let mut concurrency = 1;
         let mut value_bytes = 128;
+        let mut read_consistency = BenchmarkReadConsistency::Local;
+        let mut consistency_was_explicit = false;
+        let mut sql_write_profile = false;
         let mut index = 0;
         while index < values.len() {
             let flag = &values[index];
+            if flag == "--sql-write-profile" {
+                sql_write_profile = true;
+                index += 1;
+                continue;
+            }
             let next = || {
                 values
                     .get(index + 1)
@@ -176,6 +228,10 @@ impl Config {
                 "--warmup" => warmup = parse_u64_allow_zero(next()?, flag)?,
                 "--concurrency" => concurrency = parse_usize(next()?, flag)?,
                 "--value-bytes" => value_bytes = parse_usize(next()?, flag)?,
+                "--consistency" => {
+                    read_consistency = BenchmarkReadConsistency::parse(next()?)?;
+                    consistency_was_explicit = true;
+                }
                 "--help" | "-h" => return Err(usage()),
                 _ => return Err(format!("unknown option: {flag}\n\n{}", usage())),
             }
@@ -184,7 +240,7 @@ impl Config {
         if !(16..=4_096).contains(&value_bytes) {
             return Err("--value-bytes must be between 16 and 4096".into());
         }
-        if matches!(layer, Layer::Raw | Layer::Consensus) && concurrency != 1 {
+        if matches!(layer, Layer::Raw | Layer::Qwal | Layer::Consensus) && concurrency != 1 {
             return Err(format!("--layer {layer:?} requires --concurrency 1").to_lowercase());
         }
         let profile = profile.ok_or_else(|| "--profile is required".to_string())?;
@@ -195,14 +251,63 @@ impl Config {
         if layer == Layer::Consensus && workload != Workload::Write {
             return Err("--layer consensus supports only --workload write".into());
         }
-        if !matches!(batch_size, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
-            return Err("--batch-size must be 1, 2, 4, 8, 16, 32, or 64".into());
+        if layer == Layer::Raw && profile == Profile::Sql && workload == Workload::Write {
+            return Err(
+                "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v2 effects; use --layer qwal"
+                    .into(),
+            );
+        }
+        if layer == Layer::Qwal && (profile != Profile::Sql || workload != Workload::Write) {
+            return Err("--layer qwal supports only --profile sql --workload write".into());
+        }
+        if consistency_was_explicit
+            && (workload == Workload::Write || !matches!(layer, Layer::Handle | Layer::Runtime))
+        {
+            return Err(
+                "--consistency is supported only for handle or runtime read workloads".into(),
+            );
+        }
+        if sql_write_profile
+            && !(layer == Layer::Runtime && profile == Profile::Sql && workload == Workload::Write)
+        {
+            return Err(
+                "--sql-write-profile requires --layer runtime --profile sql --workload write"
+                    .into(),
+            );
+        }
+        if !matches!(
+            batch_size,
+            1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 | 1024
+        ) {
+            return Err(
+                "--batch-size must be 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, or 1024".into(),
+            );
+        }
+        if batch_size > 256 && layer != Layer::Qwal {
+            return Err("--batch-size 512 or 1024 requires --layer qwal".into());
         }
         if batch_size != 1 && workload != Workload::Write {
             return Err("--batch-size greater than 1 requires --workload write".into());
         }
-        if batch_size != 1 && !matches!(layer, Layer::Handle | Layer::Runtime) {
-            return Err("--batch-size greater than 1 requires --layer handle or runtime".into());
+        if batch_size != 1 && !matches!(layer, Layer::Handle | Layer::Runtime | Layer::Qwal) {
+            return Err(
+                "--batch-size greater than 1 requires --layer handle, runtime, or qwal".into(),
+            );
+        }
+        if batch_size > 64
+            && profile == Profile::Graph
+            && matches!(layer, Layer::Handle | Layer::Runtime)
+        {
+            let layer = match layer {
+                Layer::Handle => "handle",
+                Layer::Runtime => "runtime",
+                Layer::Raw | Layer::Qwal | Layer::Consensus => {
+                    unreachable!("only embedded typed batch layers reach this check")
+                }
+            };
+            return Err(format!(
+                "--profile graph supports --batch-size at most 64 on --layer {layer}"
+            ));
         }
         Ok(Self {
             layer,
@@ -213,6 +318,8 @@ impl Config {
             warmup,
             concurrency,
             value_bytes,
+            read_consistency,
+            sql_write_profile,
         })
     }
 }
@@ -247,8 +354,9 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
 
 fn usage() -> String {
     "usage: rhiza-profile --profile sql|graph|kv --workload write|get|document-get|native-read \
-     [--layer handle|runtime|raw|consensus] [--operations N] [--warmup N] [--concurrency N] \
-     [--batch-size 1|2|4|8|16|32|64] [--value-bytes N]"
+     [--layer handle|runtime|raw|qwal|consensus] [--operations N] [--warmup N] [--concurrency N] \
+     [--batch-size 1|2|4|8|16|32|64|128|256|512|1024] [--value-bytes N] [--consistency local|read_barrier] \
+     [--sql-write-profile]"
         .into()
 }
 
@@ -258,6 +366,16 @@ struct Samples {
     errors: u64,
     latency_us: BTreeMap<u64, u64>,
     error_classes: BTreeMap<String, u64>,
+    batch_calls: u64,
+    successful_batch_calls: u64,
+    failed_batch_calls: u64,
+    batch_call_latency_us: BTreeMap<u64, u64>,
+    qwal_prepare_calls: u64,
+    qwal_prepare_latency_us: BTreeMap<u64, u64>,
+    qwal_apply_calls: u64,
+    qwal_apply_latency_us: BTreeMap<u64, u64>,
+    qwal_envelope_bytes: ByteSamples,
+    sql_write_profile: SqlWritePhaseSamples,
 }
 
 impl Samples {
@@ -281,6 +399,36 @@ impl Samples {
         }
     }
 
+    fn record_batch(&mut self, latency: Duration, results: Vec<Result<(), String>>) {
+        let count = results.len().max(1) as u32;
+        let logical_item_latency = latency / count;
+        let succeeded = results.iter().all(Result::is_ok);
+        self.batch_calls += 1;
+        if succeeded {
+            self.successful_batch_calls += 1;
+            let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+            *self.batch_call_latency_us.entry(micros).or_default() += 1;
+        } else {
+            self.failed_batch_calls += 1;
+        }
+        for result in results {
+            self.record(logical_item_latency, result);
+        }
+    }
+
+    fn record_qwal_envelope(&mut self, bytes: usize) {
+        self.qwal_envelope_bytes.record(bytes);
+    }
+
+    fn record_qwal_phases(&mut self, prepare: Duration, apply: Option<Duration>) {
+        self.qwal_prepare_calls += 1;
+        record_latency(&mut self.qwal_prepare_latency_us, prepare);
+        if let Some(apply) = apply {
+            self.qwal_apply_calls += 1;
+            record_latency(&mut self.qwal_apply_latency_us, apply);
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.successes += other.successes;
         self.errors += other.errors;
@@ -290,6 +438,22 @@ impl Samples {
         for (class, count) in other.error_classes {
             *self.error_classes.entry(class).or_default() += count;
         }
+        self.batch_calls += other.batch_calls;
+        self.successful_batch_calls += other.successful_batch_calls;
+        self.failed_batch_calls += other.failed_batch_calls;
+        for (latency, count) in other.batch_call_latency_us {
+            *self.batch_call_latency_us.entry(latency).or_default() += count;
+        }
+        self.qwal_prepare_calls += other.qwal_prepare_calls;
+        for (latency, count) in other.qwal_prepare_latency_us {
+            *self.qwal_prepare_latency_us.entry(latency).or_default() += count;
+        }
+        self.qwal_apply_calls += other.qwal_apply_calls;
+        for (latency, count) in other.qwal_apply_latency_us {
+            *self.qwal_apply_latency_us.entry(latency).or_default() += count;
+        }
+        self.qwal_envelope_bytes.merge(other.qwal_envelope_bytes);
+        self.sql_write_profile.merge(other.sql_write_profile);
     }
 
     fn percentile(&self, permille: u64) -> Option<u64> {
@@ -309,6 +473,8 @@ impl Samples {
     }
 
     fn metrics(&self, elapsed: Duration, qlog_entries: Option<u64>) -> Metrics {
+        let batch_call_latency_us =
+            latencies(&self.batch_call_latency_us, self.successful_batch_calls);
         Metrics {
             attempts: self.successes + self.errors,
             successes: self.successes,
@@ -320,7 +486,28 @@ impl Samples {
                 self.successes as f64 / elapsed.as_secs_f64()
             },
             qlog_entries,
-            latency_us: Latencies {
+            logical_operations_per_qlog: qlog_entries
+                .filter(|entries| *entries > 0)
+                .map(|entries| self.successes as f64 / entries as f64),
+            batch_calls: (self.batch_calls > 0).then_some(self.batch_calls),
+            successful_batch_calls: (self.batch_calls > 0).then_some(self.successful_batch_calls),
+            failed_batch_calls: (self.batch_calls > 0).then_some(self.failed_batch_calls),
+            batch_calls_per_second: (self.batch_calls > 0).then(|| {
+                if elapsed.is_zero() {
+                    0.0
+                } else {
+                    self.batch_calls as f64 / elapsed.as_secs_f64()
+                }
+            }),
+            batch_call_latency_us,
+            qwal_prepare_latency_us: latencies(
+                &self.qwal_prepare_latency_us,
+                self.qwal_prepare_calls,
+            ),
+            qwal_apply_latency_us: latencies(&self.qwal_apply_latency_us, self.qwal_apply_calls),
+            qwal_envelope_bytes: self.qwal_envelope_bytes.metrics(),
+            sql_write_profile: self.sql_write_profile.metrics(),
+            logical_item_latency_us: Latencies {
                 p50: self.percentile(500),
                 p95: self.percentile(950),
                 p99: self.percentile(990),
@@ -329,6 +516,215 @@ impl Samples {
             },
             error_classes: self.error_classes.clone(),
         }
+    }
+}
+
+fn record_latency(samples: &mut BTreeMap<u64, u64>, latency: Duration) {
+    let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+    *samples.entry(micros).or_default() += 1;
+}
+
+fn latencies(samples: &BTreeMap<u64, u64>, count: u64) -> Option<Latencies> {
+    (count > 0).then(|| Latencies {
+        p50: percentile(samples, count, 500),
+        p95: percentile(samples, count, 950),
+        p99: percentile(samples, count, 990),
+        p99_9: percentile(samples, count, 999),
+        max: samples.last_key_value().map(|(value, _)| *value),
+    })
+}
+
+fn percentile(samples: &BTreeMap<u64, u64>, count: u64, permille: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let rank = count.saturating_mul(permille).div_ceil(1_000).max(1);
+    let mut seen = 0;
+    samples.iter().find_map(|(latency, bucket_count)| {
+        seen += bucket_count;
+        (seen >= rank).then_some(*latency)
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct ByteSamples {
+    count: u64,
+    total: u64,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+impl ByteSamples {
+    fn record(&mut self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.count += 1;
+        self.total = self.total.saturating_add(bytes);
+        self.min = Some(self.min.map_or(bytes, |current| current.min(bytes)));
+        self.max = Some(self.max.map_or(bytes, |current| current.max(bytes)));
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.count += other.count;
+        self.total = self.total.saturating_add(other.total);
+        if let Some(min) = other.min {
+            self.min = Some(self.min.map_or(min, |current| current.min(min)));
+        }
+        if let Some(max) = other.max {
+            self.max = Some(self.max.map_or(max, |current| current.max(max)));
+        }
+    }
+
+    fn metrics(&self) -> Option<QwalEnvelopeBytes> {
+        (self.count > 0).then(|| QwalEnvelopeBytes {
+            count: self.count,
+            total: self.total,
+            average: self.total as f64 / self.count as f64,
+            min: self.min.expect("non-empty byte samples have a minimum"),
+            max: self.max.expect("non-empty byte samples have a maximum"),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PhaseSamples {
+    count: u64,
+    total_us: u64,
+    latency_us: BTreeMap<u64, u64>,
+}
+
+impl PhaseSamples {
+    fn record(&mut self, micros: u64) {
+        self.count += 1;
+        self.total_us = self.total_us.saturating_add(micros);
+        *self.latency_us.entry(micros).or_default() += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count += other.count;
+        self.total_us = self.total_us.saturating_add(other.total_us);
+        for (latency, count) in other.latency_us {
+            *self.latency_us.entry(latency).or_default() += count;
+        }
+    }
+
+    fn metrics(&self) -> PhaseMetrics {
+        PhaseMetrics {
+            total_us: self.total_us,
+            latency_us: latencies(&self.latency_us, self.count)
+                .expect("a profiled phase has at least one sample"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SqlWritePhaseSamples {
+    sample_count: u64,
+    member_count: u64,
+    commit_lock_wait: PhaseSamples,
+    precheck_classification: PhaseSamples,
+    qwal_prepare: PhaseSamples,
+    consensus_propose: PhaseSamples,
+    local_qlog_append_sync: PhaseSamples,
+    sql_materializer_apply: PhaseSamples,
+    response_other_total: PhaseSamples,
+    total_service: PhaseSamples,
+}
+
+impl SqlWritePhaseSamples {
+    fn record_snapshot(
+        &mut self,
+        snapshot: SqlWriteProfileSnapshot,
+        expected_samples: u64,
+        expected_members: u64,
+    ) -> Result<(), String> {
+        if snapshot.dropped_samples != 0 {
+            return Err(format!(
+                "SQL write profiler dropped {} samples",
+                snapshot.dropped_samples
+            ));
+        }
+        let sample_count = u64::try_from(snapshot.samples.len()).unwrap_or(u64::MAX);
+        if sample_count != expected_samples {
+            return Err(format!(
+                "SQL write profiler returned {sample_count} samples; expected {expected_samples}"
+            ));
+        }
+        for sample in snapshot.samples {
+            let named_total = sample
+                .commit_lock_wait_us
+                .saturating_add(sample.precheck_classification_us)
+                .saturating_add(sample.qwal_prepare_us)
+                .saturating_add(sample.consensus_propose_us)
+                .saturating_add(sample.local_qlog_append_sync_us)
+                .saturating_add(sample.sql_materializer_apply_us)
+                .saturating_add(sample.response_other_total_us);
+            if named_total != sample.total_service_us {
+                return Err(format!(
+                    "SQL write profiler phase sum {named_total} differs from total service {}",
+                    sample.total_service_us
+                ));
+            }
+            self.sample_count += 1;
+            self.member_count = self
+                .member_count
+                .saturating_add(u64::try_from(sample.batch_member_count).unwrap_or(u64::MAX));
+            self.commit_lock_wait.record(sample.commit_lock_wait_us);
+            self.precheck_classification
+                .record(sample.precheck_classification_us);
+            self.qwal_prepare.record(sample.qwal_prepare_us);
+            self.consensus_propose.record(sample.consensus_propose_us);
+            self.local_qlog_append_sync
+                .record(sample.local_qlog_append_sync_us);
+            self.sql_materializer_apply
+                .record(sample.sql_materializer_apply_us);
+            self.response_other_total
+                .record(sample.response_other_total_us);
+            self.total_service.record(sample.total_service_us);
+        }
+        if self.member_count != expected_members {
+            return Err(format!(
+                "SQL write profiler covered {} members; expected {expected_members}",
+                self.member_count
+            ));
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sample_count += other.sample_count;
+        self.member_count += other.member_count;
+        self.commit_lock_wait.merge(other.commit_lock_wait);
+        self.precheck_classification
+            .merge(other.precheck_classification);
+        self.qwal_prepare.merge(other.qwal_prepare);
+        self.consensus_propose.merge(other.consensus_propose);
+        self.local_qlog_append_sync
+            .merge(other.local_qlog_append_sync);
+        self.sql_materializer_apply
+            .merge(other.sql_materializer_apply);
+        self.response_other_total.merge(other.response_other_total);
+        self.total_service.merge(other.total_service);
+    }
+
+    fn metrics(&self) -> Option<SqlWriteProfileMetrics> {
+        (self.sample_count > 0).then(|| SqlWriteProfileMetrics {
+            sample_count: self.sample_count,
+            member_count: self.member_count,
+            dropped_samples: 0,
+            phase_latency_us: SqlWritePhaseMetrics {
+                commit_lock_wait: self.commit_lock_wait.metrics(),
+                precheck_classification: self.precheck_classification.metrics(),
+                qwal_prepare: self.qwal_prepare.metrics(),
+                consensus_propose: self.consensus_propose.metrics(),
+                local_qlog_append_sync: self.local_qlog_append_sync.metrics(),
+                sql_materializer_apply: self.sql_materializer_apply.metrics(),
+                response_other_total: self.response_other_total.metrics(),
+                total_service: self.total_service.metrics(),
+            },
+        })
     }
 }
 
@@ -377,6 +773,7 @@ struct ReportConfig {
     read_consistency: &'static str,
     consensus: &'static str,
     durability: &'static str,
+    sql_write_profile: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -388,8 +785,65 @@ struct Metrics {
     operations_per_second: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     qlog_entries: Option<u64>,
-    latency_us: Latencies,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_operations_per_qlog: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successful_batch_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_batch_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_calls_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_call_latency_us: Option<Latencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qwal_prepare_latency_us: Option<Latencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qwal_apply_latency_us: Option<Latencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qwal_envelope_bytes: Option<QwalEnvelopeBytes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql_write_profile: Option<SqlWriteProfileMetrics>,
+    /// Amortized batch service time per logical item for write workloads, and
+    /// end-to-end call latency for non-batched workloads.
+    logical_item_latency_us: Latencies,
     error_classes: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct QwalEnvelopeBytes {
+    count: u64,
+    total: u64,
+    average: f64,
+    min: u64,
+    max: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SqlWriteProfileMetrics {
+    sample_count: u64,
+    member_count: u64,
+    dropped_samples: u64,
+    phase_latency_us: SqlWritePhaseMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SqlWritePhaseMetrics {
+    commit_lock_wait: PhaseMetrics,
+    precheck_classification: PhaseMetrics,
+    qwal_prepare: PhaseMetrics,
+    consensus_propose: PhaseMetrics,
+    local_qlog_append_sync: PhaseMetrics,
+    sql_materializer_apply: PhaseMetrics,
+    response_other_total: PhaseMetrics,
+    total_service: PhaseMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct PhaseMetrics {
+    total_us: u64,
+    latency_us: Latencies,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -436,17 +890,17 @@ async fn run(config: Config) -> Result<Report, String> {
             let rhiza = Rhiza::open(embedded_config(root.path(), config.profile)?)
                 .await
                 .map_err(|error| error.to_string())?;
-            let measured = measure_target(Target::Handle(rhiza.handle()), &config).await;
+            let measured = measure_target(Target::Handle(rhiza.handle()), &config, None).await;
             let shutdown = rhiza.shutdown().await.map_err(|error| error.to_string());
             let measured = measured?;
             shutdown?;
             measured
         }
         Layer::Runtime => {
-            let runtime = runtime(root.path(), config.profile)?;
-            measure_target(Target::Runtime(runtime), &config).await?
+            let (runtime, profiler) = runtime(root.path(), &config)?;
+            measure_target(Target::Runtime(runtime), &config, profiler).await?
         }
-        Layer::Raw => {
+        Layer::Raw | Layer::Qwal => {
             let (samples, elapsed) =
                 measure_raw(RawTarget::open(root.path(), config.profile)?, &config)?;
             (samples, elapsed, None)
@@ -458,8 +912,35 @@ async fn run(config: Config) -> Result<Report, String> {
         }
     };
 
+    let mut limitations = vec![
+        "single process on one host",
+        "excludes HTTP serialization and transport",
+        "excludes node-to-node network latency",
+        "excludes remote checkpoint upload",
+    ];
+    if config.workload != Workload::Write
+        && config.read_consistency == BenchmarkReadConsistency::Local
+    {
+        limitations.push("local reads exclude a consensus read barrier");
+    }
+    if config.layer == Layer::Qwal {
+        limitations.push(
+            "QWAL latency combines effect preparation and apply; internal phase timings are not exposed by this report",
+        );
+    }
+    if config.workload == Workload::Write {
+        limitations.push(
+            "logical_item_latency_us is batch-call elapsed divided by submitted item count; batch_call_latency_us is end-to-end physical call latency",
+        );
+    }
+    if config.sql_write_profile {
+        limitations.push(
+            "sql_write_profile total_service includes commit_lock_wait; subtract that phase for on-lock service time",
+        );
+    }
+
     Ok(Report {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         benchmark: "rhiza-profile-direct",
         generated_at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -479,18 +960,13 @@ async fn run(config: Config) -> Result<Report, String> {
             concurrency: config.concurrency,
             keyspace: KEYSPACE,
             value_bytes: config.value_bytes,
-            read_consistency: "local",
+            read_consistency: config.read_consistency.report(),
             consensus: config.layer.consensus(),
             durability: config.layer.durability(),
+            sql_write_profile: config.sql_write_profile,
         },
         measurement: samples.metrics(elapsed, qlog_entries),
-        limitations: vec![
-            "single process on one host",
-            "excludes HTTP serialization and transport",
-            "excludes node-to-node network latency",
-            "local reads exclude a consensus read barrier",
-            "excludes remote checkpoint upload",
-        ],
+        limitations,
     })
 }
 
@@ -535,11 +1011,14 @@ fn recorders(
         .collect()
 }
 
-fn runtime(root: &Path, profile: Profile) -> Result<Arc<NodeRuntime>, String> {
-    let execution_profile = profile.execution_profile();
+fn runtime(
+    root: &Path,
+    config: &Config,
+) -> Result<(Arc<NodeRuntime>, Option<SqlWriteProfiler>), String> {
+    let execution_profile = config.profile.execution_profile();
     let membership =
         Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
-    let node_config = NodeConfig::new_embedded(
+    let mut node_config = NodeConfig::new_embedded(
         "profile-bench",
         "node-1",
         root.join("node"),
@@ -550,6 +1029,17 @@ fn runtime(root: &Path, profile: Profile) -> Result<Arc<NodeRuntime>, String> {
     .map_err(|error| error.to_string())?
     .with_execution_profile(execution_profile)
     .map_err(|error| error.to_string())?;
+    let profiler = config.sql_write_profile.then(|| {
+        let capacity = config
+            .operations
+            .saturating_add(config.warmup)
+            .saturating_add(KEYSPACE)
+            .saturating_add(1);
+        SqlWriteProfiler::new(usize::try_from(capacity).unwrap_or(usize::MAX))
+    });
+    if let Some(profiler) = profiler.clone() {
+        node_config = node_config.with_sql_write_profiler(profiler);
+    }
     let consensus = Arc::new(
         ThreeNodeConsensus::from_recorders_with_ids(
             node_config.cluster_id().to_owned(),
@@ -565,6 +1055,7 @@ fn runtime(root: &Path, profile: Profile) -> Result<Arc<NodeRuntime>, String> {
     }
     NodeRuntime::open(node_config, consensus, &[])
         .map(Arc::new)
+        .map(|runtime| (runtime, profiler))
         .map_err(|error| error.to_string())
 }
 
@@ -577,6 +1068,7 @@ enum Target {
 async fn measure_target(
     target: Target,
     config: &Config,
+    profiler: Option<SqlWriteProfiler>,
 ) -> Result<(Samples, Duration, Option<u64>), String> {
     setup(&target, config).await?;
     if config.warmup > 0 {
@@ -584,6 +1076,9 @@ async fn measure_target(
         if warmup.errors > 0 {
             return Err(format!("warmup failed with {} errors", warmup.errors));
         }
+    }
+    if let Some(profiler) = &profiler {
+        profiler.drain();
     }
     let qlog_before = match &target {
         Target::Handle(_) => None,
@@ -601,7 +1096,15 @@ async fn measure_target(
         ),
         _ => None,
     };
-    Ok((measured.0, measured.1, qlog_entries))
+    let (mut samples, elapsed) = measured;
+    if let Some(profiler) = profiler {
+        samples.sql_write_profile.record_snapshot(
+            profiler.drain(),
+            qlog_entries.unwrap_or(samples.batch_calls),
+            samples.successes,
+        )?;
+    }
+    Ok((samples, elapsed, qlog_entries))
 }
 
 async fn setup(target: &Target, config: &Config) -> Result<(), String> {
@@ -679,8 +1182,12 @@ async fn run_phase_handle(
                     vec![operate(&target, &config, sequence, &request_id).await]
                 };
                 let elapsed = began.elapsed();
-                for result in results {
-                    samples.record(elapsed, result);
+                if config.workload == Workload::Write {
+                    samples.record_batch(elapsed, results);
+                } else {
+                    for result in results {
+                        samples.record(elapsed, result);
+                    }
                 }
             }
             samples
@@ -736,8 +1243,12 @@ async fn run_phase_runtime(
                     vec![operate_runtime(&runtime, &config, sequence, &request_id)]
                 };
                 let elapsed = began.elapsed();
-                for result in results {
-                    samples.record(elapsed, result);
+                if config.workload == Workload::Write {
+                    samples.record_batch(elapsed, results);
+                } else {
+                    for result in results {
+                        samples.record(elapsed, result);
+                    }
                 }
             }
             samples
@@ -773,9 +1284,9 @@ fn operate_runtime(
             request_id,
             config.value_bytes,
         ),
-        Workload::Get => get_one_runtime(runtime, config.profile, key_index),
-        Workload::DocumentGet => get_graph_document_runtime(runtime, config.profile, key_index),
-        Workload::NativeRead => native_read_runtime(runtime, config.profile),
+        Workload::Get => get_one_runtime(runtime, config, key_index),
+        Workload::DocumentGet => get_graph_document_runtime(runtime, config, key_index),
+        Workload::NativeRead => native_read_runtime(runtime, config),
     }
 }
 
@@ -857,106 +1368,147 @@ fn write_batch_runtime(
     }
 }
 
-fn get_one_runtime(runtime: &NodeRuntime, profile: Profile, key_index: u64) -> Result<(), String> {
+fn get_one_runtime(runtime: &NodeRuntime, config: &Config, key_index: u64) -> Result<(), String> {
     let key = key(key_index);
-    let present = match profile {
+    let expected = setup_value(key_index, config.value_bytes);
+    let consistency = config.read_consistency.runtime();
+    let tip = match config.profile {
         Profile::Sql => {
-            runtime
+            let result = runtime
                 .query_sql(
                     &SqlStatement {
                         sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
                         parameters: vec![SqlValue::Text(key)],
                     },
-                    ReadConsistency::Local,
+                    consistency,
                     1,
                 )
-                .map_err(|error| error.to_string())?
-                .rows
-                .len()
-                == 1
+                .map_err(|error| error.to_string())?;
+            if result.rows != vec![vec![SqlValue::Text(expected)]] {
+                return Err("runtime SQL get returned an unexpected value".into());
+            }
+            (result.applied_index, result.hash)
         }
         Profile::Graph => {
-            runtime
+            let result = runtime
                 .query_graph(
                     "MATCH (d:RhizaDocument) WHERE d.id = $id \
                  RETURN d.string_value AS value LIMIT 1",
                     &BTreeMap::from([("id".into(), GraphParameterValue::String(key))]),
-                    ReadConsistency::Local,
+                    consistency,
                     1,
                 )
-                .map_err(|error| error.to_string())?
-                .rows
-                .len()
-                == 1
+                .map_err(|error| error.to_string())?;
+            if result.rows != vec![vec![GraphResultValue::String(expected)]] {
+                return Err("runtime graph get returned an unexpected value".into());
+            }
+            (result.applied_index, result.hash)
         }
-        Profile::Kv => runtime
-            .get_kv(key.as_bytes(), ReadConsistency::Local)
-            .map_err(|error| error.to_string())?
-            .value
-            .is_some(),
+        Profile::Kv => {
+            let result = runtime
+                .get_kv(key.as_bytes(), consistency)
+                .map_err(|error| error.to_string())?;
+            if result.value.as_deref() != Some(expected.as_bytes()) {
+                return Err("runtime KV get returned an unexpected value".into());
+            }
+            (result.applied_index, result.hash)
+        }
     };
-    if present {
-        Ok(())
-    } else {
-        Err("runtime get returned no row".into())
-    }
+    validate_read_tip(config.profile, tip.0, tip.1)
 }
 
 fn get_graph_document_runtime(
     runtime: &NodeRuntime,
-    profile: Profile,
+    config: &Config,
     key_index: u64,
 ) -> Result<(), String> {
-    if profile != Profile::Graph {
+    if config.profile != Profile::Graph {
         return Err("document get requires graph profile".into());
     }
-    if runtime
-        .get_graph_document(&key(key_index), ReadConsistency::Local)
-        .map_err(|error| error.to_string())?
-        .value
-        .is_some()
+    let result = runtime
+        .get_graph_document(&key(key_index), config.read_consistency.runtime())
+        .map_err(|error| error.to_string())?;
+    if result.value
+        != Some(GraphValueV1::String(setup_value(
+            key_index,
+            config.value_bytes,
+        )))
     {
-        Ok(())
-    } else {
-        Err("runtime document get returned no value".into())
+        return Err("runtime document get returned an unexpected value".into());
     }
+    validate_read_tip(config.profile, result.applied_index, result.hash)
 }
 
-fn native_read_runtime(runtime: &NodeRuntime, profile: Profile) -> Result<(), String> {
-    let rows = match profile {
-        Profile::Sql => runtime
-            .query_sql(
-                &SqlStatement {
-                    sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
-                    parameters: vec![],
-                },
-                ReadConsistency::Local,
-                16,
-            )
-            .map_err(|error| error.to_string())?
-            .rows
-            .len(),
-        Profile::Graph => runtime
-            .query_graph(
-                "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
-                &BTreeMap::new(),
-                ReadConsistency::Local,
-                16,
-            )
-            .map_err(|error| error.to_string())?
-            .rows
-            .len(),
-        Profile::Kv => runtime
-            .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
-            .map_err(|error| error.to_string())?
-            .rows()
-            .len(),
+fn native_read_runtime(runtime: &NodeRuntime, config: &Config) -> Result<(), String> {
+    let consistency = config.read_consistency.runtime();
+    let expected = expected_native_keys();
+    let tip = match config.profile {
+        Profile::Sql => {
+            let result = runtime
+                .query_sql(
+                    &SqlStatement {
+                        sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
+                        parameters: vec![],
+                    },
+                    consistency,
+                    16,
+                )
+                .map_err(|error| error.to_string())?;
+            let actual = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next())
+                .collect::<Option<Vec<_>>>();
+            if actual != Some(expected.iter().cloned().map(SqlValue::Text).collect()) {
+                return Err("runtime SQL native read returned unexpected keys".into());
+            }
+            (result.applied_index, result.hash)
+        }
+        Profile::Graph => {
+            let result = runtime
+                .query_graph(
+                    "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16",
+                    &BTreeMap::new(),
+                    consistency,
+                    16,
+                )
+                .map_err(|error| error.to_string())?;
+            let actual = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next())
+                .collect::<Option<Vec<_>>>();
+            if actual
+                != Some(
+                    expected
+                        .iter()
+                        .cloned()
+                        .map(GraphResultValue::String)
+                        .collect(),
+                )
+            {
+                return Err("runtime graph native read returned unexpected keys".into());
+            }
+            (result.applied_index, result.hash)
+        }
+        Profile::Kv => {
+            let result = runtime
+                .scan_kv_prefix(b"bench-key-", 16, None, consistency)
+                .map_err(|error| error.to_string())?;
+            let actual: Vec<_> = result.rows().iter().map(|row| row.key().to_vec()).collect();
+            if actual
+                != expected
+                    .iter()
+                    .map(|key| key.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            {
+                return Err("runtime KV native read returned unexpected keys".into());
+            }
+            let tip = result.tip();
+            (tip.applied_index(), tip.applied_hash())
+        }
     };
-    if rows == 0 {
-        Err("runtime native read returned no rows".into())
-    } else {
-        Ok(())
-    }
+    validate_read_tip(config.profile, tip.0, tip.1)
 }
 
 async fn operate(
@@ -977,9 +1529,9 @@ async fn operate(
             )
             .await
         }
-        Workload::Get => get_one(target, config.profile, key_index).await,
-        Workload::DocumentGet => get_graph_document(target, config.profile, key_index).await,
-        Workload::NativeRead => native_read(target, config.profile).await,
+        Workload::Get => get_one(target, config, key_index).await,
+        Workload::DocumentGet => get_graph_document(target, config, key_index).await,
+        Workload::NativeRead => native_read(target, config).await,
     }
 }
 
@@ -1211,182 +1763,198 @@ where
         .map_err(|error| error.to_string())
 }
 
-async fn get_one(target: &Target, profile: Profile, key_index: u64) -> Result<(), String> {
+async fn get_one(target: &Target, config: &Config, key_index: u64) -> Result<(), String> {
     let key = key(key_index);
-    match profile {
+    let expected = setup_value(key_index, config.value_bytes);
+    let consistency = config.read_consistency.runtime();
+    let tip = match config.profile {
         Profile::Sql => {
             let statement = SqlStatement {
                 sql: "SELECT value FROM bench_items WHERE key = ?1 LIMIT 1".into(),
                 parameters: vec![SqlValue::Text(key)],
             };
-            let rows = match target {
+            let result = match target {
                 Target::Handle(handle) => handle
-                    .query(statement, ReadConsistency::Local, 1)
+                    .query(statement, consistency, 1)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .rows
-                    .len(),
+                    .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
-                        runtime
-                            .query_sql(&statement, ReadConsistency::Local, 1)
-                            .map(|result| result.rows.len())
+                        runtime.query_sql(&statement, consistency, 1)
                     })
                     .await?
                 }
             };
-            if rows != 1 {
-                return Err("sql get returned no row".into());
+            if result.rows != vec![vec![SqlValue::Text(expected)]] {
+                return Err("SQL get returned an unexpected value".into());
             }
+            (result.applied_index, result.hash)
         }
         Profile::Graph => {
             let statement = "MATCH (d:RhizaDocument) WHERE d.id = $id \
                              RETURN d.string_value AS value LIMIT 1";
             let parameters = BTreeMap::from([("id".into(), GraphParameterValue::String(key))]);
-            let rows = match target {
+            let result = match target {
                 Target::Handle(handle) => handle
-                    .query_graph(statement, parameters, ReadConsistency::Local, 1)
+                    .query_graph(statement, parameters, consistency, 1)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .rows
-                    .len(),
+                    .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
-                        runtime
-                            .query_graph(statement, &parameters, ReadConsistency::Local, 1)
-                            .map(|result| result.rows.len())
+                        runtime.query_graph(statement, &parameters, consistency, 1)
                     })
                     .await?
                 }
             };
-            if rows != 1 {
-                return Err("graph get returned no row".into());
+            if result.rows != vec![vec![GraphResultValue::String(expected)]] {
+                return Err("graph get returned an unexpected value".into());
             }
+            (result.applied_index, result.hash)
         }
         Profile::Kv => {
-            let present = match target {
+            let result = match target {
                 Target::Handle(handle) => handle
-                    .get_kv(key.as_bytes(), ReadConsistency::Local)
+                    .get_kv(key.as_bytes(), consistency)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .value
-                    .is_some(),
+                    .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
                     let key = key.into_bytes();
-                    runtime_call(runtime, move |runtime| {
-                        runtime
-                            .get_kv(&key, ReadConsistency::Local)
-                            .map(|result| result.value.is_some())
-                    })
-                    .await?
+                    runtime_call(runtime, move |runtime| runtime.get_kv(&key, consistency)).await?
                 }
             };
-            if !present {
-                return Err("kv get returned no value".into());
+            if result.value.as_deref() != Some(expected.as_bytes()) {
+                return Err("KV get returned an unexpected value".into());
             }
+            (result.applied_index, result.hash)
         }
-    }
-    Ok(())
+    };
+    validate_read_tip(config.profile, tip.0, tip.1)
 }
 
 async fn get_graph_document(
     target: &Target,
-    profile: Profile,
+    config: &Config,
     key_index: u64,
 ) -> Result<(), String> {
-    if profile != Profile::Graph {
+    if config.profile != Profile::Graph {
         return Err("document get requires graph profile".into());
     }
     let id = key(key_index);
-    let present = match target {
+    let consistency = config.read_consistency.runtime();
+    let result = match target {
         Target::Handle(handle) => handle
-            .get_graph_document(id, ReadConsistency::Local)
+            .get_graph_document(id, consistency)
             .await
-            .map_err(|error| error.to_string())?
-            .value
-            .is_some(),
+            .map_err(|error| error.to_string())?,
         Target::Runtime(runtime) => {
             runtime_call(runtime, move |runtime| {
-                runtime
-                    .get_graph_document(&id, ReadConsistency::Local)
-                    .map(|result| result.value.is_some())
+                runtime.get_graph_document(&id, consistency)
             })
             .await?
         }
     };
-    if present {
-        Ok(())
-    } else {
-        Err("document get returned no value".into())
+    if result.value
+        != Some(GraphValueV1::String(setup_value(
+            key_index,
+            config.value_bytes,
+        )))
+    {
+        return Err("document get returned an unexpected value".into());
     }
+    validate_read_tip(config.profile, result.applied_index, result.hash)
 }
 
-async fn native_read(target: &Target, profile: Profile) -> Result<(), String> {
-    let rows = match profile {
+async fn native_read(target: &Target, config: &Config) -> Result<(), String> {
+    let consistency = config.read_consistency.runtime();
+    let expected = expected_native_keys();
+    let tip = match config.profile {
         Profile::Sql => {
             let statement = SqlStatement {
                 sql: "SELECT key FROM bench_items ORDER BY key LIMIT 16".into(),
                 parameters: vec![],
             };
-            match target {
+            let result = match target {
                 Target::Handle(handle) => handle
-                    .query(statement, ReadConsistency::Local, 16)
+                    .query(statement, consistency, 16)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .rows
-                    .len(),
+                    .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
-                        runtime
-                            .query_sql(&statement, ReadConsistency::Local, 16)
-                            .map(|result| result.rows.len())
+                        runtime.query_sql(&statement, consistency, 16)
                     })
                     .await?
                 }
+            };
+            let actual = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next())
+                .collect::<Option<Vec<_>>>();
+            if actual != Some(expected.iter().cloned().map(SqlValue::Text).collect()) {
+                return Err("SQL native read returned unexpected keys".into());
             }
+            (result.applied_index, result.hash)
         }
         Profile::Graph => {
             let statement = "MATCH (d:RhizaDocument) RETURN d.id AS id ORDER BY id LIMIT 16";
             let parameters = BTreeMap::new();
-            match target {
+            let result = match target {
                 Target::Handle(handle) => handle
-                    .query_graph(statement, parameters, ReadConsistency::Local, 16)
+                    .query_graph(statement, parameters, consistency, 16)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .rows
-                    .len(),
+                    .map_err(|error| error.to_string())?,
                 Target::Runtime(runtime) => {
                     runtime_call(runtime, move |runtime| {
-                        runtime
-                            .query_graph(statement, &parameters, ReadConsistency::Local, 16)
-                            .map(|result| result.rows.len())
+                        runtime.query_graph(statement, &parameters, consistency, 16)
                     })
                     .await?
                 }
+            };
+            let actual = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next())
+                .collect::<Option<Vec<_>>>();
+            if actual
+                != Some(
+                    expected
+                        .iter()
+                        .cloned()
+                        .map(GraphResultValue::String)
+                        .collect(),
+                )
+            {
+                return Err("graph native read returned unexpected keys".into());
             }
+            (result.applied_index, result.hash)
         }
-        Profile::Kv => match target {
-            Target::Handle(handle) => handle
-                .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
-                .await
-                .map_err(|error| error.to_string())?
-                .rows()
-                .len(),
-            Target::Runtime(runtime) => {
-                runtime_call(runtime, move |runtime| {
-                    runtime
-                        .scan_kv_prefix(b"bench-key-", 16, None, ReadConsistency::Local)
-                        .map(|result| result.rows().len())
-                })
-                .await?
+        Profile::Kv => {
+            let result = match target {
+                Target::Handle(handle) => handle
+                    .scan_kv_prefix(b"bench-key-", 16, None, consistency)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                Target::Runtime(runtime) => {
+                    runtime_call(runtime, move |runtime| {
+                        runtime.scan_kv_prefix(b"bench-key-", 16, None, consistency)
+                    })
+                    .await?
+                }
+            };
+            let actual: Vec<_> = result.rows().iter().map(|row| row.key().to_vec()).collect();
+            if actual
+                != expected
+                    .iter()
+                    .map(|key| key.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            {
+                return Err("KV native read returned unexpected keys".into());
             }
-        },
+            let tip = result.tip();
+            (tip.applied_index(), tip.applied_hash())
+        }
     };
-    if rows == 0 {
-        Err("native read returned no rows".into())
-    } else {
-        Ok(())
-    }
+    validate_read_tip(config.profile, tip.0, tip.1)
 }
 
 enum RawState {
@@ -1400,6 +1968,13 @@ struct RawTarget {
     next_index: u64,
     previous_hash: LogHash,
     state: RawState,
+}
+
+struct QwalBatchOutcome {
+    results: Vec<Result<(), String>>,
+    envelope_bytes: Option<usize>,
+    prepare_latency: Duration,
+    apply_latency: Option<Duration>,
 }
 
 impl RawTarget {
@@ -1471,6 +2046,101 @@ impl RawTarget {
         Ok(())
     }
 
+    fn prepare_and_apply_sql_batch(
+        &mut self,
+        commands: &[SqlCommand],
+    ) -> Result<QwalBatchOutcome, String> {
+        let requests = commands
+            .iter()
+            .map(encode_sql_command)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let members = commands
+            .iter()
+            .zip(&requests)
+            .map(|(command, request_payload)| SqlBatchMember {
+                command,
+                request_payload,
+            })
+            .collect::<Vec<_>>();
+        let base_index = self
+            .next_index
+            .checked_sub(1)
+            .ok_or_else(|| "QWAL benchmark index underflow".to_string())?;
+        let prepare_began = Instant::now();
+        let SqlBatchPreparation { effect, results } = {
+            let RawState::Sql(state) = &self.state else {
+                return Err("QWAL benchmark requires SQL state".into());
+            };
+            state
+                .prepare_sql_batch_effect(&members, base_index, self.previous_hash)
+                .map_err(|error| error.to_string())?
+        };
+        let prepare_latency = prepare_began.elapsed();
+        let envelope_bytes = effect.as_ref().map(Vec::len);
+        let apply_latency = if let Some(payload) = effect {
+            if !payload.starts_with(QWAL_V2_MAGIC) {
+                return Err("SQLite prepared a non-QWAL v2 benchmark effect".into());
+            }
+            let apply_began = Instant::now();
+            self.apply(payload)?;
+            Some(apply_began.elapsed())
+        } else {
+            None
+        };
+        Ok(QwalBatchOutcome {
+            results: results
+                .into_iter()
+                .map(|result| result.map(|_| ()).map_err(|error| error.to_string()))
+                .collect(),
+            envelope_bytes,
+            prepare_latency,
+            apply_latency,
+        })
+    }
+
+    fn prepare_and_apply_sql(&mut self, command: &SqlCommand) -> Result<(), String> {
+        let mut outcome = self.prepare_and_apply_sql_batch(std::slice::from_ref(command))?;
+        outcome
+            .results
+            .pop()
+            .expect("one-member SQL batch returns one result")
+    }
+
+    fn write_sql_qwal(
+        &mut self,
+        key_index: u64,
+        request_id: &str,
+        value_bytes: usize,
+    ) -> Result<(), String> {
+        let command = SqlCommand {
+            request_id: request_id.into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
+                      ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                    .into(),
+                parameters: vec![
+                    SqlValue::Text(key(key_index)),
+                    SqlValue::Text(value(key_index, request_id, value_bytes)),
+                ],
+            }],
+        };
+        self.prepare_and_apply_sql(&command)
+    }
+
+    fn write_sql_qwal_batch(
+        &mut self,
+        first_sequence: u64,
+        count: usize,
+        phase: &str,
+        value_bytes: usize,
+    ) -> Result<QwalBatchOutcome, String> {
+        let commands = (0..count)
+            .map(|offset| sql_write_command(first_sequence + offset as u64, phase, value_bytes))
+            .collect::<Vec<_>>();
+        self.prepare_and_apply_sql_batch(&commands)
+    }
+
     fn write_one(
         &mut self,
         profile: Profile,
@@ -1481,16 +2151,9 @@ impl RawTarget {
         let key = key(key_index);
         let value = value(key_index, request_id, value_bytes);
         let payload = match profile {
-            Profile::Sql => encode_sql_command(&SqlCommand {
-                request_id: request_id.into(),
-                statements: vec![SqlStatement {
-                    sql: "INSERT INTO bench_items(key, value) VALUES (?1, ?2) \
-                          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-                        .into(),
-                    parameters: vec![SqlValue::Text(key), SqlValue::Text(value)],
-                }],
-            })
-            .map_err(|error| error.to_string())?,
+            Profile::Sql => {
+                return Err("raw SQL writes require prepared QWAL v2 effects".into());
+            }
             Profile::Graph => encode_replicated_graph_command(
                 &GraphCommandV1::put_document(request_id, key, GraphValueV1::String(value))
                     .map_err(|error| error.to_string())?,
@@ -1508,6 +2171,9 @@ impl RawTarget {
     fn operate(&mut self, config: &Config, sequence: u64, request_id: &str) -> Result<(), String> {
         let key_index = sequence % KEYSPACE;
         match config.workload {
+            Workload::Write if config.layer == Layer::Qwal => {
+                self.write_sql_qwal(key_index, request_id, config.value_bytes)
+            }
             Workload::Write => {
                 self.write_one(config.profile, key_index, request_id, config.value_bytes)
             }
@@ -1621,23 +2287,21 @@ impl RawTarget {
 
 fn measure_raw(mut target: RawTarget, config: &Config) -> Result<(Samples, Duration), String> {
     if config.profile == Profile::Sql {
-        let payload = encode_sql_command(&SqlCommand {
+        target.prepare_and_apply_sql(&SqlCommand {
             request_id: "profile-bench-schema".into(),
             statements: vec![SqlStatement {
                 sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)".into(),
                 parameters: vec![],
             }],
-        })
-        .map_err(|error| error.to_string())?;
-        target.apply(payload)?;
+        })?;
     }
     for index in 0..KEYSPACE {
-        target.write_one(
-            config.profile,
-            index,
-            &format!("setup-{index:016x}"),
-            config.value_bytes,
-        )?;
+        let request_id = format!("setup-{index:016x}");
+        if config.profile == Profile::Sql {
+            target.write_sql_qwal(index, &request_id, config.value_bytes)?;
+        } else {
+            target.write_one(config.profile, index, &request_id, config.value_bytes)?;
+        }
     }
     if config.warmup > 0 {
         let (warmup, _) = run_phase_raw(&mut target, config, config.warmup, "warmup");
@@ -1661,11 +2325,36 @@ fn run_phase_raw(
 ) -> (Samples, Duration) {
     let start = Instant::now();
     let mut samples = Samples::default();
-    for sequence in 0..operations {
-        let request_id = format!("{phase}-{sequence:016x}");
-        let began = Instant::now();
-        let result = target.operate(config, sequence, &request_id);
-        samples.record(began.elapsed(), result);
+    if config.layer == Layer::Qwal && config.workload == Workload::Write {
+        let mut sequence = 0;
+        while sequence < operations {
+            let count = config.batch_size.min((operations - sequence) as usize);
+            let began = Instant::now();
+            match target.write_sql_qwal_batch(sequence, count, phase, config.value_bytes) {
+                Ok(outcome) => {
+                    samples.record_qwal_phases(outcome.prepare_latency, outcome.apply_latency);
+                    if let Some(bytes) = outcome.envelope_bytes {
+                        samples.record_qwal_envelope(bytes);
+                    }
+                    samples.record_batch(began.elapsed(), outcome.results);
+                }
+                Err(error) => {
+                    samples.record_batch(began.elapsed(), repeated_batch_error(count, error));
+                }
+            }
+            sequence += count as u64;
+        }
+    } else {
+        for sequence in 0..operations {
+            let request_id = format!("{phase}-{sequence:016x}");
+            let began = Instant::now();
+            let result = target.operate(config, sequence, &request_id);
+            if config.workload == Workload::Write {
+                samples.record_batch(began.elapsed(), vec![result]);
+            } else {
+                samples.record(began.elapsed(), result);
+            }
+        }
     }
     (samples, start.elapsed())
 }
@@ -1745,13 +2434,34 @@ fn run_phase_consensus(
         let request_id = format!("{phase}-{sequence:016x}");
         let began = Instant::now();
         let result = target.write(sequence, &request_id, config.value_bytes);
-        samples.record(began.elapsed(), result);
+        samples.record_batch(began.elapsed(), vec![result]);
     }
     (samples, start.elapsed())
 }
 
 fn key(index: u64) -> String {
     format!("bench-key-{index:08}")
+}
+
+fn setup_value(index: u64, bytes: usize) -> String {
+    value(index, &format!("setup-{index:016x}"), bytes)
+}
+
+fn expected_native_keys() -> Vec<String> {
+    (0..16).map(key).collect()
+}
+
+fn validate_read_tip(profile: Profile, applied_index: u64, hash: LogHash) -> Result<(), String> {
+    let minimum_index = KEYSPACE + u64::from(profile == Profile::Sql);
+    if applied_index < minimum_index {
+        return Err(format!(
+            "read observed stale applied index {applied_index}; expected at least {minimum_index}"
+        ));
+    }
+    if hash == LogHash::ZERO {
+        return Err("read returned the zero applied hash after seeded writes".into());
+    }
+    Ok(())
 }
 
 fn value(index: u64, request_id: &str, bytes: usize) -> String {
@@ -1844,6 +2554,8 @@ mod tests {
                 warmup: 0,
                 concurrency: 4,
                 value_bytes: 64,
+                read_consistency: BenchmarkReadConsistency::Local,
+                sql_write_profile: false,
             }
         );
     }
@@ -1870,6 +2582,147 @@ mod tests {
             .map(str::to_owned),
         )
         .is_err());
+    }
+
+    #[test]
+    fn config_parses_read_consistency_only_for_handle_and_runtime_reads() {
+        for layer in ["handle", "runtime"] {
+            let barrier = Config::parse(
+                [
+                    "--profile",
+                    "kv",
+                    "--workload",
+                    "get",
+                    "--layer",
+                    layer,
+                    "--consistency",
+                    "read_barrier",
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(
+                barrier.read_consistency,
+                BenchmarkReadConsistency::ReadBarrier
+            );
+
+            let local = Config::parse(
+                ["--profile", "kv", "--workload", "get", "--layer", layer].map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(local.read_consistency, BenchmarkReadConsistency::Local);
+        }
+
+        for invalid in [
+            vec![
+                "--profile",
+                "kv",
+                "--workload",
+                "write",
+                "--consistency",
+                "read_barrier",
+            ],
+            vec![
+                "--profile",
+                "kv",
+                "--workload",
+                "get",
+                "--layer",
+                "raw",
+                "--consistency",
+                "read_barrier",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "qwal",
+                "--consistency",
+                "local",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "consensus",
+                "--consistency",
+                "local",
+            ],
+        ] {
+            assert!(Config::parse(invalid.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn config_rejects_unknown_read_consistency() {
+        let error = Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "get",
+                "--consistency",
+                "stale",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "--consistency must be local or read_barrier");
+    }
+
+    #[test]
+    fn sql_write_profiler_is_opt_in_only_for_runtime_sql_writes() {
+        let enabled = Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "runtime",
+                "--sql-write-profile",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(enabled.sql_write_profile);
+
+        for invalid in [
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "handle",
+                "--sql-write-profile",
+            ],
+            vec![
+                "--profile",
+                "kv",
+                "--workload",
+                "write",
+                "--layer",
+                "runtime",
+                "--sql-write-profile",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "get",
+                "--layer",
+                "runtime",
+                "--sql-write-profile",
+            ],
+        ] {
+            assert!(Config::parse(invalid.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]
@@ -1950,6 +2803,86 @@ mod tests {
     }
 
     #[test]
+    fn raw_sql_write_rejects_invalid_qsql_apply_measurement() {
+        let error = Config::parse(
+            ["--profile", "sql", "--workload", "write", "--layer", "raw"].map(str::to_owned),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v2 effects; use --layer qwal"
+        );
+    }
+
+    #[test]
+    fn qwal_layer_accepts_only_single_worker_sql_writes() {
+        let qwal = Config::parse(
+            ["--profile", "sql", "--workload", "write", "--layer", "qwal"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(qwal.layer, Layer::Qwal);
+        let batched = Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "qwal",
+                "--batch-size",
+                "256",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(batched.batch_size, 256);
+
+        for invalid in [
+            vec!["--profile", "kv", "--workload", "write", "--layer", "qwal"],
+            vec!["--profile", "sql", "--workload", "get", "--layer", "qwal"],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "qwal",
+                "--concurrency",
+                "2",
+            ],
+        ] {
+            assert!(Config::parse(invalid.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn qwal_sql_write_is_queryable_after_preparation_and_apply() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = RawTarget::open(root.path(), Profile::Sql).unwrap();
+        target
+            .prepare_and_apply_sql(&SqlCommand {
+                request_id: "test-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                        .into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let index_before_batch = target.next_index;
+        let outcome = target.write_sql_qwal_batch(7, 2, "test-write", 64).unwrap();
+
+        target.get_one(Profile::Sql, 7).unwrap();
+        target.get_one(Profile::Sql, 8).unwrap();
+        assert!(outcome.results.iter().all(Result::is_ok));
+        assert!(outcome
+            .envelope_bytes
+            .is_some_and(|bytes| bytes > QWAL_V2_MAGIC.len()));
+        assert_eq!(target.next_index, index_before_batch + 1);
+    }
+
+    #[test]
     fn config_rejects_zero_operations_and_unbounded_values() {
         assert!(Config::parse(
             ["--profile", "sql", "--workload", "get", "--operations", "0"].map(str::to_owned)
@@ -1970,12 +2903,53 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_size_accepts_powers_of_two_and_rejects_other_workloads() {
-        for batch_size in [1, 2, 4, 8, 16, 32, 64] {
+    fn write_batch_size_matches_profile_and_layer_caps() {
+        for layer in ["handle", "runtime"] {
+            let graph_error = Config::parse(
+                [
+                    "--layer",
+                    layer,
+                    "--profile",
+                    "graph",
+                    "--workload",
+                    "write",
+                    "--batch-size",
+                    "128",
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap_err();
+            assert_eq!(
+                graph_error,
+                format!("--profile graph supports --batch-size at most 64 on --layer {layer}")
+            );
+
+            for profile in ["kv", "sql"] {
+                let config = Config::parse(
+                    [
+                        "--layer",
+                        layer,
+                        "--profile",
+                        profile,
+                        "--workload",
+                        "write",
+                        "--batch-size",
+                        "256",
+                    ]
+                    .map(str::to_owned),
+                )
+                .unwrap();
+                assert_eq!(config.batch_size, 256);
+            }
+        }
+
+        for batch_size in [512, 1024] {
             let config = Config::parse(
                 [
+                    "--layer",
+                    "qwal",
                     "--profile",
-                    "kv",
+                    "sql",
                     "--workload",
                     "write",
                     "--batch-size",
@@ -1985,6 +2959,21 @@ mod tests {
             )
             .unwrap();
             assert_eq!(config.batch_size, batch_size);
+
+            assert!(Config::parse(
+                [
+                    "--layer",
+                    "runtime",
+                    "--profile",
+                    "sql",
+                    "--workload",
+                    "write",
+                    "--batch-size",
+                    &batch_size.to_string(),
+                ]
+                .map(str::to_owned),
+            )
+            .is_err());
         }
         for args in [
             vec![
@@ -2031,6 +3020,114 @@ mod tests {
                 .operations_per_second,
             2.0
         );
+    }
+
+    #[test]
+    fn batch_metrics_separate_call_latency_from_amortized_item_latency() {
+        let mut samples = Samples::default();
+        samples.record_batch(
+            Duration::from_micros(120),
+            vec![Ok(()), Ok(()), Ok(()), Ok(())],
+        );
+        samples.record_qwal_envelope(4_096);
+        samples.record_qwal_phases(Duration::from_micros(80), Some(Duration::from_micros(30)));
+
+        let metrics = samples.metrics(Duration::from_secs(1), Some(1));
+        assert_eq!(metrics.batch_calls, Some(1));
+        assert_eq!(metrics.successful_batch_calls, Some(1));
+        assert_eq!(metrics.failed_batch_calls, Some(0));
+        assert_eq!(metrics.batch_call_latency_us.unwrap().p50, Some(120));
+        assert_eq!(metrics.logical_item_latency_us.p50, Some(30));
+        assert_eq!(metrics.logical_operations_per_qlog, Some(4.0));
+        assert_eq!(metrics.qwal_prepare_latency_us.unwrap().p50, Some(80));
+        assert_eq!(metrics.qwal_apply_latency_us.unwrap().p50, Some(30));
+        assert_eq!(
+            metrics.qwal_envelope_bytes,
+            Some(QwalEnvelopeBytes {
+                count: 1,
+                total: 4_096,
+                average: 4_096.0,
+                min: 4_096,
+                max: 4_096,
+            })
+        );
+    }
+
+    #[test]
+    fn schema_v3_sql_profile_reports_validated_phase_histograms() {
+        let mut samples = SqlWritePhaseSamples::default();
+        samples
+            .record_snapshot(
+                SqlWriteProfileSnapshot {
+                    samples: vec![sql_write_profile_sample()],
+                    dropped_samples: 0,
+                },
+                1,
+                4,
+            )
+            .unwrap();
+
+        let metrics = samples.metrics().unwrap();
+        assert_eq!(REPORT_SCHEMA_VERSION, 3);
+        assert_eq!(metrics.sample_count, 1);
+        assert_eq!(metrics.member_count, 4);
+        assert_eq!(metrics.dropped_samples, 0);
+        assert_eq!(metrics.phase_latency_us.commit_lock_wait.total_us, 10);
+        assert_eq!(
+            metrics.phase_latency_us.qwal_prepare.latency_us.p50,
+            Some(30)
+        );
+        assert_eq!(metrics.phase_latency_us.total_service.total_us, 280);
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(
+            json["phase_latency_us"]["consensus_propose"]["total_us"],
+            40
+        );
+        assert_eq!(
+            json["phase_latency_us"]["local_qlog_append_sync"]["latency_us"]["p95"],
+            50
+        );
+    }
+
+    #[test]
+    fn sql_profile_rejects_sample_member_and_phase_sum_mismatches() {
+        let snapshot = SqlWriteProfileSnapshot {
+            samples: vec![sql_write_profile_sample()],
+            dropped_samples: 0,
+        };
+        assert!(SqlWritePhaseSamples::default()
+            .record_snapshot(snapshot.clone(), 2, 4)
+            .is_err());
+        assert!(SqlWritePhaseSamples::default()
+            .record_snapshot(snapshot.clone(), 1, 3)
+            .is_err());
+
+        let mut invalid = sql_write_profile_sample();
+        invalid.total_service_us += 1;
+        assert!(SqlWritePhaseSamples::default()
+            .record_snapshot(
+                SqlWriteProfileSnapshot {
+                    samples: vec![invalid],
+                    dropped_samples: 0,
+                },
+                1,
+                4,
+            )
+            .is_err());
+    }
+
+    fn sql_write_profile_sample() -> rhiza_node::SqlWriteProfileSample {
+        rhiza_node::SqlWriteProfileSample {
+            batch_member_count: 4,
+            commit_lock_wait_us: 10,
+            precheck_classification_us: 20,
+            qwal_prepare_us: 30,
+            consensus_propose_us: 40,
+            local_qlog_append_sync_us: 50,
+            sql_materializer_apply_us: 60,
+            response_other_total_us: 70,
+            total_service_us: 280,
+        }
     }
 
     #[test]

@@ -41,6 +41,55 @@ fn ordered_batch_atomically_applies_members_and_distinct_receipts() {
 }
 
 #[test]
+fn replicated_batch_applies_1024_members_in_order_with_distinct_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let commands = (0_u64..1024)
+        .map(|index| {
+            KvCommandV1::put(
+                format!("request-{index}"),
+                b"shared-key".to_vec(),
+                index.to_be_bytes().to_vec(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let individual_payloads = commands
+        .iter()
+        .map(|command| encode_replicated_kv_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let entry = entry(
+        1,
+        LogHash::ZERO,
+        encode_replicated_kv_batch(&commands).unwrap(),
+    );
+
+    let outcome = state.apply_entry(&entry).unwrap();
+
+    assert_eq!(outcome.applied_index(), 1);
+    assert_eq!(outcome.applied_hash(), entry.hash);
+    assert_eq!(outcome.result(), None);
+    assert_eq!(
+        state.get(b"shared-key").unwrap(),
+        Some(1023_u64.to_be_bytes().to_vec())
+    );
+    for (index, payload) in individual_payloads.iter().enumerate() {
+        let record = state
+            .check_request(&format!("request-{index}"), payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.original_log_index(), 1);
+        assert_eq!(record.original_log_hash(), entry.hash);
+        assert_eq!(
+            record.result(),
+            &KvCommandResultV1::Put {
+                replaced: index != 0,
+            }
+        );
+    }
+}
+
+#[test]
 fn request_conflict_rolls_back_every_member_and_the_applied_tip() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
@@ -73,6 +122,46 @@ fn request_conflict_rolls_back_every_member_and_the_applied_tip() {
 }
 
 #[test]
+fn bulk_receipt_lookup_preserves_order_and_member_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let stored = KvCommandV1::put("stored", b"key".to_vec(), b"one".to_vec()).unwrap();
+    let stored_payload = encode_replicated_kv_command(&stored).unwrap();
+    let stored_entry = entry(1, LogHash::ZERO, stored_payload.clone());
+    state.apply_entry(&stored_entry).unwrap();
+    let missing = KvCommandV1::put("missing", b"other".to_vec(), b"two".to_vec()).unwrap();
+    let missing_payload = encode_replicated_kv_command(&missing).unwrap();
+    let conflict = KvCommandV1::put("stored", b"key".to_vec(), b"different".to_vec()).unwrap();
+    let conflict_payload = encode_replicated_kv_command(&conflict).unwrap();
+
+    let results = state
+        .check_requests(&[
+            ("stored", stored_payload.as_slice()),
+            ("missing", missing_payload.as_slice()),
+            ("stored", conflict_payload.as_slice()),
+            ("wrong-id", missing_payload.as_slice()),
+        ])
+        .unwrap();
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(
+        results[0]
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .original_log_index(),
+        1
+    );
+    assert_eq!(results[1].as_ref().unwrap(), &None);
+    assert!(matches!(
+        &results[2],
+        Err(Error::RequestConflict { request_id }) if request_id == "stored"
+    ));
+    assert!(matches!(&results[3], Err(Error::InvalidCommand(_))));
+}
+
+#[test]
 fn malformed_or_duplicate_members_are_rejected_before_mutating_state() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
@@ -85,7 +174,8 @@ fn malformed_or_duplicate_members_are_rejected_before_mutating_state() {
         encode_replicated_kv_batch(&[]),
         Err(Error::InvalidCommand(_))
     ));
-    let oversized = (0..=MAX_KV_BATCH_MEMBERS)
+    assert_eq!(MAX_KV_BATCH_MEMBERS, 256);
+    let oversized = (0..=1024)
         .map(|index| {
             KvCommandV1::put(
                 format!("request-{index}"),

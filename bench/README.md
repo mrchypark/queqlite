@@ -198,9 +198,10 @@ cargo test --manifest-path bench/Cargo.toml
 `NodeRuntime` calls (`--layer runtime`), and the materializer (`--layer raw`)
 without HTTP. Every run preloads the same 256 bounded keys and measures a fixed
 number of operations. Handle and runtime writes use a local QuePaxa instance
-backed by three file-based Recorder voters; raw excludes consensus. Reads use
-local consistency, so they deliberately exclude a consensus read barrier. The
-stable JSON report records these boundaries, the exact Git state,
+backed by three file-based Recorder voters; raw excludes consensus. Reads default
+to local consistency; pass `--consistency read_barrier` on handle/runtime read
+workloads to measure the read-only 2/3 quorum fence. The stable JSON report
+records the selected consistency, these boundaries, the exact Git state,
 host/toolchain provenance, errors, throughput, and p50/p95/p99/p99.9/max latency
 in microseconds.
 
@@ -210,14 +211,72 @@ graph, and a bounded prefix scan for KV; compare `get` for point-read parity.
 For graph, `get` measures generic Cypher while `document-get` measures the fixed
 document projection without parsing a caller-supplied query.
 
-For `write`, `--batch-size 1|2|4|8|16|32|64` exercises the typed embedded batch
-API on the handle or runtime layer. `operations`, attempts, successes, errors,
-and throughput remain logical-command counts rather than batch-call counts.
-Successful commands in one non-atomic batch may share a QuePaxa log entry;
-runtime-layer JSON also reports `qlog_entries` for the measured phase so the
-coalescing ratio is visible. Per-command latency is the enclosing batch response
-latency. Retry an indeterminate batch as the whole unchanged vector with the
-same request IDs.
+For `write`, `--batch-size 1|2|4|8|16|32|64` exercises every typed batch API on
+the handle or runtime. SQL and KV additionally accept 128 and 256: a
+public typed SQL call is capped at 256 members and 512 KiB of aggregate
+canonical encoded input. Its FIFO group queue has a fixed 32 MiB pending
+encoded-byte budget, while one physical group is capped at 2 MiB and 1,024
+members. Direct SQL QWAL additionally accepts 512 and 1,024 members.
+`operations`, attempts, successes, errors, and
+`operations_per_second` are logical-command counts. `batch_calls`,
+`successful_batch_calls`, `failed_batch_calls`,
+`batch_calls_per_second`, and `batch_call_latency_us` describe physical API
+calls separately. `logical_item_latency_us` is the batch service time amortized
+over its submitted members; it is not an independent end-to-end latency sample
+for every member.
+
+KV public calls are capped at 256 members. Direct runtime and embedded
+`mutate_kv`/`mutate_kv_batch` calls enter a 64-call, 32 MiB FIFO queue with a
+500µs quiet period that restarts on arrival and a 2ms hard deadline at the
+default setting; one active group contains at most 1,024 members. The
+wire batch is command version 3 and the redb materializer fingerprint uses
+domain v2, so this is a clean-install breaking boundary. The 512 KiB replicated
+command ceiling still applies: an oversized flattened group is emitted as the
+largest fitting ordered prefixes. HTTP writes use their existing async writer
+batch directly and do not enter the KV queue a second time. Graph is not part of
+this KV group-commit path.
+
+For runtime writes, `qlog_entries` and `logical_operations_per_qlog` expose
+coalescing efficiency. SQL QWAL reports `qwal_prepare_latency_us`,
+`qwal_apply_latency_us`, and actual encoded `qwal_envelope_bytes`, in addition
+to whole-call latency. A QWAL v2 SQL batch is ordered and non-atomic: successful
+members share one qlog entry and one anchor, while member savepoints isolate
+failures. An all-failed batch creates no qlog entry. Retry an indeterminate
+batch as the whole unchanged vector with the same request IDs.
+
+The current release evidence is under
+`target/rhiza-bench/write-v3-group-window-idle/20260719T032700/` (an ignored
+benchmark directory). Runtime c4 submitted four concurrent public 256-member
+calls; the bounded 500µs drain window produced a median **15,824 logical
+ops/s**, 101 QLog entries per 102,400 writes, and a seven-run IQR below 1%. Direct QWAL
+medians from `target/rhiza-bench/write-v3-group-commit/20260719T025727/` were
+16,313 / 22,109 / 25,730 logical ops/s for 256 / 512 / 1,024 members. Read each
+artifact's `README.md` for exact commands, durability boundaries, topology, raw
+JSON, and limitations.
+
+The first post-`HashSet` c4 diagnostic under
+`target/rhiza-bench/write-v4-hashset/20260719T042000/` had a seven-run median of
+**17,974 logical ops/s**, **13.6%** above 15,824. It does not replace the stable
+official result: an orphan Virtualization VM was present and the post-run
+snapshot showed heavy `syspolicyd` and `trustd` activity. Treat it only as a
+signal for a controlled rerun.
+
+The checked-in [strong-read diagnostic](strong-read-results-2026-07-19.md)
+records three-run c1/c4/c16 local and read-barrier controls for SQL, KV, and
+Graph after disk space was cleared. The host was not idle and later showed an
+orphan VM/background load, so the result is diagnostic rather than publishable
+release evidence.
+
+The post-change KV artifact is
+`target/rhiza-bench/kv-group-commit/20260719T122120/`, built as binary SHA-256
+`a1f34866955b638371db4e0852f04d382425d22a0c5247aced5b828009c4db76`.
+For 102,400 logical writes in 1,600 public batch calls, c1 median was **2,008.81
+ops/s** with 1,600 qlog entries and c4 median was **10,738.69 ops/s** with
+401–402 qlog entries. This is a structural/qlog gate pass, not publishable
+throughput evidence: c1/c4 IQR was 11.09%/7.24%, and Dory VM,
+`syspolicyd`, and Storage extension activity invalidated the stability gate.
+The checked-in [SQL/KV diagnostic](sql-kv-results-2026-07-19.md) preserves the
+full comparison and raw-artifact boundary. Graph is excluded from that report.
 
 ```sh
 cargo build --release --locked --manifest-path bench/Cargo.toml \

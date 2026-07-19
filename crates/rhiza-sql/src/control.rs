@@ -4,22 +4,28 @@
 //! node-local identity and qlog progress cannot change replicated user pages.
 
 use std::{
+    collections::HashSet,
+    fmt::Write as _,
     fs::OpenOptions,
     path::{Path, PathBuf},
 };
 
 use rhiza_core::{ConfigurationState, LogAnchor, LogHash};
 use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{ApplyProgress, Error, RequestConflict, RequestOutcome, Result};
 
-const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x01";
-const CONTROL_SCHEMA_VERSION: u64 = 1;
-const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x01";
+const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x03";
+const CONTROL_SCHEMA_VERSION: u64 = 3;
+const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x03";
 const MAX_RESULT_BLOB_BYTES: usize = super::MAX_SQL_EFFECT_BYTES;
+const SQLITE_VARIABLE_LIMIT: usize = 999;
+const RECEIPT_LOOKUP_CHUNK_SIZE: usize = SQLITE_VARIABLE_LIMIT;
+const RECEIPT_INSERT_CHUNK_SIZE: usize = (SQLITE_VARIABLE_LIMIT - 2) / 3;
 
 const CREATE_CONTROL_META_SQL: &str = r#"CREATE TABLE control_meta (
     key TEXT PRIMARY KEY,
@@ -389,29 +395,22 @@ impl ControlStore {
         request_id: &str,
         request_digest: LogHash,
     ) -> Result<Option<RequestReceipt>> {
-        let receipt = self.conn.query_row(
-            "SELECT request_digest, original_log_index, original_log_hash, result_blob FROM request_receipts WHERE request_id = ?1",
-            params![request_id],
-            |row| {
-                let digest = hash_from_blob(row.get(0)?)?;
-                let index = u64_from_sql(row.get(1)?)?;
-                let hash = hash_from_blob(row.get(2)?)?;
-                Ok(RequestReceipt::new(request_id, digest, LogAnchor::new(index, hash), row.get(3)?))
-            },
-        ).optional().map_err(sqlite_error)?;
+        self.lookup_requests(&[(request_id, request_digest)])?
+            .pop()
+            .expect("one request produces one aligned lookup")
+    }
 
-        match receipt {
-            Some(receipt) if receipt.request_digest != request_digest => {
-                Err(Error::RequestConflict(RequestConflict {
-                    request_id: request_id.to_owned(),
-                    original_outcome: RequestOutcome::new(
-                        receipt.original_anchor.index(),
-                        receipt.original_anchor.hash(),
-                    ),
-                }))
-            }
-            value => Ok(value),
-        }
+    /// Returns receipts in the exact order of the requested `(id, digest)`
+    /// pairs using one bounded control-sidecar query.
+    ///
+    /// Request ids must be unique. Missing ids produce `Ok(None)`; an existing
+    /// id with another digest produces an aligned request-conflict error so a
+    /// caller can isolate that member without issuing another query.
+    pub fn lookup_requests(
+        &self,
+        requests: &[(&str, LogHash)],
+    ) -> Result<Vec<Result<Option<RequestReceipt>>>> {
+        lookup_requests_from(&self.conn, requests)
     }
 
     pub fn begin_pending(&self, pending: &PendingApply) -> Result<()> {
@@ -467,12 +466,79 @@ impl ControlStore {
         }
     }
 
+    /// Durably advances a log entry that changes no replicated user data and
+    /// does not transition the configuration. The exact committed base is
+    /// checked again inside the same FULL-synchronous transaction as the tip
+    /// update, so this path cannot bypass an older physical apply intent.
+    pub fn commit_metadata_only_entry(
+        &self,
+        expected_base: LogAnchor,
+        entry: LogAnchor,
+        expected_configuration: &ConfigurationState,
+        expected_user_db_digest: LogHash,
+    ) -> Result<()> {
+        let expected_entry_index = expected_base
+            .index()
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidEntry("applied index is exhausted".into()))?;
+        if entry.index() != expected_entry_index {
+            return Err(Error::InvalidEntry(
+                "metadata-only entry is not the next slot".into(),
+            ));
+        }
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        if pending_from(&tx)?.is_some() {
+            return Err(Error::InvalidEntry(
+                "metadata-only commit cannot bypass a pending physical apply".into(),
+            ));
+        }
+        if meta_anchor(&tx, "applied_tip")? != expected_base {
+            return Err(Error::InvalidEntry(
+                "metadata-only commit does not match the committed base".into(),
+            ));
+        }
+        if meta_configuration(&tx)? != *expected_configuration {
+            return Err(Error::InvalidEntry(
+                "metadata-only commit configuration changed".into(),
+            ));
+        }
+        if meta_hash(&tx, "user_db_digest")? != expected_user_db_digest {
+            return Err(Error::InvalidEntry(
+                "metadata-only commit user database digest changed".into(),
+            ));
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE control_meta SET value = ?1 WHERE key = 'applied_tip' AND value = ?2",
+                params![
+                    anchor_bytes(entry).as_slice(),
+                    anchor_bytes(expected_base).as_slice()
+                ],
+            )
+            .map_err(sqlite_error)?;
+        if changed != 1 {
+            return Err(Error::InvalidEntry(
+                "metadata-only tip compare-and-swap affected an unexpected row count".into(),
+            ));
+        }
+        tx.commit().map_err(sqlite_error)
+    }
+
     pub fn commit_applied(
         &self,
         pending: &PendingApply,
         configuration_state: &ConfigurationState,
-        receipt: Option<&RequestReceipt>,
+        receipts: &[RequestReceipt],
     ) -> Result<()> {
+        if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+            return Err(Error::ResourceExhausted(format!(
+                "applied receipt batch exceeds {} members",
+                super::MAX_QWAL_V2_RECEIPTS
+            )));
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         if pending_from(&tx)?.as_ref() != Some(pending) {
@@ -485,15 +551,52 @@ impl ControlStore {
                 "configuration state moved backwards".into(),
             ));
         }
-        if let Some(receipt) = receipt {
+        let mut result_bytes = 0usize;
+        let mut request_ids = HashSet::with_capacity(receipts.len());
+        for receipt in receipts {
             validate_receipt(receipt)?;
+            result_bytes = result_bytes
+                .checked_add(receipt.result_blob.len())
+                .ok_or_else(|| Error::ResourceExhausted("receipt result bytes overflow".into()))?;
+            if result_bytes > super::MAX_QWAL_V2_BYTES {
+                return Err(Error::ResourceExhausted(format!(
+                    "receipt results exceed {} bytes",
+                    super::MAX_QWAL_V2_BYTES
+                )));
+            }
             if receipt.original_anchor != pending.entry {
                 return Err(Error::InvalidEntry(
                     "request receipt anchor does not match applied entry".into(),
                 ));
             }
-            insert_or_validate_receipt(&tx, receipt)?;
+            if !request_ids.insert(receipt.request_id.as_str()) {
+                return Err(Error::InvalidEntry(
+                    "applied receipt request ids must be unique".into(),
+                ));
+            }
         }
+        let lookups = receipts
+            .iter()
+            .map(|receipt| (receipt.request_id(), receipt.request_digest()))
+            .collect::<Vec<_>>();
+        let existing = lookup_requests_from(&tx, &lookups)?;
+        let mut absent = Vec::with_capacity(receipts.len());
+        for (receipt, existing) in receipts.iter().zip(existing) {
+            match existing? {
+                None => absent.push(receipt),
+                Some(existing) if existing == *receipt => {}
+                Some(existing) => {
+                    return Err(Error::RequestConflict(RequestConflict {
+                        request_id: receipt.request_id.clone(),
+                        original_outcome: RequestOutcome::new(
+                            existing.original_anchor.index(),
+                            existing.original_anchor.hash(),
+                        ),
+                    }));
+                }
+            }
+        }
+        insert_receipts_bulk(&tx, pending.entry, &absent)?;
         put_anchor(&tx, "applied_tip", pending.entry)?;
         put_configuration(&tx, configuration_state)?;
         put_hash(&tx, "user_db_digest", pending.target_db_digest)?;
@@ -795,6 +898,161 @@ fn validate_all_receipts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn lookup_requests_from(
+    conn: &Connection,
+    requests: &[(&str, LogHash)],
+) -> Result<Vec<Result<Option<RequestReceipt>>>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    if requests.len() > super::MAX_QWAL_V2_RECEIPTS {
+        return Err(Error::ResourceExhausted(format!(
+            "request lookup exceeds {} members",
+            super::MAX_QWAL_V2_RECEIPTS
+        )));
+    }
+    let mut request_ids = HashSet::with_capacity(requests.len());
+    for (request_id, _) in requests {
+        if !request_ids.insert(*request_id) {
+            return Err(Error::InvalidCommand(format!(
+                "duplicate request id in bulk lookup: {request_id}"
+            )));
+        }
+    }
+
+    let mut aligned = Vec::with_capacity(requests.len());
+    for chunk in requests.chunks(RECEIPT_LOOKUP_CHUNK_SIZE) {
+        aligned.extend(lookup_request_chunk(conn, chunk)?);
+    }
+    Ok(aligned)
+}
+
+fn lookup_request_chunk(
+    conn: &Connection,
+    requests: &[(&str, LogHash)],
+) -> Result<Vec<Result<Option<RequestReceipt>>>> {
+    let mut sql = String::from("WITH requested(position,request_id) AS (VALUES ");
+    for index in 0..requests.len() {
+        if index != 0 {
+            sql.push(',');
+        }
+        write!(sql, "({index},?{})", index + 1)
+            .expect("writing to an in-memory SQL string cannot fail");
+    }
+    sql.push_str(
+        ") SELECT requested.request_id,receipts.request_digest,receipts.original_log_index,receipts.original_log_hash,receipts.result_blob FROM requested LEFT JOIN request_receipts AS receipts ON receipts.request_id=requested.request_id ORDER BY requested.position",
+    );
+    let mut statement = conn.prepare(&sql).map_err(sqlite_error)?;
+    let receipts = statement
+        .query_map(
+            params_from_iter(requests.iter().map(|(request_id, _)| *request_id)),
+            |row| {
+                let request_id: String = row.get(0)?;
+                let Some(request_digest) = row.get::<_, Option<Vec<u8>>>(1)? else {
+                    return Ok(None);
+                };
+                Ok(Some(RequestReceipt::new(
+                    request_id,
+                    hash_from_blob(request_digest)?,
+                    LogAnchor::new(u64_from_sql(row.get(2)?)?, hash_from_blob(row.get(3)?)?),
+                    row.get(4)?,
+                )))
+            },
+        )
+        .map_err(sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if receipts.len() != requests.len() {
+        return Err(Error::Sqlite(
+            "bulk receipt lookup did not preserve request cardinality".into(),
+        ));
+    }
+    let mut aligned = Vec::with_capacity(receipts.len());
+    for ((request_id, request_digest), receipt) in requests.iter().zip(receipts) {
+        if let Some(receipt) = &receipt {
+            if receipt.request_id() != *request_id {
+                return Err(Error::Sqlite(
+                    "bulk receipt lookup did not preserve request order".into(),
+                ));
+            }
+            if receipt.request_digest() != *request_digest {
+                aligned.push(Err(Error::RequestConflict(RequestConflict {
+                    request_id: (*request_id).to_owned(),
+                    original_outcome: RequestOutcome::new(
+                        receipt.original_anchor.index(),
+                        receipt.original_anchor.hash(),
+                    ),
+                })));
+                continue;
+            }
+        }
+        aligned.push(Ok(receipt));
+    }
+    Ok(aligned)
+}
+
+fn insert_receipts_bulk(
+    conn: &Connection,
+    anchor: LogAnchor,
+    receipts: &[&RequestReceipt],
+) -> Result<()> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+        return Err(Error::ResourceExhausted(
+            "bulk receipt insert exceeds the QWAL receipt limit".into(),
+        ));
+    }
+    for chunk in receipts.chunks(RECEIPT_INSERT_CHUNK_SIZE) {
+        insert_receipt_chunk(conn, anchor, chunk)?;
+    }
+    Ok(())
+}
+
+fn insert_receipt_chunk(
+    conn: &Connection,
+    anchor: LogAnchor,
+    receipts: &[&RequestReceipt],
+) -> Result<()> {
+    let bind_count = 2 + receipts.len() * 3;
+    debug_assert!(bind_count <= SQLITE_VARIABLE_LIMIT);
+
+    let mut sql = String::from(
+        "INSERT INTO request_receipts(request_id,request_digest,original_log_index,original_log_hash,result_blob) VALUES ",
+    );
+    for index in 0..receipts.len() {
+        if index != 0 {
+            sql.push(',');
+        }
+        let request_id = 3 + index * 3;
+        let request_digest = request_id + 1;
+        let result_blob = request_id + 2;
+        write!(
+            sql,
+            "(?{request_id},?{request_digest},?1,?2,?{result_blob})"
+        )
+        .expect("writing to an in-memory SQL string cannot fail");
+    }
+    let mut values = Vec::with_capacity(bind_count);
+    values.push(Value::Integer(u64_to_sql(anchor.index())?));
+    values.push(Value::Blob(anchor.hash().as_bytes().to_vec()));
+    for receipt in receipts {
+        values.push(Value::Text(receipt.request_id.clone()));
+        values.push(Value::Blob(receipt.request_digest.as_bytes().to_vec()));
+        values.push(Value::Blob(receipt.result_blob.clone()));
+    }
+    let inserted = conn
+        .execute(&sql, params_from_iter(values.iter()))
+        .map_err(sqlite_error)?;
+    if inserted != receipts.len() {
+        return Err(Error::Sqlite(
+            "bulk receipt insert affected an unexpected row count".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_or_validate_receipt(conn: &Connection, receipt: &RequestReceipt) -> Result<()> {
     if let Some(existing) = conn.query_row(
         "SELECT request_digest, original_log_index, original_log_hash, result_blob FROM request_receipts WHERE request_id=?1",
@@ -940,10 +1198,13 @@ fn meta_configuration(conn: &Connection) -> Result<ConfigurationState> {
         .map_err(|error| Error::Sqlite(format!("invalid control configuration: {error}")))
 }
 fn put_anchor(conn: &Connection, key: &str, value: LogAnchor) -> Result<()> {
-    let mut encoded = Vec::with_capacity(40);
-    encoded.extend_from_slice(&value.index().to_be_bytes());
-    encoded.extend_from_slice(value.hash().as_bytes());
-    put_meta(conn, key, &encoded)
+    put_meta(conn, key, &anchor_bytes(value))
+}
+fn anchor_bytes(value: LogAnchor) -> [u8; 40] {
+    let mut encoded = [0_u8; 40];
+    encoded[..8].copy_from_slice(&value.index().to_be_bytes());
+    encoded[8..].copy_from_slice(value.hash().as_bytes());
+    encoded
 }
 fn meta_anchor(conn: &Connection, key: &str) -> Result<LogAnchor> {
     let bytes = get_meta(conn, key)?;
@@ -1018,8 +1279,11 @@ mod tests {
         )
     }
     fn receipt(digest: LogHash) -> RequestReceipt {
+        receipt_for("request-1", digest)
+    }
+    fn receipt_for(request_id: &str, digest: LogHash) -> RequestReceipt {
         RequestReceipt::new(
-            "request-1",
+            request_id,
             digest,
             LogAnchor::new(1, hash(b"entry")),
             crate::encode_sql_result(&crate::SqlCommandResult {
@@ -1039,6 +1303,32 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error, Error::IdentityMismatch("node_id".into()));
+    }
+
+    #[test]
+    fn v3_control_and_snapshot_reject_v2_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.control");
+        let store = ControlStore::create(&path, &identity("node-a")).unwrap();
+        let mut old_snapshot = store.export_replicated_snapshot().unwrap();
+        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 2;
+        assert!(matches!(
+            store.import_replicated_snapshot(&old_snapshot),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE control_meta SET value=?1 WHERE key='schema_version'",
+            [2_u64.to_be_bytes().as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            ControlStore::open_existing_unchecked(&path),
+            Err(Error::Sqlite(message)) if message.contains("version")
+        ));
     }
 
     #[test]
@@ -1106,7 +1396,7 @@ mod tests {
             .commit_applied(
                 &pending,
                 identity("node-a").configuration_state(),
-                Some(&receipt),
+                std::slice::from_ref(&receipt),
             )
             .unwrap();
         assert_eq!(
@@ -1117,6 +1407,329 @@ mod tests {
             store.lookup_request("request-1", hash(b"other")),
             Err(Error::RequestConflict(_))
         ));
+    }
+
+    #[test]
+    fn bulk_lookup_is_aligned_and_rejects_conflicts_or_duplicate_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let pending = pending();
+        let existing = receipt_for("request-a", hash(b"request-a"));
+        store.begin_pending(&pending).unwrap();
+        store
+            .commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                std::slice::from_ref(&existing),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lookup_requests(&[
+                    ("request-a", hash(b"request-a")),
+                    ("request-b", hash(b"request-b")),
+                ])
+                .unwrap(),
+            vec![Ok(Some(existing.clone())), Ok(None)]
+        );
+        assert!(matches!(
+            store
+                .lookup_requests(&[("request-a", hash(b"different"))])
+                .unwrap()
+                .pop()
+                .unwrap(),
+            Err(Error::RequestConflict(_))
+        ));
+        assert!(matches!(
+            store.lookup_requests(&[
+                ("request-a", hash(b"request-a")),
+                ("request-a", hash(b"request-a")),
+            ]),
+            Err(Error::InvalidCommand(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn capacity_sized_receipt_paths_reject_a_duplicate_at_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let pending = pending();
+        let mut receipts = (0usize..super::super::MAX_QWAL_V2_RECEIPTS)
+            .map(|index| receipt_for(&format!("request-{index:04}"), hash(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        receipts.last_mut().unwrap().request_id = receipts[0].request_id.clone();
+        store.begin_pending(&pending).unwrap();
+
+        assert!(matches!(
+            store.commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &receipts,
+            ),
+            Err(Error::InvalidEntry(message)) if message.contains("unique")
+        ));
+        assert_eq!(store.pending().unwrap(), Some(pending));
+
+        let lookups = receipts
+            .iter()
+            .map(|receipt| (receipt.request_id(), receipt.request_digest()))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.lookup_requests(&lookups),
+            Err(Error::InvalidCommand(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn batch_receipts_commit_at_one_anchor_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let pending = pending();
+        let receipts = [
+            receipt_for("request-a", hash(b"request-a")),
+            receipt_for("request-b", hash(b"request-b")),
+        ];
+        store.begin_pending(&pending).unwrap();
+        store
+            .commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &receipts,
+            )
+            .unwrap();
+        assert_eq!(store.pending().unwrap(), None);
+        for receipt in &receipts {
+            assert_eq!(
+                store
+                    .lookup_request(receipt.request_id(), receipt.request_digest())
+                    .unwrap(),
+                Some(receipt.clone())
+            );
+            assert_eq!(receipt.original_anchor(), pending.entry());
+        }
+
+        let pending = PendingApply::new(
+            pending.entry(),
+            LogAnchor::new(2, hash(b"entry-2")),
+            pending.target_db_digest(),
+            hash(b"target-2"),
+            4096,
+        );
+        let conflicting = [
+            RequestReceipt::new(
+                "request-c",
+                hash(b"request-c"),
+                pending.entry(),
+                receipts[0].result_blob().to_vec(),
+            ),
+            RequestReceipt::new(
+                "request-a",
+                hash(b"different"),
+                pending.entry(),
+                receipts[0].result_blob().to_vec(),
+            ),
+        ];
+        store.begin_pending(&pending).unwrap();
+        assert!(store
+            .commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &conflicting,
+            )
+            .is_err());
+        assert_eq!(store.pending().unwrap(), Some(pending));
+        assert_eq!(
+            store
+                .lookup_request("request-c", hash(b"request-c"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn all_exact_receipts_across_chunks_finish_pending_recovery_without_reinsertion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let pending = pending();
+        let receipts = (0usize..1024)
+            .map(|index| receipt_for(&format!("request-{index:04}"), hash(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        store.begin_pending(&pending).unwrap();
+        for receipt in &receipts {
+            insert_or_validate_receipt(&store.conn, receipt).unwrap();
+        }
+
+        store
+            .commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &receipts,
+            )
+            .unwrap();
+
+        assert_eq!(store.pending().unwrap(), None);
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(pending.entry().index(), pending.entry().hash())
+        );
+        assert_eq!(
+            store
+                .lookup_requests(
+                    &receipts
+                        .iter()
+                        .map(|receipt| (receipt.request_id(), receipt.request_digest()))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            receipts
+                .into_iter()
+                .map(|receipt| Ok(Some(receipt)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn one_thousand_twenty_four_receipts_share_one_anchor_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.control");
+        let pending = pending();
+        let receipts = (0usize..1024)
+            .map(|index| receipt_for(&format!("request-{index:04}"), hash(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        {
+            let store = ControlStore::create(&path, &identity("node-a")).unwrap();
+            store.begin_pending(&pending).unwrap();
+            store
+                .commit_applied(
+                    &pending,
+                    identity("node-a").configuration_state(),
+                    &receipts,
+                )
+                .unwrap();
+        }
+        let reopened_identity = ControlIdentity::new(
+            "cluster",
+            "node-a",
+            7,
+            identity("node-a").configuration_state().clone(),
+            11,
+            hash(b"fingerprint"),
+            pending.target_db_digest(),
+        );
+        let store = ControlStore::open_existing(&path, &reopened_identity).unwrap();
+        let lookups = receipts
+            .iter()
+            .map(|receipt| (receipt.request_id(), receipt.request_digest()))
+            .collect::<Vec<_>>();
+        let restored = store.lookup_requests(&lookups).unwrap();
+        assert_eq!(restored.len(), 1024);
+        assert!(restored.iter().all(|receipt| {
+            receipt
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|receipt| receipt.original_anchor() == pending.entry())
+        }));
+    }
+
+    #[test]
+    fn conflict_in_a_later_lookup_chunk_changes_nothing_and_retains_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let first = pending();
+        let existing = receipt_for("request-1000", hash(b"original"));
+        store.begin_pending(&first).unwrap();
+        store
+            .commit_applied(
+                &first,
+                identity("node-a").configuration_state(),
+                std::slice::from_ref(&existing),
+            )
+            .unwrap();
+        let pending = PendingApply::new(
+            first.entry(),
+            LogAnchor::new(2, hash(b"entry-2")),
+            first.target_db_digest(),
+            hash(b"target-2"),
+            4096,
+        );
+        let receipts = (0usize..1024)
+            .map(|index| {
+                RequestReceipt::new(
+                    format!("request-{index:04}"),
+                    hash(&index.to_le_bytes()),
+                    pending.entry(),
+                    existing.result_blob().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        store.begin_pending(&pending).unwrap();
+
+        assert!(matches!(
+            store.commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &receipts,
+            ),
+            Err(Error::RequestConflict(_))
+        ));
+        assert_eq!(store.pending().unwrap(), Some(pending));
+        assert_eq!(
+            store
+                .lookup_request("request-0000", hash(&0usize.to_le_bytes()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(first.entry().index(), first.entry().hash())
+        );
+    }
+
+    #[test]
+    fn error_in_a_later_insert_chunk_rolls_back_earlier_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+        let pending = pending();
+        let receipts = (0usize..1024)
+            .map(|index| receipt_for(&format!("request-{index:04}"), hash(&index.to_le_bytes())))
+            .collect::<Vec<_>>();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER abort_later_receipt BEFORE INSERT ON request_receipts
+                 WHEN NEW.request_id = 'request-0500'
+                 BEGIN SELECT RAISE(ABORT, 'later insert failure'); END;",
+            )
+            .unwrap();
+        store.begin_pending(&pending).unwrap();
+
+        assert!(matches!(
+            store.commit_applied(
+                &pending,
+                identity("node-a").configuration_state(),
+                &receipts,
+            ),
+            Err(Error::Sqlite(_))
+        ));
+        assert_eq!(store.pending().unwrap(), Some(pending));
+        assert_eq!(
+            store
+                .lookup_request("request-0000", hash(&0usize.to_le_bytes()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(0, LogHash::ZERO)
+        );
     }
 
     #[test]
@@ -1137,7 +1750,7 @@ mod tests {
             store.commit_applied(
                 &pending,
                 identity("node-a").configuration_state(),
-                Some(&oversized),
+                std::slice::from_ref(&oversized),
             ),
             Err(Error::ResourceExhausted(_))
         ));
@@ -1166,7 +1779,7 @@ mod tests {
             .commit_applied(
                 &pending,
                 identity("node-a").configuration_state(),
-                Some(&malformed),
+                std::slice::from_ref(&malformed),
             )
             .is_err());
         assert_eq!(store.pending().unwrap(), Some(pending));
@@ -1201,6 +1814,85 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_commit_advances_exact_tip_without_pending_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.control");
+        let original = identity("node-a");
+        let base = LogAnchor::new(0, LogHash::ZERO);
+        let entry = LogAnchor::new(1, hash(b"noop"));
+        {
+            let store = ControlStore::create(&path, &original).unwrap();
+            store
+                .commit_metadata_only_entry(
+                    base,
+                    entry,
+                    original.configuration_state(),
+                    original.user_db_digest(),
+                )
+                .unwrap();
+            assert_eq!(store.pending().unwrap(), None);
+        }
+
+        let store = ControlStore::open_existing_unchecked(&path).unwrap();
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(entry.index(), entry.hash())
+        );
+        assert_eq!(
+            store.configuration_state().unwrap(),
+            *original.configuration_state()
+        );
+        assert_eq!(store.user_db_digest().unwrap(), original.user_db_digest());
+        assert_eq!(store.pending().unwrap(), None);
+    }
+
+    #[test]
+    fn metadata_only_commit_rejects_an_inexact_base_without_changing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = identity("node-a");
+        let store = ControlStore::create(dir.path().join("sqlite.control"), &original).unwrap();
+
+        assert!(matches!(
+            store.commit_metadata_only_entry(
+                LogAnchor::new(0, hash(b"wrong-base")),
+                LogAnchor::new(1, hash(b"noop")),
+                original.configuration_state(),
+                original.user_db_digest(),
+            ),
+            Err(Error::InvalidEntry(_))
+        ));
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(0, LogHash::ZERO)
+        );
+        assert_eq!(store.pending().unwrap(), None);
+    }
+
+    #[test]
+    fn metadata_only_commit_does_not_bypass_legacy_pending_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = identity("node-a");
+        let store = ControlStore::create(dir.path().join("sqlite.control"), &original).unwrap();
+        let pending = pending();
+        store.begin_pending(&pending).unwrap();
+
+        assert!(matches!(
+            store.commit_metadata_only_entry(
+                pending.base(),
+                pending.entry(),
+                original.configuration_state(),
+                original.user_db_digest(),
+            ),
+            Err(Error::InvalidEntry(_))
+        ));
+        assert_eq!(store.pending().unwrap(), Some(pending));
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(0, LogHash::ZERO)
+        );
+    }
+
+    #[test]
     fn committed_state_and_receipt_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sqlite.control");
@@ -1212,7 +1904,7 @@ mod tests {
             let store = ControlStore::create(&path, &original).unwrap();
             store.begin_pending(&pending).unwrap();
             store
-                .commit_applied(&pending, &next_config, Some(&receipt))
+                .commit_applied(&pending, &next_config, std::slice::from_ref(&receipt))
                 .unwrap();
         }
         let reopened_identity = ControlIdentity::new(
@@ -1247,7 +1939,7 @@ mod tests {
             .commit_applied(
                 &source_pending,
                 identity("node-a").configuration_state(),
-                Some(&receipt(hash(b"request"))),
+                std::slice::from_ref(&receipt(hash(b"request"))),
             )
             .unwrap();
         let snapshot = source.export_replicated_snapshot().unwrap();

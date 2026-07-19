@@ -38,6 +38,19 @@ done
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+assert_statefulset_env_values_are_quoted_strings() {
+  manifest="$1"
+  yq eval-all -e '
+    [select(.kind == "StatefulSet") |
+      .spec.template.spec.containers[].env[]? |
+      select(has("value")) |
+      select((.value | tag) != "!!str" or (.value | style) != "double")]
+    | length == 0
+  ' "$manifest" >/dev/null || {
+    echo "StatefulSet env.value must be emitted as an explicitly quoted string: $manifest" >&2
+    return 1
+  }
+}
 for profile in sql graph kv; do
 for replicas in 3 7; do
   id="$replicas"
@@ -53,6 +66,7 @@ for replicas in 3 7; do
   env -u RHIZA_IMAGE RHIZA_EXECUTION_PROFILE="$profile" \
     scripts/render-k8s-config.sh "$id" "$replicas" \
     "$tmp/config-${profile}-${id}.json" "$tmp/config-${profile}-${id}.yaml" successor
+  assert_statefulset_env_values_are_quoted_strings "$tmp/config-${profile}-${id}.yaml"
   yq eval '.' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval 'select(.kind == "StatefulSet") | .metadata.name' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}-c${id}" ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
@@ -101,6 +115,7 @@ jq '.members |= to_entries | .members |= map(
 RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tcp.json" \
     "$tmp/config-sql-3-tcp.yaml"
+assert_statefulset_env_values_are_quoted_strings "$tmp/config-sql-3-tcp.yaml"
 [ "$(yq eval -r 'select(.kind == "Service" and .metadata.name == "rhiza-sql-c3") |
   .spec.ports[] | select(.name == "recorder-tcp") | .port' \
   "$tmp/config-sql-3-tcp.yaml")" = 8082 ]
@@ -170,6 +185,7 @@ RHIZA_EXECUTION_PROFILE=sql RHIZA_RECORDER_TRANSPORT=tcp-postcard \
   RHIZA_RECORDER_TLS_SECRET=rhiza-recorder-tls \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3-tls.json" \
     "$tmp/config-sql-3-tls.yaml"
+assert_statefulset_env_values_are_quoted_strings "$tmp/config-sql-3-tls.yaml"
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
   select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
@@ -205,6 +221,8 @@ for recorder_tls in off on; do
     RHIZA_RECORDER_TLS="$recorder_tls" "${candidate_env[@]}" \
     scripts/render-k8s-config.sh 3 3 "$candidate_bundle" \
       "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
+  assert_statefulset_env_values_are_quoted_strings \
+    "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml"
   [ "$(yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[] |
     select(.name == "RHIZA_RECORDER_TRANSPORT") | .value' \
@@ -855,6 +873,7 @@ RHIZA_OBJECT_SECRET=rustfs-credentials \
 RHIZA_S3_ALLOW_HTTP=true \
   scripts/render-k8s-config.sh 3 3 \
     "$tmp/config-3.json" "$tmp/config-3-rustfs.yaml" successor
+assert_statefulset_env_values_are_quoted_strings "$tmp/config-3-rustfs.yaml"
 [ "$(yq eval -r 'select(.kind == "StatefulSet") |
   .spec.template.spec.containers[0].env[] |
   select(.name == "RHIZA_S3_ENDPOINT") | .value' \
@@ -1058,6 +1077,7 @@ fi
 
 RHIZA_AUTH_SECRET=rendered-auth \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-3.json" "$tmp/auth-cluster.yaml"
+assert_statefulset_env_values_are_quoted_strings "$tmp/auth-cluster.yaml"
 RHIZA_AUTH_SECRET=rendered-auth RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/admin-job.yaml" \
   scripts/k8s-admin-job.sh rhiza-sql-c3 rhiza-sql-c3-0 GET /v1/admin/membership/status
 yq eval '.' "$tmp/admin-job.yaml" >/dev/null

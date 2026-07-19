@@ -16,7 +16,7 @@ use std::{
 
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use rhiza_core::{
-    EntryType, ExecutionProfile, LogEntry, LogHash, LogIndex, ReplicatedCommandEnvelope,
+    EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, ReplicatedCommandEnvelope,
 };
 use tempfile::NamedTempFile;
 
@@ -924,6 +924,15 @@ impl LadybugStateMachine {
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
         meta_hash(&connection, "applied_hash")
+    }
+
+    /// Returns the applied index and hash observed by one Ladybug query snapshot.
+    pub fn applied_tip(&self) -> Result<LogAnchor> {
+        let guard = self.read_database()?;
+        let database = guard.as_ref().ok_or(Error::Closed)?;
+        let connection = Connection::new(database).map_err(ladybug_error)?;
+        let (index, hash) = materialized_tip(&connection)?;
+        Ok(LogAnchor::new(index, hash))
     }
 
     /// Safe read boundary for the fixed document projection. No raw Cypher is accepted.
@@ -4076,6 +4085,21 @@ mod query_tests {
             state.get_document_with_tip("missing").unwrap(),
             (None, 0, LogHash::ZERO)
         );
+    }
+
+    #[test]
+    fn applied_tip_returns_index_and_hash_from_one_query_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            LadybugStateMachine::open(dir.path().join("graph.lbug"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+
+        assert_eq!(
+            state.applied_tip().unwrap(),
+            LogAnchor::new(0, LogHash::ZERO)
+        );
+        assert_eq!(state.applied_index().unwrap(), 0);
+        assert_eq!(state.applied_hash().unwrap(), LogHash::ZERO);
     }
 
     #[test]

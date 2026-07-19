@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
-use rhiza_kv::{encode_replicated_kv_batch, encode_replicated_kv_command};
+use rhiza_kv::{encode_replicated_kv_batch, encode_replicated_kv_command, MAX_KV_VALUE_BYTES};
 use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, CheckpointCoordinator,
@@ -44,12 +44,13 @@ fn kv_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
     drop(runtime);
 
     let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
+    let reopened_read = reopened
+        .get_kv(b"key", ReadConsistency::ReadBarrier)
+        .unwrap();
+    assert_eq!(reopened_read.value, Some(b"value".to_vec()));
     assert_eq!(
-        reopened
-            .get_kv(b"key", ReadConsistency::Local)
-            .unwrap()
-            .value,
-        Some(b"value".to_vec())
+        (reopened_read.applied_index, reopened_read.hash),
+        (written.applied_index(), written.hash())
     );
 }
 
@@ -62,7 +63,7 @@ fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
         &[],
     )
     .unwrap();
-    runtime
+    let written = runtime
         .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
         .unwrap();
 
@@ -71,8 +72,10 @@ fn kv_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
         .unwrap();
 
     assert_eq!(read.value, Some(b"value".to_vec()));
-    assert_eq!(read.applied_index, 2);
-    assert_eq!(read.hash, runtime.applied_hash().unwrap());
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (written.applied_index(), written.hash())
+    );
 }
 
 #[test]
@@ -125,7 +128,7 @@ fn kv_scan_pages_ranges_and_prefixes_with_the_exact_snapshot_tip() {
             .collect::<Vec<_>>(),
         vec![b"a".as_slice(), b"aa".as_slice()]
     );
-    assert_eq!(prefix.tip().applied_index(), 4);
+    assert_eq!(prefix.tip().applied_index(), 3);
     assert_eq!(prefix.tip().applied_hash(), runtime.applied_hash().unwrap());
 }
 
@@ -201,8 +204,8 @@ async fn kv_http_routes_use_base64_and_map_invalid_input_without_mutating_state(
     assert!(get.status().is_success());
     let get = get.json::<KvGetResponse>().await.unwrap();
     assert_eq!(get.value.as_deref(), Some("dmFsdWU="));
-    assert_eq!(get.applied_index, 2);
-    assert_ne!(get.hash, put.hash);
+    assert_eq!(get.applied_index, 1);
+    assert_eq!(get.hash, put.hash);
 
     let second_put = client
         .post(&put_url)
@@ -236,7 +239,7 @@ async fn kv_http_routes_use_base64_and_map_invalid_input_without_mutating_state(
     assert_eq!(scan.entries[0].key, "a2V5");
     assert_eq!(scan.entries[0].value, "dmFsdWU=");
     assert_eq!(scan.next_cursor.as_deref(), Some("a2V5"));
-    assert_eq!(scan.applied_index, 3);
+    assert_eq!(scan.applied_index, 2);
 
     for invalid in [
         serde_json::json!({"prefix":"a2V5", "start":"aQ=="}),
@@ -290,14 +293,10 @@ async fn largest_node_valid_kv_record_scans_without_latching_readiness() {
     });
     let request_id = "largest-http";
     let key = b"k";
-    let empty = KvCommandV1::put(request_id, key.to_vec(), Vec::new()).unwrap();
-    let overhead = encode_replicated_kv_command(&empty).unwrap().len();
-    let value = vec![b'v'; MAX_COMMAND_BYTES - overhead];
+    let value = vec![b'v'; MAX_KV_VALUE_BYTES];
     let command = KvCommandV1::put(request_id, key.to_vec(), value.clone()).unwrap();
-    assert_eq!(
-        encode_replicated_kv_command(&command).unwrap().len(),
-        MAX_COMMAND_BYTES
-    );
+    assert_eq!(value.len(), MAX_KV_VALUE_BYTES);
+    assert!(encode_replicated_kv_command(&command).unwrap().len() <= MAX_COMMAND_BYTES);
     let client = reqwest::Client::new();
 
     let put = post_kv_put(
@@ -447,7 +446,7 @@ async fn kv_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
             .unwrap();
     });
     let client = reqwest::Client::new();
-    let value = vec![0; 66 * 1024];
+    let value = vec![0; 130 * 1024];
     let commands = (0..4)
         .map(|index| {
             KvCommandV1::put(

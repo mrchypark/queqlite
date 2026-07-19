@@ -31,7 +31,6 @@ pub type Priority = u128;
 const RECORDER_STATE_VERSION: u16 = 4;
 const CONFIGURATION_STATE_VERSION: u16 = 3;
 const RECORD_WORKER_QUEUE_CAPACITY: usize = 1;
-const PROOF_WORKER_QUEUE_CAPACITY: usize = 1;
 const CONTROL_WORKER_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +60,7 @@ pub enum Error {
     RandomnessUnavailable(String),
     RecorderRootLocked(PathBuf),
     Rejected(RejectReason),
+    ReadFenceUnsupported,
     TypedProofInstallRequired,
     TypedRecordRequired,
 }
@@ -100,6 +100,9 @@ impl fmt::Display for Error {
                 write!(f, "recorder root is already owned: {}", root.display())
             }
             Self::Rejected(reason) => write!(f, "QuePaxa recorder rejected request: {reason:?}"),
+            Self::ReadFenceUnsupported => {
+                write!(f, "recorder does not implement context-bound read fences")
+            }
             Self::TypedProofInstallRequired => {
                 write!(
                     f,
@@ -698,6 +701,70 @@ pub struct RecordSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ReadFenceRequest {
+    pub cluster_id: ClusterId,
+    pub epoch: Epoch,
+    pub config_id: ConfigId,
+    pub config_digest: LogHash,
+    pub slot: Slot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ReadFenceSlotState {
+    Empty,
+    /// The exact slot is present, or a durable later slot proves that this
+    /// recorder has already crossed the requested position. A crossed gap has
+    /// no exact summary and must therefore fail closed as pending.
+    Occupied {
+        summary: Option<Box<RecordSummary>>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ReadFenceObservation {
+    pub recorder_id: NodeId,
+    pub cluster_id: ClusterId,
+    pub epoch: Epoch,
+    pub config_id: ConfigId,
+    pub config_digest: LogHash,
+    pub slot: Slot,
+    pub max_head: Option<Slot>,
+    pub slot_state: ReadFenceSlotState,
+}
+
+fn valid_read_fence_observation(
+    observation: &ReadFenceObservation,
+    expected_recorder_id: &str,
+    request: &ReadFenceRequest,
+) -> bool {
+    if observation.recorder_id != expected_recorder_id
+        || observation.cluster_id != request.cluster_id
+        || observation.epoch != request.epoch
+        || observation.config_id != request.config_id
+        || observation.config_digest != request.config_digest
+        || observation.slot != request.slot
+    {
+        return false;
+    }
+    match &observation.slot_state {
+        ReadFenceSlotState::Empty => observation
+            .max_head
+            .is_none_or(|max_head| max_head < request.slot),
+        ReadFenceSlotState::Occupied { summary } => {
+            observation
+                .max_head
+                .is_some_and(|max_head| max_head >= request.slot)
+                && summary.as_ref().is_none_or(|summary| {
+                    summary.recorder_id == observation.recorder_id
+                        && summary.slot == request.slot
+                        && summary.config_id == request.config_id
+                        && summary.config_digest == request.config_digest
+                })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RecordResponse {
     pub from: NodeId,
     pub slot: Slot,
@@ -1095,7 +1162,9 @@ const RECORDED_HEAD_MAGIC: &[u8; 4] = b"QRHD";
 const RECORDED_HEAD_VERSION: u16 = 3;
 const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";
 const RECORDER_WAL_VERSION: u16 = 1;
-const RECORDER_WAL_SOFT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
+// Keep rotation bounded while allowing 512 KiB replicated commands to amortize
+// quorum fsyncs without forcing a synchronous checkpoint every few dozen slots.
+const RECORDER_WAL_SOFT_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 #[cfg(not(test))]
 const RECORDER_WAL_HARD_FRAME_LIMIT: u64 = 1_024;
 #[cfg(test)]
@@ -1179,15 +1248,6 @@ enum RecordedHeadProvenance {
 }
 
 pub trait RecorderRpc: Send + Sync {
-    /// Compatibility hook for the pre-typed recorder protocol.
-    #[doc(hidden)]
-    fn call(&self, _request: RecorderRequest) -> Result<RecorderReply> {
-        Err(Error::MigrationRequired {
-            format: "recorder transport",
-            version: 1,
-        })
-    }
-
     /// Performs one genuine QuePaxa Record operation.
     ///
     /// Network implementations must enforce a finite deadline and return an
@@ -1213,12 +1273,18 @@ pub trait RecorderRpc: Send + Sync {
         Err(Error::TypedRecordRequired)
     }
 
-    fn uses_typed_protocol(&self) -> bool {
+    /// Whether this recorder can atomically bind an exact slot observation to
+    /// the durable maximum accepted-or-decided head and the requested config.
+    fn supports_context_read_fence(&self) -> bool {
         false
     }
 
+    fn observe_read_fence(&self, _request: ReadFenceRequest) -> Result<ReadFenceObservation> {
+        Err(Error::ReadFenceUnsupported)
+    }
+
     fn recorder_id(&self) -> Result<NodeId> {
-        Ok(self.call(RecorderRequest::Identity)?.recorder_id)
+        Err(Error::TypedRecordRequired)
     }
 
     fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
@@ -1234,15 +1300,15 @@ pub trait RecorderRpc: Send + Sync {
         command_hash: LogHash,
         command: StoredCommand,
     ) -> Result<()> {
-        self.call(RecorderRequest::StoreCommand {
+        let _ = (
             cluster_id,
             epoch,
             config_id,
             config_digest,
             command_hash,
             command,
-        })?;
-        Ok(())
+        );
+        Err(Error::TypedRecordRequired)
     }
 
     fn fetch_command(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
@@ -1257,15 +1323,8 @@ pub trait RecorderRpc: Send + Sync {
         config_digest: LogHash,
         command_hash: LogHash,
     ) -> Result<Option<StoredCommand>> {
-        Ok(self
-            .call(RecorderRequest::FetchCommand {
-                cluster_id,
-                epoch,
-                config_id,
-                config_digest,
-                command_hash,
-            })?
-            .command)
+        let _ = (cluster_id, epoch, config_id, config_digest, command_hash);
+        Err(Error::TypedRecordRequired)
     }
 }
 
@@ -2989,8 +3048,12 @@ pub struct ThreeNodeConsensus {
     membership: FixedMembership,
     recorders: Vec<Arc<dyn RecorderRpc>>,
     record_workers: Vec<RecordWorker>,
-    proof_workers: Vec<ProofWorker>,
     control_workers: Vec<ControlWorker>,
+    // Read fences must not queue behind recovery/control RPCs whose network
+    // deadline is intentionally longer. A lost majority can otherwise occupy
+    // two control workers and turn a read-only quorum check into the caller's
+    // HTTP timeout instead of a prompt Unavailable result.
+    read_fence_workers: Vec<ControlWorker>,
     priority_source: Arc<dyn PrioritySource>,
     proposal_sequence: AtomicU64,
     legacy_tip: Mutex<SingleNodeState>,
@@ -3099,17 +3162,6 @@ impl Drop for RecordWorker {
     }
 }
 
-struct ProofJob {
-    proof: DecisionProof,
-    command: StoredCommand,
-}
-
-struct ProofWorker {
-    sender: Option<std::sync::mpsc::SyncSender<ProofJob>>,
-    handle: Option<thread::JoinHandle<()>>,
-    pending: Arc<AtomicUsize>,
-}
-
 enum ControlJob {
     InstallProof {
         index: usize,
@@ -3122,15 +3174,15 @@ enum ControlJob {
         slot: Slot,
         result: std::sync::mpsc::SyncSender<(usize, Result<Option<DecisionProof>>)>,
     },
-    LegacyInspect {
-        index: usize,
-        request: RecorderRequest,
-        result: std::sync::mpsc::SyncSender<(usize, Result<RecorderReply>)>,
-    },
     InspectSummary {
         index: usize,
         slot: Slot,
         result: std::sync::mpsc::SyncSender<(usize, Result<Option<RecordSummary>>)>,
+    },
+    ObserveReadFence {
+        index: usize,
+        request: ReadFenceRequest,
+        result: std::sync::mpsc::SyncSender<(usize, Result<ReadFenceObservation>)>,
     },
     StoreCommand {
         index: usize,
@@ -3173,20 +3225,20 @@ impl ControlJob {
                 let reply = control_rpc(|| recorder.inspect_decision_proof(slot));
                 let _ = result.send((index, reply));
             }
-            Self::LegacyInspect {
-                index,
-                request,
-                result,
-            } => {
-                let reply = control_rpc(|| recorder.call(request));
-                let _ = result.send((index, reply));
-            }
             Self::InspectSummary {
                 index,
                 slot,
                 result,
             } => {
                 let reply = control_rpc(|| recorder.inspect_record_summary(slot));
+                let _ = result.send((index, reply));
+            }
+            Self::ObserveReadFence {
+                index,
+                request,
+                result,
+            } => {
+                let reply = control_rpc(|| recorder.observe_read_fence(request));
                 let _ = result.send((index, reply));
             }
             Self::StoreCommand {
@@ -3242,10 +3294,10 @@ impl ControlJob {
             Self::InspectProof { index, result, .. } => {
                 let _ = result.send((index, Err(error)));
             }
-            Self::LegacyInspect { index, result, .. } => {
+            Self::InspectSummary { index, result, .. } => {
                 let _ = result.send((index, Err(error)));
             }
-            Self::InspectSummary { index, result, .. } => {
+            Self::ObserveReadFence { index, result, .. } => {
                 let _ = result.send((index, Err(error)));
             }
             Self::FetchCommand { index, result, .. } => {
@@ -3264,76 +3316,6 @@ struct ControlWorker {
     sender: Option<std::sync::mpsc::SyncSender<ControlJob>>,
     handle: Option<thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
-}
-
-impl ProofWorker {
-    fn spawn(recorder: Arc<dyn RecorderRpc>, membership: Membership) -> Result<Self> {
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<ProofJob>(PROOF_WORKER_QUEUE_CAPACITY);
-        let pending = Arc::new(AtomicUsize::new(0));
-        let worker_pending = Arc::clone(&pending);
-        let handle = thread::Builder::new()
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let (_, epoch, config_id, config_digest) = proof_context(&job.proof);
-                        let Some(value) = job.proof.proposal().value.as_ref() else {
-                            return;
-                        };
-                        if recorder
-                            .store_command_for(
-                                proof_cluster_id(&job.proof).to_owned(),
-                                epoch,
-                                config_id,
-                                config_digest,
-                                value.command_hash,
-                                job.command,
-                            )
-                            .is_ok()
-                        {
-                            let _ = recorder.install_decision_proof(job.proof, &membership);
-                        }
-                    }));
-                    worker_pending.fetch_sub(1, Ordering::Release);
-                }
-            })
-            .map_err(|error| Error::Io(error.to_string()))?;
-        Ok(Self {
-            sender: Some(sender),
-            handle: Some(handle),
-            pending,
-        })
-    }
-
-    fn dispatch(&self, job: ProofJob) {
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        let accepted = self
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(job).is_ok());
-        if !accepted {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending.load(Ordering::Acquire) == 0
-    }
-
-    fn shutdown(&mut self) {
-        self.sender.take();
-        if let Some(handle) = self.handle.take() {
-            if self.pending.load(Ordering::Acquire) == 0 || handle.is_finished() {
-                let _ = handle.join();
-            }
-        }
-    }
-}
-
-impl Drop for ProofWorker {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3500,27 +3482,25 @@ impl Drop for ThreeNodeConsensus {
         for worker in &mut self.record_workers {
             worker.shutdown();
         }
-        for worker in &mut self.proof_workers {
+        for worker in &mut self.control_workers {
             worker.shutdown();
         }
-        for worker in &mut self.control_workers {
+        for worker in &mut self.read_fence_workers {
             worker.shutdown();
         }
     }
 }
 
 impl ThreeNodeConsensus {
-    /// Waits up to `timeout` for accepted recorder, proof, and control RPC jobs.
-    /// Returns `true` when all three worker sets are idle. Best-effort proof jobs
-    /// dropped because their queue was full are not tracked.
+    /// Waits up to `timeout` for accepted recorder and control RPC jobs.
     /// Callers must first quiesce proposal admission and ensure no proposal
     /// can still dispatch jobs; this only drains already accepted jobs.
     pub fn finish_pending_rpcs(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
             if self.record_workers.iter().all(RecordWorker::is_idle)
-                && self.proof_workers.iter().all(ProofWorker::is_idle)
                 && self.control_workers.iter().all(ControlWorker::is_idle)
+                && self.read_fence_workers.iter().all(ControlWorker::is_idle)
             {
                 return true;
             }
@@ -3695,11 +3675,12 @@ impl ThreeNodeConsensus {
                 RecordWorker::spawn(recorder_id, Arc::clone(recorder), config_id, config_digest)
             })
             .collect::<Result<Vec<_>>>()?;
-        let proof_workers = recorders
-            .iter()
-            .map(|recorder| ProofWorker::spawn(Arc::clone(recorder), membership.clone()))
-            .collect::<Result<Vec<_>>>()?;
         let control_workers = recorders
+            .iter()
+            .cloned()
+            .map(ControlWorker::spawn)
+            .collect::<Result<Vec<_>>>()?;
+        let read_fence_workers = recorders
             .iter()
             .cloned()
             .map(ControlWorker::spawn)
@@ -3713,8 +3694,8 @@ impl ThreeNodeConsensus {
             membership,
             recorders,
             record_workers,
-            proof_workers,
             control_workers,
+            read_fence_workers,
             priority_source: Arc::new(OsPrioritySource),
             proposal_sequence: AtomicU64::new(1),
             legacy_tip: Mutex::new(SingleNodeState {
@@ -4190,19 +4171,6 @@ impl ThreeNodeConsensus {
                 .ok_or(Error::CommandUnavailable)?,
         };
         if command.entry_type != EntryType::ConfigChange && !transition_involved {
-            let Some((last_worker, other_workers)) = self.proof_workers.split_last() else {
-                return Err(Error::NoQuorum);
-            };
-            for worker in other_workers {
-                worker.dispatch(ProofJob {
-                    proof: proof.clone(),
-                    command: command.clone(),
-                });
-            }
-            last_worker.dispatch(ProofJob {
-                proof: proof.clone(),
-                command,
-            });
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;
@@ -4370,6 +4338,14 @@ impl ThreeNodeConsensus {
                 },
             );
         }
+        self.select_decision_proof(slot, proofs)
+    }
+
+    fn select_decision_proof(
+        &self,
+        slot: Slot,
+        mut proofs: Vec<DecisionProof>,
+    ) -> Result<Option<DecisionProof>> {
         for proof in &proofs {
             if proof_cluster_id(proof) != self.cluster_id {
                 return Err(Error::Rejected(RejectReason::WrongCluster));
@@ -4401,53 +4377,68 @@ impl ThreeNodeConsensus {
         Ok(proofs.pop())
     }
 
+    fn certified_inspection_from_proof(
+        &self,
+        slot: Slot,
+        prev_hash: LogHash,
+        proof: DecisionProof,
+    ) -> Result<CertifiedDecisionInspection> {
+        let decision = certificate_from_proof(&proof)?;
+        self.ensure_predecessor(slot, prev_hash, decision.value.prev_hash)?;
+        let Some(command) = self.fetch_verified_value(slot, &decision.value)? else {
+            return Ok(CertifiedDecisionInspection::Unavailable);
+        };
+        if command.entry_type == EntryType::ConfigChange {
+            self.install_decision_proof_quorum(proof.clone())?;
+        }
+        let entry = self.log_entry_from_value(slot, command, &decision.value)?;
+        Ok(CertifiedDecisionInspection::Committed(Box::new(
+            CertifiedDecision {
+                entry,
+                certificate: decision,
+                proof,
+            },
+        )))
+    }
+
     pub fn inspect_certified_decision_at(
         &self,
         slot: Slot,
         prev_hash: LogHash,
     ) -> Result<CertifiedDecisionInspection> {
-        if let Some(proof) = self.inspect_decision_proof_at(slot)? {
-            let decision = certificate_from_proof(&proof)?;
-            self.ensure_predecessor(slot, prev_hash, decision.value.prev_hash)?;
-            let Some(command) = self.fetch_verified_value(slot, &decision.value)? else {
-                return Ok(CertifiedDecisionInspection::Unavailable);
-            };
-            if command.entry_type == EntryType::ConfigChange {
-                self.install_decision_proof_quorum(proof.clone())?;
-            }
-            let entry = self.log_entry_from_value(slot, command, &decision.value)?;
-            return Ok(CertifiedDecisionInspection::Committed(Box::new(
-                CertifiedDecision {
-                    entry,
-                    certificate: decision,
-                    proof,
-                },
-            )));
-        }
-        if self
-            .recorders
+        self.inspect_typed_record_summaries(slot, prev_hash)
+    }
+
+    pub fn supports_context_read_fence(&self) -> bool {
+        self.recorders
             .iter()
-            .all(|recorder| recorder.uses_typed_protocol())
-        {
-            return self.inspect_typed_record_summaries(slot, prev_hash);
+            .all(|recorder| recorder.supports_context_read_fence())
+    }
+
+    /// Observes whether `slot` is still empty at a quorum of recorders without
+    /// mutating durable state. Any occupied or ambiguous quorum is delegated to
+    /// the existing certified inspection path and can never become Empty.
+    pub fn inspect_context_read_fence_at(
+        &self,
+        slot: Slot,
+        prev_hash: LogHash,
+    ) -> Result<CertifiedDecisionInspection> {
+        if !self.supports_context_read_fence() {
+            return Err(Error::ReadFenceUnsupported);
         }
-        // Compatibility inspection may classify an undecided legacy slot, but
-        // never supplies a production decision or certificate.
         let quorum = self.membership.quorum_size();
-        let request = RecorderRequest::Inspect {
+        let total = self.read_fence_workers.len();
+        let request = ReadFenceRequest {
             cluster_id: self.cluster_id.clone(),
             epoch: self.epoch,
             config_id: self.config_id,
             config_digest: self.config_digest,
             slot,
         };
-        let config_id = self.config_id;
-        let config_digest = self.config_digest;
-        let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
         let mut saturated = 0;
-        for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::LegacyInspect {
+        for (index, worker) in self.read_fence_workers.iter().enumerate() {
+            if worker.dispatch(ControlJob::ObserveReadFence {
                 index,
                 request: request.clone(),
                 result: sender.clone(),
@@ -4457,39 +4448,48 @@ impl ThreeNodeConsensus {
             }
         }
         drop(sender);
-        let mut replies = Vec::with_capacity(quorum);
+        let mut successful = 0_usize;
+        let mut empty = 0_usize;
         let mut worker_failed = false;
+        let mut received = 0_usize;
         for (index, result) in receiver {
+            received += 1;
             match result {
-                Ok(reply)
-                    if reply.recorder_id == self.membership.members()[index]
-                        && reply.slot == slot
-                        && reply.config_id == config_id
-                        && reply.config_digest == config_digest =>
+                Ok(observation)
+                    if valid_read_fence_observation(
+                        &observation,
+                        &self.membership.members()[index],
+                        &request,
+                    ) =>
                 {
-                    replies.push(reply);
+                    successful += 1;
+                    if observation.slot_state == ReadFenceSlotState::Empty {
+                        empty += 1;
+                        if empty >= quorum {
+                            return Ok(CertifiedDecisionInspection::Empty);
+                        }
+                    }
                 }
                 Err(Error::ProposeFailed) => worker_failed = true,
                 Ok(_) | Err(_) => {}
             }
-            if replies.len() >= quorum {
-                break;
+            let remaining = total.saturating_sub(received);
+            if successful.saturating_add(remaining) < quorum {
+                return Ok(CertifiedDecisionInspection::Unavailable);
             }
         }
-        if replies.len() < quorum {
-            if worker_failed && !control_quorum_reachable(replies.len(), saturated, quorum) {
+        if successful < quorum {
+            if worker_failed && !control_quorum_reachable(successful, saturated, quorum) {
                 return Err(Error::ProposeFailed);
             }
             return Ok(CertifiedDecisionInspection::Unavailable);
         }
-        if replies
-            .iter()
-            .any(|reply| reply.highest_promised.is_some() || reply.accepted.is_some())
-        {
-            Ok(CertifiedDecisionInspection::Pending)
-        } else {
-            Ok(CertifiedDecisionInspection::Empty)
-        }
+        Ok(match self.inspect_certified_decision_at(slot, prev_hash)? {
+            // An occupied fence quorum cannot be weakened by the legacy typed
+            // summary path's context-free absence classification.
+            CertifiedDecisionInspection::Empty => CertifiedDecisionInspection::Pending,
+            inspection => inspection,
+        })
     }
 
     fn inspect_typed_record_summaries(
@@ -4534,7 +4534,12 @@ impl ThreeNodeConsensus {
                 Ok(_) | Err(_) => {}
             }
             if successful >= quorum {
-                break;
+                if summaries.is_empty() {
+                    return Ok(CertifiedDecisionInspection::Empty);
+                }
+                if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
+                    return self.certified_inspection_from_proof(slot, prev_hash, proof);
+                }
             }
         }
         if successful < quorum {
@@ -4546,8 +4551,28 @@ impl ThreeNodeConsensus {
         if summaries.is_empty() {
             return Ok(CertifiedDecisionInspection::Empty);
         }
+        if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
+            return self.certified_inspection_from_proof(slot, prev_hash, proof);
+        }
+        Ok(CertifiedDecisionInspection::Pending)
+    }
+
+    fn proof_from_record_summaries(
+        &self,
+        slot: Slot,
+        summaries: &[RecordSummary],
+    ) -> Result<Option<DecisionProof>> {
+        let quorum = self.membership.quorum_size();
+        let mut summaries = summaries.to_vec();
         summaries.sort_by(|left, right| left.recorder_id.cmp(&right.recorder_id));
         summaries.dedup_by(|left, right| left.recorder_id == right.recorder_id);
+        let installed_proofs = summaries
+            .iter()
+            .filter_map(|summary| summary.decided.clone())
+            .collect();
+        if let Some(proof) = self.select_decision_proof(slot, installed_proofs)? {
+            return Ok(Some(proof));
+        }
         for step in summaries
             .iter()
             .map(|summary| summary.step)
@@ -4596,42 +4621,33 @@ impl ThreeNodeConsensus {
                         proposal,
                         summaries: proof_summaries.clone(),
                     })
+            } else if step % 4 == 2 {
+                step_summaries
+                    .iter()
+                    .filter_map(|summary| summary.aggregate_prior.clone())
+                    .max()
+                    .map(|proposal| DecisionProof::Phase2 {
+                        cluster_id: self.cluster_id.clone(),
+                        slot,
+                        epoch: self.epoch,
+                        config_id: self.config_id,
+                        config_digest: self.config_digest,
+                        step,
+                        proposal,
+                        summaries: proof_summaries.clone(),
+                    })
             } else {
                 None
             };
             let Some(proof) = proof else {
                 continue;
             };
-            if proof
-                .validate_for_cluster(
-                    &self.cluster_id,
-                    slot,
-                    self.epoch,
-                    self.config_id,
-                    &self.membership,
-                )
-                .is_err()
-            {
+            let Ok(Some(proof)) = self.select_decision_proof(slot, vec![proof]) else {
                 continue;
-            }
-            let decision = certificate_from_proof(&proof)?;
-            self.ensure_predecessor(slot, prev_hash, decision.value.prev_hash)?;
-            let Some(command) = self.fetch_verified_value(slot, &decision.value)? else {
-                return Ok(CertifiedDecisionInspection::Unavailable);
             };
-            if command.entry_type == EntryType::ConfigChange {
-                self.install_decision_proof_quorum(proof.clone())?;
-            }
-            let entry = self.log_entry_from_value(slot, command, &decision.value)?;
-            return Ok(CertifiedDecisionInspection::Committed(Box::new(
-                CertifiedDecision {
-                    entry,
-                    certificate: decision,
-                    proof,
-                },
-            )));
+            return Ok(Some(proof));
         }
-        Ok(CertifiedDecisionInspection::Pending)
+        Ok(None)
     }
 
     pub fn recover_decision_at(
@@ -4887,10 +4903,6 @@ pub enum CertifiedDecisionInspection {
 }
 
 impl RecorderRpc for RecorderFileStore {
-    fn call(&self, request: RecorderRequest) -> Result<RecorderReply> {
-        self.apply(request)
-    }
-
     fn recorder_id(&self) -> Result<NodeId> {
         Ok(self.recorder_id.clone())
     }
@@ -4931,16 +4943,113 @@ impl RecorderRpc for RecorderFileStore {
         )))
     }
 
-    fn uses_typed_protocol(&self) -> bool {
+    fn supports_context_read_fence(&self) -> bool {
         true
+    }
+
+    fn observe_read_fence(&self, request: ReadFenceRequest) -> Result<ReadFenceObservation> {
+        let _guard = self
+            .sync
+            .lock()
+            .map_err(|_| Error::Io("recorder lock poisoned".into()))?;
+        self.recover_intent()?;
+        if request.cluster_id != self.cluster_id {
+            return Err(Error::Rejected(RejectReason::WrongCluster));
+        }
+        if request.epoch != self.epoch {
+            return Err(Error::Rejected(if request.epoch < self.epoch {
+                RejectReason::StaleEpoch
+            } else {
+                RejectReason::FutureEpoch
+            }));
+        }
+        let configuration = self.configuration_state()?;
+        if request.config_id != configuration.config_id
+            || request.config_digest != configuration.config_digest
+        {
+            return Err(Error::Rejected(RejectReason::WrongConfig));
+        }
+        let max_head = configuration.max_accepted_or_decided_slot;
+        let exists_in_wal = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?
+            .slots
+            .contains_key(&request.slot);
+        let exact_exists = exists_in_wal || self.path(request.slot).exists();
+        let summary = if exact_exists {
+            let state = self.load_unlocked(request.slot, configuration.config_digest)?;
+            Some(Box::new(record_summary(
+                &self.recorder_id,
+                &state,
+                state.decision_proof().cloned(),
+            )))
+        } else {
+            None
+        };
+        let slot_state =
+            if summary.is_none() && max_head.is_none_or(|max_head| max_head < request.slot) {
+                ReadFenceSlotState::Empty
+            } else {
+                ReadFenceSlotState::Occupied { summary }
+            };
+        Ok(ReadFenceObservation {
+            recorder_id: self.recorder_id.clone(),
+            cluster_id: request.cluster_id,
+            epoch: request.epoch,
+            config_id: request.config_id,
+            config_digest: request.config_digest,
+            slot: request.slot,
+            max_head,
+            slot_state,
+        })
     }
 
     fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
         RecorderFileStore::store_command(self, command_hash, command)
     }
 
+    fn store_command_for(
+        &self,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> Result<()> {
+        self.apply(RecorderRequest::StoreCommand {
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        })?;
+        Ok(())
+    }
+
     fn fetch_command(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
         RecorderFileStore::fetch_command(self, command_hash)
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> Result<Option<StoredCommand>> {
+        Ok(self
+            .apply(RecorderRequest::FetchCommand {
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+            })?
+            .command)
     }
 }
 
@@ -6388,23 +6497,24 @@ mod tests {
     use super::{
         command_file_reads, decode_wal_frame, encode_stored_command, encode_wal_frame,
         last_file_sync_kind, reset_command_file_reads, reset_sync_counts, sync_counts,
-        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, ConfigChange,
-        ConfigurationState, Consensus, ControlDispatch, ControlJob, DecisionProof, DriveOutcome,
-        Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
-        ProposerProgress, RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore,
-        RecorderRequest, RecorderRpc, RecorderSlotState, RecorderSummary, RejectReason,
-        SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue,
+        CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus, ControlDispatch,
+        ControlJob, DecisionInspection, DecisionProof, DriveOutcome, Error, FileSyncKind,
+        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
+        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+        RecordedHeadProvenance, RecorderFileStore, RecorderRequest, RecorderRpc, RecorderSlotState,
+        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeSet, HashMap, HashSet},
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Condvar, Mutex,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     fn record_requests(consensus: &ThreeNodeConsensus, slot: u64) -> Vec<RecordRequest> {
@@ -6480,6 +6590,13 @@ mod tests {
         release_first: Mutex<mpsc::Receiver<()>>,
     }
 
+    struct BlockingInspectionReadFenceRecorder {
+        recorder_id: &'static str,
+        block_inspection: bool,
+        started: mpsc::SyncSender<&'static str>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
     struct BlockingCommandStoreRecorder {
         started: mpsc::SyncSender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
@@ -6548,6 +6665,40 @@ mod tests {
                 self.release_first.lock().unwrap().recv().unwrap();
             }
             Ok(None)
+        }
+    }
+
+    impl RecorderRpc for BlockingInspectionReadFenceRecorder {
+        fn inspect_record_summary(&self, _slot: u64) -> super::Result<Option<RecordSummary>> {
+            if self.block_inspection {
+                self.started.send(self.recorder_id).unwrap();
+                let (released, condition) = &*self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            Ok(None)
+        }
+
+        fn supports_context_read_fence(&self) -> bool {
+            true
+        }
+
+        fn observe_read_fence(
+            &self,
+            request: ReadFenceRequest,
+        ) -> super::Result<ReadFenceObservation> {
+            Ok(ReadFenceObservation {
+                recorder_id: self.recorder_id.into(),
+                cluster_id: request.cluster_id,
+                epoch: request.epoch,
+                config_id: request.config_id,
+                config_digest: request.config_digest,
+                slot: request.slot,
+                max_head: None,
+                slot_state: ReadFenceSlotState::Empty,
+            })
         }
     }
 
@@ -7982,6 +8133,53 @@ mod tests {
         assert_eq!(replies.len(), 2);
 
         release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn blocked_control_majority_does_not_head_of_line_block_read_fence() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let recorders = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|recorder_id| {
+                (
+                    recorder_id.into(),
+                    Box::new(BlockingInspectionReadFenceRecorder {
+                        recorder_id,
+                        block_inspection: recorder_id != "n3",
+                        started: started_tx.clone(),
+                        release: Arc::clone(&release),
+                    }) as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap(),
+        );
+        let inspecting = Arc::clone(&consensus);
+        let inspection = thread::spawn(move || inspecting.inspect_decision_at(1, LogHash::ZERO));
+        let mut started = BTreeSet::new();
+        started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(started, BTreeSet::from(["n1", "n2"]));
+
+        let before = Instant::now();
+        assert_eq!(
+            consensus
+                .inspect_context_read_fence_at(1, LogHash::ZERO)
+                .unwrap(),
+            CertifiedDecisionInspection::Empty
+        );
+        assert!(before.elapsed() < Duration::from_millis(250));
+
+        let (released, condition) = &*release;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        assert_eq!(
+            inspection.join().unwrap().unwrap(),
+            DecisionInspection::Empty
+        );
         assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 

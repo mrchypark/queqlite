@@ -242,11 +242,30 @@ replays the original result rather than executing the SQL again.
 
 `/v1/sql/query` accepts one read-only statement and supports `local`, applied-
 index, and quorum read-barrier consistency. QSQL v2 is only the client request
-encoding. Replication uses QWAL v1: the request runs once on an exact-base
-staging copy, and the qlog carries canonical final page images bound to the
-base index, hash, database digest, request digest, persisted result, and
-executor fingerprint. If another command wins the proposed slot, the effect
-is regenerated from the new base. Inline effects are capped at 256 KiB.
+encoding. Replication uses QWAL v2: one canonical envelope can contain 1 to 1,024
+ordered successful receipts at one shared qlog anchor. Each public typed call is
+still bounded to 256 members and 512 KiB of aggregate canonical encoded input.
+The runtime's bounded FIFO group-commit queue can combine concurrent whole calls
+into one physical page effect. Pending jobs have a fixed 32 MiB encoded-byte
+budget; one active physical group is capped at 2 MiB and 1,024 members. The
+runtime coalesces an eligible prefix of single-statement commands. Each member
+runs under a savepoint, so a failed member is rolled back without
+discarding earlier successes or preventing later members. Multi-statement
+commands retain their one-command transaction boundary. The envelope binds the
+ordered successful receipt subset, shared base and target digests, final page
+images, and executor fingerprint into one canonical payload. An all-failed
+batch proposes nothing.
+
+Exact duplicates in one batch alias the first result. A stored exact retry
+returns its original result and anchor; the same request ID with different
+bytes is a conflict. If another payload wins the proposed slot, Rhiza applies
+that winner, rechecks stored receipts, and prepares the remaining requests from
+the new exact base. An effect that exceeds the 512 KiB command cap is retried
+with a halved prefix until it fits or one command alone is rejected. Receipt and
+request-ID duplicate validation uses pre-sized `HashSet`s in one pass rather
+than rescanning every preceding member. QWAL v2, the current generation-3
+control sidecar, and generation-3 `QSNP` snapshots require a clean installation:
+older files and payloads fail closed, with no migration or rolling dual decoder.
 
 Read-only SQL runs only against the selected local materialization, so it may
 use nondeterministic and runtime-introspection functions such as `random()`,
@@ -299,11 +318,14 @@ and `RETURNING` responses are bounded by server row and byte limits.
 
 SQLite storage is QWAL-only. A canonical user database must be paired with its
 mandatory `.control` sidecar; legacy `__rhiza_meta` databases and old
-QSQL/QEFX/qlog histories are not upgraded or dual-decoded. Upgrade by stopping
-the old writers and bootstrapping every voter from one trusted QSNP snapshot.
+QSQL/QEFX/qlog histories are not upgraded, migrated, or dual-decoded. Install
+the current generation into empty data directories; same-generation `QSNP`
+restore is recovery, not an upgrade path.
 The recording VFS currently runs in staging shadow/audit mode, while full
-closed-file page diff and target digest verification remain the correctness
-path.
+closed-file page diff remains the correctness path. Preparation computes the
+target digest during that same complete target scan. Apply-time base/target
+digest validation, file sync, owned-inode checks, atomic rename, parent-directory
+sync, and receipt/control commit remain unchanged.
 
 Recovery metadata uses QANC v3 and binds the recovery generation,
 configuration state, snapshot identity, and executor fingerprint. A mismatch
@@ -311,6 +333,9 @@ is rejected during recovery rather than replayed best-effort.
 
 The message-level comparison with Hiqlite and the bounded effect-replication
 contract are documented in [`docs/hiqlite-sql-message-review.md`](docs/hiqlite-sql-message-review.md).
+The measured 3-peer `emptyDir` / no-PVC failure matrix and operator recovery
+steps are documented in
+[`docs/three-peer-emptydir-recovery-2026-07-19.md`](docs/three-peer-emptydir-recovery-2026-07-19.md).
 
 ## rhiza graph and rhiza kv HTTP APIs
 
@@ -441,11 +466,32 @@ scan by sending the returned cursor with the same prefix or range.
 
 ## Write batching and the Recorder fast path
 
-The HTTP writer queue coalesces concurrent requests for up to eight members or
-500 microseconds by default. Graph and KV members are encoded as one canonical,
-ordered replicated batch, committed in one qlog entry, and applied atomically
-while retaining an independent request ID and retry result for every member.
-Oversized batches fall back to individual proposals.
+Graph public typed batches remain capped at 64 members. KV public typed batches
+are capped at 256 members. For KV, direct
+`NodeRuntime::mutate_kv`/`mutate_kv_batch` calls and the corresponding embedded
+`RhizaHandle` methods enter a bounded FIFO group-commit queue. It retains at
+most 64 public calls and 32 MiB of canonical member bytes. The default 500
+microsecond quiet period restarts when another call arrives, but a hard deadline
+of four quiet periods bounds collection latency. The queue drains at most 1,024
+members into one active group.
+The internal replicated KV batch uses wire command version 3, while the redb
+materializer fingerprint is domain v2.
+
+One encoded qlog command remains capped at 512 KiB. If a flattened group is too
+large, Rhiza proposes the largest ordered prefix that fits and continues from
+the next exact qlog base; it does not remove the byte ceiling. Every committed
+prefix is applied atomically while retaining an independent request ID and retry
+receipt for each member.
+
+HTTP writes already pass through the asynchronous HTTP writer queue, which
+coalesces up to eight requests or 500 microseconds by default. Its KV dispatch
+uses the direct writer batch path and does not enqueue a second time in the
+internal KV group queue. Graph continues to use only this HTTP writer batching
+path and is outside the KV group-commit result below.
+
+KV wire-batch v3 and materializer-domain v2 are a clean-install breaking
+boundary. Older KV materializer fingerprints and snapshots fail closed; there
+is no in-place migration or rolling dual decoder.
 
 On the ordinary QuePaxa fast path, the preferred proposal can be decided after
 the phase-zero Recorder quorum; the command is piggybacked on the typed Record

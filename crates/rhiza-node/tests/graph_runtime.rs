@@ -54,12 +54,16 @@ fn graph_profile_reuses_node_runtime_commit_and_reopen_lifecycle() {
     drop(runtime);
 
     let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
+    let reopened_read = reopened
+        .get_graph_document("document-1", ReadConsistency::ReadBarrier)
+        .unwrap();
     assert_eq!(
-        reopened
-            .get_graph_document("document-1", ReadConsistency::Local)
-            .unwrap()
-            .value,
+        reopened_read.value,
         Some(GraphValueV1::String("hello".into()))
+    );
+    assert_eq!(
+        (reopened_read.applied_index, reopened_read.hash),
+        (written.applied_index(), written.hash())
     );
 }
 
@@ -72,7 +76,7 @@ fn graph_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
         &[],
     )
     .unwrap();
-    runtime
+    let written = runtime
         .mutate_graph(
             GraphCommandV1::put_document("request-1", "document-1", GraphValueV1::U64(42)).unwrap(),
         )
@@ -83,8 +87,10 @@ fn graph_read_barrier_returns_value_and_tip_from_one_materializer_boundary() {
         .unwrap();
 
     assert_eq!(read.value, Some(GraphValueV1::U64(42)));
-    assert_eq!(read.applied_index, 2);
-    assert_eq!(read.hash, runtime.applied_hash().unwrap());
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (written.applied_index(), written.hash())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -166,7 +172,7 @@ async fn graph_batch_byte_cap_falls_back_to_individual_entries() {
     );
     let (addr, server) = serve_graph(Arc::clone(&runtime), dir.path()).await;
     let client = reqwest::Client::new();
-    let value = "x".repeat(65 * 1024);
+    let value = "x".repeat(129 * 1024);
     let commands = (0..4)
         .map(|index| {
             GraphCommandV1::put_document(
@@ -348,8 +354,8 @@ async fn graph_http_routes_enforce_auth_body_limits_and_return_atomic_value_with
     assert!(get.status().is_success());
     let get = get.json::<GraphGetDocumentResponse>().await.unwrap();
     assert_eq!(get.value, Some(GraphValueDto::String("hello".into())));
-    assert_eq!(get.applied_index, 2);
-    assert_ne!(get.hash, put.hash);
+    assert_eq!(get.applied_index, 1);
+    assert_eq!(get.hash, put.hash);
 
     let sql_route = client
         .post(format!("http://{addr}/v1/sql/query"))
@@ -478,7 +484,7 @@ async fn graph_query_returns_general_read_only_cypher_for_all_consistency_modes(
     assert!(barrier.status().is_success());
     assert_eq!(
         barrier.json::<serde_json::Value>().await.unwrap()["applied_index"],
-        2
+        1
     );
     server.abort();
 }

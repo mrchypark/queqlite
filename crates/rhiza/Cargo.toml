@@ -14,7 +14,7 @@ kv = ["dep:rhiza-kv", "rhiza-node/kv"]
 rhiza-core = { path = "../rhiza-core" }
 rhiza-graph = { path = "../rhiza-graph", optional = true }
 rhiza-kv = { path = "../rhiza-kv", optional = true }
-rhiza-node = { path = "../rhiza-node", default-features = false }
+rhiza-node = { path = "../rhiza-node", default-features = false, features = ["sql"] }
 rhiza-quepaxa = { path = "../rhiza-quepaxa" }
 rhiza-sql = { path = "../rhiza-sql" }
 tokio.workspace = true

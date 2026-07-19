@@ -320,6 +320,11 @@ if [ "$recorder_tls" = on ]; then
     }]
   ' "$output"
 fi
+yq eval --inplace '
+  (select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[].env[]? |
+    select(has("value")) | .value) style = "double"
+' "$output"
 if grep -Eq '__[A-Z0-9_]+__' "$output"; then
   echo "unrendered placeholder" >&2
   exit 65

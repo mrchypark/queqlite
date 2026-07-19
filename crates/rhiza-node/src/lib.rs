@@ -9,17 +9,20 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[cfg(any(feature = "sql", feature = "kv"))]
+use std::collections::VecDeque;
 
 #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
 compile_error!("rhiza-node requires at least one execution profile feature: sql, graph, or kv");
 
 #[cfg(feature = "graph")]
 use std::collections::BTreeMap;
-#[cfg(feature = "sql")]
+#[cfg(any(feature = "sql", test))]
 use std::sync::atomic::AtomicUsize;
 
 use axum::{
@@ -45,6 +48,7 @@ use rhiza_graph::{
 #[cfg(feature = "kv")]
 use rhiza_kv::{
     encode_replicated_kv_batch, encode_replicated_kv_command, KvRequestRecord, RedbStateMachine,
+    MAX_KV_BATCH_MEMBERS,
 };
 #[cfg(feature = "kv")]
 pub use rhiza_kv::{KvScanResult, KvScanRow, MAX_KV_SCAN_RESULT_BYTES, MAX_KV_SCAN_ROWS};
@@ -56,15 +60,16 @@ use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 #[cfg(feature = "sql")]
 use rhiza_quepaxa::Consensus;
 use rhiza_quepaxa::{
-    CertifiedDecisionInspection, DecisionInspection, DecisionProof, Membership, RecordRequest,
-    RecordSummary, RecorderFileStore, RecorderRpc, RejectReason, ThreeNodeConsensus,
+    CertifiedDecisionInspection, DecisionInspection, DecisionProof, Membership,
+    ReadFenceObservation, ReadFenceRequest, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, RejectReason, ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{
-    decode_qwal_v1, encode_put_request, encode_sql_command, restore_snapshot_file,
-    RecoverySnapshot, RequestConflict, RequestOutcome, SqlCommand, SqlCommandResult,
-    SqlEffectPreparation, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
-    MAX_SQL_STATEMENTS, QWAL_V1_MAGIC,
+    decode_qwal_v2, encode_put_request, encode_sql_command, restore_snapshot_file,
+    RecoverySnapshot, RequestConflict, RequestOutcome, SqlBatchMember, SqlCommand,
+    SqlCommandResult, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
+    MAX_QWAL_V2_RECEIPTS, MAX_SQL_STATEMENTS, QWAL_V2_MAGIC,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -98,7 +103,7 @@ pub use recorder_tcp::{
 };
 
 pub const MAX_FETCH_ENTRIES: u32 = 1_024;
-pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
+pub const MAX_COMMAND_BYTES: usize = 512 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 256;
 pub const MAX_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_VALUE_BYTES: usize = 240 * 1024;
@@ -107,19 +112,161 @@ pub const DEFAULT_CLIENT_CONCURRENCY: usize = 16;
 pub const DEFAULT_PEER_CONCURRENCY: usize = 32;
 pub const DEFAULT_WRITER_BATCH_MAX: usize = 8;
 const MAX_WRITE_BATCH_MEMBERS: usize = 64;
+#[cfg(feature = "sql")]
+const MAX_SQL_WRITE_BATCH_MEMBERS: usize = MAX_QWAL_V2_RECEIPTS;
+#[cfg(feature = "sql")]
+pub const MAX_TYPED_SQL_WRITE_BATCH_MEMBERS: usize = 256;
+#[cfg(feature = "sql")]
+pub const DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY: usize = 64;
+#[cfg(feature = "sql")]
+pub const MAX_SQL_GROUP_COMMIT_QUEUE_CAPACITY: usize = 4_096;
+// One full 1,024-receipt group is four aggregate-capped public calls.
+#[cfg(feature = "sql")]
+const MAX_SQL_GROUP_COMMIT_ACTIVE_BYTES: usize = 4 * MAX_COMMAND_BYTES;
+// Keep the configured call limit for compatibility, but never retain more than 64 full calls.
+#[cfg(feature = "sql")]
+const MAX_SQL_GROUP_COMMIT_PENDING_BYTES: usize =
+    DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY * MAX_COMMAND_BYTES;
+#[cfg(feature = "kv")]
+const MAX_KV_GROUP_COMMIT_MEMBERS: usize = 1_024;
+#[cfg(feature = "kv")]
+const KV_GROUP_COMMIT_QUEUE_CAPACITY: usize = 64;
+#[cfg(feature = "kv")]
+const MAX_KV_GROUP_COMMIT_PENDING_BYTES: usize = KV_GROUP_COMMIT_QUEUE_CAPACITY * MAX_COMMAND_BYTES;
 pub const DEFAULT_WRITER_BATCH_WINDOW: Duration = Duration::from_micros(500);
 pub const PROTOCOL_VERSION: &str = "1";
-pub const RECORDER_PROTOCOL_VERSION: &str = "2";
-const RECORDER_WIRE_VERSION: u16 = 2;
+pub const RECORDER_PROTOCOL_VERSION: &str = "3";
+const RECORDER_WIRE_VERSION: u16 = 3;
 pub const VERSION_HEADER: &str = "x-rhiza-version";
 pub const NODE_ID_HEADER: &str = "x-rhiza-node-id";
 pub const RECOVERY_GENERATION_HEADER: &str = "x-rhiza-recovery-generation";
-pub const RECORDER_PATH: &str = "/v1/quepaxa/recorder";
 pub const RECORDER_IDENTITY_PATH: &str = "/v2/quepaxa/recorder/identity";
+
+/// A bounded, clone-shared observer for successful physical SQL write batches.
+///
+/// Installing this observer enables write-phase timing. A runtime without an observer does not
+/// read the clock or synchronize on the profiling path.
+#[cfg(feature = "sql")]
+#[derive(Clone)]
+pub struct SqlWriteProfiler {
+    inner: Arc<SqlWriteProfilerInner>,
+}
+
+#[cfg(feature = "sql")]
+struct SqlWriteProfilerInner {
+    capacity: usize,
+    state: Mutex<SqlWriteProfilerState>,
+}
+
+#[cfg(feature = "sql")]
+#[derive(Default)]
+struct SqlWriteProfilerState {
+    samples: VecDeque<SqlWriteProfileSample>,
+    dropped_samples: u64,
+}
+
+/// Timing for one successfully committed physical SQL QWAL batch.
+#[cfg(feature = "sql")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlWriteProfileSample {
+    pub batch_member_count: usize,
+    pub commit_lock_wait_us: u64,
+    pub precheck_classification_us: u64,
+    pub qwal_prepare_us: u64,
+    pub consensus_propose_us: u64,
+    pub local_qlog_append_sync_us: u64,
+    pub sql_materializer_apply_us: u64,
+    pub response_other_total_us: u64,
+    pub total_service_us: u64,
+}
+
+/// A point-in-time copy of a SQL write profiler's bounded samples.
+#[cfg(feature = "sql")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SqlWriteProfileSnapshot {
+    pub samples: Vec<SqlWriteProfileSample>,
+    pub dropped_samples: u64,
+}
+
+#[cfg(feature = "sql")]
+impl SqlWriteProfiler {
+    /// Creates an observer that retains at most `capacity` of the newest samples.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero.
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "SQL write profiler capacity must be non-zero");
+        Self {
+            inner: Arc::new(SqlWriteProfilerInner {
+                capacity,
+                state: Mutex::new(SqlWriteProfilerState::default()),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> SqlWriteProfileSnapshot {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SqlWriteProfileSnapshot {
+            samples: state.samples.iter().cloned().collect(),
+            dropped_samples: state.dropped_samples,
+        }
+    }
+
+    /// Returns and clears retained samples while preserving the cumulative dropped count.
+    pub fn drain(&self) -> SqlWriteProfileSnapshot {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SqlWriteProfileSnapshot {
+            samples: state.samples.drain(..).collect(),
+            dropped_samples: state.dropped_samples,
+        }
+    }
+
+    fn record(&self, sample: SqlWriteProfileSample) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.samples.len() == self.inner.capacity {
+            state.samples.pop_front();
+            state.dropped_samples = state.dropped_samples.saturating_add(1);
+        }
+        state.samples.push_back(sample);
+    }
+}
+
+#[cfg(feature = "sql")]
+impl fmt::Debug for SqlWriteProfiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqlWriteProfiler")
+            .field("capacity", &self.inner.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "sql")]
+impl PartialEq for SqlWriteProfiler {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+#[cfg(feature = "sql")]
+impl Eq for SqlWriteProfiler {}
 pub const RECORDER_STORE_COMMAND_PATH: &str = "/v2/quepaxa/recorder/store-command";
 pub const RECORDER_FETCH_COMMAND_PATH: &str = "/v2/quepaxa/recorder/fetch-command";
 pub const RECORDER_INSPECT_PROOF_PATH: &str = "/v2/quepaxa/recorder/inspect-proof";
 pub const RECORDER_INSPECT_RECORD_PATH: &str = "/v2/quepaxa/recorder/inspect-record";
+pub const RECORDER_READ_FENCE_PATH: &str = "/v3/quepaxa/recorder/read-fence";
 pub const RECORDER_RECORD_PATH: &str = "/v2/quepaxa/recorder/record";
 pub const RECORDER_INSTALL_PROOF_PATH: &str = "/v2/quepaxa/recorder/install-decision-proof";
 pub const LOG_FETCH_PATH: &str = "/v1/log/fetch";
@@ -154,9 +301,22 @@ pub const READYZ_PATH: &str = "/readyz";
 const MAX_STARTUP_RECOVERY_ENTRIES: usize = 100_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_FENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+// Leave enough of the public one-second write budget to classify and return a
+// lost-quorum attempt instead of racing the caller's ambiguous timeout.
+const QUORUM_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const CLIENT_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const SYNC_FLUSH_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const SYNC_FLUSH_RETRY_MAX: Duration = Duration::from_secs(1);
+
+fn map_quorum_record_transport_error(error: rhiza_quepaxa::Error) -> rhiza_quepaxa::Error {
+    match error {
+        rhiza_quepaxa::Error::Io(_) | rhiza_quepaxa::Error::Decode(_) => {
+            rhiza_quepaxa::Error::ProposeFailed
+        }
+        error => error,
+    }
+}
 #[cfg(feature = "sql")]
 pub const DEFAULT_SQL_MAX_ROWS: u32 = 1_000;
 #[cfg(feature = "sql")]
@@ -228,6 +388,8 @@ pub enum ConfigError {
     InvalidRecoveryGeneration,
     InvalidWriterBatchMax(usize),
     InvalidWriterBatchWindow,
+    #[cfg(feature = "sql")]
+    InvalidSqlGroupCommitQueueCapacity(usize),
     EmptyPeerNodeId,
     EmptyPeerBaseUrl,
     InvalidPeerBaseUrl(String),
@@ -268,6 +430,11 @@ impl fmt::Display for ConfigError {
             Self::InvalidWriterBatchWindow => write!(
                 f,
                 "writer batch window must be positive and shorter than the client deadline"
+            ),
+            #[cfg(feature = "sql")]
+            Self::InvalidSqlGroupCommitQueueCapacity(capacity) => write!(
+                f,
+                "SQL group commit queue capacity must be within 1..={MAX_SQL_GROUP_COMMIT_QUEUE_CAPACITY}, got {capacity}"
             ),
             Self::EmptyPeerNodeId => write!(f, "peer node_id must not be empty"),
             Self::EmptyPeerBaseUrl => write!(f, "peer base_url must not be empty"),
@@ -571,9 +738,23 @@ impl HttpRecorderClient {
         T: serde::Serialize,
         U: serde::de::DeserializeOwned,
     {
+        self.post_v2_with_timeout(path, body, HTTP_REQUEST_TIMEOUT)
+    }
+
+    fn post_v2_with_timeout<T, U>(
+        &self,
+        path: &str,
+        body: T,
+        timeout: Duration,
+    ) -> rhiza_quepaxa::Result<U>
+    where
+        T: serde::Serialize,
+        U: serde::de::DeserializeOwned,
+    {
         let response = self
             .client()?
             .post(self.url(path))
+            .timeout(timeout)
             .header(VERSION_HEADER, RECORDER_PROTOCOL_VERSION)
             .header(NODE_ID_HEADER, &self.local_node_id)
             .header(
@@ -655,7 +836,8 @@ impl RecorderRpc for HttpRecorderClient {
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        self.post_v2(RECORDER_RECORD_PATH, request)
+        self.post_v2_with_timeout(RECORDER_RECORD_PATH, request, QUORUM_RECORD_REQUEST_TIMEOUT)
+            .map_err(map_quorum_record_transport_error)
     }
 
     fn install_decision_proof(
@@ -680,8 +862,19 @@ impl RecorderRpc for HttpRecorderClient {
         self.post_v2(RECORDER_INSPECT_RECORD_PATH, InspectProofV2 { slot })
     }
 
-    fn uses_typed_protocol(&self) -> bool {
+    fn supports_context_read_fence(&self) -> bool {
         true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        self.post_v2_with_timeout(
+            RECORDER_READ_FENCE_PATH,
+            request,
+            READ_FENCE_REQUEST_TIMEOUT,
+        )
     }
 }
 
@@ -856,6 +1049,504 @@ struct RuntimeBatchMember {
     request_id: String,
     payload: Vec<u8>,
     operation: QueuedOperation,
+}
+
+#[cfg(feature = "sql")]
+type SqlGroupCommitResult = Result<Vec<Result<ClientWriteResponse, NodeError>>, NodeError>;
+
+#[cfg(feature = "sql")]
+struct SqlGroupCommitJob {
+    member_count: usize,
+    encoded_bytes: usize,
+    members: Mutex<Option<Vec<RuntimeBatchMember>>>,
+    result: Mutex<Option<SqlGroupCommitResult>>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "sql")]
+impl SqlGroupCommitJob {
+    fn new(members: Vec<RuntimeBatchMember>) -> Self {
+        Self {
+            member_count: members.len(),
+            encoded_bytes: members.iter().fold(0_usize, |bytes, member| {
+                bytes.saturating_add(member.payload.len())
+            }),
+            members: Mutex::new(Some(members)),
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn take_members(&self) -> Result<Vec<RuntimeBatchMember>, NodeError> {
+        self.members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                NodeError::Invariant("SQL group commit job members were already consumed".into())
+            })
+    }
+
+    fn publish(&self, result: SqlGroupCommitResult) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(result);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self, cancelled: &AtomicBool) -> SqlGroupCommitResult {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(NodeError::Unavailable(
+                    "SQL group commit cancelled during shutdown".into(),
+                ));
+            }
+            result = self
+                .changed
+                .wait(result)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+struct SqlGroupCommitQueue {
+    capacity: usize,
+    state: Mutex<SqlGroupCommitQueueState>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "sql")]
+#[derive(Default)]
+struct SqlGroupCommitQueueState {
+    pending: VecDeque<Arc<SqlGroupCommitJob>>,
+    pending_encoded_bytes: usize,
+    leader_active: bool,
+}
+
+#[cfg(feature = "sql")]
+impl SqlGroupCommitQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(SqlGroupCommitQueueState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+        cancelled: &AtomicBool,
+    ) -> Result<(Arc<SqlGroupCommitJob>, bool), NodeError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "SQL group commit is unavailable during shutdown".into(),
+            ));
+        }
+        let job = Arc::new(SqlGroupCommitJob::new(members));
+        if job.encoded_bytes > MAX_COMMAND_BYTES {
+            return Err(NodeError::ResourceExhausted(format!(
+                "SQL group commit call exceeds {MAX_COMMAND_BYTES} encoded bytes"
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.len() >= self.capacity {
+            return Err(NodeError::ResourceExhausted(format!(
+                "SQL group commit queue is full (capacity {})",
+                self.capacity
+            )));
+        }
+        let pending_encoded_bytes = state
+            .pending_encoded_bytes
+            .saturating_add(job.encoded_bytes);
+        if pending_encoded_bytes > MAX_SQL_GROUP_COMMIT_PENDING_BYTES {
+            return Err(NodeError::ResourceExhausted(format!(
+                "SQL group commit queue exceeds {MAX_SQL_GROUP_COMMIT_PENDING_BYTES} pending encoded bytes"
+            )));
+        }
+        state.pending_encoded_bytes = pending_encoded_bytes;
+        state.pending.push_back(Arc::clone(&job));
+        self.changed.notify_all();
+        let leader = !state.leader_active;
+        if leader {
+            state.leader_active = true;
+        }
+        Ok((job, leader))
+    }
+
+    fn drain_next_group(&self) -> Option<Vec<Arc<SqlGroupCommitJob>>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_empty() {
+            state.leader_active = false;
+            return None;
+        }
+        let mut member_count = 0_usize;
+        let mut encoded_bytes = 0_usize;
+        let mut jobs = Vec::new();
+        while let Some(job) = state.pending.front() {
+            let next_count = member_count.saturating_add(job.member_count);
+            let next_encoded_bytes = encoded_bytes.saturating_add(job.encoded_bytes);
+            if !jobs.is_empty()
+                && (next_count > MAX_SQL_WRITE_BATCH_MEMBERS
+                    || next_encoded_bytes > MAX_SQL_GROUP_COMMIT_ACTIVE_BYTES)
+            {
+                break;
+            }
+            let job = state.pending.pop_front().expect("front job exists");
+            member_count = next_count;
+            encoded_bytes = next_encoded_bytes;
+            state.pending_encoded_bytes = state
+                .pending_encoded_bytes
+                .checked_sub(job.encoded_bytes)
+                .expect("queued SQL byte reservation covers every pending job");
+            jobs.push(job);
+        }
+        Some(jobs)
+    }
+
+    fn collect_until_full_or_timeout(&self, timeout: Duration) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_empty() {
+            state.leader_active = false;
+            return false;
+        }
+        let hard_deadline = Instant::now() + timeout.saturating_mul(4);
+        loop {
+            let member_count = state
+                .pending
+                .iter()
+                .fold(0_usize, |count, job| count.saturating_add(job.member_count));
+            if member_count >= MAX_SQL_WRITE_BATCH_MEMBERS
+                || state.pending_encoded_bytes >= MAX_SQL_GROUP_COMMIT_ACTIVE_BYTES
+            {
+                return true;
+            }
+            let remaining = hard_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let observed_calls = state.pending.len();
+            let (next, quiet) = self
+                .changed
+                .wait_timeout_while(state, timeout.min(remaining), |state| {
+                    state.pending.len() == observed_calls
+                        && state
+                            .pending
+                            .iter()
+                            .fold(0_usize, |count, job| count.saturating_add(job.member_count))
+                            < MAX_SQL_WRITE_BATCH_MEMBERS
+                        && state.pending_encoded_bytes < MAX_SQL_GROUP_COMMIT_ACTIVE_BYTES
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if quiet.timed_out() {
+                return true;
+            }
+        }
+    }
+
+    fn fail_pending(&self, error: NodeError) {
+        let jobs = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.leader_active = false;
+            state.pending_encoded_bytes = 0;
+            state.pending.drain(..).collect::<Vec<_>>()
+        };
+        for job in jobs {
+            job.publish(Err(error.clone()));
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_pending_calls(&self, expected: usize, timeout: Duration) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timed_out) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.pending.len() != expected)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !timed_out.timed_out(),
+            "expected {expected} pending SQL group commit calls, got {}",
+            state.pending.len()
+        );
+    }
+}
+
+#[cfg(feature = "kv")]
+type KvGroupCommitResult = Result<Vec<Result<ClientWriteResponse, NodeError>>, NodeError>;
+
+#[cfg(feature = "kv")]
+struct KvGroupCommitJob {
+    member_count: usize,
+    encoded_bytes: usize,
+    members: Mutex<Option<Vec<RuntimeBatchMember>>>,
+    result: Mutex<Option<KvGroupCommitResult>>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "kv")]
+impl KvGroupCommitJob {
+    fn new(members: Vec<RuntimeBatchMember>) -> Self {
+        Self {
+            member_count: members.len(),
+            encoded_bytes: members.iter().fold(0_usize, |bytes, member| {
+                bytes.saturating_add(member.payload.len())
+            }),
+            members: Mutex::new(Some(members)),
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn take_members(&self) -> Result<Vec<RuntimeBatchMember>, NodeError> {
+        self.members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                NodeError::Invariant("KV group commit job members were already consumed".into())
+            })
+    }
+
+    fn publish(&self, result: KvGroupCommitResult) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(result);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self, cancelled: &AtomicBool) -> KvGroupCommitResult {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(NodeError::Unavailable(
+                    "KV group commit cancelled during shutdown".into(),
+                ));
+            }
+            result = self
+                .changed
+                .wait(result)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(feature = "kv")]
+struct KvGroupCommitQueue {
+    state: Mutex<KvGroupCommitQueueState>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Default)]
+struct KvGroupCommitQueueState {
+    pending: VecDeque<Arc<KvGroupCommitJob>>,
+    pending_encoded_bytes: usize,
+    leader_active: bool,
+}
+
+#[cfg(feature = "kv")]
+impl KvGroupCommitQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(KvGroupCommitQueueState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        members: Vec<RuntimeBatchMember>,
+        cancelled: &AtomicBool,
+    ) -> Result<(Arc<KvGroupCommitJob>, bool), NodeError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "KV group commit is unavailable during shutdown".into(),
+            ));
+        }
+        let job = Arc::new(KvGroupCommitJob::new(members));
+        if job.member_count == 0 || job.member_count > MAX_KV_BATCH_MEMBERS {
+            return Err(NodeError::InvalidRequest(format!(
+                "KV group commit call must contain 1..={MAX_KV_BATCH_MEMBERS} members"
+            )));
+        }
+        if job.encoded_bytes > MAX_KV_GROUP_COMMIT_PENDING_BYTES {
+            return Err(NodeError::ResourceExhausted(format!(
+                "KV group commit call exceeds {MAX_KV_GROUP_COMMIT_PENDING_BYTES} encoded bytes"
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.len() >= KV_GROUP_COMMIT_QUEUE_CAPACITY {
+            return Err(NodeError::ResourceExhausted(format!(
+                "KV group commit queue is full (capacity {KV_GROUP_COMMIT_QUEUE_CAPACITY})"
+            )));
+        }
+        let pending_encoded_bytes = state
+            .pending_encoded_bytes
+            .saturating_add(job.encoded_bytes);
+        if pending_encoded_bytes > MAX_KV_GROUP_COMMIT_PENDING_BYTES {
+            return Err(NodeError::ResourceExhausted(format!(
+                "KV group commit queue exceeds {MAX_KV_GROUP_COMMIT_PENDING_BYTES} pending encoded bytes"
+            )));
+        }
+        state.pending_encoded_bytes = pending_encoded_bytes;
+        state.pending.push_back(Arc::clone(&job));
+        self.changed.notify_all();
+        let leader = !state.leader_active;
+        if leader {
+            state.leader_active = true;
+        }
+        Ok((job, leader))
+    }
+
+    fn drain_next_group(&self) -> Option<Vec<Arc<KvGroupCommitJob>>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_empty() {
+            state.leader_active = false;
+            return None;
+        }
+        let mut member_count = 0_usize;
+        let mut encoded_bytes = 0_usize;
+        let mut jobs = Vec::new();
+        while let Some(job) = state.pending.front() {
+            let next_count = member_count.saturating_add(job.member_count);
+            let next_encoded_bytes = encoded_bytes.saturating_add(job.encoded_bytes);
+            if !jobs.is_empty()
+                && (next_count > MAX_KV_GROUP_COMMIT_MEMBERS
+                    || next_encoded_bytes > MAX_KV_GROUP_COMMIT_PENDING_BYTES)
+            {
+                break;
+            }
+            let job = state.pending.pop_front().expect("front job exists");
+            member_count = next_count;
+            encoded_bytes = next_encoded_bytes;
+            state.pending_encoded_bytes = state
+                .pending_encoded_bytes
+                .checked_sub(job.encoded_bytes)
+                .expect("queued KV byte reservation covers every pending job");
+            jobs.push(job);
+        }
+        Some(jobs)
+    }
+
+    fn collect_until_full_or_timeout(&self, timeout: Duration) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_empty() {
+            state.leader_active = false;
+            return false;
+        }
+        let hard_deadline = Instant::now() + timeout.saturating_mul(4);
+        loop {
+            let member_count = state
+                .pending
+                .iter()
+                .fold(0_usize, |count, job| count.saturating_add(job.member_count));
+            if member_count >= MAX_KV_GROUP_COMMIT_MEMBERS
+                || state.pending_encoded_bytes >= MAX_KV_GROUP_COMMIT_PENDING_BYTES
+            {
+                return true;
+            }
+            let remaining = hard_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let observed_calls = state.pending.len();
+            let (next, quiet) = self
+                .changed
+                .wait_timeout_while(state, timeout.min(remaining), |state| {
+                    state.pending.len() == observed_calls
+                        && state
+                            .pending
+                            .iter()
+                            .fold(0_usize, |count, job| count.saturating_add(job.member_count))
+                            < MAX_KV_GROUP_COMMIT_MEMBERS
+                        && state.pending_encoded_bytes < MAX_KV_GROUP_COMMIT_PENDING_BYTES
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if quiet.timed_out() {
+                return true;
+            }
+        }
+    }
+
+    fn fail_pending(&self, error: NodeError) {
+        let jobs = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.leader_active = false;
+            state.pending_encoded_bytes = 0;
+            state.pending.drain(..).collect::<Vec<_>>()
+        };
+        for job in jobs {
+            job.publish(Err(error.clone()));
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_pending_calls(&self, expected: usize, timeout: Duration) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timed_out) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.pending.len() != expected)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !timed_out.timed_out(),
+            "expected {expected} pending KV group commit calls, got {}",
+            state.pending.len()
+        );
+    }
 }
 
 #[cfg(any(feature = "graph", feature = "kv"))]
@@ -1473,6 +2164,10 @@ where
             RECORDER_INSPECT_RECORD_PATH,
             post(handle_recorder_inspect_record::<R>),
         )
+        .route(
+            RECORDER_READ_FENCE_PATH,
+            post(handle_recorder_read_fence::<R>),
+        )
         .route(RECORDER_RECORD_PATH, post(handle_recorder_record::<R>))
         .route(
             RECORDER_INSTALL_PROOF_PATH,
@@ -1631,6 +2326,27 @@ where
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             recorder.inspect_record_summary(request.body.slot)
+        })
+        .await,
+    )
+}
+
+async fn handle_recorder_read_fence<R>(
+    State(state): State<RecorderRouteState<R>>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    Json(request): Json<RecorderWire<ReadFenceRequest>>,
+) -> Response
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
+    if request.version != RECORDER_WIRE_VERSION {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let recorder = state.recorder;
+    recorder_v2_response(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            recorder.observe_read_fence(request.body)
         })
         .await,
     )
@@ -3187,11 +3903,16 @@ pub struct NodeConfig {
     writer_batch_max: usize,
     writer_batch_window: Duration,
     execution_profile: ExecutionProfile,
+    #[cfg(feature = "sql")]
+    sql_write_profiler: Option<SqlWriteProfiler>,
+    #[cfg(feature = "sql")]
+    sql_group_commit_queue_capacity: usize,
 }
 
 impl fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NodeConfig")
+        let mut debug = f.debug_struct("NodeConfig");
+        debug
             .field("cluster_id_source", &self.cluster_id_source)
             .field("logical_cluster_id", &self.logical_cluster_id)
             .field("cluster_id", &self.cluster_id)
@@ -3215,8 +3936,18 @@ impl fmt::Debug for NodeConfig {
             .field("ack_mode", &self.ack_mode)
             .field("writer_batch_max", &self.writer_batch_max)
             .field("writer_batch_window", &self.writer_batch_window)
-            .field("execution_profile", &self.execution_profile)
-            .finish()
+            .field("execution_profile", &self.execution_profile);
+        #[cfg(feature = "sql")]
+        debug.field(
+            "sql_write_profiler",
+            &self.sql_write_profiler.as_ref().map(|_| "installed"),
+        );
+        #[cfg(feature = "sql")]
+        debug.field(
+            "sql_group_commit_queue_capacity",
+            &self.sql_group_commit_queue_capacity,
+        );
+        debug.finish()
     }
 }
 
@@ -3391,6 +4122,10 @@ impl NodeConfig {
             writer_batch_max: DEFAULT_WRITER_BATCH_MAX,
             writer_batch_window: DEFAULT_WRITER_BATCH_WINDOW,
             execution_profile: ExecutionProfile::Sqlite,
+            #[cfg(feature = "sql")]
+            sql_write_profiler: None,
+            #[cfg(feature = "sql")]
+            sql_group_commit_queue_capacity: DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY,
         })
     }
 
@@ -3406,6 +4141,24 @@ impl NodeConfig {
     pub fn with_read_consistency(mut self, read_consistency: ReadConsistency) -> Self {
         self.read_consistency = read_consistency;
         self
+    }
+
+    #[cfg(feature = "sql")]
+    pub fn with_sql_write_profiler(mut self, profiler: SqlWriteProfiler) -> Self {
+        self.sql_write_profiler = Some(profiler);
+        self
+    }
+
+    #[cfg(feature = "sql")]
+    pub fn with_sql_group_commit_queue_capacity(
+        mut self,
+        capacity: usize,
+    ) -> Result<Self, ConfigError> {
+        if !(1..=MAX_SQL_GROUP_COMMIT_QUEUE_CAPACITY).contains(&capacity) {
+            return Err(ConfigError::InvalidSqlGroupCommitQueueCapacity(capacity));
+        }
+        self.sql_group_commit_queue_capacity = capacity;
+        Ok(self)
     }
 
     pub fn with_ack_mode(mut self, ack_mode: AckMode) -> Self {
@@ -3514,6 +4267,16 @@ impl NodeConfig {
 
     pub const fn execution_profile(&self) -> ExecutionProfile {
         self.execution_profile
+    }
+
+    #[cfg(feature = "sql")]
+    pub const fn sql_write_profiler(&self) -> Option<&SqlWriteProfiler> {
+        self.sql_write_profiler.as_ref()
+    }
+
+    #[cfg(feature = "sql")]
+    pub const fn sql_group_commit_queue_capacity(&self) -> usize {
+        self.sql_group_commit_queue_capacity
     }
 }
 
@@ -4728,6 +5491,22 @@ impl Materializer {
         }
     }
 
+    fn applied_tip(&self) -> Result<LogAnchor, String> {
+        match self {
+            #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
+            Self::Unavailable => unreachable!("no execution profiles are compiled in"),
+            #[cfg(feature = "sql")]
+            Self::Sql(state) => state
+                .applied_tip()
+                .map(|tip| LogAnchor::new(tip.applied_index(), tip.applied_hash()))
+                .map_err(|error| error.to_string()),
+            #[cfg(feature = "graph")]
+            Self::Graph(state) => state.applied_tip().map_err(|error| error.to_string()),
+            #[cfg(feature = "kv")]
+            Self::Kv(state) => state.applied_tip().map_err(|error| error.to_string()),
+        }
+    }
+
     fn configuration_state(&self) -> Result<Option<ConfigurationState>, String> {
         match self {
             #[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
@@ -4767,18 +5546,308 @@ impl Materializer {
     }
 }
 
+const READ_BARRIER_COALESCE_WINDOW: Duration = Duration::from_micros(50);
+
+struct ReadBarrierRounds {
+    state: Mutex<ReadBarrierRoundsState>,
+    collection_window: Duration,
+}
+
+struct ReadBarrierRoundsState {
+    tail: Option<Arc<ReadBarrierRound>>,
+    next_generation: u64,
+}
+
+struct ReadBarrierRound {
+    #[cfg(test)]
+    generation: u64,
+    collection_deadline: Instant,
+    predecessor: Mutex<Option<Arc<ReadBarrierRound>>>,
+    phase: Mutex<ReadBarrierRoundPhase>,
+    changed: Condvar,
+}
+
+#[derive(Clone)]
+enum ReadBarrierRoundPhase {
+    Collecting,
+    Running,
+    Complete(Result<LogAnchor, NodeError>),
+}
+
+struct ReadBarrierParticipant {
+    round: Arc<ReadBarrierRound>,
+    leader: bool,
+}
+
+struct ReadBarrierPublication {
+    round: Arc<ReadBarrierRound>,
+    published: bool,
+}
+
+impl ReadBarrierRounds {
+    fn new(collection_window: Duration) -> Self {
+        Self {
+            state: Mutex::new(ReadBarrierRoundsState {
+                tail: None,
+                next_generation: 0,
+            }),
+            collection_window,
+        }
+    }
+
+    fn join(&self) -> Result<ReadBarrierParticipant, NodeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier generation lock is poisoned".into()))?;
+        if let Some(tail) = state.tail.as_ref() {
+            let collecting = matches!(
+                *tail.phase.lock().map_err(|_| {
+                    NodeError::Invariant("read barrier round lock is poisoned".into())
+                })?,
+                ReadBarrierRoundPhase::Collecting
+            );
+            if collecting {
+                return Ok(ReadBarrierParticipant {
+                    round: Arc::clone(tail),
+                    leader: false,
+                });
+            }
+        }
+
+        let generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Invariant("read barrier generation is exhausted".into()))?;
+        state.next_generation = generation;
+        let collection_deadline = Instant::now()
+            .checked_add(self.collection_window)
+            .unwrap_or_else(Instant::now);
+        let round = Arc::new(ReadBarrierRound {
+            #[cfg(test)]
+            generation,
+            collection_deadline,
+            predecessor: Mutex::new(state.tail.clone()),
+            phase: Mutex::new(ReadBarrierRoundPhase::Collecting),
+            changed: Condvar::new(),
+        });
+        state.tail = Some(Arc::clone(&round));
+        Ok(ReadBarrierParticipant {
+            round,
+            leader: true,
+        })
+    }
+
+    fn cancel_waiters(&self) {
+        let mut round = self.state.lock().ok().and_then(|state| state.tail.clone());
+        while let Some(current) = round {
+            if let Ok(_phase) = current.phase.lock() {
+                current.changed.notify_all();
+            }
+            round = current
+                .predecessor
+                .lock()
+                .ok()
+                .and_then(|predecessor| predecessor.clone());
+        }
+    }
+}
+
+impl ReadBarrierRound {
+    fn wait_complete(&self, cancelled: &AtomicBool) -> Result<(), NodeError> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        loop {
+            if matches!(*phase, ReadBarrierRoundPhase::Complete(_)) {
+                return Ok(());
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(NodeError::Unavailable(
+                    "read barrier cancelled during shutdown".into(),
+                ));
+            }
+            phase = self
+                .changed
+                .wait(phase)
+                .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        }
+    }
+
+    fn result(&self, cancelled: &AtomicBool) -> Result<LogAnchor, NodeError> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        loop {
+            if let ReadBarrierRoundPhase::Complete(result) = &*phase {
+                return result.clone();
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(NodeError::Unavailable(
+                    "read barrier cancelled during shutdown".into(),
+                ));
+            }
+            phase = self
+                .changed
+                .wait(phase)
+                .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        }
+    }
+
+    fn complete(&self, result: Result<LogAnchor, NodeError>) {
+        if let Ok(mut phase) = self.phase.lock() {
+            if !matches!(*phase, ReadBarrierRoundPhase::Complete(_)) {
+                *phase = ReadBarrierRoundPhase::Complete(result);
+            }
+            self.changed.notify_all();
+        } else {
+            self.changed.notify_all();
+        }
+    }
+}
+
+impl ReadBarrierParticipant {
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.round.generation
+    }
+
+    #[cfg(test)]
+    fn is_leader(&self) -> bool {
+        self.leader
+    }
+
+    fn publication(&self) -> Option<ReadBarrierPublication> {
+        self.leader.then(|| ReadBarrierPublication {
+            round: Arc::clone(&self.round),
+            published: false,
+        })
+    }
+
+    fn wait(&self, cancelled: &AtomicBool) -> Result<LogAnchor, NodeError> {
+        self.round.result(cancelled)
+    }
+}
+
+impl ReadBarrierPublication {
+    fn wait_turn(&self, cancelled: &AtomicBool) -> Result<(), NodeError> {
+        let predecessor = self
+            .round
+            .predecessor
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier predecessor lock is poisoned".into()))?
+            .clone();
+        if let Some(predecessor) = predecessor {
+            predecessor.wait_complete(cancelled)?;
+            self.round
+                .predecessor
+                .lock()
+                .map_err(|_| {
+                    NodeError::Invariant("read barrier predecessor lock is poisoned".into())
+                })?
+                .take();
+        }
+
+        let mut phase = self
+            .round
+            .phase
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(NodeError::Unavailable(
+                    "read barrier cancelled during shutdown".into(),
+                ));
+            }
+            if !matches!(*phase, ReadBarrierRoundPhase::Collecting) {
+                return Err(NodeError::Invariant(
+                    "read barrier leader left the collecting phase early".into(),
+                ));
+            }
+            let now = Instant::now();
+            if now >= self.round.collection_deadline {
+                return Ok(());
+            }
+            let wait = self
+                .round
+                .collection_deadline
+                .saturating_duration_since(now);
+            let (next, _) =
+                self.round.changed.wait_timeout(phase, wait).map_err(|_| {
+                    NodeError::Invariant("read barrier round lock is poisoned".into())
+                })?;
+            phase = next;
+        }
+    }
+
+    fn start(&self, cancelled: &AtomicBool) -> Result<(), NodeError> {
+        let mut phase = self
+            .round
+            .phase
+            .lock()
+            .map_err(|_| NodeError::Invariant("read barrier round lock is poisoned".into()))?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "read barrier cancelled during shutdown".into(),
+            ));
+        }
+        if !matches!(*phase, ReadBarrierRoundPhase::Collecting) {
+            return Err(NodeError::Invariant(
+                "read barrier generation cannot start twice".into(),
+            ));
+        }
+        *phase = ReadBarrierRoundPhase::Running;
+        Ok(())
+    }
+
+    fn publish(&mut self, result: Result<LogAnchor, NodeError>) {
+        self.round.complete(result);
+        self.published = true;
+    }
+}
+
+impl Drop for ReadBarrierPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            self.round.complete(Err(NodeError::Unavailable(
+                "read barrier generation leader terminated".into(),
+            )));
+        }
+    }
+}
+
+#[cfg(all(test, feature = "kv"))]
+type KvGroupCommitAfterExecuteHook = Arc<dyn Fn(&NodeRuntime) + Send + Sync>;
+
 pub struct NodeRuntime {
     config: NodeConfig,
     consensus: Arc<ThreeNodeConsensus>,
     log_store: FileLogStore,
     materializer: Mutex<Materializer>,
     commit: Mutex<()>,
+    #[cfg(feature = "sql")]
+    sql_group_commit: SqlGroupCommitQueue,
+    #[cfg(feature = "kv")]
+    kv_group_commit: KvGroupCommitQueue,
+    read_barriers: ReadBarrierRounds,
     checkpointing: AtomicBool,
     operation_cancelled: AtomicBool,
     operation_cancelled_notify: tokio::sync::Notify,
     ready: AtomicBool,
     fatal: AtomicBool,
     fatal_reason: Mutex<Option<String>>,
+    #[cfg(test)]
+    materialized_tip_checks: AtomicUsize,
+    #[cfg(test)]
+    read_barrier_before_snapshot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, feature = "sql"))]
+    sql_group_commit_before_execute_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, feature = "kv"))]
+    kv_group_commit_before_execute_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, feature = "kv"))]
+    kv_group_commit_after_execute_hook: Option<KvGroupCommitAfterExecuteHook>,
     _data_root_lock: fs::File,
 }
 
@@ -4787,6 +5856,160 @@ struct ExecutedPayload {
     response: WriteResponse,
     sql_result: Option<SqlCommandResult>,
 }
+
+#[cfg(feature = "sql")]
+trait SqlWritePhaseProfile {
+    type Mark;
+
+    fn mark(&self) -> Self::Mark;
+    fn commit_lock_acquired(&mut self);
+    fn add_precheck_classification(&mut self, mark: Self::Mark);
+    fn add_qwal_prepare(&mut self, mark: Self::Mark);
+    fn add_consensus_propose(&mut self, mark: Self::Mark);
+    fn add_local_qlog_append_sync(&mut self, mark: Self::Mark);
+    fn add_sql_materializer_apply(&mut self, mark: Self::Mark);
+    fn record_success(&mut self, batch_member_count: usize);
+}
+
+#[cfg(feature = "sql")]
+struct DisabledSqlWritePhaseProfile;
+
+#[cfg(feature = "sql")]
+impl SqlWritePhaseProfile for DisabledSqlWritePhaseProfile {
+    type Mark = ();
+
+    #[inline]
+    fn mark(&self) {}
+
+    #[inline]
+    fn commit_lock_acquired(&mut self) {}
+
+    #[inline]
+    fn add_precheck_classification(&mut self, (): ()) {}
+
+    #[inline]
+    fn add_qwal_prepare(&mut self, (): ()) {}
+
+    #[inline]
+    fn add_consensus_propose(&mut self, (): ()) {}
+
+    #[inline]
+    fn add_local_qlog_append_sync(&mut self, (): ()) {}
+
+    #[inline]
+    fn add_sql_materializer_apply(&mut self, (): ()) {}
+
+    #[inline]
+    fn record_success(&mut self, _batch_member_count: usize) {}
+}
+
+#[cfg(feature = "sql")]
+struct EnabledSqlWritePhaseProfile {
+    observer: SqlWriteProfiler,
+    service_started: Instant,
+    commit_lock_wait: Duration,
+    precheck_classification: Duration,
+    qwal_prepare: Duration,
+    consensus_propose: Duration,
+    local_qlog_append_sync: Duration,
+    sql_materializer_apply: Duration,
+}
+
+#[cfg(feature = "sql")]
+impl EnabledSqlWritePhaseProfile {
+    fn new(observer: SqlWriteProfiler) -> Self {
+        Self {
+            observer,
+            service_started: Instant::now(),
+            commit_lock_wait: Duration::ZERO,
+            precheck_classification: Duration::ZERO,
+            qwal_prepare: Duration::ZERO,
+            consensus_propose: Duration::ZERO,
+            local_qlog_append_sync: Duration::ZERO,
+            sql_materializer_apply: Duration::ZERO,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.service_started = Instant::now();
+        self.commit_lock_wait = Duration::ZERO;
+        self.precheck_classification = Duration::ZERO;
+        self.qwal_prepare = Duration::ZERO;
+        self.consensus_propose = Duration::ZERO;
+        self.local_qlog_append_sync = Duration::ZERO;
+        self.sql_materializer_apply = Duration::ZERO;
+    }
+}
+
+#[cfg(feature = "sql")]
+impl SqlWritePhaseProfile for EnabledSqlWritePhaseProfile {
+    type Mark = Instant;
+
+    #[inline]
+    fn mark(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn commit_lock_acquired(&mut self) {
+        self.commit_lock_wait = self.service_started.elapsed();
+    }
+
+    fn add_precheck_classification(&mut self, mark: Instant) {
+        self.precheck_classification += mark.elapsed();
+    }
+
+    fn add_qwal_prepare(&mut self, mark: Instant) {
+        self.qwal_prepare += mark.elapsed();
+    }
+
+    fn add_consensus_propose(&mut self, mark: Instant) {
+        self.consensus_propose += mark.elapsed();
+    }
+
+    fn add_local_qlog_append_sync(&mut self, mark: Instant) {
+        self.local_qlog_append_sync += mark.elapsed();
+    }
+
+    fn add_sql_materializer_apply(&mut self, mark: Instant) {
+        self.sql_materializer_apply += mark.elapsed();
+    }
+
+    fn record_success(&mut self, batch_member_count: usize) {
+        let total_service_us = duration_as_u64_micros(self.service_started.elapsed());
+        let commit_lock_wait_us = duration_as_u64_micros(self.commit_lock_wait);
+        let precheck_classification_us = duration_as_u64_micros(self.precheck_classification);
+        let qwal_prepare_us = duration_as_u64_micros(self.qwal_prepare);
+        let consensus_propose_us = duration_as_u64_micros(self.consensus_propose);
+        let local_qlog_append_sync_us = duration_as_u64_micros(self.local_qlog_append_sync);
+        let sql_materializer_apply_us = duration_as_u64_micros(self.sql_materializer_apply);
+        let named_us = commit_lock_wait_us
+            .saturating_add(precheck_classification_us)
+            .saturating_add(qwal_prepare_us)
+            .saturating_add(consensus_propose_us)
+            .saturating_add(local_qlog_append_sync_us)
+            .saturating_add(sql_materializer_apply_us);
+        self.observer.record(SqlWriteProfileSample {
+            batch_member_count,
+            commit_lock_wait_us,
+            precheck_classification_us,
+            qwal_prepare_us,
+            consensus_propose_us,
+            local_qlog_append_sync_us,
+            sql_materializer_apply_us,
+            response_other_total_us: total_service_us.saturating_sub(named_us),
+            total_service_us,
+        });
+        self.reset();
+    }
+}
+
+#[cfg(feature = "sql")]
+fn duration_as_u64_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "sql")]
+type CheckedSqlRequest = Result<Option<(RequestOutcome, SqlCommandResult)>, NodeError>;
 
 #[cfg(feature = "sql")]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4856,17 +6079,32 @@ impl NodeRuntime {
         recover_startup_decisions(&config, consensus.as_ref(), &log_store, &materializer)?;
 
         Ok(Self {
+            #[cfg(feature = "sql")]
+            sql_group_commit: SqlGroupCommitQueue::new(config.sql_group_commit_queue_capacity),
+            #[cfg(feature = "kv")]
+            kv_group_commit: KvGroupCommitQueue::new(),
             config,
             consensus,
             log_store,
             materializer: Mutex::new(materializer),
             commit: Mutex::new(()),
+            read_barriers: ReadBarrierRounds::new(READ_BARRIER_COALESCE_WINDOW),
             checkpointing: AtomicBool::new(false),
             operation_cancelled: AtomicBool::new(false),
             operation_cancelled_notify: tokio::sync::Notify::new(),
             ready: AtomicBool::new(true),
             fatal: AtomicBool::new(false),
             fatal_reason: Mutex::new(None),
+            #[cfg(test)]
+            materialized_tip_checks: AtomicUsize::new(0),
+            #[cfg(test)]
+            read_barrier_before_snapshot_hook: None,
+            #[cfg(all(test, feature = "sql"))]
+            sql_group_commit_before_execute_hook: None,
+            #[cfg(all(test, feature = "kv"))]
+            kv_group_commit_before_execute_hook: None,
+            #[cfg(all(test, feature = "kv"))]
+            kv_group_commit_after_execute_hook: None,
             _data_root_lock: data_root_lock,
         })
     }
@@ -4988,10 +6226,14 @@ impl NodeRuntime {
                 self.get_graph_document_local(id, Some(required))
             }
             ReadConsistency::ReadBarrier => {
-                let _commit = self.lock_commit()?;
-                self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.get_graph_document_local(id, None)
+                let anchor = self.establish_read_barrier()?;
+                self.validate_read_barrier_before_snapshot(anchor)?;
+                let response = self.get_graph_document_local(id, Some(anchor.index()))?;
+                self.validate_read_barrier_snapshot(
+                    anchor,
+                    LogAnchor::new(response.applied_index, response.hash),
+                )?;
+                Ok(response)
             }
         }
     }
@@ -5015,25 +6257,25 @@ impl NodeRuntime {
                 self.query_graph_local(statement, parameters, Some(required), max_rows)
             }
             ReadConsistency::ReadBarrier => {
-                let _commit = self.lock_commit()?;
-                self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.query_graph_local(statement, parameters, None, max_rows)
+                let anchor = self.establish_read_barrier()?;
+                self.validate_read_barrier_before_snapshot(anchor)?;
+                let result =
+                    self.query_graph_local(statement, parameters, Some(anchor.index()), max_rows)?;
+                self.validate_read_barrier_snapshot(
+                    anchor,
+                    LogAnchor::new(result.applied_index, result.hash),
+                )?;
+                Ok(result)
             }
         }
     }
 
     #[cfg(feature = "kv")]
     pub fn mutate_kv(&self, command: KvCommandV1) -> Result<KvMutationOutcome, NodeError> {
-        let payload = encode_replicated_kv_command(&command)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
-        if payload.len() > MAX_COMMAND_BYTES {
-            return Err(NodeError::InvalidRequest(format!(
-                "command exceeds {MAX_COMMAND_BYTES} bytes"
-            )));
-        }
-        let _commit = self.lock_commit()?;
-        self.mutate_kv_payload_locked(&command, payload)
+        self.mutate_kv_batch(vec![command])?
+            .into_iter()
+            .next()
+            .expect("one-member KV batch returns one result")
     }
 
     /// Executes an ordered, non-atomic batch of KV mutations.
@@ -5051,7 +6293,7 @@ impl NodeRuntime {
         commands: Vec<KvCommandV1>,
     ) -> Result<Vec<Result<KvMutationOutcome, NodeError>>, NodeError> {
         self.require_execution_profile(ExecutionProfile::Kv)?;
-        validate_typed_batch_len(commands.len())?;
+        validate_kv_batch_len(commands.len())?;
         let mut members = Vec::with_capacity(commands.len());
         for command in commands {
             let payload = encode_replicated_kv_command(&command)
@@ -5065,7 +6307,7 @@ impl NodeRuntime {
             });
         }
         Ok(self
-            .execute_client_batch(members)
+            .execute_kv_group_commit(members)?
             .into_iter()
             .map(|result| {
                 result.and_then(|response| match response {
@@ -5125,10 +6367,14 @@ impl NodeRuntime {
             ReadConsistency::Local => self.get_kv_local(key, None),
             ReadConsistency::AppliedIndex(required) => self.get_kv_local(key, Some(required)),
             ReadConsistency::ReadBarrier => {
-                let _commit = self.lock_commit()?;
-                self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.get_kv_local(key, None)
+                let anchor = self.establish_read_barrier()?;
+                self.validate_read_barrier_before_snapshot(anchor)?;
+                let response = self.get_kv_local(key, Some(anchor.index()))?;
+                self.validate_read_barrier_snapshot(
+                    anchor,
+                    LogAnchor::new(response.applied_index, response.hash),
+                )?;
+                Ok(response)
             }
         }
     }
@@ -5148,10 +6394,15 @@ impl NodeRuntime {
                 self.scan_kv_range_local(start, end, limit, cursor, Some(required))
             }
             ReadConsistency::ReadBarrier => {
-                let _commit = self.lock_commit()?;
-                self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.scan_kv_range_local(start, end, limit, cursor, None)
+                let anchor = self.establish_read_barrier()?;
+                self.validate_read_barrier_before_snapshot(anchor)?;
+                let result =
+                    self.scan_kv_range_local(start, end, limit, cursor, Some(anchor.index()))?;
+                self.validate_read_barrier_snapshot(
+                    anchor,
+                    LogAnchor::new(result.tip().applied_index(), result.tip().applied_hash()),
+                )?;
+                Ok(result)
             }
         }
     }
@@ -5170,10 +6421,15 @@ impl NodeRuntime {
                 self.scan_kv_prefix_local(prefix, limit, cursor, Some(required))
             }
             ReadConsistency::ReadBarrier => {
-                let _commit = self.lock_commit()?;
-                self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.scan_kv_prefix_local(prefix, limit, cursor, None)
+                let anchor = self.establish_read_barrier()?;
+                self.validate_read_barrier_before_snapshot(anchor)?;
+                let result =
+                    self.scan_kv_prefix_local(prefix, limit, cursor, Some(anchor.index()))?;
+                self.validate_read_barrier_snapshot(
+                    anchor,
+                    LogAnchor::new(result.tip().applied_index(), result.tip().applied_hash()),
+                )?;
+                Ok(result)
             }
         }
     }
@@ -5189,18 +6445,20 @@ impl NodeRuntime {
 
     /// Executes an ordered, non-atomic batch of SQL commands.
     ///
-    /// Each newly applied command is prepared and committed as its own exact-base QWAL entry.
-    /// Per-command conflicts remain isolated in the returned vector, whose order and length match
-    /// `commands`. The whole vector is validated before the first write attempt, so an outer `Err`
-    /// guarantees that nothing was attempted.
+    /// All successful, previously unseen members that fit the replicated command byte cap share
+    /// one exact-base QWAL entry. Failed members are rolled back independently and later members
+    /// continue. The aggregate canonical input is limited to [`MAX_COMMAND_BYTES`]. The whole
+    /// vector is validated before the first write attempt, so an outer `Err` guarantees that
+    /// nothing was attempted.
     #[cfg(feature = "sql")]
     pub fn execute_sql_batch(
         &self,
         commands: Vec<SqlCommand>,
     ) -> Result<Vec<Result<SqlExecuteResponse, NodeError>>, NodeError> {
         self.require_execution_profile(ExecutionProfile::Sqlite)?;
-        validate_typed_batch_len(commands.len())?;
+        validate_sql_batch_len(commands.len())?;
         let mut members = Vec::with_capacity(commands.len());
+        let mut aggregate_encoded_bytes = 0_usize;
         for command in commands {
             validate_field(
                 "request_id",
@@ -5210,14 +6468,30 @@ impl NodeRuntime {
             )?;
             let payload = encode_sql_command_with_index(&command)?;
             validate_command_size(&payload)?;
+            aggregate_encoded_bytes = aggregate_encoded_bytes.saturating_add(payload.len());
+            if aggregate_encoded_bytes > MAX_COMMAND_BYTES {
+                return Err(NodeError::ResourceExhausted(format!(
+                    "SQL write batch exceeds {MAX_COMMAND_BYTES} aggregate encoded bytes"
+                )));
+            }
             members.push(RuntimeBatchMember {
                 request_id: command.request_id.clone(),
                 payload,
                 operation: QueuedOperation::Sql(command),
             });
         }
-        Ok(self
-            .execute_client_batch(members)
+        let single_statement_batch = members.iter().all(|member| {
+            matches!(
+                &member.operation,
+                QueuedOperation::Sql(command) if command.statements.len() == 1
+            )
+        });
+        let results = if single_statement_batch {
+            self.execute_sql_group_commit(members)?
+        } else {
+            self.execute_client_batch(members)
+        };
+        Ok(results
             .into_iter()
             .map(|result| {
                 result.and_then(|response| match response {
@@ -5235,21 +6509,152 @@ impl NodeRuntime {
         &self,
         command: SqlCommand,
     ) -> Result<SqlExecuteResponse, NodeError> {
-        validate_field(
-            "request_id",
-            &command.request_id,
-            MAX_REQUEST_ID_BYTES,
-            false,
-        )?;
-        let payload = encode_sql_command_with_index(&command)?;
-        if payload.len() > MAX_COMMAND_BYTES {
-            return Err(NodeError::InvalidRequest(format!(
-                "command exceeds {MAX_COMMAND_BYTES} bytes"
+        self.execute_sql_batch(vec![command])?
+            .into_iter()
+            .next()
+            .expect("one-member SQL batch returns one result")
+    }
+
+    #[cfg(feature = "sql")]
+    fn execute_sql_group_commit(&self, members: Vec<RuntimeBatchMember>) -> SqlGroupCommitResult {
+        let (job, leader) = self
+            .sql_group_commit
+            .enqueue(members, &self.operation_cancelled)?;
+        if leader {
+            if let Some(observer) = self.config.sql_write_profiler.clone() {
+                self.run_sql_group_commit_leader(&mut EnabledSqlWritePhaseProfile::new(observer));
+            } else {
+                self.run_sql_group_commit_leader(&mut DisabledSqlWritePhaseProfile);
+            }
+        }
+        job.wait(&self.operation_cancelled)
+    }
+
+    #[cfg(feature = "sql")]
+    fn run_sql_group_commit_leader<P: SqlWritePhaseProfile>(&self, profile: &mut P) {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.sql_group_commit.fail_pending(error);
+                return;
+            }
+        };
+        profile.commit_lock_acquired();
+
+        loop {
+            if !self
+                .sql_group_commit
+                .collect_until_full_or_timeout(self.config.writer_batch_window())
+            {
+                break;
+            }
+            let Some(jobs) = self.sql_group_commit.drain_next_group() else {
+                break;
+            };
+            if let Err(error) = self
+                .ensure_ready()
+                .and_then(|_| self.ensure_writes_active())
+            {
+                for job in &jobs {
+                    job.publish(Err(error.clone()));
+                }
+                self.sql_group_commit.fail_pending(error);
+                return;
+            }
+            let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if let Some(hook) = &self.sql_group_commit_before_execute_hook {
+                    hook();
+                }
+                self.execute_sql_group_locked(&jobs, profile)
+            }));
+            let grouped_results = match execution {
+                Ok(Ok(grouped_results)) => grouped_results,
+                Ok(Err(error)) => {
+                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                        error
+                    } else {
+                        self.latch(error)
+                    };
+                    for job in &jobs {
+                        job.publish(Err(error.clone()));
+                    }
+                    self.sql_group_commit.fail_pending(error);
+                    return;
+                }
+                Err(_) => {
+                    let error =
+                        self.latch(NodeError::Fatal("SQL group commit leader panicked".into()));
+                    for job in &jobs {
+                        job.publish(Err(error.clone()));
+                    }
+                    self.sql_group_commit.fail_pending(error);
+                    return;
+                }
+            };
+            for (job, results) in jobs.iter().zip(grouped_results) {
+                job.publish(Ok(results));
+            }
+        }
+    }
+
+    #[cfg(feature = "sql")]
+    fn execute_sql_group_locked<P: SqlWritePhaseProfile>(
+        &self,
+        jobs: &[Arc<SqlGroupCommitJob>],
+        profile: &mut P,
+    ) -> Result<Vec<Vec<Result<ClientWriteResponse, NodeError>>>, NodeError> {
+        if self.operation_cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "SQL group commit cancelled during shutdown".into(),
+            ));
+        }
+        let total_members = jobs.iter().map(|job| job.member_count).sum();
+        if total_members == 0 || total_members > MAX_SQL_WRITE_BATCH_MEMBERS {
+            return Err(NodeError::Invariant(format!(
+                "SQL group commit drained {total_members} members outside 1..={MAX_SQL_WRITE_BATCH_MEMBERS}"
             )));
         }
-        let _commit = self.lock_commit()?;
-        let outcome = self.execute_sql_payload_locked(&command, payload)?;
-        Ok(sql_execute_response(outcome.response, outcome.sql_result))
+        let mut members = Vec::with_capacity(total_members);
+        for job in jobs {
+            let job_members = job.take_members()?;
+            if job_members.len() != job.member_count {
+                return Err(NodeError::Invariant(
+                    "SQL group commit job member count changed while queued".into(),
+                ));
+            }
+            members.extend(job_members);
+        }
+        let results = self.execute_sql_client_batch_locked(&members, profile);
+        if self.operation_cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "SQL group commit cancelled during shutdown".into(),
+            ));
+        }
+        if self.is_fatal() {
+            return Err(NodeError::Fatal(
+                self.fatal_reason()
+                    .unwrap_or_else(|| "SQL group commit failed fatally".into()),
+            ));
+        }
+        if results.len() != total_members {
+            return Err(NodeError::Invariant(format!(
+                "SQL group commit returned {} results for {total_members} members",
+                results.len()
+            )));
+        }
+        let mut results = results.into_iter();
+        let grouped = jobs
+            .iter()
+            .map(|job| results.by_ref().take(job.member_count).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        if results.next().is_some() || grouped.iter().map(Vec::len).sum::<usize>() != total_members
+        {
+            return Err(NodeError::Invariant(
+                "SQL group commit result offsets were misaligned".into(),
+            ));
+        }
+        Ok(grouped)
     }
 
     #[cfg(feature = "sql")]
@@ -5259,6 +6664,29 @@ impl NodeRuntime {
     ) -> Vec<Result<ClientWriteResponse, NodeError>> {
         if self.config.execution_profile != ExecutionProfile::Sqlite {
             return self.execute_profile_client_batch(members);
+        }
+        let is_single_statement_sql = members.iter().all(|member| {
+            matches!(
+                &member.operation,
+                QueuedOperation::Sql(command) if command.statements.len() == 1
+            )
+        });
+        if is_single_statement_sql {
+            if let Some(observer) = self.config.sql_write_profiler.clone() {
+                let mut profile = EnabledSqlWritePhaseProfile::new(observer);
+                let _commit = match self.lock_commit() {
+                    Ok(commit) => commit,
+                    Err(error) => return members.into_iter().map(|_| Err(error.clone())).collect(),
+                };
+                profile.commit_lock_acquired();
+                if let Err(error) = self
+                    .ensure_ready()
+                    .and_then(|_| self.ensure_writes_active())
+                {
+                    return members.into_iter().map(|_| Err(error.clone())).collect();
+                }
+                return self.execute_sql_client_batch_locked(&members, &mut profile);
+            }
         }
         let _commit = match self.lock_commit() {
             Ok(commit) => commit,
@@ -5271,10 +6699,507 @@ impl NodeRuntime {
             return members.into_iter().map(|_| Err(error.clone())).collect();
         }
 
+        if is_single_statement_sql {
+            return self
+                .execute_sql_client_batch_locked(&members, &mut DisabledSqlWritePhaseProfile);
+        }
+
         members
             .iter()
             .map(|member| self.execute_single_member_locked(member))
             .collect()
+    }
+
+    #[cfg(feature = "sql")]
+    fn execute_sql_client_batch_locked<P: SqlWritePhaseProfile>(
+        &self,
+        members: &[RuntimeBatchMember],
+        profile: &mut P,
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
+        let classification_mark = profile.mark();
+        let mut results = vec![None; members.len()];
+        let mut pending = Vec::new();
+        let mut canonical_by_request: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut lookup_indices = Vec::with_capacity(members.len());
+        let mut aliases = vec![None; members.len()];
+        let mut blocked_by = vec![None; members.len()];
+
+        for (index, member) in members.iter().enumerate() {
+            let QueuedOperation::Sql(command) = &member.operation else {
+                unreachable!("SQL batch members were validated by the caller");
+            };
+            let canonicals = canonical_by_request
+                .entry(command.request_id.clone())
+                .or_default();
+            if let Some(canonical) = canonicals
+                .iter()
+                .copied()
+                .find(|canonical| members[*canonical].payload == member.payload)
+            {
+                aliases[index] = Some(canonical);
+                continue;
+            }
+            blocked_by[index] = canonicals.last().copied();
+            canonicals.push(index);
+            lookup_indices.push(index);
+        }
+
+        let preflight = self.check_sql_members_bulk(members, &lookup_indices);
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                profile.add_precheck_classification(classification_mark);
+                return members.iter().map(|_| Err(error.clone())).collect();
+            }
+        };
+        for (index, lookup) in preflight {
+            match lookup {
+                Ok(Some((outcome, sql_result))) => {
+                    results[index] = Some(Ok(ClientWriteResponse::Sql(sql_execute_response(
+                        write_response(outcome),
+                        Some(sql_result),
+                    ))));
+                }
+                Ok(None) => pending.push(index),
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        profile.add_precheck_classification(classification_mark);
+
+        while !pending.is_empty() {
+            let eligible = pending
+                .iter()
+                .copied()
+                .filter(|index| {
+                    blocked_by[*index].is_none_or(|predecessor| results[predecessor].is_some())
+                })
+                .take(MAX_SQL_WRITE_BATCH_MEMBERS)
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                let error = self.latch(NodeError::Invariant(
+                    "SQL writer batch has an unresolved duplicate dependency".into(),
+                ));
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let (last_index, last_hash) = match self.ensure_materialized_tip() {
+                Ok(tip) => tip,
+                Err(error) => {
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let mut attempt_count = eligible.len();
+            let (proposal_payload, prepared_results) = loop {
+                let attempted = &eligible[..attempt_count];
+                let batch_members = attempted
+                    .iter()
+                    .map(|index| {
+                        let QueuedOperation::Sql(command) = &members[*index].operation else {
+                            unreachable!("SQL batch members were validated above");
+                        };
+                        SqlBatchMember {
+                            command,
+                            request_payload: &members[*index].payload,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let preparation_mark = profile.mark();
+                let preparation = self.lock_sqlite().and_then(|sqlite| {
+                    sqlite
+                        .prepare_sql_batch_effect(&batch_members, last_index, last_hash)
+                        .map_err(|error| self.map_sqlite_error(error))
+                });
+                profile.add_qwal_prepare(preparation_mark);
+                let preparation = match preparation {
+                    Ok(preparation) => preparation,
+                    Err(NodeError::ResourceExhausted(message)) if attempt_count > 1 => {
+                        attempt_count = attempt_count.div_ceil(2);
+                        let _ = message;
+                        continue;
+                    }
+                    Err(NodeError::ResourceExhausted(message)) => {
+                        results[attempted[0]] = Some(Err(NodeError::ResourceExhausted(message)));
+                        break (None, Vec::new());
+                    }
+                    Err(error) => {
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                };
+                if preparation.results.len() != attempted.len() {
+                    let error = self.latch(NodeError::Invariant(
+                        "SQLite batch preparation returned a misaligned result vector".into(),
+                    ));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break (None, Vec::new());
+                }
+
+                let mut proposed = Vec::new();
+                for (index, member_result) in attempted.iter().copied().zip(preparation.results) {
+                    match member_result {
+                        Ok(result) => proposed.push((index, result)),
+                        Err(error) => {
+                            results[index] = Some(Err(self.map_sql_batch_member_error(error)))
+                        }
+                    }
+                }
+                match preparation.effect {
+                    Some(_) if proposed.is_empty() => {
+                        let error = self.latch(NodeError::Invariant(
+                            "SQLite prepared an effect without a successful SQL member".into(),
+                        ));
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                    Some(payload) if !payload.starts_with(QWAL_V2_MAGIC) => {
+                        let error = self.latch(NodeError::Invariant(
+                            "SQLite materializer prepared a non-QWAL v2 SQL batch".into(),
+                        ));
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                    Some(payload) if payload.len() <= MAX_COMMAND_BYTES => {
+                        break (Some(payload), proposed)
+                    }
+                    Some(_) if attempt_count > 1 => {
+                        for index in attempted {
+                            results[*index] = None;
+                        }
+                        attempt_count = attempt_count.div_ceil(2);
+                    }
+                    Some(_) => {
+                        results[attempted[0]] = Some(Err(NodeError::ResourceExhausted(format!(
+                            "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
+                        ))));
+                        break (None, Vec::new());
+                    }
+                    None if proposed.is_empty() => break (None, Vec::new()),
+                    None => {
+                        let error = self.latch(NodeError::Invariant(
+                            "SQLite omitted the effect for successful SQL members".into(),
+                        ));
+                        for index in pending.drain(..) {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                        break (None, Vec::new());
+                    }
+                }
+            };
+
+            pending.retain(|index| results[*index].is_none());
+            let Some(proposal_payload) = proposal_payload else {
+                continue;
+            };
+            let slot = match last_index.checked_add(1) {
+                Some(slot) => slot,
+                None => {
+                    let error = self.latch(NodeError::Invariant("qlog index is exhausted".into()));
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            let consensus_mark = profile.mark();
+            let entry = self.consensus.propose_at_cancellable(
+                slot,
+                last_hash,
+                Command::new(CommandKind::Deterministic, proposal_payload.clone()),
+                &self.operation_cancelled,
+            );
+            profile.add_consensus_propose(consensus_mark);
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error = self.map_consensus_error(error);
+                    for index in pending.drain(..) {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            if let Err(error) = self.persist_sql_entry_profiled(&entry, slot, last_hash, profile) {
+                for index in pending.drain(..) {
+                    results[index] = Some(Err(error.clone()));
+                }
+                break;
+            }
+
+            let exact_winner =
+                entry.entry_type == EntryType::Command && entry.payload == proposal_payload;
+            let exact_winner_member_count = exact_winner.then_some(prepared_results.len());
+            if exact_winner {
+                for (index, sql_result) in prepared_results {
+                    results[index] = Some(Ok(ClientWriteResponse::Sql(sql_execute_response(
+                        WriteResponse {
+                            applied_index: entry.index,
+                            hash: entry.hash,
+                        },
+                        Some(sql_result),
+                    ))));
+                }
+                pending.retain(|index| results[*index].is_none());
+            }
+
+            let current_pending = std::mem::take(&mut pending);
+            let classification_mark = profile.mark();
+            let post_commit = self.check_sql_members_bulk(members, &current_pending);
+            let post_commit = match post_commit {
+                Ok(post_commit) => post_commit,
+                Err(error) => {
+                    for index in current_pending {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    profile.add_precheck_classification(classification_mark);
+                    if let Some(batch_member_count) = exact_winner_member_count {
+                        profile.record_success(batch_member_count);
+                    }
+                    break;
+                }
+            };
+            for (index, lookup) in post_commit {
+                match lookup {
+                    Ok(Some((outcome, sql_result))) => {
+                        results[index] = Some(Ok(ClientWriteResponse::Sql(sql_execute_response(
+                            write_response(outcome),
+                            Some(sql_result),
+                        ))));
+                    }
+                    Ok(None) => pending.push(index),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+            profile.add_precheck_classification(classification_mark);
+            if let Some(batch_member_count) = exact_winner_member_count {
+                profile.record_success(batch_member_count);
+            }
+        }
+
+        for (index, canonical) in aliases.into_iter().enumerate() {
+            if let Some(canonical) = canonical {
+                results[index] = results[canonical].clone();
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(self.latch(NodeError::Invariant(
+                        "SQL writer batch omitted a request result".into(),
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "sql")]
+    fn check_sql_members_bulk(
+        &self,
+        members: &[RuntimeBatchMember],
+        indices: &[usize],
+    ) -> Result<Vec<(usize, CheckedSqlRequest)>, NodeError> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rounds = Vec::<Vec<usize>>::new();
+        let mut occurrence_by_request = HashMap::<String, usize>::new();
+        for index in indices {
+            let QueuedOperation::Sql(command) = &members[*index].operation else {
+                return Err(self.latch(NodeError::Invariant(
+                    "non-SQL member reached SQL receipt precheck".into(),
+                )));
+            };
+            let round = occurrence_by_request
+                .entry(command.request_id.clone())
+                .or_default();
+            if rounds.len() == *round {
+                rounds.push(Vec::new());
+            }
+            rounds[*round].push(*index);
+            *round += 1;
+        }
+
+        let sqlite = self.lock_sqlite()?;
+        let mut checked = Vec::with_capacity(indices.len());
+        for round in rounds {
+            let requests = round
+                .iter()
+                .map(|index| {
+                    let QueuedOperation::Sql(command) = &members[*index].operation else {
+                        unreachable!("SQL receipt round contains only SQL members");
+                    };
+                    (
+                        command.request_id.as_str(),
+                        members[*index].payload.as_slice(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let lookups = sqlite
+                .check_sql_requests(&requests)
+                .map_err(|error| self.map_sqlite_error(error))?;
+            if lookups.len() != round.len() {
+                return Err(self.latch(NodeError::Invariant(
+                    "SQLite bulk receipt precheck returned a misaligned result vector".into(),
+                )));
+            }
+            for (index, lookup) in round.into_iter().zip(lookups) {
+                checked.push((
+                    index,
+                    match lookup {
+                        Ok(Some((outcome, Some(sql_result)))) => Ok(Some((outcome, sql_result))),
+                        Ok(Some((_, None))) => Err(self.latch(NodeError::Invariant(
+                            "stored SQL receipt omitted its command result".into(),
+                        ))),
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(self.map_sql_batch_member_error(error)),
+                    },
+                ));
+            }
+        }
+        Ok(checked)
+    }
+
+    #[cfg(feature = "kv")]
+    fn execute_kv_group_commit(&self, members: Vec<RuntimeBatchMember>) -> KvGroupCommitResult {
+        let (job, leader) = self
+            .kv_group_commit
+            .enqueue(members, &self.operation_cancelled)?;
+        if leader {
+            self.run_kv_group_commit_leader();
+        }
+        job.wait(&self.operation_cancelled)
+    }
+
+    #[cfg(feature = "kv")]
+    fn run_kv_group_commit_leader(&self) {
+        let _commit = match self.lock_commit() {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.kv_group_commit.fail_pending(error);
+                return;
+            }
+        };
+
+        loop {
+            if !self
+                .kv_group_commit
+                .collect_until_full_or_timeout(self.config.writer_batch_window())
+            {
+                break;
+            }
+            let Some(jobs) = self.kv_group_commit.drain_next_group() else {
+                break;
+            };
+            if let Err(error) = self
+                .ensure_ready()
+                .and_then(|_| self.ensure_writes_active())
+            {
+                for job in &jobs {
+                    job.publish(Err(error.clone()));
+                }
+                self.kv_group_commit.fail_pending(error);
+                return;
+            }
+            let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if let Some(hook) = &self.kv_group_commit_before_execute_hook {
+                    hook();
+                }
+                self.execute_kv_group_locked(&jobs)
+            }));
+            let grouped_results = match execution {
+                Ok(Ok(grouped_results)) => grouped_results,
+                Ok(Err(error)) => {
+                    let error = if matches!(error, NodeError::Unavailable(_)) {
+                        error
+                    } else {
+                        self.latch(error)
+                    };
+                    for job in &jobs {
+                        job.publish(Err(error.clone()));
+                    }
+                    self.kv_group_commit.fail_pending(error);
+                    return;
+                }
+                Err(_) => {
+                    let error =
+                        self.latch(NodeError::Fatal("KV group commit leader panicked".into()));
+                    for job in &jobs {
+                        job.publish(Err(error.clone()));
+                    }
+                    self.kv_group_commit.fail_pending(error);
+                    return;
+                }
+            };
+            for (job, results) in jobs.iter().zip(grouped_results) {
+                job.publish(Ok(results));
+            }
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    fn execute_kv_group_locked(
+        &self,
+        jobs: &[Arc<KvGroupCommitJob>],
+    ) -> Result<Vec<Vec<Result<ClientWriteResponse, NodeError>>>, NodeError> {
+        if self.operation_cancelled.load(Ordering::Acquire) {
+            return Err(NodeError::Unavailable(
+                "KV group commit cancelled during shutdown".into(),
+            ));
+        }
+        let total_members = jobs.iter().map(|job| job.member_count).sum();
+        if total_members == 0 || total_members > MAX_KV_GROUP_COMMIT_MEMBERS {
+            return Err(NodeError::Invariant(format!(
+                "KV group commit drained {total_members} members outside 1..={MAX_KV_GROUP_COMMIT_MEMBERS}"
+            )));
+        }
+        let mut members = Vec::with_capacity(total_members);
+        for job in jobs {
+            let job_members = job.take_members()?;
+            if job_members.len() != job.member_count {
+                return Err(NodeError::Invariant(
+                    "KV group commit job member count changed while queued".into(),
+                ));
+            }
+            members.extend(job_members);
+        }
+        let results = self.execute_kv_client_batch_locked(&members);
+        #[cfg(test)]
+        if let Some(hook) = &self.kv_group_commit_after_execute_hook {
+            hook(self);
+        }
+        if results.len() != total_members {
+            let error = self.latch(NodeError::Invariant(format!(
+                "KV group commit returned {} results for {total_members} members",
+                results.len()
+            )));
+            return Ok(jobs
+                .iter()
+                .map(|job| vec![Err(error.clone()); job.member_count])
+                .collect());
+        }
+        let mut results = results.into_iter();
+        let grouped = jobs
+            .iter()
+            .map(|job| results.by_ref().take(job.member_count).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        debug_assert!(results.next().is_none());
+        debug_assert_eq!(grouped.iter().map(Vec::len).sum::<usize>(), total_members);
+        Ok(grouped)
     }
 
     #[cfg(not(feature = "sql"))]
@@ -5518,11 +7443,23 @@ impl NodeRuntime {
         {
             return members.into_iter().map(|_| Err(error.clone())).collect();
         }
+        self.execute_kv_client_batch_locked(&members)
+    }
 
+    #[cfg(feature = "kv")]
+    #[cfg_attr(
+        all(not(feature = "sql"), not(feature = "graph")),
+        allow(irrefutable_let_patterns, unreachable_patterns)
+    )]
+    fn execute_kv_client_batch_locked(
+        &self,
+        members: &[RuntimeBatchMember],
+    ) -> Vec<Result<ClientWriteResponse, NodeError>> {
         let mut results = vec![None; members.len()];
         let mut pending = Vec::new();
         let mut canonical_by_request = HashMap::new();
         let mut aliases = vec![None; members.len()];
+        let mut lookup_indices = Vec::with_capacity(members.len());
         for (index, member) in members.iter().enumerate() {
             let QueuedOperation::Kv(command) = &member.operation else {
                 results[index] = Some(Err(NodeError::ExecutionProfileMismatch {
@@ -5531,22 +7468,29 @@ impl NodeRuntime {
                 }));
                 continue;
             };
-            match self.check_kv_request(command.request_id(), &member.payload) {
+            match classify_pending_request(
+                &mut canonical_by_request,
+                members,
+                index,
+                command.request_id(),
+            ) {
+                Ok(None) => lookup_indices.push(index),
+                Ok(Some(canonical)) => aliases[index] = Some(canonical),
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        let preflight = match self.check_kv_members_bulk(members, &lookup_indices) {
+            Ok(preflight) => preflight,
+            Err(error) => return members.iter().map(|_| Err(error.clone())).collect(),
+        };
+        for (index, lookup) in preflight {
+            match lookup {
                 Ok(Some(record)) => {
                     results[index] = Some(Ok(ClientWriteResponse::Kv(
                         KvMutationOutcome::from_record(record),
                     )));
                 }
-                Ok(None) => match classify_pending_request(
-                    &mut canonical_by_request,
-                    &members,
-                    index,
-                    command.request_id(),
-                ) {
-                    Ok(None) => pending.push(index),
-                    Ok(Some(canonical)) => aliases[index] = Some(canonical),
-                    Err(error) => results[index] = Some(Err(error)),
-                },
+                Ok(None) => pending.push(index),
                 Err(error) => results[index] = Some(Err(error)),
             }
         }
@@ -5577,16 +7521,7 @@ impl NodeRuntime {
             let (proposal_count, proposal_payload) = if full_payload.len() <= MAX_COMMAND_BYTES {
                 (commands.len(), full_payload)
             } else {
-                let mut prefix = None;
-                for count in (2..commands.len()).rev() {
-                    let payload = encode_replicated_kv_batch(&commands[..count])
-                        .expect("the validated KV batch prefix remains valid");
-                    if payload.len() <= MAX_COMMAND_BYTES {
-                        prefix = Some((count, payload));
-                        break;
-                    }
-                }
-                let Some(prefix) = prefix else {
+                let Some(prefix) = largest_fitting_kv_batch_prefix(&commands) else {
                     let index = pending.remove(0);
                     results[index] = Some(self.execute_profile_member_locked(&members[index]));
                     continue;
@@ -5635,13 +7570,19 @@ impl NodeRuntime {
                 break;
             }
 
+            let current_pending = std::mem::take(&mut pending);
+            let post_commit = match self.check_kv_members_bulk(members, &current_pending) {
+                Ok(post_commit) => post_commit,
+                Err(error) => {
+                    for index in current_pending {
+                        results[index] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
             let mut remaining = Vec::new();
-            for index in pending.drain(..) {
-                let member = &members[index];
-                let QueuedOperation::Kv(command) = &member.operation else {
-                    unreachable!("KV pending members were validated above");
-                };
-                match self.check_kv_request(command.request_id(), &member.payload) {
+            for (index, lookup) in post_commit {
+                match lookup {
                     Ok(Some(record)) => {
                         results[index] = Some(Ok(ClientWriteResponse::Kv(
                             KvMutationOutcome::from_record(record),
@@ -5683,6 +7624,50 @@ impl NodeRuntime {
                 })
             })
             .collect()
+    }
+
+    #[cfg(feature = "kv")]
+    fn check_kv_members_bulk(
+        &self,
+        members: &[RuntimeBatchMember],
+        indices: &[usize],
+    ) -> Result<Vec<(usize, Result<Option<KvRequestRecord>, NodeError>)>, NodeError> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let materializer = self.lock_materializer()?;
+        let Materializer::Kv(kv) = &*materializer else {
+            return Err(NodeError::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Kv,
+                actual: materializer.profile(),
+            });
+        };
+        let requests = indices
+            .iter()
+            .map(|index| {
+                let QueuedOperation::Kv(command) = &members[*index].operation else {
+                    unreachable!("KV receipt lookup contains only KV members");
+                };
+                (command.request_id(), members[*index].payload.as_slice())
+            })
+            .collect::<Vec<_>>();
+        let lookups = kv
+            .check_requests(&requests)
+            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        if lookups.len() != indices.len() {
+            return Err(self.latch(NodeError::Invariant(
+                "KV bulk receipt lookup returned a misaligned result vector".into(),
+            )));
+        }
+        Ok(indices
+            .iter()
+            .copied()
+            .zip(
+                lookups.into_iter().map(|lookup| {
+                    lookup.map_err(|error| NodeError::InvalidRequest(error.to_string()))
+                }),
+            )
+            .collect())
     }
 
     fn execute_profile_member_locked(
@@ -5797,40 +7782,75 @@ impl NodeRuntime {
         base_hash: LogHash,
     ) -> Result<Vec<u8>, NodeError> {
         let sqlite = self.lock_sqlite()?;
-        match sqlite.prepare_sql_effect(command, request_payload, base_index, base_hash) {
-            Ok(SqlEffectPreparation::Effect(payload)) if !payload.starts_with(QWAL_V1_MAGIC) => {
-                Err(self.latch(NodeError::Invariant(
-                    "SQLite materializer prepared a non-QWAL SQL proposal".into(),
-                )))
-            }
-            Ok(SqlEffectPreparation::Effect(payload)) if payload.len() <= MAX_COMMAND_BYTES => {
-                Ok(payload)
-            }
-            Ok(SqlEffectPreparation::Effect(_)) => Err(NodeError::ResourceExhausted(format!(
-                "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
-            ))),
+        let preparation = sqlite.prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command,
+                request_payload,
+            }],
+            base_index,
+            base_hash,
+        );
+        let preparation = match preparation {
+            Ok(preparation) => preparation,
             Err(rhiza_sql::Error::ResourceExhausted(message)) => {
-                Err(NodeError::ResourceExhausted(message))
+                return Err(NodeError::ResourceExhausted(message));
             }
-            Err(error) => {
-                let message = error.to_string();
-                let statement_index = first_invalid_sql_statement(command, |prefix| {
-                    let Ok(prefix_payload) = encode_sql_command(prefix) else {
-                        return true;
-                    };
-                    sqlite
-                        .prepare_sql_effect(prefix, &prefix_payload, base_index, base_hash)
-                        .is_err()
-                });
-                match statement_index {
-                    Some(statement_index) => Err(NodeError::InvalidSqlStatement {
-                        statement_index,
-                        message,
-                    }),
-                    None => Err(NodeError::InvalidRequest(message)),
+            Err(error) => return Err(self.map_sqlite_error(error)),
+        };
+        let result = preparation
+            .results
+            .into_iter()
+            .next()
+            .expect("one-member SQL preparation returns one result");
+        if let Err(error) = result {
+            if let rhiza_sql::Error::ResourceExhausted(message) = error {
+                return Err(NodeError::ResourceExhausted(message));
+            }
+            if let rhiza_sql::Error::RequestConflict(conflict) = error {
+                return Err(NodeError::RequestConflict(conflict));
+            }
+            let message = error.to_string();
+            let statement_index = first_invalid_sql_statement(command, |prefix| {
+                let Ok(prefix_payload) = encode_sql_command(prefix) else {
+                    return true;
+                };
+                let prefix_member = [SqlBatchMember {
+                    command: prefix,
+                    request_payload: &prefix_payload,
+                }];
+                match sqlite.prepare_sql_batch_effect(&prefix_member, base_index, base_hash) {
+                    Ok(preparation) => preparation
+                        .results
+                        .into_iter()
+                        .next()
+                        .is_none_or(|result| result.is_err()),
+                    Err(_) => true,
                 }
-            }
+            });
+            return match statement_index {
+                Some(statement_index) => Err(NodeError::InvalidSqlStatement {
+                    statement_index,
+                    message,
+                }),
+                None => Err(NodeError::InvalidRequest(message)),
+            };
         }
+        let payload = preparation.effect.ok_or_else(|| {
+            self.latch(NodeError::Invariant(
+                "successful SQL preparation omitted its QWAL v2 effect".into(),
+            ))
+        })?;
+        if !payload.starts_with(QWAL_V2_MAGIC) {
+            return Err(self.latch(NodeError::Invariant(
+                "SQLite materializer prepared a non-QWAL v2 SQL proposal".into(),
+            )));
+        }
+        if payload.len() > MAX_COMMAND_BYTES {
+            return Err(NodeError::ResourceExhausted(format!(
+                "SQL effect exceeds {MAX_COMMAND_BYTES} bytes"
+            )));
+        }
+        Ok(payload)
     }
 
     #[cfg(feature = "sql")]
@@ -5857,9 +7877,9 @@ impl NodeRuntime {
                 .lock_sqlite()?
                 .prepare_put_effect(request_id, key, value, &payload, last_index, last_hash)
                 .map_err(|error| self.map_sqlite_error(error))?;
-            if !proposal_payload.starts_with(QWAL_V1_MAGIC) {
+            if !proposal_payload.starts_with(QWAL_V2_MAGIC) {
                 return Err(self.latch(NodeError::Invariant(
-                    "SQLite materializer prepared a non-QWAL legacy put proposal".into(),
+                    "SQLite materializer prepared a non-QWAL v2 legacy put proposal".into(),
                 )));
             }
             if proposal_payload.len() > MAX_COMMAND_BYTES {
@@ -5920,16 +7940,33 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "sql")]
+    fn map_sql_batch_member_error(&self, error: rhiza_sql::Error) -> NodeError {
+        match error {
+            rhiza_sql::Error::RequestConflict(conflict) => NodeError::RequestConflict(conflict),
+            rhiza_sql::Error::ResourceExhausted(message) => NodeError::ResourceExhausted(message),
+            rhiza_sql::Error::InvalidCommand(message) | rhiza_sql::Error::Sqlite(message) => {
+                NodeError::InvalidSqlStatement {
+                    statement_index: 0,
+                    message,
+                }
+            }
+            other => self.map_sqlite_error(other),
+        }
+    }
+
+    #[cfg(feature = "sql")]
     pub fn read(&self, key: &str, consistency: ReadConsistency) -> Result<ReadResponse, NodeError> {
         validate_key(key)?;
         match consistency {
             ReadConsistency::Local => self.read_local(key, None),
             ReadConsistency::AppliedIndex(required) => self.read_local(key, Some(required)),
             ReadConsistency::ReadBarrier => {
+                let anchor = self.establish_read_barrier()?;
                 let _commit = self.lock_commit()?;
                 self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.read_local(key, None)
+                self.ensure_writes_active()?;
+                self.validate_read_barrier_descendant_locked(anchor)?;
+                self.read_local(key, Some(anchor.index()))
             }
         }
     }
@@ -5952,10 +7989,12 @@ impl NodeRuntime {
                 self.query_sql_local(statement, Some(required), max_rows)
             }
             ReadConsistency::ReadBarrier => {
+                let anchor = self.establish_read_barrier()?;
                 let _commit = self.lock_commit()?;
                 self.ensure_ready()?;
-                self.commit_read_barrier()?;
-                self.query_sql_local(statement, None, max_rows)
+                self.ensure_writes_active()?;
+                self.validate_read_barrier_descendant_locked(anchor)?;
+                self.query_sql_local(statement, Some(anchor.index()), max_rows)
             }
         }
     }
@@ -5976,6 +8015,15 @@ impl NodeRuntime {
 
     pub fn cancel_operations(&self) {
         self.operation_cancelled.store(true, Ordering::Release);
+        #[cfg(feature = "sql")]
+        self.sql_group_commit.fail_pending(NodeError::Unavailable(
+            "SQL group commit cancelled during shutdown".into(),
+        ));
+        #[cfg(feature = "kv")]
+        self.kv_group_commit.fail_pending(NodeError::Unavailable(
+            "KV group commit cancelled during shutdown".into(),
+        ));
+        self.read_barriers.cancel_waiters();
         self.operation_cancelled_notify.notify_waiters();
     }
 
@@ -6584,23 +8632,205 @@ impl NodeRuntime {
         })
     }
 
-    fn commit_read_barrier(&self) -> Result<(), NodeError> {
+    fn establish_read_barrier(&self) -> Result<LogAnchor, NodeError> {
+        let participant = self.read_barriers.join().map_err(|error| match error {
+            NodeError::Invariant(_) => self.latch(error),
+            other => other,
+        })?;
+        let Some(mut publication) = participant.publication() else {
+            return participant.wait(&self.operation_cancelled);
+        };
+
+        let result = (|| {
+            publication.wait_turn(&self.operation_cancelled)?;
+            // The public read path must not own this mutex before entering the
+            // coalescer. The generation cutoff happens only after the round
+            // leader owns commit, immediately before consensus begins.
+            let _commit = self.lock_commit()?;
+            publication.start(&self.operation_cancelled)?;
+            self.ensure_ready()?;
+            self.commit_read_barrier_locked()
+        })();
+        publication.publish(result.clone());
+        result
+    }
+
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    fn validate_read_barrier_before_snapshot(&self, anchor: LogAnchor) -> Result<(), NodeError> {
+        {
+            let _commit = self.lock_commit()?;
+            self.ensure_ready()?;
+            self.ensure_writes_active()?;
+            self.validate_read_barrier_qlog_descendant_locked(anchor)?;
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.read_barrier_before_snapshot_hook {
+            hook();
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    fn validate_read_barrier_snapshot(
+        &self,
+        anchor: LogAnchor,
+        observed: LogAnchor,
+    ) -> Result<(), NodeError> {
+        if observed.index() < anchor.index() {
+            return Err(NodeError::Unavailable(format!(
+                "read snapshot tip {} precedes read barrier {}",
+                observed.index(),
+                anchor.index()
+            )));
+        }
+        if observed.index() == anchor.index() && observed.hash() != anchor.hash() {
+            return Err(self.latch(NodeError::Invariant(
+                "read snapshot tip hash differs from the read barrier anchor".into(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_read_barrier_descendant_locked(&self, anchor: LogAnchor) -> Result<(), NodeError> {
+        let (applied_index, applied_hash) = self.ensure_materialized_tip()?;
+        self.validate_read_barrier_descendant_from_tip(
+            anchor,
+            LogAnchor::new(applied_index, applied_hash),
+            "materialized",
+        )
+    }
+
+    #[cfg(any(feature = "graph", feature = "kv"))]
+    fn validate_read_barrier_qlog_descendant_locked(
+        &self,
+        anchor: LogAnchor,
+    ) -> Result<(), NodeError> {
+        let (qlog_index, qlog_hash) = self.durable_tip()?;
+        self.validate_read_barrier_descendant_from_tip(
+            anchor,
+            LogAnchor::new(qlog_index, qlog_hash),
+            "qlog",
+        )
+    }
+
+    fn validate_read_barrier_descendant_from_tip(
+        &self,
+        anchor: LogAnchor,
+        tip: LogAnchor,
+        tip_kind: &str,
+    ) -> Result<(), NodeError> {
+        if tip.index() < anchor.index() {
+            return Err(self.latch(NodeError::Invariant(format!(
+                "{tip_kind} tip {} precedes read barrier {}",
+                tip.index(),
+                anchor.index()
+            ))));
+        }
+        if tip.index() == anchor.index() {
+            if tip.hash() != anchor.hash() {
+                return Err(self.latch(NodeError::Invariant(format!(
+                    "{tip_kind} tip hash differs from the read barrier anchor"
+                ))));
+            }
+            return Ok(());
+        }
+        if anchor.index() == 0 {
+            if anchor.hash() == LogHash::ZERO {
+                return Ok(());
+            }
+            return Err(self.latch(NodeError::Invariant(
+                "genesis read barrier anchor has a non-zero hash".into(),
+            )));
+        }
+
+        let logical = self
+            .log_store
+            .logical_state()
+            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?;
+        if let Some(compacted) = logical.anchor.as_ref().map(RecoveryAnchor::compacted) {
+            if compacted.index() > anchor.index() {
+                return Ok(());
+            }
+            if compacted.index() == anchor.index() {
+                if compacted.hash() == anchor.hash() {
+                    return Ok(());
+                }
+                return Err(self.latch(NodeError::Invariant(
+                    "compacted qlog hash differs from the read barrier anchor".into(),
+                )));
+            }
+        }
+        let retained = self
+            .log_store
+            .read(anchor.index())
+            .map_err(|error| self.latch(NodeError::Storage(error.to_string())))?
+            .ok_or_else(|| {
+                self.latch(NodeError::Invariant(
+                    "read barrier anchor is neither retained nor compacted".into(),
+                ))
+            })?;
+        if retained.hash != anchor.hash() {
+            return Err(self.latch(NodeError::Invariant(
+                "retained qlog hash differs from the read barrier anchor".into(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn commit_read_barrier_locked(&self) -> Result<LogAnchor, NodeError> {
         self.ensure_writes_active()?;
+        let context_read_fence = self.consensus.supports_context_read_fence();
         loop {
             self.ensure_ready()?;
             let (last_index, last_hash) = self.ensure_materialized_tip()?;
             let slot = last_index.checked_add(1).ok_or_else(|| {
                 self.latch(NodeError::Invariant("qlog index is exhausted".into()))
             })?;
-            match self
-                .consensus
-                .inspect_decision_at(slot, last_hash)
-                .map_err(|error| self.map_consensus_error(error))?
-            {
+            let inspection = if context_read_fence {
+                match self
+                    .consensus
+                    .inspect_context_read_fence_at(slot, last_hash)
+                    .map_err(|error| self.map_consensus_error(error))?
+                {
+                    CertifiedDecisionInspection::Committed(certified) => {
+                        DecisionInspection::Committed(certified.entry)
+                    }
+                    CertifiedDecisionInspection::Empty => DecisionInspection::Empty,
+                    CertifiedDecisionInspection::Pending => DecisionInspection::Pending,
+                    CertifiedDecisionInspection::Unavailable => DecisionInspection::Unavailable,
+                }
+            } else {
+                self.consensus
+                    .inspect_decision_at(slot, last_hash)
+                    .map_err(|error| self.map_consensus_error(error))?
+            };
+            match inspection {
                 DecisionInspection::Committed(entry) => {
                     self.persist_entry(&entry, slot, last_hash)?;
                 }
-                DecisionInspection::Pending | DecisionInspection::Empty => {
+                DecisionInspection::Empty if context_read_fence => {
+                    // Configuration may have been sealed while the read-only
+                    // quorum observation was in flight. Never return an anchor
+                    // from a configuration that is no longer write-active.
+                    self.ensure_writes_active()?;
+                    return Ok(LogAnchor::new(last_index, last_hash));
+                }
+                DecisionInspection::Pending => {
+                    let entry = self
+                        .consensus
+                        .propose_at_cancellable(
+                            slot,
+                            last_hash,
+                            Command::new(CommandKind::ReadBarrier, Vec::new()),
+                            &self.operation_cancelled,
+                        )
+                        .map_err(|error| self.map_consensus_error(error))?;
+                    self.persist_entry(&entry, slot, last_hash)?;
+                    // Pending may conceal a historical phase-2 Noop whose
+                    // asynchronous proof was never installed. It cannot fence
+                    // this read, so inspect the following slot before returning.
+                }
+                DecisionInspection::Empty => {
                     let entry = self
                         .consensus
                         .propose_at_cancellable(
@@ -6614,7 +8844,7 @@ impl NodeRuntime {
                         entry.entry_type == EntryType::Noop && entry.payload.is_empty();
                     self.persist_entry(&entry, slot, last_hash)?;
                     if is_barrier {
-                        return Ok(());
+                        return Ok(LogAnchor::new(entry.index, entry.hash));
                     }
                 }
                 DecisionInspection::Unavailable => {
@@ -6682,14 +8912,15 @@ impl NodeRuntime {
     }
 
     fn ensure_materialized_tip(&self) -> Result<(LogIndex, LogHash), NodeError> {
+        #[cfg(test)]
+        self.materialized_tip_checks.fetch_add(1, Ordering::Relaxed);
         let (last_index, last_hash) = self.durable_tip()?;
         let materializer = self.lock_materializer()?;
-        let applied_index = materializer
-            .applied_index()
+        let applied_tip = materializer
+            .applied_tip()
             .map_err(|error| self.latch(NodeError::Storage(error)))?;
-        let applied_hash = materializer
-            .applied_hash()
-            .map_err(|error| self.latch(NodeError::Storage(error)))?;
+        let applied_index = applied_tip.index();
+        let applied_hash = applied_tip.hash();
         if (applied_index, applied_hash) != (last_index, last_hash) {
             return Err(self.latch(NodeError::Invariant(format!(
                 "qlog tip {last_index}/{} differs from {} materializer tip {applied_index}/{}",
@@ -6726,6 +8957,41 @@ impl NodeRuntime {
         self.lock_materializer()?
             .apply_entry(entry)
             .map_err(|error| self.latch(NodeError::Invariant(error)))
+    }
+
+    #[cfg(feature = "sql")]
+    fn persist_sql_entry_profiled<P: SqlWritePhaseProfile>(
+        &self,
+        entry: &LogEntry,
+        expected_index: LogIndex,
+        expected_prev_hash: LogHash,
+        profile: &mut P,
+    ) -> Result<Option<SqlCommandResult>, NodeError> {
+        let configuration_state = self.configuration_state()?;
+        validate_runtime_entry(
+            &self.config,
+            &configuration_state,
+            entry,
+            expected_index,
+            expected_prev_hash,
+        )
+        .map_err(|error| self.latch(error))?;
+
+        let qlog_mark = profile.mark();
+        let append_result = self
+            .log_store
+            .append(entry)
+            .map_err(|error| self.latch(NodeError::Storage(error.to_string())));
+        profile.add_local_qlog_append_sync(qlog_mark);
+        append_result?;
+
+        let materializer_mark = profile.mark();
+        let apply_result = self
+            .lock_materializer()?
+            .apply_entry(entry)
+            .map_err(|error| self.latch(NodeError::Invariant(error)));
+        profile.add_sql_materializer_apply(materializer_mark);
+        apply_result
     }
 
     fn require_execution_profile(&self, expected: ExecutionProfile) -> Result<(), NodeError> {
@@ -6883,6 +9149,7 @@ impl NodeRuntime {
     fn map_consensus_error(&self, error: rhiza_quepaxa::Error) -> NodeError {
         match error {
             rhiza_quepaxa::Error::NoQuorum
+            | rhiza_quepaxa::Error::ProposeFailed
             | rhiza_quepaxa::Error::CommandUnavailable
             | rhiza_quepaxa::Error::Cancelled
             | rhiza_quepaxa::Error::Io(_) => NodeError::Unavailable(error.to_string()),
@@ -6988,7 +9255,9 @@ pub fn rehydrate_recorder_after_checkpoint(
 mod tests {
     use axum::http::HeaderValue;
 
-    use rhiza_core::{EntryType, ExecutionProfile, LogHash, StoredCommand};
+    use rhiza_core::{
+        Command, CommandKind, EntryType, ExecutionProfile, LogAnchor, LogHash, StoredCommand,
+    };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
     #[cfg(feature = "kv")]
@@ -6997,19 +9266,411 @@ mod tests {
     use rhiza_quepaxa::{
         AcceptedValue, Membership, Proposal, ProposalPriority, RecordRequest, ThreeNodeConsensus,
     };
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc, Arc, Barrier,
+    };
 
     #[cfg(any(feature = "graph", feature = "kv"))]
     use super::node_error_response;
     #[cfg(feature = "graph")]
     use super::with_graph_client_permit;
+    use super::ReadBarrierRounds;
     use super::{
         client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
         valid_recorder_record, Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand,
-        SqlQueryResponse, SqlStatement, SqlValue, MAX_COMMAND_BYTES, MAX_SQL_RESPONSE_BYTES,
-        PROTOCOL_VERSION, SYNC_FLUSH_RETRY_INITIAL, VERSION_HEADER,
+        SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
+        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V2_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
+        VERSION_HEADER,
     };
     use super::{NodeConfig, NodeRuntime, NodeService};
+
+    #[test]
+    fn concurrent_read_barriers_registered_before_cutoff_share_one_generation() {
+        let rounds = ReadBarrierRounds::new(Duration::ZERO);
+        let cancelled = AtomicBool::new(false);
+        let participants = (0..4).map(|_| rounds.join().unwrap()).collect::<Vec<_>>();
+        let generation = participants[0].generation();
+        assert!(participants[0].is_leader());
+        assert!(participants[1..]
+            .iter()
+            .all(|participant| !participant.is_leader() && participant.generation() == generation));
+
+        let calls = AtomicUsize::new(0);
+        let mut publication = participants[0].publication().unwrap();
+        publication.wait_turn(&cancelled).unwrap();
+        publication.start(&cancelled).unwrap();
+        let anchor = LogAnchor::new(7, LogHash::digest(&[b"shared-barrier"]));
+        calls.fetch_add(1, Ordering::Relaxed);
+        publication.publish(Ok(anchor));
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for participant in &participants[1..] {
+            assert_eq!(participant.wait(&cancelled).unwrap(), anchor);
+        }
+    }
+
+    #[test]
+    fn read_barrier_arriving_after_running_cutoff_uses_next_generation() {
+        let rounds = Arc::new(ReadBarrierRounds::new(Duration::ZERO));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let first = rounds.join().unwrap();
+        let first_generation = first.generation();
+        let (running_tx, running_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_cancelled = Arc::clone(&cancelled);
+        let first_worker = std::thread::spawn(move || {
+            let mut publication = first.publication().unwrap();
+            publication.wait_turn(&first_cancelled).unwrap();
+            publication.start(&first_cancelled).unwrap();
+            running_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let anchor = LogAnchor::new(1, LogHash::digest(&[b"first"]));
+            publication.publish(Ok(anchor));
+            anchor
+        });
+        running_rx.recv().unwrap();
+
+        let late = rounds.join().unwrap();
+        assert!(late.is_leader());
+        assert_eq!(late.generation(), first_generation + 1);
+        release_tx.send(()).unwrap();
+        assert_eq!(first_worker.join().unwrap().index(), 1);
+
+        let mut publication = late.publication().unwrap();
+        publication.wait_turn(&cancelled).unwrap();
+        publication.start(&cancelled).unwrap();
+        let second = LogAnchor::new(2, LogHash::digest(&[b"second"]));
+        publication.publish(Ok(second));
+        assert_eq!(late.wait(&cancelled).unwrap(), second);
+    }
+
+    #[test]
+    fn completed_read_barrier_is_not_reused_and_predecessor_failure_retries_independently() {
+        let rounds = ReadBarrierRounds::new(Duration::ZERO);
+        let cancelled = AtomicBool::new(false);
+        let failed = rounds.join().unwrap();
+        let failed_generation = failed.generation();
+        let mut publication = failed.publication().unwrap();
+        publication.wait_turn(&cancelled).unwrap();
+        publication.start(&cancelled).unwrap();
+        publication.publish(Err(NodeError::Unavailable("no quorum".into())));
+        assert!(matches!(
+            failed.wait(&cancelled),
+            Err(NodeError::Unavailable(_))
+        ));
+
+        let retry = rounds.join().unwrap();
+        assert!(retry.is_leader());
+        assert_eq!(retry.generation(), failed_generation + 1);
+        let mut publication = retry.publication().unwrap();
+        publication.wait_turn(&cancelled).unwrap();
+        publication.start(&cancelled).unwrap();
+        let anchor = LogAnchor::new(1, LogHash::digest(&[b"retry"]));
+        publication.publish(Ok(anchor));
+        assert_eq!(retry.wait(&cancelled).unwrap(), anchor);
+
+        let later = rounds.join().unwrap();
+        assert!(later.is_leader());
+        assert_eq!(later.generation(), retry.generation() + 1);
+    }
+
+    #[test]
+    fn read_barrier_leader_drop_and_global_cancel_wake_waiters() {
+        let rounds = Arc::new(ReadBarrierRounds::new(Duration::ZERO));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let abandoned = rounds.join().unwrap();
+        let follower = rounds.join().unwrap();
+        drop(abandoned.publication().unwrap());
+        assert!(matches!(
+            follower.wait(&cancelled),
+            Err(NodeError::Unavailable(_))
+        ));
+
+        let leader = rounds.join().unwrap();
+        let waiting = rounds.join().unwrap();
+        let waiting_cancelled = Arc::clone(&cancelled);
+        let waiter = std::thread::spawn(move || waiting.wait(&waiting_cancelled));
+        cancelled.store(true, Ordering::Release);
+        rounds.cancel_waiters();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::Unavailable(_))
+        ));
+        drop(leader.publication().unwrap());
+    }
+
+    #[test]
+    fn sql_c4_read_barrier_shares_one_qlog_anchor_and_preserves_snapshot_tip() {
+        let (_dir, mut runtime) = sql_test_runtime();
+        runtime.read_barriers = ReadBarrierRounds::new(Duration::from_millis(20));
+        let runtime = Arc::new(runtime);
+        let start = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.read("missing", ReadConsistency::ReadBarrier)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(responses
+            .iter()
+            .all(|response| response.applied_index == 0 && response.hash == LogHash::ZERO));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[test]
+    fn read_barrier_anchor_remains_valid_when_materialized_tip_advances() {
+        let (_dir, runtime) = sql_test_runtime();
+        let anchor = runtime.establish_read_barrier().unwrap();
+        let write = runtime.write("request-1", "alpha", "one").unwrap();
+        assert!(write.applied_index > anchor.index());
+
+        let _commit = runtime.lock_commit().unwrap();
+        runtime.ensure_ready().unwrap();
+        runtime.ensure_writes_active().unwrap();
+        runtime
+            .validate_read_barrier_descendant_locked(anchor)
+            .unwrap();
+        let read = runtime.read_local("alpha", Some(anchor.index())).unwrap();
+
+        assert_eq!(read.value.as_deref(), Some("one"));
+        assert_eq!(read.applied_index, write.applied_index);
+        assert_eq!(read.hash, write.hash);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_read_barrier_checks_materialized_tip_once_before_snapshot() {
+        let (_dir, runtime) = graph_test_runtime();
+
+        let response = runtime
+            .get_graph_document("missing", ReadConsistency::ReadBarrier)
+            .unwrap();
+
+        assert_eq!(response.applied_index, 0);
+        assert_eq!(response.hash, LogHash::ZERO);
+        assert_eq!(runtime.materialized_tip_checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_c4_read_barrier_shares_one_qlog_anchor_and_preserves_snapshot_tip() {
+        let (_dir, mut runtime) = graph_test_runtime();
+        runtime.read_barriers = ReadBarrierRounds::new(Duration::from_millis(20));
+        let runtime = Arc::new(runtime);
+        let start = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.get_graph_document("missing", ReadConsistency::ReadBarrier)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(responses
+            .iter()
+            .all(|response| response.applied_index == 0 && response.hash == LogHash::ZERO));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_read_barrier_releases_commit_lock_before_backend_snapshot() {
+        let (_dir, mut runtime) = graph_test_runtime();
+        let initial = runtime
+            .mutate_graph(
+                GraphCommandV1::put_document(
+                    "request-1",
+                    "document-1",
+                    GraphValueV1::String("one".into()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.read_barrier_before_snapshot_hook = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let runtime = Arc::new(runtime);
+        let reader = {
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || {
+                runtime.get_graph_document("document-1", ReadConsistency::ReadBarrier)
+            })
+        };
+        entered.wait();
+        let (advanced_tx, advanced_rx) = mpsc::channel();
+        let writer = {
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || {
+                let outcome = runtime
+                    .mutate_graph(
+                        GraphCommandV1::put_document(
+                            "request-2",
+                            "document-1",
+                            GraphValueV1::String("two".into()),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                advanced_tx
+                    .send((outcome.applied_index(), outcome.hash()))
+                    .unwrap();
+                outcome
+            })
+        };
+
+        let advanced_before_snapshot = advanced_rx.recv_timeout(Duration::from_secs(2));
+        release.wait();
+        let written = writer.join().unwrap();
+        let read = reader.join().unwrap().unwrap();
+
+        assert!(
+            advanced_before_snapshot.is_ok(),
+            "graph write must advance while the read is paused before its backend snapshot"
+        );
+        assert!(read.applied_index >= initial.applied_index());
+        if read.applied_index == initial.applied_index() {
+            assert_eq!(read.hash, initial.hash());
+        }
+        assert_eq!(read.applied_index, written.applied_index());
+        assert_eq!(read.hash, written.hash());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn read_barrier_rejects_same_index_snapshot_with_different_hash() {
+        let (_dir, runtime) = graph_test_runtime();
+        let anchor = LogAnchor::new(7, LogHash::digest(&[b"barrier-anchor"]));
+        let observed = LogAnchor::new(7, LogHash::digest(&[b"divergent-snapshot"]));
+
+        assert!(matches!(
+            runtime.validate_read_barrier_snapshot(anchor, observed),
+            Err(NodeError::Invariant(message))
+                if message.contains("snapshot tip hash differs")
+        ));
+        assert!(runtime.is_fatal());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_read_barrier_checks_materialized_tip_once_before_snapshot() {
+        let (_dir, runtime) = kv_test_runtime();
+
+        let response = runtime
+            .get_kv(b"missing", ReadConsistency::ReadBarrier)
+            .unwrap();
+
+        assert_eq!(response.applied_index, 0);
+        assert_eq!(response.hash, LogHash::ZERO);
+        assert_eq!(runtime.materialized_tip_checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_c4_read_barrier_shares_one_qlog_anchor_and_preserves_snapshot_tip() {
+        let (_dir, mut runtime) = kv_test_runtime();
+        runtime.read_barriers = ReadBarrierRounds::new(Duration::from_millis(20));
+        let runtime = Arc::new(runtime);
+        let start = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.get_kv(b"missing", ReadConsistency::ReadBarrier)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(responses
+            .iter()
+            .all(|response| response.applied_index == 0 && response.hash == LogHash::ZERO));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_read_barrier_releases_commit_lock_before_backend_snapshot() {
+        let (_dir, mut runtime) = kv_test_runtime();
+        let initial = runtime
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"one".to_vec()).unwrap())
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.read_barrier_before_snapshot_hook = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let runtime = Arc::new(runtime);
+        let reader = {
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || runtime.get_kv(b"key", ReadConsistency::ReadBarrier))
+        };
+        entered.wait();
+        let (advanced_tx, advanced_rx) = mpsc::channel();
+        let writer = {
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || {
+                let outcome = runtime
+                    .mutate_kv(
+                        KvCommandV1::put("request-2", b"key".to_vec(), b"two".to_vec()).unwrap(),
+                    )
+                    .unwrap();
+                advanced_tx
+                    .send((outcome.applied_index(), outcome.hash()))
+                    .unwrap();
+                outcome
+            })
+        };
+
+        let advanced_before_snapshot = advanced_rx.recv_timeout(Duration::from_secs(2));
+        release.wait();
+        let written = writer.join().unwrap();
+        let read = reader.join().unwrap().unwrap();
+
+        assert!(
+            advanced_before_snapshot.is_ok(),
+            "KV write must advance while the read is paused before its backend snapshot"
+        );
+        assert!(read.applied_index >= initial.applied_index());
+        if read.applied_index == initial.applied_index() {
+            assert_eq!(read.hash, initial.hash());
+        }
+        assert_eq!(read.applied_index, written.applied_index());
+        assert_eq!(read.hash, written.hash());
+    }
 
     #[test]
     fn client_authentication_rejects_empty_expected_token() {
@@ -7438,6 +10099,595 @@ mod tests {
         assert!(runtime.is_ready());
     }
 
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_coalesces_four_waiting_64_member_calls_into_one_qlog() {
+        let (_dir, runtime) = kv_test_runtime();
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(5));
+        let workers = (0..4)
+            .map(|call| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let commands = (0..64)
+                        .map(|member| {
+                            let id = call * 64 + member;
+                            KvCommandV1::put(
+                                format!("kv-group-{id}"),
+                                format!("key-{id}").into_bytes(),
+                                vec![u8::try_from(call).unwrap(); 128],
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    start.wait();
+                    runtime.mutate_kv_batch(commands)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(4, Duration::from_secs(5));
+        drop(commit);
+
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let anchors = responses
+            .iter()
+            .flatten()
+            .map(|result| {
+                let outcome = result.as_ref().unwrap();
+                (outcome.applied_index(), outcome.hash())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_rejects_public_257_member_call_before_writing() {
+        let (_dir, runtime) = kv_test_runtime();
+        let commands = (0..257)
+            .map(|id| {
+                KvCommandV1::put(
+                    format!("kv-over-{id}"),
+                    format!("key-{id}").into_bytes(),
+                    b"value".to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let error = runtime.mutate_kv_batch(commands).unwrap_err();
+
+        assert!(matches!(error, NodeError::InvalidRequest(_)));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        assert!(runtime
+            .kv_group_commit
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .is_empty());
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_lone_call_completes_and_leaves_queue_idle() {
+        let (_dir, runtime) = kv_test_runtime();
+
+        let outcome = runtime
+            .mutate_kv(KvCommandV1::put("kv-lone", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap();
+
+        assert_eq!(outcome.applied_index(), 1);
+        let state = runtime
+            .kv_group_commit
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_encoded_bytes, 0);
+        assert!(!state.leader_active);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_shutdown_wakes_waiters_without_writing() {
+        let (_dir, runtime) = kv_test_runtime();
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|id| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.mutate_kv(
+                        KvCommandV1::put(
+                            format!("kv-shutdown-{id}"),
+                            format!("key-{id}").into_bytes(),
+                            b"value".to_vec(),
+                        )
+                        .unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(2, Duration::from_secs(5));
+
+        runtime.cancel_operations();
+        drop(commit);
+
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(NodeError::Unavailable(_))
+            ));
+        }
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        let state = runtime
+            .kv_group_commit
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_encoded_bytes, 0);
+        assert!(!state.leader_active);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_preserves_cross_call_retry_conflict_and_new_result_offsets() {
+        let (_dir, runtime) = kv_test_runtime();
+        let runtime = Arc::new(runtime);
+        let stored = KvCommandV1::put(
+            "kv-stored",
+            b"stored-key".to_vec(),
+            b"stored-value".to_vec(),
+        )
+        .unwrap();
+        let stored_outcome = runtime.mutate_kv(stored.clone()).unwrap();
+        let conflict =
+            KvCommandV1::put("kv-stored", b"stored-key".to_vec(), b"conflict".to_vec()).unwrap();
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let retry_worker = {
+            let runtime = Arc::clone(&runtime);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                runtime.mutate_kv_batch(vec![stored, conflict])
+            })
+        };
+        let new_worker = {
+            let runtime = Arc::clone(&runtime);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                runtime.mutate_kv_batch(vec![
+                    KvCommandV1::put("kv-new-1", b"new-1".to_vec(), b"one".to_vec()).unwrap(),
+                    KvCommandV1::put("kv-new-2", b"new-2".to_vec(), b"two".to_vec()).unwrap(),
+                ])
+            })
+        };
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(2, Duration::from_secs(5));
+        drop(commit);
+
+        let retry_results = retry_worker.join().unwrap().unwrap();
+        let new_results = new_worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            retry_results[0].as_ref().unwrap().applied_index(),
+            stored_outcome.applied_index()
+        );
+        assert!(matches!(
+            retry_results[1],
+            Err(NodeError::InvalidRequest(_))
+        ));
+        let new_anchors = new_results
+            .iter()
+            .map(|result| {
+                let outcome = result.as_ref().unwrap();
+                (outcome.applied_index(), outcome.hash())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(new_anchors.len(), 1);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_releases_pending_byte_budget_after_drain_and_failure() {
+        let queue = super::KvGroupCommitQueue::new();
+        let cancelled = AtomicBool::new(false);
+        let member = |id: usize, bytes: usize| super::RuntimeBatchMember {
+            #[cfg(feature = "sql")]
+            request_id: format!("kv-byte-{id}"),
+            payload: vec![u8::try_from(id).unwrap_or_default(); bytes],
+            operation: super::QueuedOperation::Kv(
+                KvCommandV1::put(
+                    format!("kv-byte-{id}"),
+                    format!("key-{id}").into_bytes(),
+                    b"value".to_vec(),
+                )
+                .unwrap(),
+            ),
+        };
+        for id in 0..63 {
+            queue
+                .enqueue(vec![member(id, MAX_COMMAND_BYTES)], &cancelled)
+                .unwrap();
+        }
+
+        let overflow = match queue.enqueue(vec![member(63, MAX_COMMAND_BYTES * 2)], &cancelled) {
+            Ok(_) => panic!("pending KV byte budget must reject oversized aggregate work"),
+            Err(error) => error,
+        };
+        assert!(matches!(overflow, NodeError::ResourceExhausted(_)));
+
+        let drained = queue.drain_next_group().unwrap();
+        assert_eq!(drained.len(), 63);
+        let released = queue
+            .enqueue(vec![member(64, MAX_COMMAND_BYTES)], &cancelled)
+            .unwrap()
+            .0;
+        queue.fail_pending(NodeError::Unavailable("test failure".into()));
+        assert!(matches!(
+            released.wait(&cancelled),
+            Err(NodeError::Unavailable(_))
+        ));
+        let state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_encoded_bytes, 0);
+        assert!(!state.leader_active);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_window_restarts_after_staggered_enqueue() {
+        let queue = Arc::new(super::KvGroupCommitQueue::new());
+        let cancelled = AtomicBool::new(false);
+        let member = |id: usize| super::RuntimeBatchMember {
+            #[cfg(feature = "sql")]
+            request_id: format!("kv-debounce-{id}"),
+            payload: vec![u8::try_from(id).unwrap_or_default()],
+            operation: super::QueuedOperation::Kv(
+                KvCommandV1::put(
+                    format!("kv-debounce-{id}"),
+                    format!("key-{id}").into_bytes(),
+                    b"value".to_vec(),
+                )
+                .unwrap(),
+            ),
+        };
+        queue.enqueue(vec![member(1)], &cancelled).unwrap();
+        let collector = Arc::clone(&queue);
+        let (finished, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let collected = collector.collect_until_full_or_timeout(Duration::from_millis(100));
+            finished.send(collected).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(75));
+        queue.enqueue(vec![member(2)], &cancelled).unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+        queue.enqueue(vec![member(3)], &cancelled).unwrap();
+        assert!(receive.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(receive.recv_timeout(Duration::from_millis(150)).unwrap());
+        worker.join().unwrap();
+        assert_eq!(queue.drain_next_group().unwrap().len(), 3);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_returns_committed_group_when_cancelled_after_execution() {
+        let (_dir, mut runtime) = kv_test_runtime();
+        runtime.kv_group_commit_after_execute_hook = Some(Arc::new(NodeRuntime::cancel_operations));
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|call| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let commands = (0..64)
+                        .map(|member| {
+                            let id = call * 64 + member;
+                            KvCommandV1::put(
+                                format!("kv-cancel-after-{id}"),
+                                format!("key-{id}").into_bytes(),
+                                b"value".to_vec(),
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    start.wait();
+                    runtime.mutate_kv_batch(commands)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(2, Duration::from_secs(5));
+        drop(commit);
+
+        let results = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 128);
+        let anchors = results
+            .iter()
+            .map(|result| {
+                let outcome = result.as_ref().unwrap();
+                (outcome.applied_index(), outcome.hash())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+        assert!(runtime.operation_cancelled.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_largest_fitting_prefix_is_exact_for_large_grouped_batch() {
+        let commands = (0..256)
+            .map(|id| {
+                KvCommandV1::put(
+                    format!("kv-prefix-{id:04}"),
+                    format!("key-{id:04}").into_bytes(),
+                    vec![b'x'; 4 * 1024],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(super::encode_replicated_kv_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
+        let expected = (2..commands.len())
+            .filter(|count| {
+                super::encode_replicated_kv_batch(&commands[..*count])
+                    .unwrap()
+                    .len()
+                    <= MAX_COMMAND_BYTES
+            })
+            .max()
+            .unwrap();
+
+        let (count, payload) = super::largest_fitting_kv_batch_prefix(&commands).unwrap();
+
+        assert_eq!(count, expected);
+        assert!(payload.len() <= MAX_COMMAND_BYTES);
+        assert!(
+            super::encode_replicated_kv_batch(&commands[..count + 1])
+                .unwrap()
+                .len()
+                > MAX_COMMAND_BYTES
+        );
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_large_batch_uses_largest_fitting_fifo_sub_batches() {
+        let (_dir, runtime) = kv_test_runtime();
+        let runtime = Arc::new(runtime);
+        let calls = (0..4)
+            .map(|call| {
+                (0..64)
+                    .map(|member| {
+                        let id = call * 64 + member;
+                        KvCommandV1::put(
+                            format!("kv-large-{id:04}"),
+                            format!("key-{id:04}").into_bytes(),
+                            vec![b'x'; 4 * 1024],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let flattened = calls.iter().flatten().cloned().collect::<Vec<_>>();
+        let (largest_prefix, _) = super::largest_fitting_kv_batch_prefix(&flattened).unwrap();
+        let expected_entries = flattened.len().div_ceil(largest_prefix);
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(5));
+        let workers = calls
+            .into_iter()
+            .map(|commands| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    runtime.mutate_kv_batch(commands)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(4, Duration::from_secs(5));
+        drop(commit);
+
+        let mut counts = std::collections::BTreeMap::new();
+        for result in workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap().unwrap())
+        {
+            *counts
+                .entry(result.unwrap().applied_index())
+                .or_insert(0_usize) += 1;
+        }
+
+        assert_eq!(counts.len(), expected_entries);
+        let counts = counts.into_values().collect::<Vec<_>>();
+        assert!(counts[..counts.len() - 1]
+            .iter()
+            .all(|count| *count == largest_prefix));
+        assert_eq!(counts.iter().sum::<usize>(), 256);
+        assert_eq!(
+            runtime.log_store().last_index().unwrap(),
+            Some(u64::try_from(expected_entries).unwrap())
+        );
+        for index in 1..=u64::try_from(expected_entries).unwrap() {
+            assert!(runtime
+                .log_store()
+                .read(index)
+                .unwrap()
+                .is_some_and(|entry| entry.payload.len() <= MAX_COMMAND_BYTES));
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_leader_panic_wakes_active_and_pending_calls_with_same_fatal() {
+        let (_dir, mut runtime) = kv_test_runtime();
+        runtime.kv_group_commit_before_execute_hook =
+            Some(Arc::new(|| panic!("injected KV group leader panic")));
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let mut workers = Vec::new();
+        for call in 0..17 {
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(std::thread::spawn(move || {
+                worker_runtime.mutate_kv_batch(
+                    (0..64)
+                        .map(|member| {
+                            let id = call * 64 + member;
+                            KvCommandV1::put(
+                                format!("kv-panic-{id}"),
+                                format!("key-{id}").into_bytes(),
+                                b"value".to_vec(),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+            }));
+            runtime
+                .kv_group_commit
+                .wait_for_pending_calls(call + 1, Duration::from_secs(5));
+        }
+        drop(commit);
+
+        let errors = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap_err())
+            .collect::<Vec<_>>();
+        assert!(errors
+            .iter()
+            .all(|error| matches!(error, NodeError::Fatal(_))));
+        assert_eq!(errors[0].to_string(), errors[1].to_string());
+        assert!(runtime.is_fatal());
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_group_commit_reopens_all_four_grouped_calls_at_shared_durable_anchor() {
+        let (dir, runtime) = kv_test_runtime();
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(5));
+        let workers = (0..4)
+            .map(|call| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let commands = (0..64)
+                        .map(|member| {
+                            let id = call * 64 + member;
+                            KvCommandV1::put(
+                                format!("kv-reopen-{id}"),
+                                format!("key-{id:04}").into_bytes(),
+                                vec![u8::try_from(call).unwrap(); 128],
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    start.wait();
+                    runtime.mutate_kv_batch(commands)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .kv_group_commit
+            .wait_for_pending_calls(4, Duration::from_secs(5));
+        drop(commit);
+
+        let results = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let anchors = results
+            .iter()
+            .map(|result| {
+                let outcome = result.as_ref().unwrap();
+                (outcome.applied_index(), outcome.hash())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let [(applied_index, applied_hash)] = anchors.into_iter().collect::<Vec<_>>()[..] else {
+            panic!("four grouped calls must share one durable anchor");
+        };
+        assert_eq!(
+            runtime.log_store().last_index().unwrap(),
+            Some(applied_index)
+        );
+        let config = runtime.config().clone();
+        drop(runtime);
+
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                config.cluster_id().to_owned(),
+                config.node_id().to_owned(),
+                config.epoch(),
+                config.config_id(),
+                [
+                    dir.path().join("recorders/n1"),
+                    dir.path().join("recorders/n2"),
+                    dir.path().join("recorders/n3"),
+                ],
+                applied_index + 1,
+                applied_hash,
+            )
+            .unwrap(),
+        );
+        let reopened = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+        assert_eq!(reopened.applied_index().unwrap(), applied_index);
+        assert_eq!(reopened.applied_hash().unwrap(), applied_hash);
+        assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+        for id in 0..256 {
+            let response = reopened
+                .get_kv(format!("key-{id:04}").as_bytes(), ReadConsistency::Local)
+                .unwrap();
+            assert_eq!(
+                response.value,
+                Some(vec![u8::try_from(id / 64).unwrap(); 128])
+            );
+            assert_eq!(response.applied_index, applied_index);
+            assert_eq!(response.hash, applied_hash);
+        }
+    }
+
     #[test]
     fn sql_batch_preflight_rejects_entire_vector_without_growing_log() {
         let (_dir, runtime) = sql_test_runtime();
@@ -7460,6 +10710,744 @@ mod tests {
     }
 
     #[test]
+    fn sql_batch_rejects_aggregate_encoded_input_over_command_cap_before_io() {
+        let (_dir, runtime) = sql_test_runtime();
+        let command = |request_id: &str, fill: char| SqlCommand {
+            request_id: request_id.into(),
+            statements: vec![SqlStatement {
+                sql: "SELECT ?1".into(),
+                parameters: vec![SqlValue::Text(
+                    std::iter::repeat_n(fill, MAX_COMMAND_BYTES / 2).collect(),
+                )],
+            }],
+        };
+
+        let error = runtime
+            .execute_sql_batch(vec![
+                command("aggregate-a", 'a'),
+                command("aggregate-b", 'b'),
+            ])
+            .unwrap_err();
+
+        assert!(matches!(error, NodeError::ResourceExhausted(_)));
+        assert_eq!(runtime.log_store().last_index().unwrap(), None);
+        assert!(runtime
+            .sql_group_commit
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .is_empty());
+    }
+
+    #[test]
+    fn sql_write_profiling_records_nothing_when_observer_is_not_installed() {
+        let profiler = SqlWriteProfiler::new(8);
+        let (_dir, runtime) = sql_test_runtime();
+
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE profiled_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+
+        assert!(runtime.config().sql_write_profiler().is_none());
+        assert!(profiler.snapshot().samples.is_empty());
+    }
+
+    #[test]
+    fn sql_write_profiling_records_one_consistent_sample_for_one_physical_batch() {
+        let profiler = SqlWriteProfiler::new(8);
+        let (_dir, runtime) = sql_test_runtime_with_profiler(Some(profiler.clone()));
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE profiled_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        profiler.drain();
+
+        let commands = (1..=3)
+            .map(|id| SqlCommand {
+                request_id: format!("insert-{id}"),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO profiled_items(id) VALUES (?1)".into(),
+                    parameters: vec![SqlValue::Integer(id)],
+                }],
+            })
+            .collect();
+        let responses = runtime.execute_sql_batch(commands).unwrap();
+
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.dropped_samples, 0);
+        let [sample] = snapshot.samples.as_slice() else {
+            panic!("one physical SQL batch must emit one sample: {snapshot:?}");
+        };
+        assert_eq!(sample.batch_member_count, 3);
+        assert_eq!(
+            sample.total_service_us,
+            sample
+                .commit_lock_wait_us
+                .saturating_add(sample.precheck_classification_us)
+                .saturating_add(sample.qwal_prepare_us)
+                .saturating_add(sample.consensus_propose_us)
+                .saturating_add(sample.local_qlog_append_sync_us)
+                .saturating_add(sample.sql_materializer_apply_us)
+                .saturating_add(sample.response_other_total_us)
+        );
+        let (applied_index, applied_hash) = runtime.ensure_materialized_tip().unwrap();
+        assert!(responses.iter().all(|response| {
+            response.as_ref().is_ok_and(|response| {
+                response.applied_index == applied_index && response.hash == applied_hash
+            })
+        }));
+    }
+
+    #[test]
+    fn sql_write_profiling_does_not_fabricate_sample_for_failed_batch() {
+        let profiler = SqlWriteProfiler::new(8);
+        let (_dir, runtime) = sql_test_runtime_with_profiler(Some(profiler.clone()));
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE profiled_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "first".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO profiled_items(id) VALUES (1)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        profiler.drain();
+        let last_index = runtime.log_store().last_index().unwrap();
+
+        let error = runtime
+            .execute_sql(SqlCommand {
+                request_id: "duplicate".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO profiled_items(id) VALUES (1)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, NodeError::InvalidSqlStatement { .. }));
+        assert!(profiler.snapshot().samples.is_empty());
+        assert_eq!(runtime.log_store().last_index().unwrap(), last_index);
+    }
+
+    #[test]
+    fn sql_group_commit_coalesces_four_waiting_typed_calls_into_one_1024_receipt_qwal() {
+        let profiler = SqlWriteProfiler::new(8);
+        let (_dir, runtime) = sql_test_runtime_with_profiler(Some(profiler.clone()));
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "group-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE grouped_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        profiler.drain();
+
+        let commit = runtime.lock_commit().unwrap();
+        let start = Arc::new(Barrier::new(5));
+        let workers = (0..4)
+            .map(|call| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let commands = (0..256)
+                        .map(|offset| {
+                            let id = call * 256 + offset;
+                            SqlCommand {
+                                request_id: format!("group-{id}"),
+                                statements: vec![SqlStatement {
+                                    sql: "INSERT INTO grouped_items(id) VALUES (?1)".into(),
+                                    parameters: vec![SqlValue::Integer(id)],
+                                }],
+                            }
+                        })
+                        .collect();
+                    start.wait();
+                    runtime.execute_sql_batch(commands).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(4, Duration::from_secs(5));
+        drop(commit);
+
+        let results = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1024);
+        let first = results[0].as_ref().unwrap();
+        assert!(results.iter().all(|result| {
+            result.as_ref().is_ok_and(|result| {
+                result.applied_index == first.applied_index && result.hash == first.hash
+            })
+        }));
+        let entry = runtime
+            .log_store()
+            .read(first.applied_index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rhiza_sql::decode_qwal_v2(&entry.payload)
+                .unwrap()
+                .receipts
+                .len(),
+            1024
+        );
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+        let snapshot = profiler.snapshot();
+        let [sample] = snapshot.samples.as_slice() else {
+            panic!("one grouped physical commit must emit one sample: {snapshot:?}");
+        };
+        assert_eq!(sample.batch_member_count, 1024);
+    }
+
+    #[test]
+    fn sql_group_commit_keeps_fifth_whole_call_for_the_next_physical_group() {
+        let (_dir, runtime) = sql_test_runtime();
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "next-group-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE next_group_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+
+        let commit = runtime.lock_commit().unwrap();
+        let mut workers = Vec::new();
+        for call in 0..5 {
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(std::thread::spawn(move || {
+                worker_runtime
+                    .execute_sql_batch(
+                        (0..256)
+                            .map(|offset| {
+                                let id = call * 256 + offset;
+                                SqlCommand {
+                                    request_id: format!("next-group-{id}"),
+                                    statements: vec![SqlStatement {
+                                        sql: "INSERT INTO next_group_items(id) VALUES (?1)".into(),
+                                        parameters: vec![SqlValue::Integer(id)],
+                                    }],
+                                }
+                            })
+                            .collect(),
+                    )
+                    .unwrap()
+            }));
+            runtime
+                .sql_group_commit
+                .wait_for_pending_calls(call as usize + 1, Duration::from_secs(5));
+        }
+        drop(commit);
+
+        let calls = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        for call in &calls[..4] {
+            assert!(call
+                .iter()
+                .all(|result| result.as_ref().unwrap().applied_index == 2));
+        }
+        assert!(calls[4]
+            .iter()
+            .all(|result| result.as_ref().unwrap().applied_index == 3));
+        assert_eq!(
+            rhiza_sql::decode_qwal_v2(&runtime.log_store().read(2).unwrap().unwrap().payload)
+                .unwrap()
+                .receipts
+                .len(),
+            1024
+        );
+        assert_eq!(
+            rhiza_sql::decode_qwal_v2(&runtime.log_store().read(3).unwrap().unwrap().payload)
+                .unwrap()
+                .receipts
+                .len(),
+            256
+        );
+    }
+
+    #[test]
+    fn sql_group_commit_preserves_fifo_call_offsets_for_retries_conflicts_aliases_and_failures() {
+        let (_dir, runtime) = sql_test_runtime();
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "fifo-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE fifo_items(id INTEGER PRIMARY KEY, value TEXT UNIQUE)"
+                        .into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let stored_command = SqlCommand {
+            request_id: "fifo-stored".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO fifo_items(id, value) VALUES (1, 'stored')".into(),
+                parameters: vec![],
+            }],
+        };
+        let stored = runtime.execute_sql(stored_command.clone()).unwrap();
+        let valid_alias = SqlCommand {
+            request_id: "fifo-alias".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO fifo_items(id, value) VALUES (2, 'alias')".into(),
+                parameters: vec![],
+            }],
+        };
+        let conflict = SqlCommand {
+            request_id: stored_command.request_id.clone(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO fifo_items(id, value) VALUES (3, 'conflict')".into(),
+                parameters: vec![],
+            }],
+        };
+        let failed = SqlCommand {
+            request_id: "fifo-failed".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO fifo_items(id, value) VALUES (4, 'stored')".into(),
+                parameters: vec![],
+            }],
+        };
+        let valid = SqlCommand {
+            request_id: "fifo-valid".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO fifo_items(id, value) VALUES (5, 'valid')".into(),
+                parameters: vec![],
+            }],
+        };
+
+        let commit = runtime.lock_commit().unwrap();
+        let first_runtime = Arc::clone(&runtime);
+        let first = std::thread::spawn(move || {
+            first_runtime
+                .execute_sql_batch(vec![
+                    stored_command,
+                    conflict,
+                    valid_alias.clone(),
+                    valid_alias,
+                ])
+                .unwrap()
+        });
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(1, Duration::from_secs(5));
+        let second_runtime = Arc::clone(&runtime);
+        let second = std::thread::spawn(move || {
+            second_runtime
+                .execute_sql_batch(vec![failed, valid])
+                .unwrap()
+        });
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(2, Duration::from_secs(5));
+        drop(commit);
+
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(
+            first[0].as_ref().unwrap().applied_index,
+            stored.applied_index
+        );
+        assert!(matches!(first[1], Err(NodeError::RequestConflict(_))));
+        assert_eq!(first[2], first[3]);
+        assert_eq!(first[2].as_ref().unwrap().applied_index, 3);
+        assert!(matches!(
+            second[0],
+            Err(NodeError::InvalidSqlStatement { .. })
+        ));
+        assert_eq!(second[1].as_ref().unwrap().applied_index, 3);
+    }
+
+    #[test]
+    fn sql_group_commit_rejects_overload_before_enqueue_without_orphaning_the_leader() {
+        let (_dir, runtime) = sql_test_runtime_configured(None, Some(1));
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "overload-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE overload_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let command = |request_id: &str, id| SqlCommand {
+            request_id: request_id.into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO overload_items(id) VALUES (?1)".into(),
+                parameters: vec![SqlValue::Integer(id)],
+            }],
+        };
+
+        let commit = runtime.lock_commit().unwrap();
+        let leader_runtime = Arc::clone(&runtime);
+        let leader = std::thread::spawn(move || {
+            leader_runtime.execute_sql_batch(vec![command("overload-first", 1)])
+        });
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(1, Duration::from_secs(5));
+        let overload = runtime
+            .execute_sql_batch(vec![command("overload-second", 2)])
+            .unwrap_err();
+        assert!(matches!(overload, NodeError::ResourceExhausted(_)));
+        drop(commit);
+        assert!(leader.join().unwrap().unwrap()[0].is_ok());
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn sql_group_commit_bounds_pending_bytes_and_releases_reservations() {
+        let queue = super::SqlGroupCommitQueue::new(super::MAX_SQL_GROUP_COMMIT_QUEUE_CAPACITY);
+        let cancelled = AtomicBool::new(false);
+        let member = |id: usize| super::RuntimeBatchMember {
+            request_id: format!("queued-{id}"),
+            payload: vec![u8::try_from(id).unwrap_or_default(); MAX_COMMAND_BYTES],
+            operation: super::QueuedOperation::Sql(SqlCommand {
+                request_id: format!("queued-{id}"),
+                statements: vec![SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                }],
+            }),
+        };
+        let mut queued = Vec::new();
+        for id in 0..super::DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY {
+            queued.push(queue.enqueue(vec![member(id)], &cancelled).unwrap().0);
+        }
+
+        let overflow = match queue.enqueue(
+            vec![member(super::DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY)],
+            &cancelled,
+        ) {
+            Ok(_) => panic!("pending byte budget must reject one more full command"),
+            Err(error) => error,
+        };
+        assert!(matches!(overflow, NodeError::ResourceExhausted(_)));
+
+        let drained = queue.drain_next_group().unwrap();
+        assert_eq!(drained.len(), 4);
+        let released = queue
+            .enqueue(
+                vec![member(super::DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY + 1)],
+                &cancelled,
+            )
+            .unwrap()
+            .0;
+
+        queue.fail_pending(NodeError::Unavailable("test failure".into()));
+        for job in queued.into_iter().skip(drained.len()) {
+            assert!(matches!(
+                job.wait(&cancelled),
+                Err(NodeError::Unavailable(_))
+            ));
+        }
+        assert!(matches!(
+            released.wait(&cancelled),
+            Err(NodeError::Unavailable(_))
+        ));
+        let state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_encoded_bytes, 0);
+        assert!(!state.leader_active);
+    }
+
+    #[test]
+    fn sql_group_commit_window_restarts_after_staggered_enqueue() {
+        let queue = Arc::new(super::SqlGroupCommitQueue::new(
+            super::DEFAULT_SQL_GROUP_COMMIT_QUEUE_CAPACITY,
+        ));
+        let cancelled = AtomicBool::new(false);
+        let member = |id: usize| super::RuntimeBatchMember {
+            request_id: format!("sql-debounce-{id}"),
+            payload: vec![u8::try_from(id).unwrap_or_default()],
+            operation: super::QueuedOperation::Sql(SqlCommand {
+                request_id: format!("sql-debounce-{id}"),
+                statements: vec![SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                }],
+            }),
+        };
+        queue.enqueue(vec![member(1)], &cancelled).unwrap();
+        let collector = Arc::clone(&queue);
+        let (finished, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let collected = collector.collect_until_full_or_timeout(Duration::from_millis(100));
+            finished.send(collected).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(75));
+        queue.enqueue(vec![member(2)], &cancelled).unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+        queue.enqueue(vec![member(3)], &cancelled).unwrap();
+        assert!(receive.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(receive.recv_timeout(Duration::from_millis(150)).unwrap());
+        worker.join().unwrap();
+        assert_eq!(queue.drain_next_group().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sql_group_commit_leader_panic_wakes_every_queued_call_with_the_same_fatal_error() {
+        let (_dir, mut runtime) = sql_test_runtime();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "panic-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE panic_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        runtime.sql_group_commit_before_execute_hook =
+            Some(Arc::new(|| panic!("injected SQL group leader panic")));
+        let runtime = Arc::new(runtime);
+        let commit = runtime.lock_commit().unwrap();
+        let mut workers = Vec::new();
+        for id in 1..=2 {
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(std::thread::spawn(move || {
+                worker_runtime.execute_sql_batch(vec![SqlCommand {
+                    request_id: format!("panic-{id}"),
+                    statements: vec![SqlStatement {
+                        sql: "INSERT INTO panic_items(id) VALUES (?1)".into(),
+                        parameters: vec![SqlValue::Integer(id)],
+                    }],
+                }])
+            }));
+            runtime
+                .sql_group_commit
+                .wait_for_pending_calls(id as usize, Duration::from_secs(5));
+        }
+        drop(commit);
+
+        let errors = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap_err())
+            .collect::<Vec<_>>();
+        assert!(errors
+            .iter()
+            .all(|error| matches!(error, NodeError::Fatal(_))));
+        assert_eq!(errors[0].to_string(), errors[1].to_string());
+        assert!(runtime.is_fatal());
+    }
+
+    #[test]
+    fn sql_group_commit_shutdown_wakes_queued_calls_with_the_same_unavailable_error() {
+        let (_dir, runtime) = sql_test_runtime();
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "shutdown-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE shutdown_items(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let command = |id| SqlCommand {
+            request_id: format!("shutdown-{id}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO shutdown_items(id) VALUES (?1)".into(),
+                parameters: vec![SqlValue::Integer(id)],
+            }],
+        };
+
+        let commit = runtime.lock_commit().unwrap();
+        let leader_runtime = Arc::clone(&runtime);
+        let leader = std::thread::spawn(move || leader_runtime.execute_sql_batch(vec![command(1)]));
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(1, Duration::from_secs(5));
+        let follower_runtime = Arc::clone(&runtime);
+        let follower =
+            std::thread::spawn(move || follower_runtime.execute_sql_batch(vec![command(2)]));
+        runtime
+            .sql_group_commit
+            .wait_for_pending_calls(2, Duration::from_secs(5));
+
+        runtime.cancel_operations();
+        let follower_error = follower.join().unwrap().unwrap_err();
+        drop(commit);
+        let leader_error = leader.join().unwrap().unwrap_err();
+
+        assert!(matches!(leader_error, NodeError::Unavailable(_)));
+        assert_eq!(leader_error.to_string(), follower_error.to_string());
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn sql_group_commit_reprepares_combined_calls_after_a_foreign_slot_winner() {
+        let (_dir, runtime) = sql_test_runtime();
+        let runtime = Arc::new(runtime);
+        let schema = runtime
+            .execute_sql(SqlCommand {
+                request_id: "group-winner-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE group_winner(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        let winner = runtime
+            .consensus()
+            .propose_at(
+                2,
+                schema.hash,
+                Command::new(CommandKind::ReadBarrier, Vec::new()),
+            )
+            .unwrap();
+
+        let commit = runtime.lock_commit().unwrap();
+        let mut workers = Vec::new();
+        for id in 1..=2 {
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(std::thread::spawn(move || {
+                worker_runtime
+                    .execute_sql_batch(vec![SqlCommand {
+                        request_id: format!("group-winner-{id}"),
+                        statements: vec![SqlStatement {
+                            sql: "INSERT INTO group_winner(id) VALUES (?1)".into(),
+                            parameters: vec![SqlValue::Integer(id)],
+                        }],
+                    }])
+                    .unwrap()
+            }));
+            runtime
+                .sql_group_commit
+                .wait_for_pending_calls(id as usize, Duration::from_secs(5));
+        }
+        drop(commit);
+
+        let results = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(runtime.log_store().read(2).unwrap(), Some(winner));
+        assert!(results
+            .iter()
+            .all(|result| result.as_ref().unwrap().applied_index == 3));
+        assert_eq!(
+            results[0].as_ref().unwrap().hash,
+            results[1].as_ref().unwrap().hash
+        );
+    }
+
+    #[test]
+    fn sql_group_commit_all_failed_calls_return_aligned_without_consensus() {
+        let (_dir, runtime) = sql_test_runtime();
+        let runtime = Arc::new(runtime);
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "all-failed-schema".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE all_failed(value TEXT UNIQUE)".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+        runtime
+            .execute_sql(SqlCommand {
+                request_id: "all-failed-existing".into(),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO all_failed(value) VALUES ('existing')".into(),
+                    parameters: vec![],
+                }],
+            })
+            .unwrap();
+
+        let commit = runtime.lock_commit().unwrap();
+        let mut workers = Vec::new();
+        for id in 1..=2 {
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(std::thread::spawn(move || {
+                worker_runtime
+                    .execute_sql_batch(vec![SqlCommand {
+                        request_id: format!("all-failed-{id}"),
+                        statements: vec![SqlStatement {
+                            sql: "INSERT INTO all_failed(value) VALUES ('existing')".into(),
+                            parameters: vec![],
+                        }],
+                    }])
+                    .unwrap()
+            }));
+            runtime
+                .sql_group_commit
+                .wait_for_pending_calls(id as usize, Duration::from_secs(5));
+        }
+        drop(commit);
+
+        for worker in workers {
+            let results = worker.join().unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(matches!(
+                results[0],
+                Err(NodeError::InvalidSqlStatement { .. })
+            ));
+        }
+        assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn sql_group_commit_lone_call_completes_after_the_bounded_collection_round() {
+        let (_dir, runtime) = sql_test_runtime();
+
+        let result = runtime
+            .execute_sql_batch(vec![SqlCommand {
+                request_id: "lone-call".into(),
+                statements: vec![SqlStatement {
+                    sql: "CREATE TABLE lone_call(id INTEGER PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+            }])
+            .unwrap();
+
+        assert!(result[0].is_ok());
+        let queue = runtime
+            .sql_group_commit
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(queue.pending.is_empty());
+        assert!(!queue.leader_active);
+    }
+
+    #[test]
     fn legacy_put_endpoint_commits_qwal_instead_of_raw_put_payload() {
         let (_dir, runtime) = sql_test_runtime();
 
@@ -7470,7 +11458,7 @@ mod tests {
             .read(response.applied_index)
             .unwrap()
             .unwrap();
-        assert!(entry.payload.starts_with(b"QWAL\0\x01"));
+        assert!(entry.payload.starts_with(QWAL_V2_MAGIC));
         assert!(!entry.payload.starts_with(b"put\t"));
         assert_eq!(
             runtime.read("key", ReadConsistency::Local).unwrap().value,
@@ -7479,7 +11467,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_batch_preserves_order_commits_individual_qwal_effects_and_retries_exactly() {
+    fn sql_batch_preserves_order_commits_one_qwal_effect_and_retries_exactly() {
         let (_dir, runtime) = sql_test_runtime();
         runtime
             .execute_sql(SqlCommand {
@@ -7509,10 +11497,18 @@ mod tests {
         let log_index = runtime.log_store().last_index().unwrap();
         let replay = runtime.execute_sql_batch(commands).unwrap();
 
-        assert_eq!(first_indices, vec![2, 3, 4]);
-        for index in 1..=4 {
+        assert_eq!(first_indices, vec![2, 2, 2]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|result| result.as_ref().unwrap().hash)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        for index in 1..=2 {
             let entry = runtime.log_store().read(index).unwrap().unwrap();
-            assert!(entry.payload.starts_with(b"QWAL\0\x01"));
+            assert!(entry.payload.starts_with(QWAL_V2_MAGIC));
         }
         assert_eq!(
             replay
@@ -7541,7 +11537,7 @@ mod tests {
             .execute_sql(SqlCommand {
                 request_id: "large-effect".into(),
                 statements: vec![SqlStatement {
-                    sql: "INSERT INTO large_effect(value) VALUES (randomblob(400000))".into(),
+                    sql: "INSERT INTO large_effect(value) VALUES (randomblob(700000))".into(),
                     parameters: vec![],
                 }],
             })
@@ -7583,6 +11579,10 @@ mod tests {
         assert!(results[0].is_ok());
         assert!(matches!(results[1], Err(NodeError::RequestConflict(_))));
         assert!(results[2].is_ok());
+        assert_eq!(
+            results[0].as_ref().unwrap().applied_index,
+            results[2].as_ref().unwrap().applied_index
+        );
         assert!(runtime.is_ready());
     }
 
@@ -7653,9 +11653,22 @@ mod tests {
     }
 
     fn sql_test_runtime() -> (tempfile::TempDir, NodeRuntime) {
+        sql_test_runtime_configured(None, None)
+    }
+
+    fn sql_test_runtime_with_profiler(
+        profiler: Option<SqlWriteProfiler>,
+    ) -> (tempfile::TempDir, NodeRuntime) {
+        sql_test_runtime_configured(profiler, None)
+    }
+
+    fn sql_test_runtime_configured(
+        profiler: Option<SqlWriteProfiler>,
+        queue_capacity: Option<usize>,
+    ) -> (tempfile::TempDir, NodeRuntime) {
         let dir = tempfile::tempdir().unwrap();
         let cluster_id = "node-unit-test";
-        let config = NodeConfig::new_embedded(
+        let mut config = NodeConfig::new_embedded(
             cluster_id,
             "n1",
             dir.path().join("node"),
@@ -7666,6 +11679,14 @@ mod tests {
         .unwrap()
         .with_execution_profile(ExecutionProfile::Sqlite)
         .unwrap();
+        if let Some(profiler) = profiler {
+            config = config.with_sql_write_profiler(profiler);
+        }
+        if let Some(queue_capacity) = queue_capacity {
+            config = config
+                .with_sql_group_commit_queue_capacity(queue_capacity)
+                .unwrap();
+        }
         let consensus = Arc::new(
             ThreeNodeConsensus::from_recovered_tip(
                 "rhiza:sql:node-unit-test",
@@ -7757,12 +11778,57 @@ mod tests {
     }
 }
 
+#[cfg(feature = "kv")]
+fn largest_fitting_kv_batch_prefix(commands: &[KvCommandV1]) -> Option<(usize, Vec<u8>)> {
+    if commands.len() < 3 {
+        return None;
+    }
+    let mut lower = 2_usize;
+    let mut upper = commands.len() - 1;
+    let mut largest = None;
+    while lower <= upper {
+        let count = lower + (upper - lower) / 2;
+        let payload = encode_replicated_kv_batch(&commands[..count])
+            .expect("the validated KV batch prefix remains valid");
+        if payload.len() <= MAX_COMMAND_BYTES {
+            largest = Some((count, payload));
+            lower = count + 1;
+        } else {
+            upper = count - 1;
+        }
+    }
+    largest
+}
+
+#[cfg(feature = "graph")]
 fn validate_typed_batch_len(len: usize) -> Result<(), NodeError> {
     if (1..=MAX_WRITE_BATCH_MEMBERS).contains(&len) {
         Ok(())
     } else {
         Err(NodeError::InvalidRequest(format!(
             "write batch must contain 1..={MAX_WRITE_BATCH_MEMBERS} commands"
+        )))
+    }
+}
+
+#[cfg(feature = "kv")]
+fn validate_kv_batch_len(len: usize) -> Result<(), NodeError> {
+    if (1..=MAX_KV_BATCH_MEMBERS).contains(&len) {
+        Ok(())
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "KV write batch must contain 1..={MAX_KV_BATCH_MEMBERS} commands"
+        )))
+    }
+}
+
+#[cfg(feature = "sql")]
+fn validate_sql_batch_len(len: usize) -> Result<(), NodeError> {
+    if (1..=MAX_TYPED_SQL_WRITE_BATCH_MEMBERS).contains(&len) {
+        Ok(())
+    } else {
+        Err(NodeError::InvalidRequest(format!(
+            "SQL write batch must contain 1..={MAX_TYPED_SQL_WRITE_BATCH_MEMBERS} commands"
         )))
     }
 }
@@ -8190,8 +12256,8 @@ pub(crate) fn validate_profile_entry_shape(
     validate_entry_shape(entry)?;
     #[cfg(feature = "sql")]
     if _profile == ExecutionProfile::Sqlite && entry.entry_type == EntryType::Command {
-        decode_qwal_v1(&entry.payload)
-            .map_err(|error| format!("SQLite command is not canonical QWAL v1: {error}"))?;
+        decode_qwal_v2(&entry.payload)
+            .map_err(|error| format!("SQLite command is not canonical QWAL v2: {error}"))?;
     }
     Ok(())
 }

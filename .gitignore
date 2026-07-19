@@ -1,2 +1,4 @@
 /target/
+/artifacts/
+/bench/hiqlite-recovery-client/target/
 **/*.rs.bk

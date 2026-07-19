@@ -11,8 +11,8 @@ use std::{
 use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
 use rhiza_quepaxa::{
     AcceptedValue, CertifiedDecisionInspection, DecisionProof, Error, Membership, PrioritySource,
-    Proposal, ProposalPriority, RecordRequest, RecordSummary, RecorderFileStore, RecorderReply,
-    RecorderRequest, RecorderRpc, ThreeNodeConsensus,
+    Proposal, ProposalPriority, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    ThreeNodeConsensus,
 };
 
 const CLUSTER_ID: &str = "adversarial-cluster";
@@ -115,8 +115,39 @@ impl AdversarialRecorder {
 }
 
 impl RecorderRpc for AdversarialRecorder {
-    fn call(&self, request: RecorderRequest) -> Result<RecorderReply, Error> {
-        self.store.call(request)
+    fn recorder_id(&self) -> Result<String, Error> {
+        self.store.recorder_id()
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> Result<(), Error> {
+        self.store.store_command_for(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> Result<Option<StoredCommand>, Error> {
+        self.store
+            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
     fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
@@ -139,10 +170,6 @@ impl RecorderRpc for AdversarialRecorder {
     fn inspect_record_summary(&self, slot: u64) -> Result<Option<RecordSummary>, Error> {
         self.store.inspect_record_summary(slot)
     }
-
-    fn uses_typed_protocol(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone)]
@@ -152,10 +179,6 @@ struct DroppedRecorder {
 }
 
 impl RecorderRpc for DroppedRecorder {
-    fn call(&self, _request: RecorderRequest) -> Result<RecorderReply, Error> {
-        Err(Error::Io("scripted dropped delivery".into()))
-    }
-
     fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
         self.counts.dropped.fetch_add(1, Ordering::Relaxed);
         if let Some(broadcast) = &self.broadcast {
@@ -170,10 +193,6 @@ impl RecorderRpc for DroppedRecorder {
 
     fn inspect_record_summary(&self, _slot: u64) -> Result<Option<RecordSummary>, Error> {
         Err(Error::Io("scripted dropped delivery".into()))
-    }
-
-    fn uses_typed_protocol(&self) -> bool {
-        true
     }
 }
 

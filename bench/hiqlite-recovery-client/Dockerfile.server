@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.95.0-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+COPY . .
+RUN --mount=type=cache,id=hiqlite-recovery-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=hiqlite-recovery-cargo-target,target=/work/target,sharing=locked \
+    cargo build --locked --features server --release \
+    && install -D -m 0755 /work/target/release/hiqlite /out/hiqlite
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+WORKDIR /app
+COPY --from=builder /out/hiqlite /app/hiqlite
+ENTRYPOINT ["/app/hiqlite"]
+CMD ["serve", "--config-file", "/app/hiqlite.toml"]

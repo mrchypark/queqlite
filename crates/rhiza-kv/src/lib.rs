@@ -12,7 +12,8 @@ use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use rhiza_core::{
-    ConfigChange, EntryType, ExecutionProfile, LogEntry, LogHash, ReplicatedCommandEnvelope,
+    ConfigChange, EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash,
+    ReplicatedCommandEnvelope,
 };
 use tempfile::NamedTempFile;
 
@@ -22,9 +23,9 @@ const RECEIPT_MAGIC: &[u8; 6] = b"RHKR\0\x01";
 const SNAPSHOT_DOMAIN: &[u8] = b"rhiza-kv-snapshot-v1\0";
 const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"RHKS";
 const SNAPSHOT_WIRE_VERSION: u16 = 1;
-const MATERIALIZER_DOMAIN: &[u8] = b"rhiza-kv-materializer-v1\0";
+const MATERIALIZER_DOMAIN: &[u8] = b"rhiza-kv-materializer-v2\0";
 const COMMAND_VERSION: u16 = 1;
-const BATCH_COMMAND_VERSION: u16 = 2;
+const BATCH_COMMAND_VERSION: u16 = 3;
 const BATCH_REQUEST_ID: &str = "__rhiza_kv_batch_v1";
 
 const DATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__rhiza_kv_data_v1");
@@ -45,8 +46,10 @@ pub const MAX_REQUEST_ID_BYTES: usize = 256;
 pub const MAX_KV_KEY_BYTES: usize = 4 * 1024;
 /// Maximum accepted value size in bytes.
 pub const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
-/// Maximum commands carried by one replicated KV batch.
-pub const MAX_KV_BATCH_MEMBERS: usize = 64;
+/// Maximum commands accepted by one public typed KV batch.
+pub const MAX_KV_BATCH_MEMBERS: usize = 256;
+/// Maximum commands carried by one internal replicated KV batch.
+const MAX_REPLICATED_KV_BATCH_MEMBERS: usize = 1024;
 /// Maximum rows returned by one ordered scan.
 pub const MAX_KV_SCAN_ROWS: usize = 1024;
 /// Maximum combined key and value bytes returned by one ordered scan.
@@ -296,10 +299,13 @@ pub fn encode_replicated_kv_command(command: &KvCommandV1) -> Result<Vec<u8>, Er
 }
 
 /// Encodes ordered individual KV commands as one canonical replicated batch.
+///
+/// Internal group commit may combine up to 1,024 commands. Public typed APIs must continue to
+/// enforce [`MAX_KV_BATCH_MEMBERS`] before calling this replication codec.
 pub fn encode_replicated_kv_batch(commands: &[KvCommandV1]) -> Result<Vec<u8>, Error> {
-    if commands.is_empty() || commands.len() > MAX_KV_BATCH_MEMBERS {
+    if commands.is_empty() || commands.len() > MAX_REPLICATED_KV_BATCH_MEMBERS {
         return Err(Error::InvalidCommand(format!(
-            "KV batch must contain 1..={MAX_KV_BATCH_MEMBERS} commands"
+            "replicated KV batch must contain 1..={MAX_REPLICATED_KV_BATCH_MEMBERS} commands"
         )));
     }
     let mut request_ids = BTreeSet::new();
@@ -388,9 +394,9 @@ fn decode_replicated_kv_commands(payload: &[u8]) -> Result<Vec<DecodedKvCommand>
                 return Err(Error::Codec("invalid KV batch magic or version".into()));
             }
             let count = usize::from(decoder.u16()?);
-            if count == 0 || count > MAX_KV_BATCH_MEMBERS {
+            if count == 0 || count > MAX_REPLICATED_KV_BATCH_MEMBERS {
                 return Err(Error::InvalidCommand(format!(
-                    "KV batch must contain 1..={MAX_KV_BATCH_MEMBERS} commands"
+                    "replicated KV batch must contain 1..={MAX_REPLICATED_KV_BATCH_MEMBERS} commands"
                 )));
             }
             let mut request_ids = BTreeSet::new();
@@ -988,6 +994,14 @@ impl RedbStateMachine {
         read_hash_meta(&table, META_APPLIED_HASH)
     }
 
+    /// Returns the applied index and hash observed by one redb read transaction.
+    pub fn applied_tip(&self) -> Result<LogAnchor, Error> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+        let tip = read_tip(&table)?;
+        Ok(LogAnchor::new(tip.applied_index(), tip.applied_hash()))
+    }
+
     /// Builds a consistent online snapshot by logically copying one redb read transaction.
     pub fn create_snapshot(&self, target_index: u64) -> Result<RedbSnapshot, Error> {
         let read = self.database.begin_read().map_err(database_error)?;
@@ -1066,29 +1080,25 @@ impl RedbStateMachine {
         request_id: &str,
         replicated_payload: &[u8],
     ) -> Result<Option<KvRequestRecord>, Error> {
-        let command = decode_replicated_kv_command(replicated_payload)?;
-        if command.request_id() != request_id {
-            return Err(Error::InvalidCommand(
-                "provided and encoded request ids differ".into(),
-            ));
-        }
-        let payload_hash = LogHash::digest(&[replicated_payload]);
         let read = self.database.begin_read().map_err(database_error)?;
         let table = read.open_table(REQUEST_TABLE).map_err(database_error)?;
-        let record = table
-            .get(request_id.as_bytes())
-            .map_err(database_error)?
-            .map(|value| KvRequestRecord::decode(value.value()))
-            .transpose()?;
-        if record
-            .as_ref()
-            .is_some_and(|record| record.payload_hash != payload_hash)
-        {
-            return Err(Error::RequestConflict {
-                request_id: request_id.into(),
-            });
-        }
-        Ok(record)
+        check_request_in_table(&table, request_id, replicated_payload)
+    }
+
+    /// Checks an ordered set of idempotency receipts in one redb read transaction.
+    ///
+    /// Database and table-open failures abort the lookup. Payload, identity, receipt decoding, and
+    /// request-conflict failures remain aligned with their individual request.
+    pub fn check_requests(
+        &self,
+        requests: &[(&str, &[u8])],
+    ) -> Result<Vec<Result<Option<KvRequestRecord>, Error>>, Error> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(REQUEST_TABLE).map_err(database_error)?;
+        Ok(requests
+            .iter()
+            .map(|(request_id, payload)| check_request_in_table(&table, request_id, payload))
+            .collect())
     }
 
     /// Applies one qlog entry in exactly one redb write transaction.
@@ -1636,6 +1646,30 @@ fn read_request(
         .transpose()
 }
 
+fn check_request_in_table(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    request_id: &str,
+    replicated_payload: &[u8],
+) -> Result<Option<KvRequestRecord>, Error> {
+    let command = decode_replicated_kv_command(replicated_payload)?;
+    if command.request_id() != request_id {
+        return Err(Error::InvalidCommand(
+            "provided and encoded request ids differ".into(),
+        ));
+    }
+    let payload_hash = LogHash::digest(&[replicated_payload]);
+    let record = read_request(table, request_id)?;
+    if record
+        .as_ref()
+        .is_some_and(|record| record.payload_hash != payload_hash)
+    {
+        return Err(Error::RequestConflict {
+            request_id: request_id.into(),
+        });
+    }
+    Ok(record)
+}
+
 struct Decoder<'a> {
     encoded: &'a [u8],
     offset: usize,
@@ -1699,6 +1733,107 @@ impl<'a> Decoder<'a> {
             return Err(Error::Codec("trailing bytes".into()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+fn batch_v2_materializer_fingerprint() -> LogHash {
+    LogHash::digest(&[
+        b"rhiza-kv-materializer-v1\0",
+        b"redb=4.1.0",
+        b"schema=1",
+        COMMAND_MAGIC,
+        &COMMAND_VERSION.to_be_bytes(),
+        BATCH_COMMAND_MAGIC,
+        &2_u16.to_be_bytes(),
+    ])
+}
+
+#[cfg(test)]
+mod replicated_batch_tests {
+    use super::*;
+
+    #[test]
+    fn replicated_batch_codec_accepts_1024_canonically_and_rejects_1025() {
+        let commands = (0..1024)
+            .map(|index| {
+                KvCommandV1::delete(
+                    format!("request-{index}"),
+                    format!("key-{index}").into_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let encoded = encode_replicated_kv_batch(&commands).unwrap();
+        assert_eq!(encode_replicated_kv_batch(&commands).unwrap(), encoded);
+        let envelope = ReplicatedCommandEnvelope::decode(&encoded).unwrap();
+        assert_eq!(envelope.command_version(), 3);
+        let previous_wire = ReplicatedCommandEnvelope::new(
+            ExecutionProfile::Kv,
+            2,
+            BATCH_REQUEST_ID,
+            envelope.body().to_vec(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            decode_replicated_kv_commands(&previous_wire),
+            Err(Error::InvalidCommand(message)) if message.contains("unsupported command version 2")
+        ));
+        let decoded = decode_replicated_kv_commands(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1024);
+        assert!(decoded
+            .iter()
+            .zip(&commands)
+            .all(|(decoded, command)| decoded.command == *command));
+
+        let mut oversized = commands;
+        oversized.push(KvCommandV1::delete("request-1024", b"key-1024".to_vec()).unwrap());
+        assert!(matches!(
+            encode_replicated_kv_batch(&oversized),
+            Err(Error::InvalidCommand(_))
+        ));
+
+        let mut forged_body = envelope.body().to_vec();
+        let count_offset = BATCH_COMMAND_MAGIC.len();
+        forged_body[count_offset..count_offset + 2].copy_from_slice(&1025_u16.to_be_bytes());
+        let extra = oversized.last().unwrap().encode();
+        forged_body.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+        forged_body.extend_from_slice(&extra);
+        let forged = ReplicatedCommandEnvelope::new(
+            ExecutionProfile::Kv,
+            BATCH_COMMAND_VERSION,
+            BATCH_REQUEST_ID,
+            forged_body,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            decode_replicated_kv_commands(&forged),
+            Err(Error::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn materializer_fingerprint_identifies_the_v3_replicated_batch_contract() {
+        let expected = LogHash::digest(&[
+            b"rhiza-kv-materializer-v2\0",
+            b"redb=4.1.0",
+            b"schema=1",
+            COMMAND_MAGIC,
+            &COMMAND_VERSION.to_be_bytes(),
+            BATCH_COMMAND_MAGIC,
+            &3_u16.to_be_bytes(),
+        ]);
+
+        assert_eq!(kv_materializer_fingerprint(), expected);
+        assert_ne!(
+            kv_materializer_fingerprint(),
+            batch_v2_materializer_fingerprint()
+        );
     }
 }
 
@@ -1789,6 +1924,45 @@ mod snapshot_tests {
         assert_eq!(value, Some(b"value".to_vec()));
         assert_eq!(tip.applied_index(), 41);
         assert_eq!(tip.applied_hash(), hash);
+    }
+
+    #[test]
+    fn applied_tip_returns_index_and_hash_from_one_read_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            RedbStateMachine::open(dir.path().join("tip.redb"), "cluster-1", "node-1", 7, 3)
+                .unwrap();
+        let hash = LogHash::digest(&[b"tip"]);
+        seed_rows(&state, [], 41, hash);
+
+        assert_eq!(state.applied_tip().unwrap(), LogAnchor::new(41, hash));
+        assert_eq!(state.applied_index().unwrap(), 41);
+        assert_eq!(state.applied_hash().unwrap(), hash);
+    }
+
+    #[test]
+    fn open_rejects_storage_with_the_previous_batch_v2_materializer_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("previous-fingerprint.redb");
+        {
+            let state = RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+            let write = state.database.begin_write().unwrap();
+            {
+                let mut progress = write.open_table(PROGRESS_TABLE).unwrap();
+                progress
+                    .insert(
+                        META_MATERIALIZER_FINGERPRINT,
+                        batch_v2_materializer_fingerprint().as_bytes().as_slice(),
+                    )
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        assert!(matches!(
+            RedbStateMachine::open(&path, "cluster-1", "node-1", 7, 3),
+            Err(Error::InvalidEntry(message)) if message.contains("materializer_fingerprint")
+        ));
     }
 
     #[test]
@@ -2030,6 +2204,20 @@ mod snapshot_tests {
     fn restore_rejects_a_tampered_materializer_fingerprint() {
         let (dir, mut snapshot) = snapshot_fixture();
         snapshot.materializer_fingerprint = LogHash::ZERO;
+        snapshot.digest = snapshot.recompute_digest();
+        let target = dir.path().join("restored.redb");
+
+        assert!(matches!(
+            restore_snapshot_file(&target, &snapshot, "node-2"),
+            Err(Error::InvalidSnapshot(_))
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_rejects_the_previous_batch_v2_materializer_fingerprint() {
+        let (dir, mut snapshot) = snapshot_fixture();
+        snapshot.materializer_fingerprint = batch_v2_materializer_fingerprint();
         snapshot.digest = snapshot.recompute_digest();
         let target = dir.path().join("restored.redb");
 

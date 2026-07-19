@@ -11,8 +11,8 @@ use rhiza_node::{
     RuntimeConfigurationStatus, LOG_FETCH_PATH, NODE_ID_HEADER, PROTOCOL_VERSION, VERSION_HEADER,
 };
 use rhiza_quepaxa::{
-    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderReply,
-    RecorderRequest, RecorderRpc, ThreeNodeConsensus,
+    DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc,
+    ThreeNodeConsensus,
 };
 use tempfile::TempDir;
 
@@ -805,8 +805,39 @@ struct SlowRecorder {
 }
 
 impl RecorderRpc for SlowRecorder {
-    fn call(&self, request: RecorderRequest) -> rhiza_quepaxa::Result<RecorderReply> {
-        self.inner.call(request)
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.inner.recorder_id()
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: rhiza_core::StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.inner.store_command_for(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<rhiza_core::StoredCommand>> {
+        self.inner
+            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
@@ -828,10 +859,6 @@ impl RecorderRpc for SlowRecorder {
 
     fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         self.inner.inspect_record_summary(slot)
-    }
-
-    fn uses_typed_protocol(&self) -> bool {
-        true
     }
 }
 

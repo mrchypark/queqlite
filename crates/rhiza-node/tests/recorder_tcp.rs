@@ -8,8 +8,8 @@ use rhiza_node::{
 };
 use rhiza_quepaxa::{
     AcceptedValue, CertifiedDecisionInspection, DecisionProof, Error, Membership, Proposal,
-    ProposalPriority, RecordRequest, RecordSummary, RecorderFileStore, RecorderRpc, RejectReason,
-    ThreeNodeConsensus,
+    ProposalPriority, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+    RecorderFileStore, RecorderRpc, RejectReason, ThreeNodeConsensus,
 };
 
 fn peers() -> Vec<PeerConfig> {
@@ -365,6 +365,19 @@ async fn recorder_tcp_round_trips_identity_store_and_fetch() {
 
     tokio::task::spawn_blocking(move || {
         assert_eq!(client.recorder_id().unwrap(), "node-1");
+        assert_eq!(
+            client
+                .observe_read_fence(ReadFenceRequest {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest,
+                    slot: 1,
+                })
+                .unwrap()
+                .slot_state,
+            ReadFenceSlotState::Empty
+        );
         client
             .store_command_for(
                 "rhiza:sql:cluster-a".into(),
@@ -379,8 +392,24 @@ async fn recorder_tcp_round_trips_identity_store_and_fetch() {
             client
                 .fetch_command_for("rhiza:sql:cluster-a".into(), 1, 1, config_digest, hash,)
                 .unwrap(),
-            Some(command)
+            Some(command.clone())
         );
+        client.record(record_request("node-1", 1)).unwrap();
+        assert!(matches!(
+            client
+                .observe_read_fence(ReadFenceRequest {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest,
+                    slot: 1,
+                })
+                .unwrap()
+                .slot_state,
+            ReadFenceSlotState::Occupied {
+                summary: Some(summary)
+            } if summary.slot == 1
+        ));
     })
     .await
     .unwrap();
@@ -388,7 +417,7 @@ async fn recorder_tcp_round_trips_identity_store_and_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn three_tcp_recorders_commit_and_expose_record_and_proof() {
+async fn three_tcp_recorders_reconstruct_ordinary_proof_from_typed_summaries() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
     let mut servers = Vec::new();
@@ -461,11 +490,15 @@ async fn three_tcp_recorders_commit_and_expose_record_and_proof() {
         let inspector =
             TcpPostcardRecorderClient::new(first_address, "node-1", "node-1", "peer-token-1", 1)
                 .unwrap();
-        assert!(inspector.inspect_record_summary(1).unwrap().is_some());
-        assert_eq!(
-            inspector.inspect_decision_proof(1).unwrap(),
-            Some(proof.clone())
-        );
+        let summary = inspector.inspect_record_summary(1).unwrap().unwrap();
+        assert_eq!(summary.decided, None);
+        assert_eq!(summary.step, 4);
+        assert_eq!(summary.first_current.as_ref(), Some(proof.proposal()));
+        assert_eq!(summary.aggregate_prior, None);
+        assert_eq!(inspector.inspect_decision_proof(1).unwrap(), None);
+
+        // The explicit proof-install transport remains available for
+        // configuration transitions even though ordinary decisions elide it.
         inspector
             .install_decision_proof(proof.clone(), &install_membership)
             .unwrap();

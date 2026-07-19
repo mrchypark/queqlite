@@ -1,0 +1,226 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hiqlite-recovery-config
+type: Opaque
+stringData:
+  hiqlite.toml: |
+    [hiqlite]
+    node_id_from = "k8s"
+    nodes = [
+      "1 hiqlite-recovery-0.hiqlite-recovery-headless:8100 hiqlite-recovery-0.hiqlite-recovery-headless:8200",
+      "2 hiqlite-recovery-1.hiqlite-recovery-headless:8100 hiqlite-recovery-1.hiqlite-recovery-headless:8200",
+      "3 hiqlite-recovery-2.hiqlite-recovery-headless:8100 hiqlite-recovery-2.hiqlite-recovery-headless:8200",
+    ]
+    data_dir = "/app/data"
+    log_sync = "immediate"
+    wal_size = 8388608
+    logs_until_snapshot = 10000
+    secret_raft = "__SECRET_RAFT__"
+    secret_api = "__SECRET_API__"
+    backup_cron = "0 0 0 1 1 * 2099"
+    backup_keep_days = 30
+    backup_keep_days_local = 30
+    s3_url = "http://rustfs.__OBJECT_NAMESPACE__.svc.cluster.local:9000"
+    s3_bucket = "hiqlite"
+    s3_region = "us-east-1"
+    s3_path_style = true
+    s3_key = "rustfsadmin"
+    s3_secret = "rustfsadmin"
+    enc_keys = [ "bVCyTsGaggVy5yqQ/UzluN29DZW41M3hTSkx6Y3NtZmRuQkR2TnJxUTYzcjQ=" ]
+    enc_key_active = "bVCyTsGaggVy5yqQ"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hiqlite-recovery-headless
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: hiqlite-recovery
+    app.kubernetes.io/component: voter
+  ports:
+    - name: raft
+      port: 8100
+      targetPort: raft
+    - name: api
+      port: 8200
+      targetPort: api
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hiqlite-recovery
+spec:
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  serviceName: hiqlite-recovery-headless
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hiqlite-recovery
+      app.kubernetes.io/component: voter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hiqlite-recovery
+        app.kubernetes.io/component: voter
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Recovery cells model abrupt process/node loss, not a graceful scale-down.
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: emptydir-marker
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              printf '%s\n' "$POD_UID" > /marker/emptydir-marker
+              : > "/marker/emptydir-marker-$POD_UID"
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          volumeMounts:
+            - name: marker
+              mountPath: /marker
+      containers:
+        - name: hiqlite
+          image: __HIQLITE_IMAGE__
+          imagePullPolicy: Never
+          args: ["serve", "--config-file", "/app/hiqlite.toml"]
+          env:
+            - name: HQL_LOG_SYNC
+              value: immediate
+          ports:
+            - name: raft
+              containerPort: 8100
+            - name: api
+              containerPort: 8200
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: api
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/hiqlite.toml
+              subPath: hiqlite.toml
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+        - name: marker-inspector
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args: ["exec sleep 2147483647"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 4Mi
+            limits:
+              cpu: 50m
+              memory: 16Mi
+          volumeMounts:
+            - name: marker
+              mountPath: /marker
+      volumes:
+        - name: config
+          secret:
+            secretName: hiqlite-recovery-config
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: marker
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hiqlite-recovery-proxy
+spec:
+  selector:
+    app.kubernetes.io/name: hiqlite-recovery
+    app.kubernetes.io/component: proxy
+  ports:
+    - name: api
+      port: 8200
+      targetPort: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hiqlite-recovery-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hiqlite-recovery
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hiqlite-recovery
+        app.kubernetes.io/component: proxy
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: proxy
+          image: __INGRESS_IMAGE__
+          imagePullPolicy: Never
+          args: ["proxy", "--config-file", "/dev/null", "--log-level", "debug"]
+          env:
+            - name: LISTEN_PORT
+              value: "8200"
+            - name: HQL_NODES
+              value: |
+                1 hiqlite-recovery-0.hiqlite-recovery-headless:8100 hiqlite-recovery-0.hiqlite-recovery-headless:8200
+                2 hiqlite-recovery-1.hiqlite-recovery-headless:8100 hiqlite-recovery-1.hiqlite-recovery-headless:8200
+                3 hiqlite-recovery-2.hiqlite-recovery-headless:8100 hiqlite-recovery-2.hiqlite-recovery-headless:8200
+            - name: HQL_SECRET_API
+              value: "__SECRET_API__"
+            - name: ENC_KEYS
+              value: "bVCyTsGaggVy5yqQ/UzluN29DZW41M3hTSkx6Y3NtZmRuQkR2TnJxUTYzcjQ="
+            - name: ENC_KEY_ACTIVE
+              value: "bVCyTsGaggVy5yqQ"
+          ports:
+            - name: api
+              containerPort: 8200
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: api
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

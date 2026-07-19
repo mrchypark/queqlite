@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -8,8 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
-pub const QWAL_V1_MAGIC: &[u8; 6] = b"QWAL\0\x01";
-pub const MAX_QWAL_V1_BYTES: usize = 256 * 1024;
+pub const QWAL_V2_MAGIC: &[u8; 6] = b"QWAL\0\x03";
+pub const MAX_QWAL_V2_BYTES: usize = 512 * 1024;
+pub const MAX_QWAL_V2_RECEIPTS: usize = 1024;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -23,18 +25,31 @@ const MAX_FINGERPRINT_BYTES: usize = 4 * 1024;
 /// Page numbers are one-based, as they are in SQLite's file format.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct QwalPageV1 {
+pub struct QwalPageV2 {
     pub page_no: u64,
     pub after_image: Vec<u8>,
 }
 
-/// Canonical QWAL v1 page effect decided by the replicated log.
+/// One successful member of a QWAL v2 batch.
+///
+/// The decided entry anchor is intentionally absent: every receipt in the
+/// envelope is installed at the single anchor of the log entry carrying the
+/// batch.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwalReceiptV2 {
+    pub request_id: String,
+    pub request_digest: LogHash,
+    pub result_blob: Vec<u8>,
+}
+
+/// Canonical QWAL v2 page effect decided by the replicated log.
 ///
 /// The envelope deliberately contains no local path or WAL-index state. The
 /// caller owns the control-sidecar intent and atomic installation protocol.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct QwalEnvelopeV1 {
+pub struct QwalEnvelopeV2 {
     pub cluster_id: String,
     pub epoch: u64,
     pub configuration_id: u64,
@@ -47,23 +62,44 @@ pub struct QwalEnvelopeV1 {
     pub target_file_bytes: u64,
     pub materializer_fingerprint: String,
     pub page_size: u32,
-    pub request_id: String,
-    pub request_digest: LogHash,
-    pub result_blob: Vec<u8>,
-    pub pages: Vec<QwalPageV1>,
+    pub receipts: Vec<QwalReceiptV2>,
+    pub pages: Vec<QwalPageV2>,
 }
 
-impl QwalEnvelopeV1 {
+impl QwalEnvelopeV2 {
     /// Validates every structural property that does not require the base file.
     pub fn validate(&self) -> Result<()> {
         validate_nonempty_bounded("cluster_id", &self.cluster_id, MAX_ID_BYTES)?;
-        validate_nonempty_bounded("request_id", &self.request_id, MAX_ID_BYTES)?;
         validate_nonempty_bounded(
             "materializer_fingerprint",
             &self.materializer_fingerprint,
             MAX_FINGERPRINT_BYTES,
         )?;
         validate_page_size(self.page_size)?;
+
+        if self.receipts.is_empty() || self.receipts.len() > MAX_QWAL_V2_RECEIPTS {
+            return invalid(format!(
+                "QWAL receipts must contain 1..={MAX_QWAL_V2_RECEIPTS} members"
+            ));
+        }
+        let mut result_bytes = 0usize;
+        let mut request_ids = HashSet::with_capacity(self.receipts.len());
+        for receipt in &self.receipts {
+            validate_nonempty_bounded("request_id", &receipt.request_id, MAX_ID_BYTES)?;
+            if !request_ids.insert(receipt.request_id.as_str()) {
+                return invalid("QWAL receipt request ids must be unique");
+            }
+            crate::validate_sql_result_blob_bounds(&receipt.result_blob)
+                .map_err(|_| Error::InvalidEntry("QWAL receipt result is not canonical".into()))?;
+            result_bytes = result_bytes
+                .checked_add(receipt.result_blob.len())
+                .ok_or_else(|| Error::ResourceExhausted("QWAL result bytes overflow".into()))?;
+            if result_bytes > MAX_QWAL_V2_BYTES {
+                return Err(Error::ResourceExhausted(format!(
+                    "QWAL results exceed {MAX_QWAL_V2_BYTES} bytes"
+                )));
+            }
+        }
 
         let page_size = u64::from(self.page_size);
         if self.base_file_bytes == 0 || !self.base_file_bytes.is_multiple_of(page_size) {
@@ -99,9 +135,9 @@ impl QwalEnvelopeV1 {
             page_bytes = page_bytes
                 .checked_add(page.after_image.len())
                 .ok_or_else(|| Error::ResourceExhausted("QWAL page bytes overflow".into()))?;
-            if page_bytes > MAX_QWAL_V1_BYTES {
+            if page_bytes > MAX_QWAL_V2_BYTES {
                 return Err(Error::ResourceExhausted(format!(
-                    "QWAL page images exceed {MAX_QWAL_V1_BYTES} bytes"
+                    "QWAL page images exceed {MAX_QWAL_V2_BYTES} bytes"
                 )));
             }
             previous = page.page_no;
@@ -125,55 +161,50 @@ impl QwalEnvelopeV1 {
             }
         }
 
-        if self.result_blob.len() > MAX_QWAL_V1_BYTES {
-            return Err(Error::ResourceExhausted(format!(
-                "QWAL result exceeds {MAX_QWAL_V1_BYTES} bytes"
-            )));
-        }
         Ok(())
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        encode_qwal_v1(self)
+        encode_qwal_v2(self)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        decode_qwal_v1(bytes)
+        decode_qwal_v2(bytes)
     }
 }
 
-pub fn encode_qwal_v1(effect: &QwalEnvelopeV1) -> Result<Vec<u8>> {
+pub fn encode_qwal_v2(effect: &QwalEnvelopeV2) -> Result<Vec<u8>> {
     effect.validate()?;
     let body = postcard::to_allocvec(effect)
         .map_err(|error| Error::InvalidEntry(format!("QWAL encode failed: {error}")))?;
-    let encoded_len = QWAL_V1_MAGIC
+    let encoded_len = QWAL_V2_MAGIC
         .len()
         .checked_add(body.len())
         .ok_or_else(|| Error::ResourceExhausted("QWAL encoded length overflows".into()))?;
-    if encoded_len > MAX_QWAL_V1_BYTES {
+    if encoded_len > MAX_QWAL_V2_BYTES {
         return Err(Error::ResourceExhausted(format!(
-            "QWAL envelope exceeds {MAX_QWAL_V1_BYTES} bytes"
+            "QWAL envelope exceeds {MAX_QWAL_V2_BYTES} bytes"
         )));
     }
     let mut encoded = Vec::with_capacity(encoded_len);
-    encoded.extend_from_slice(QWAL_V1_MAGIC);
+    encoded.extend_from_slice(QWAL_V2_MAGIC);
     encoded.extend_from_slice(&body);
     Ok(encoded)
 }
 
-pub fn decode_qwal_v1(bytes: &[u8]) -> Result<QwalEnvelopeV1> {
-    if bytes.len() > MAX_QWAL_V1_BYTES {
+pub fn decode_qwal_v2(bytes: &[u8]) -> Result<QwalEnvelopeV2> {
+    if bytes.len() > MAX_QWAL_V2_BYTES {
         return Err(Error::ResourceExhausted(format!(
-            "QWAL envelope exceeds {MAX_QWAL_V1_BYTES} bytes"
+            "QWAL envelope exceeds {MAX_QWAL_V2_BYTES} bytes"
         )));
     }
-    let Some(body) = bytes.strip_prefix(QWAL_V1_MAGIC) else {
-        return invalid("invalid QWAL v1 magic");
+    let Some(body) = bytes.strip_prefix(QWAL_V2_MAGIC) else {
+        return invalid("invalid QWAL v2 magic");
     };
     if body.is_empty() {
-        return invalid("empty QWAL v1 body");
+        return invalid("empty QWAL v2 body");
     }
-    let effect: QwalEnvelopeV1 = postcard::from_bytes(body)
+    let effect: QwalEnvelopeV2 = postcard::from_bytes(body)
         .map_err(|error| Error::InvalidEntry(format!("QWAL decode failed: {error}")))?;
     effect.validate()?;
 
@@ -220,10 +251,11 @@ pub fn sqlite_page_size(path: impl AsRef<Path>) -> Result<u32> {
 ///
 /// Pages removed by a shrink are represented only by `target_file_bytes` in
 /// the envelope; this function therefore returns images for target pages only.
+/// The target digest is computed from the same complete target scan.
 pub fn diff_closed_databases(
     base_path: impl AsRef<Path>,
     target_path: impl AsRef<Path>,
-) -> Result<Vec<QwalPageV1>> {
+) -> Result<(Vec<QwalPageV2>, LogHash)> {
     let base_path = base_path.as_ref();
     let target_path = target_path.as_ref();
     let base_page_size = sqlite_page_size(base_path)?;
@@ -233,34 +265,36 @@ pub fn diff_closed_databases(
     }
 
     let page_size = base_page_size as usize;
-    let target_bytes = fs::metadata(target_path).map_err(io_error)?.len();
-    let target_pages = target_bytes / u64::from(base_page_size);
     let mut base = File::open(base_path).map_err(io_error)?;
     let mut target = File::open(target_path).map_err(io_error)?;
+    let target_bytes = target.metadata().map_err(io_error)?.len();
+    let target_pages = target_bytes / u64::from(base_page_size);
     let mut base_page = vec![0; page_size];
     let mut target_page = vec![0; page_size];
+    let mut target_hasher = Sha256::new();
     let mut pages = Vec::new();
     let mut changed_bytes = 0usize;
 
     for page_index in 0..target_pages {
         target.read_exact(&mut target_page).map_err(io_error)?;
+        target_hasher.update(&target_page);
         let base_has_page = read_page_or_eof(&mut base, &mut base_page)?;
         if !base_has_page || base_page != target_page {
             changed_bytes = changed_bytes
                 .checked_add(page_size)
                 .ok_or_else(|| Error::ResourceExhausted("QWAL diff size overflows".into()))?;
-            if changed_bytes > MAX_QWAL_V1_BYTES {
+            if changed_bytes > MAX_QWAL_V2_BYTES {
                 return Err(Error::ResourceExhausted(format!(
-                    "QWAL changed pages exceed {MAX_QWAL_V1_BYTES} bytes"
+                    "QWAL changed pages exceed {MAX_QWAL_V2_BYTES} bytes"
                 )));
             }
-            pages.push(QwalPageV1 {
+            pages.push(QwalPageV2 {
                 page_no: page_index + 1,
                 after_image: target_page.clone(),
             });
         }
     }
-    Ok(pages)
+    Ok((pages, LogHash::from_bytes(target_hasher.finalize().into())))
 }
 
 /// Copies `base_path` to a new temp path and applies a validated page effect.
@@ -270,7 +304,7 @@ pub fn diff_closed_databases(
 pub fn apply_qwal_to_file(
     base_path: impl AsRef<Path>,
     temp_path: impl AsRef<Path>,
-    effect: &QwalEnvelopeV1,
+    effect: &QwalEnvelopeV2,
 ) -> Result<()> {
     effect.validate()?;
     let base_path = base_path.as_ref();
@@ -310,7 +344,7 @@ fn apply_to_new_temp(
     base_path: &Path,
     temp_path: &Path,
     mut temp: File,
-    effect: &QwalEnvelopeV1,
+    effect: &QwalEnvelopeV2,
 ) -> Result<()> {
     let mut base = File::open(base_path).map_err(io_error)?;
     std::io::copy(&mut base, &mut temp).map_err(io_error)?;
@@ -415,6 +449,12 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn generation_capacity_is_1024_receipts_and_512_kib() {
+        assert_eq!(MAX_QWAL_V2_RECEIPTS, 1024);
+        assert_eq!(MAX_QWAL_V2_BYTES, 512 * 1024);
+    }
+
     fn sqlite_header(page_size: u32, page_count: u32) -> Vec<u8> {
         let mut page = vec![0; page_size as usize];
         page[..SQLITE_MAGIC.len()].copy_from_slice(SQLITE_MAGIC);
@@ -447,8 +487,8 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
-    fn envelope(base: &Path, target: &Path, pages: Vec<QwalPageV1>) -> QwalEnvelopeV1 {
-        QwalEnvelopeV1 {
+    fn envelope(base: &Path, target: &Path, pages: Vec<QwalPageV2>) -> QwalEnvelopeV2 {
+        QwalEnvelopeV2 {
             cluster_id: "cluster-a".into(),
             epoch: 3,
             configuration_id: 4,
@@ -459,13 +499,22 @@ mod tests {
             base_file_bytes: fs::metadata(base).unwrap().len(),
             target_db_digest: file_digest(target).unwrap(),
             target_file_bytes: fs::metadata(target).unwrap().len(),
-            materializer_fingerprint: "sqlite-test-qwal-v1".into(),
+            materializer_fingerprint: "sqlite-test-qwal-v2".into(),
             page_size: sqlite_page_size(base).unwrap(),
-            request_id: "request-a".into(),
-            request_digest: LogHash::digest(&[b"request"]),
-            result_blob: b"result".to_vec(),
+            receipts: vec![QwalReceiptV2 {
+                request_id: "request-a".into(),
+                request_digest: LogHash::digest(&[b"request"]),
+                result_blob: crate::encode_sql_result(&crate::SqlCommandResult {
+                    statement_results: Vec::new(),
+                })
+                .unwrap(),
+            }],
             pages,
         }
+    }
+
+    fn diff_pages(base: &Path, target: &Path) -> Vec<QwalPageV2> {
+        diff_closed_databases(base, target).unwrap().0
     }
 
     #[test]
@@ -475,15 +524,49 @@ mod tests {
         let target = dir.path().join("target.db");
         write_pages(&base, 512, &[1, 2]);
         write_pages(&target, 512, &[1, 3]);
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
 
         let encoded = effect.encode().unwrap();
-        assert!(encoded.starts_with(QWAL_V1_MAGIC));
-        assert_eq!(QwalEnvelopeV1::decode(&encoded).unwrap(), effect);
+        assert!(encoded.starts_with(QWAL_V2_MAGIC));
+        assert_eq!(QwalEnvelopeV2::decode(&encoded).unwrap(), effect);
+    }
+
+    #[test]
+    fn closed_file_diff_returns_the_exact_target_digest_for_every_shape() {
+        let large_base = vec![1; 1_024];
+        let mut large_target = large_base.clone();
+        large_target[1_023] = 2;
+        for (base_fills, target_fills) in [
+            (vec![1], vec![2, 3, 4]),
+            (vec![1, 2, 3], vec![4]),
+            (vec![1, 2, 3], vec![1, 2, 3]),
+            (large_base, large_target),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("base.db");
+            let target = dir.path().join("target.db");
+            write_pages(&base, 512, &base_fills);
+            write_pages(&target, 512, &target_fills);
+
+            let (_, target_digest) = diff_closed_databases(&base, &target).unwrap();
+
+            assert_eq!(target_digest, file_digest(&target).unwrap());
+        }
+    }
+
+    #[test]
+    fn fused_target_digest_preserves_canonical_qwal_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        let target = dir.path().join("target.db");
+        write_pages(&base, 512, &[1, 2]);
+        write_pages(&target, 512, &[1, 3]);
+        let (pages, target_digest) = diff_closed_databases(&base, &target).unwrap();
+        let legacy = envelope(&base, &target, pages.clone());
+        let mut fused = envelope(&base, &target, pages);
+        fused.target_db_digest = target_digest;
+
+        assert_eq!(fused.encode().unwrap(), legacy.encode().unwrap());
     }
 
     #[test]
@@ -493,18 +576,82 @@ mod tests {
         let target = dir.path().join("target.db");
         write_pages(&base, 512, &[1]);
         write_pages(&target, 512, &[2]);
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
         let mut trailing = effect.encode().unwrap();
         trailing.push(0);
-        assert!(QwalEnvelopeV1::decode(&trailing).is_err());
+        assert!(QwalEnvelopeV2::decode(&trailing).is_err());
 
         let mut corrupt = effect.encode().unwrap();
         corrupt[0] ^= 0xff;
-        assert!(QwalEnvelopeV1::decode(&corrupt).is_err());
+        assert!(QwalEnvelopeV2::decode(&corrupt).is_err());
+
+        for old_magic in [b"QWAL\0\x01", b"QWAL\0\x02"] {
+            let mut old = old_magic.to_vec();
+            old.extend_from_slice(&effect.encode().unwrap()[QWAL_V2_MAGIC.len()..]);
+            assert!(QwalEnvelopeV2::decode(&old).is_err());
+        }
+    }
+
+    #[test]
+    fn receipts_preserve_order_and_reject_empty_duplicate_or_oversized_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        write_pages(&base, 512, &[1]);
+        let mut effect = envelope(&base, &base, Vec::new());
+        effect.receipts = (0..MAX_QWAL_V2_RECEIPTS)
+            .map(|index| QwalReceiptV2 {
+                request_id: format!("request-{index:03}"),
+                request_digest: LogHash::digest(&[&index.to_le_bytes()]),
+                result_blob: crate::encode_sql_result(&crate::SqlCommandResult {
+                    statement_results: Vec::new(),
+                })
+                .unwrap(),
+            })
+            .collect();
+        let decoded = QwalEnvelopeV2::decode(&effect.encode().unwrap()).unwrap();
+        assert_eq!(decoded.receipts, effect.receipts);
+
+        effect.receipts[MAX_QWAL_V2_RECEIPTS - 1].request_id =
+            effect.receipts[0].request_id.clone();
+        assert!(matches!(
+            effect.validate(),
+            Err(Error::InvalidEntry(message)) if message.contains("unique")
+        ));
+
+        effect.receipts.clear();
+        assert!(effect.validate().is_err());
+
+        effect.receipts = vec![
+            QwalReceiptV2 {
+                request_id: "duplicate".into(),
+                request_digest: LogHash::ZERO,
+                result_blob: crate::encode_sql_result(&crate::SqlCommandResult {
+                    statement_results: Vec::new(),
+                })
+                .unwrap(),
+            },
+            QwalReceiptV2 {
+                request_id: "duplicate".into(),
+                request_digest: LogHash::digest(&[b"different"]),
+                result_blob: crate::encode_sql_result(&crate::SqlCommandResult {
+                    statement_results: Vec::new(),
+                })
+                .unwrap(),
+            },
+        ];
+        assert!(effect.validate().is_err());
+
+        effect.receipts = (0..=MAX_QWAL_V2_RECEIPTS)
+            .map(|index| QwalReceiptV2 {
+                request_id: format!("request-{index}"),
+                request_digest: LogHash::ZERO,
+                result_blob: crate::encode_sql_result(&crate::SqlCommandResult {
+                    statement_results: Vec::new(),
+                })
+                .unwrap(),
+            })
+            .collect();
+        assert!(effect.validate().is_err());
     }
 
     #[test]
@@ -514,26 +661,26 @@ mod tests {
         let target = dir.path().join("target.db");
         write_pages(&base, 512, &[1, 2]);
         write_pages(&target, 512, &[2, 3]);
-        let page = diff_closed_databases(&base, &target).unwrap()[0].clone();
+        let page = diff_pages(&base, &target)[0].clone();
 
         for pages in [
-            vec![QwalPageV1 {
+            vec![QwalPageV2 {
                 page_no: 0,
                 after_image: vec![0; 512],
             }],
             vec![page.clone(), page.clone()],
             vec![
-                QwalPageV1 {
+                QwalPageV2 {
                     page_no: 2,
                     after_image: vec![0; 512],
                 },
                 page.clone(),
             ],
-            vec![QwalPageV1 {
+            vec![QwalPageV2 {
                 page_no: 1,
                 after_image: vec![0; 511],
             }],
-            vec![QwalPageV1 {
+            vec![QwalPageV2 {
                 page_no: 3,
                 after_image: vec![0; 512],
             }],
@@ -549,11 +696,7 @@ mod tests {
         let target = dir.path().join("target.db");
         write_pages(&base, 512, &[1]);
         write_pages(&target, 512, &[2]);
-        let mut effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let mut effect = envelope(&base, &target, diff_pages(&base, &target));
         effect.pages[0].after_image[0] = b'X';
         assert!(effect.validate().is_err());
     }
@@ -571,7 +714,7 @@ mod tests {
             let applied = dir.path().join("applied.db");
             write_pages(&base, 512, &base_fills);
             write_pages(&target, 512, &target_fills);
-            let pages = diff_closed_databases(&base, &target).unwrap();
+            let pages = diff_pages(&base, &target);
             let effect = envelope(&base, &target, pages);
 
             apply_qwal_to_file(&base, &applied, &effect).unwrap();
@@ -587,11 +730,7 @@ mod tests {
         write_pages(&base, 512, &[1]);
         write_pages(&target, 512, &[2, 3, 4]);
 
-        let mut gap = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let mut gap = envelope(&base, &target, diff_pages(&base, &target));
         gap.pages.retain(|page| page.page_no != 2);
         assert!(gap.validate().is_err());
 
@@ -612,11 +751,7 @@ mod tests {
         let applied = dir.path().join("applied.db");
         write_pages(&base, 512, &[1, 2, 3]);
         write_pages(&target, 512, &[1]);
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
         assert!(effect.pages.iter().all(|page| page.page_no == 1));
         effect.validate().unwrap();
         apply_qwal_to_file(&base, &applied, &effect).unwrap();
@@ -649,11 +784,7 @@ mod tests {
         write_pages(&base, 512, &[1]);
         write_pages(&target, 512, &[2]);
         write_pages(&wrong, 512, &[3]);
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
 
         assert!(apply_qwal_to_file(&wrong, &applied, &effect).is_err());
         assert!(!applied.exists());
@@ -673,11 +804,7 @@ mod tests {
         write_pages(&base, 512, &[1]);
         write_pages(&target, 512, &[2]);
         fs::write(&occupied, b"owned by caller").unwrap();
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
 
         assert!(apply_qwal_to_file(&base, &occupied, &effect).is_err());
         assert_eq!(fs::read(&occupied).unwrap(), b"owned by caller");
@@ -697,11 +824,7 @@ mod tests {
         write_pages(&target, 512, &[2]);
         fs::write(&victim, b"do not touch").unwrap();
         symlink(&victim, &link).unwrap();
-        let effect = envelope(
-            &base,
-            &target,
-            diff_closed_databases(&base, &target).unwrap(),
-        );
+        let effect = envelope(&base, &target, diff_pages(&base, &target));
 
         assert!(apply_qwal_to_file(&base, &link, &effect).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
@@ -760,7 +883,7 @@ mod tests {
             transaction.commit().unwrap();
         }
 
-        let pages = diff_closed_databases(&base, &target).unwrap();
+        let pages = diff_pages(&base, &target);
         assert!(!pages.is_empty());
         let effect = envelope(&base, &target, pages);
         apply_qwal_to_file(&base, &applied, &effect).unwrap();

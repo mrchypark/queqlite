@@ -1,0 +1,17 @@
+diff --git a/hiqlite/src/server/proxy/mod.rs b/hiqlite/src/server/proxy/mod.rs
+index 9d80c3f..c738087 100644
+--- a/hiqlite/src/server/proxy/mod.rs
++++ b/hiqlite/src/server/proxy/mod.rs
+@@ -57,9 +57,9 @@ pub async fn start_proxy(config: Config) -> Result<(), Error> {
+                 //     "/membership/:raft_type",
+                 //     get(management::get_membership).post(management::post_membership),
+                 // )
+-                .route("/metrics/:raft_type", get(handlers::metrics)),
++                .route("/metrics/{raft_type}", get(handlers::metrics)),
+         )
+         .route("/listen", get(handlers::listen))
+-        .route("/stream", get(handlers::stream))
++        .route("/stream/{raft_type}", get(handlers::stream))
+         // .route("/health", get(api::health))
+         .route("/ping", get(handlers::ping))
+         .with_state(state.clone());

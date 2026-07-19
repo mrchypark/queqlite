@@ -53,7 +53,8 @@ use rhiza_node::{
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
-    DecisionProof, Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
+    DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
+    RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{SqlStatement, SqlValue};
@@ -1293,7 +1294,7 @@ fn parse_graph_query(
                     .map_err(|error| format!("invalid --params-json: {error}"))?
             }
             "--consistency" => {
-                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                consistency = Some(parse_read_consistency(&next_value(
                     &mut args,
                     "--consistency",
                 )?)?)
@@ -1349,7 +1350,7 @@ fn parse_kv_get(
             "--token" => token = Some(next_value(&mut args, "--token")?),
             "--key-base64" => key = Some(next_value(&mut args, "--key-base64")?),
             "--consistency" => {
-                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                consistency = Some(parse_read_consistency(&next_value(
                     &mut args,
                     "--consistency",
                 )?)?)
@@ -1399,7 +1400,7 @@ fn parse_kv_scan(
                 limit = Some(parsed);
             }
             "--consistency" => {
-                consistency = Some(parse_multimodel_read_consistency(&next_value(
+                consistency = Some(parse_read_consistency(&next_value(
                     &mut args,
                     "--consistency",
                 )?)?)
@@ -1491,8 +1492,8 @@ fn parse_kv_delete(
     })
 }
 
-#[cfg(any(feature = "graph", feature = "kv"))]
-fn parse_multimodel_read_consistency(value: &str) -> Result<ReadConsistency, String> {
+#[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
+fn parse_read_consistency(value: &str) -> Result<ReadConsistency, String> {
     match value {
         "local" => Ok(ReadConsistency::Local),
         "read_barrier" => Ok(ReadConsistency::ReadBarrier),
@@ -1506,15 +1507,6 @@ fn parse_multimodel_read_consistency(value: &str) -> Result<ReadConsistency, Str
             .map_err(|_| {
                 "consistency must be `local`, `read_barrier`, or `applied_index:N`".to_string()
             }),
-    }
-}
-
-#[cfg(feature = "sql")]
-fn parse_read_consistency(value: &str) -> Result<ReadConsistency, String> {
-    match value {
-        "local" => Ok(ReadConsistency::Local),
-        "read_barrier" => Ok(ReadConsistency::ReadBarrier),
-        _ => Err("consistency must be `local` or `read_barrier`".into()),
     }
 }
 
@@ -2422,21 +2414,55 @@ async fn serve_local_until<F>(config: ServeConfig, shutdown: F) -> Result<(), St
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    tokio::pin!(shutdown);
     let node_config = config.node_config()?;
     let recorder = open_recorder(&config)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut recorder_server =
-        spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
-    tokio::task::yield_now().await;
+    let recorder_server_startup =
+        spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone());
+    tokio::pin!(recorder_server_startup);
+    let mut recorder_server = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        result = &mut recorder_server_startup => result?,
+    };
+    tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
+        result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
+        () = tokio::task::yield_now() => {}
+    }
 
-    let consensus = build_consensus(&config)?;
+    let consensus = build_consensus(&config, Some(&recorder))?;
     let runtime_startup = open_runtime_with_retry(node_config, consensus, Vec::new());
     tokio::pin!(runtime_startup);
     let runtime = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
         result = &mut runtime_startup => result?,
         result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
     };
-    let client_listener = bind_client_listener(&config).await?;
+    let client_listener_startup = bind_client_listener(&config);
+    tokio::pin!(client_listener_startup);
+    let client_listener = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            runtime.cancel_operations();
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
+        result = &mut recorder_server.0 => {
+            runtime.cancel_operations();
+            return Err(recorder_task_error(result));
+        }
+        result = &mut client_listener_startup => result?,
+    };
     println!(
         "rhiza serving client={} recorder={}",
         config.client_listen,
@@ -2459,7 +2485,6 @@ where
             .await
             .map_err(|error| format!("client server stopped: {error}"))
     }));
-    tokio::pin!(shutdown);
     let (exit, result) = tokio::select! {
         biased;
         () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
@@ -2508,7 +2533,6 @@ async fn serve_remote_until<F>(config: ServeConfig, shutdown: F) -> Result<(), S
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let remote = config
         .remote
         .clone()
@@ -2527,49 +2551,102 @@ where
         ),
     )
     .map_err(|error| error.to_string())?;
+    serve_remote_with_archive_until(config, remote, archive, shutdown).await
+}
+
+async fn serve_remote_with_archive_until<F>(
+    config: ServeConfig,
+    remote: RemoteCheckpointConfig,
+    archive: ObjectArchiveStore,
+    shutdown: F,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::pin!(shutdown);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let authoritative_identity = archive
         .checkpoint_identity()
         .map_err(|error| error.to_string())?
         .clone();
     let node_config = config.node_config()?;
-    let preparation = if config.bundle.predecessor.is_some() {
-        require_successor_startup_mode(remote.startup)?;
-        let restored =
-            restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
+    let preparation = tokio::select! {
+        biased;
+        () = &mut shutdown => return Ok(()),
+        result = async {
+            if config.bundle.predecessor.is_some() {
+                require_successor_startup_mode(remote.startup)?;
+                let restored =
+                    restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                if restored.requires_recorder_install() {
+                    install_successor_recorder_for_startup(&config)?;
+                    restored.complete().map_err(|error| error.to_string())?;
+                }
+                write_local_checkpoint_identity_marker(
+                    &config.data_dir,
+                    config.execution_profile,
+                    &authoritative_identity,
+                )?;
+                Ok::<_, String>(StartupPreparation::RecorderFirst)
+            } else {
+                prepare_remote_startup(
+                    remote.startup,
+                    &archive,
+                    &config.data_dir,
+                    &config.node_id,
+                    config.execution_profile,
+                )
                 .await
-                .map_err(|error| error.to_string())?;
-        if restored.requires_recorder_install() {
-            install_successor_recorder_for_startup(&config)?;
-            restored.complete().map_err(|error| error.to_string())?;
-        }
-        write_local_checkpoint_identity_marker(
-            &config.data_dir,
-            config.execution_profile,
-            &authoritative_identity,
-        )?;
-        StartupPreparation::RecorderFirst
-    } else {
-        prepare_remote_startup(
-            remote.startup,
-            &archive,
-            &config.data_dir,
-            &config.node_id,
-            config.execution_profile,
-        )
-        .await?
+            }
+        } => result?,
     };
     let recorder = open_recorder(&config)?;
-    let mut recorder_server = match &preparation {
-        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
-            let server =
-                spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
-            tokio::task::yield_now().await;
-            Some(server)
+    let startup_recorder = match &preparation {
+        StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } => {
+            Some(StartupRecorderGate::new(recorder.clone(), *checkpoint_root))
         }
-        StartupPreparation::RuntimeFirstWithPeerCatchup { .. } => None,
+        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
+            None
+        }
     };
+    let mut recorder_server = match &startup_recorder {
+        Some(startup_recorder) => tokio::select! {
+            biased;
+            () = &mut shutdown => return Ok(()),
+            result = spawn_recorder_server(
+                &config,
+                startup_recorder.clone(),
+                shutdown_rx.clone(),
+            ) => result?,
+        },
+        None => tokio::select! {
+            biased;
+            () = &mut shutdown => return Ok(()),
+            result = spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()) => result?,
+        },
+    };
+    tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
+        result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
+        () = tokio::task::yield_now() => {}
+    }
 
-    let consensus = build_consensus(&config)?;
+    let local_recorder = remote_startup_uses_direct_recorder(&preparation).then_some(&recorder);
+    let recovered_checkpoint = match &preparation {
+        StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } => {
+            Some(*checkpoint_root)
+        }
+        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
+            None
+        }
+    };
+    let consensus = build_consensus_at_checkpoint(&config, local_recorder, recovered_checkpoint)?;
     let peer_candidates = match &preparation {
         StartupPreparation::RuntimeFirstWithPeerCatchup { .. } => build_log_peers(&config)?,
         StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
@@ -2578,39 +2655,82 @@ where
     };
     let runtime_startup = open_runtime_with_retry(node_config, consensus, peer_candidates);
     tokio::pin!(runtime_startup);
-    let runtime = if let Some(server) = recorder_server.as_mut() {
-        tokio::select! {
-            result = &mut runtime_startup => result?,
-            result = &mut server.0 => return Err(recorder_task_error(result)),
+    let runtime = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
         }
-    } else {
-        runtime_startup.await?
+        result = &mut recorder_server.0 => return Err(recorder_task_error(result)),
+        result = &mut runtime_startup => result?,
     };
     if let StartupPreparation::VerifyLocalCheckpoint { identity, root } = &preparation {
         verify_local_rejoin_checkpoint(&runtime, identity, *root)?;
     }
-    if let StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_index } = &preparation {
-        rehydrate_recorder_with_retry(runtime.clone(), recorder.clone(), *checkpoint_index).await?;
-    }
-    if recorder_server.is_none() {
-        recorder_server =
-            Some(spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?);
-        tokio::task::yield_now().await;
+    if let StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } = &preparation {
+        verify_local_rejoin_checkpoint(&runtime, &authoritative_identity, *checkpoint_root)?;
+        let rehydration = rehydrate_recorder_with_retry(
+            runtime.clone(),
+            recorder.clone(),
+            checkpoint_root.index(),
+        );
+        tokio::pin!(rehydration);
+        tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                runtime.cancel_operations();
+                stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+                return Ok(());
+            }
+            result = &mut recorder_server.0 => {
+                runtime.cancel_operations();
+                return Err(recorder_task_error(result));
+            }
+            result = &mut rehydration => result?,
+        }
+        startup_recorder
+            .as_ref()
+            .expect("runtime-first startup has a recorder gate")
+            .activate();
     }
 
-    let coordinator = Arc::new(
-        CheckpointCoordinator::open_with_holder_and_options(
-            archive,
-            remote.durability.clone(),
-            &config.node_id,
-            CheckpointPublisherOptions::new(remote.lease_duration_ms),
-        )
-        .await
-        .map_err(|error| error.to_string())?,
+    let coordinator_startup = CheckpointCoordinator::open_with_holder_and_options(
+        archive,
+        remote.durability.clone(),
+        &config.node_id,
+        CheckpointPublisherOptions::new(remote.lease_duration_ms),
     );
+    tokio::pin!(coordinator_startup);
+    let coordinator = Arc::new(tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            runtime.cancel_operations();
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
+        result = &mut recorder_server.0 => {
+            runtime.cancel_operations();
+            return Err(recorder_task_error(result));
+        }
+        result = &mut coordinator_startup => result.map_err(|error| error.to_string())?,
+    });
     coordinator
         .note_recovered_committed(runtime.applied_index().map_err(|error| error.to_string())?);
-    let client_listener = bind_client_listener(&config).await?;
+    let client_listener_startup = bind_client_listener(&config);
+    tokio::pin!(client_listener_startup);
+    let client_listener = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            runtime.cancel_operations();
+            stop_recorder_during_startup(&shutdown_tx, &mut recorder_server).await?;
+            return Ok(());
+        }
+        result = &mut recorder_server.0 => {
+            runtime.cancel_operations();
+            return Err(recorder_task_error(result));
+        }
+        result = &mut client_listener_startup => result?,
+    };
     println!(
         "rhiza serving client={} recorder={} recovery_generation={}",
         config.client_listen,
@@ -2642,14 +2762,12 @@ where
             .await
             .map_err(|error| format!("client server stopped: {error}"))
     }));
-    let mut recorder_server = recorder_server.expect("remote recorder server started");
     let mut worker = checkpoint_worker(
         remote.durability,
         Arc::clone(&runtime),
         Arc::clone(&coordinator),
         shutdown_rx.clone(),
     );
-    tokio::pin!(shutdown);
     let (exit, result) = if let Some(worker) = worker.as_mut() {
         tokio::select! {
             biased;
@@ -2812,6 +2930,122 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
     .map_err(|error| error.to_string())
 }
 
+#[derive(Clone)]
+struct StartupRecorderGate {
+    recorder: RecorderFileStore,
+    checkpoint_root: LogAnchor,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StartupRecorderGate {
+    fn new(recorder: RecorderFileStore, checkpoint_root: LogAnchor) -> Self {
+        Self {
+            recorder,
+            checkpoint_root,
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn activate(&self) {
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn require_active(&self) -> rhiza_quepaxa::Result<()> {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(rhiza_quepaxa::Error::Io(
+                "recorder is quarantined during checkpoint recovery".into(),
+            ))
+        }
+    }
+
+    fn require_visible_slot(&self, slot: u64) -> rhiza_quepaxa::Result<()> {
+        if slot <= self.checkpoint_root.index() {
+            return Err(rhiza_quepaxa::Error::Io(format!(
+                "recorder checkpoint root {} does not expose historical slot {slot}",
+                self.checkpoint_root.index()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RecorderRpc for StartupRecorderGate {
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.recorder.recorder_id()
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: rhiza_core::LogHash,
+        command_hash: rhiza_core::LogHash,
+        command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        self.recorder.store_command_for(
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: rhiza_core::LogHash,
+        command_hash: rhiza_core::LogHash,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        self.recorder
+            .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
+    }
+
+    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        self.require_active()?;
+        self.recorder.record(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.require_active()?;
+        self.recorder.install_decision_proof(proof, membership)
+    }
+
+    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        self.require_visible_slot(slot)?;
+        self.recorder.inspect_decision_proof(slot)
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        self.require_visible_slot(slot)?;
+        self.recorder.inspect_record_summary(slot)
+    }
+
+    fn supports_context_read_fence(&self) -> bool {
+        self.recorder.supports_context_read_fence()
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        self.require_visible_slot(request.slot)?;
+        self.recorder.observe_read_fence(request)
+    }
+}
+
 fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
     if config.recorder_transport.is_tcp() {
         config
@@ -2824,11 +3058,14 @@ fn active_recorder_listen(config: &ServeConfig) -> Result<&str, String> {
     }
 }
 
-async fn spawn_recorder_server(
+async fn spawn_recorder_server<R>(
     config: &ServeConfig,
-    recorder: RecorderFileStore,
+    recorder: R,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<AbortOnDrop<Result<(), String>>, String> {
+) -> Result<AbortOnDrop<Result<(), String>>, String>
+where
+    R: RecorderRpc + Clone + Send + Sync + 'static,
+{
     match config.recorder_transport {
         RecorderTransport::Http => {
             let listener = tokio::net::TcpListener::bind(&config.recorder_listen)
@@ -2969,6 +3206,17 @@ fn recorder_task_error(result: Result<Result<(), String>, tokio::task::JoinError
     }
 }
 
+async fn stop_recorder_during_startup(
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    recorder_server: &mut AbortOnDrop<Result<(), String>>,
+) -> Result<(), String> {
+    shutdown.send_replace(true);
+    let joined = tokio::time::timeout(SERVE_SHUTDOWN_TIMEOUT, &mut recorder_server.0)
+        .await
+        .map_err(|_| "recorder server did not stop during startup shutdown".to_string())?;
+    joined.map_err(|error| format!("recorder server task failed: {error}"))?
+}
+
 fn checkpoint_worker(
     mode: DurabilityMode,
     runtime: Arc<NodeRuntime>,
@@ -3049,7 +3297,27 @@ fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String
     }
 }
 
-fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, String> {
+fn build_consensus(
+    config: &ServeConfig,
+    local_recorder: Option<&RecorderFileStore>,
+) -> Result<Arc<ThreeNodeConsensus>, String> {
+    build_consensus_at_checkpoint(config, local_recorder, None)
+}
+
+fn build_consensus_at_checkpoint(
+    config: &ServeConfig,
+    local_recorder: Option<&RecorderFileStore>,
+    recovered_checkpoint: Option<LogAnchor>,
+) -> Result<Arc<ThreeNodeConsensus>, String> {
+    if let Some(recorder) = local_recorder {
+        let recorder_id = recorder.recorder_id().map_err(|error| error.to_string())?;
+        if recorder_id != config.node_id {
+            return Err(format!(
+                "local recorder identity mismatch: expected {}, got {recorder_id}",
+                config.node_id
+            ));
+        }
+    }
     let local_token = config.local_peer_token()?.to_owned();
     let tls_ca_bundle = if config.recorder_transport.is_tls() {
         let tls = config
@@ -3070,7 +3338,7 @@ fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, Stri
         .iter()
         .enumerate()
         .map(|(index, peer)| {
-            let client: Box<dyn RecorderRpc> = match config.recorder_transport {
+            let network_client: Box<dyn RecorderRpc> = match config.recorder_transport {
                 RecorderTransport::Http => Box::new(
                     HttpRecorderClient::new_with_recovery_generation(
                         peer.base_url(),
@@ -3156,18 +3424,41 @@ fn build_consensus(config: &ServeConfig) -> Result<Arc<ThreeNodeConsensus>, Stri
                     )?)
                 }
             };
-            Ok((peer.node_id().to_owned(), client))
+            let recorder: Box<dyn RecorderRpc> = if peer.node_id() == config.node_id {
+                local_recorder
+                    .map(|recorder| Box::new(recorder.clone()) as Box<dyn RecorderRpc>)
+                    .unwrap_or(network_client)
+            } else {
+                network_client
+            };
+            Ok((peer.node_id().to_owned(), recorder))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    ThreeNodeConsensus::from_recorders_with_ids(
-        config.cluster_id.clone(),
-        config.node_id.clone(),
-        config.epoch,
-        config.bundle.config_id,
-        recorders,
-    )
-    .map(Arc::new)
-    .map_err(|error| error.to_string())
+    let consensus = match recovered_checkpoint {
+        Some(checkpoint_root) => {
+            let next_index = checkpoint_root
+                .index()
+                .checked_add(1)
+                .ok_or_else(|| "checkpoint root index cannot advance".to_string())?;
+            ThreeNodeConsensus::from_recorders_with_ids_and_recovered_tip(
+                config.cluster_id.clone(),
+                config.node_id.clone(),
+                config.epoch,
+                config.bundle.config_id,
+                recorders,
+                next_index,
+                checkpoint_root.hash(),
+            )
+        }
+        None => ThreeNodeConsensus::from_recorders_with_ids(
+            config.cluster_id.clone(),
+            config.node_id.clone(),
+            config.epoch,
+            config.bundle.config_id,
+            recorders,
+        ),
+    };
+    consensus.map(Arc::new).map_err(|error| error.to_string())
 }
 
 fn build_log_peers(config: &ServeConfig) -> Result<Vec<HttpLogPeer>, String> {
@@ -3445,7 +3736,7 @@ fn unix_time_ms() -> Result<u64, String> {
 
 fn open_offline_runtime(config: &ServeConfig) -> Result<NodeRuntime, String> {
     let node_config = config.node_config()?;
-    let consensus = build_consensus(config)?;
+    let consensus = build_consensus(config, None)?;
     NodeRuntime::open(node_config, consensus, &[]).map_err(|error| error.to_string())
 }
 
@@ -3856,8 +4147,15 @@ enum StartupPreparation {
         root: LogAnchor,
     },
     RuntimeFirstWithPeerCatchup {
-        checkpoint_index: u64,
+        checkpoint_root: LogAnchor,
     },
+}
+
+fn remote_startup_uses_direct_recorder(preparation: &StartupPreparation) -> bool {
+    !matches!(
+        preparation,
+        StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
+    )
 }
 
 async fn prepare_remote_startup(
@@ -3903,7 +4201,7 @@ async fn prepare_remote_startup(
                 Ok(StartupPreparation::RecorderFirst)
             } else {
                 Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                    checkpoint_index: tip.index(),
+                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
                 })
             }
         }
@@ -4691,7 +4989,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get --url <preferred> [--token <token>] --key-base64 <base64> [--consistency local|read_barrier|applied_index:N]\n  rhiza kv scan --url <preferred> [--token <token>] (--start-base64 <base64> [--end-base64 <base64>]|--prefix-base64 <base64>) [--cursor-base64 <base64>] [--limit N] [--consistency local|read_barrier|applied_index:N]\n  rhiza kv put --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64> --value-base64 <base64>\n  rhiza kv delete --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64>\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get --url <preferred> [--token <token>] --key-base64 <base64> [--consistency local|read_barrier|applied_index:N]\n  rhiza kv scan --url <preferred> [--token <token>] (--start-base64 <base64> [--end-base64 <base64>]|--prefix-base64 <base64>) [--cursor-base64 <base64>] [--limit N] [--consistency local|read_barrier|applied_index:N]\n  rhiza kv put --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64> --value-base64 <base64>\n  rhiza kv delete --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64>\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -4726,9 +5024,9 @@ mod tests {
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::AcceptedValue;
     #[cfg(feature = "sql")]
-    use rhiza_quepaxa::{RecordRequest, RecordSummary, RecorderReply};
+    use rhiza_quepaxa::{RecordRequest, RecordSummary};
     #[cfg(feature = "sql")]
-    use rhiza_sql::{encode_sql_command, SqlCommand, SqlEffectPreparation, SqliteStateMachine};
+    use rhiza_sql::{encode_sql_command, SqlBatchMember, SqlCommand, SqliteStateMachine};
 
     use super::*;
 
@@ -4873,7 +5171,10 @@ mod tests {
         .err()
         .expect("invalid consistency should fail");
 
-        assert_eq!(error, "consistency must be `local` or `read_barrier`");
+        assert_eq!(
+            error,
+            "consistency must be `local`, `read_barrier`, or `applied_index:N`"
+        );
     }
 
     #[test]
@@ -4915,6 +5216,68 @@ mod tests {
         };
         assert_eq!(query.consistency, Some(ReadConsistency::ReadBarrier));
         assert!(parse_read_consistency("barrier").is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "sql")]
+    fn sql_read_parsers_accept_the_full_applied_index_domain_without_aliases() {
+        let read = parse_command([
+            "read",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--key",
+            "alpha",
+            "--consistency",
+            "applied_index:0",
+        ])
+        .unwrap();
+        let Command::Read(read) = read else {
+            panic!("expected read command");
+        };
+        assert_eq!(read.consistency, Some(ReadConsistency::AppliedIndex(0)));
+
+        let query = parse_command([
+            "sql",
+            "query",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "client-secret",
+            "--sql",
+            "SELECT 1",
+            "--consistency",
+            "applied_index:18446744073709551615",
+        ])
+        .unwrap();
+        let Command::SqlQuery(query) = query else {
+            panic!("expected sql query command");
+        };
+        assert_eq!(
+            query.consistency,
+            Some(ReadConsistency::AppliedIndex(u64::MAX))
+        );
+
+        for invalid in [
+            "applied_index:",
+            "applied_index:18446744073709551616",
+            "applied-index:1",
+            "barrier",
+        ] {
+            assert!(
+                parse_read_consistency(invalid).is_err(),
+                "{invalid} must not be accepted"
+            );
+        }
+
+        for command in ["rhiza read ", "rhiza sql query "] {
+            let usage = USAGE
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .expect("SQL read command must be documented");
+            assert!(usage.contains("local|read_barrier|applied_index:N"));
+        }
     }
 
     #[test]
@@ -6435,9 +6798,25 @@ mod tests {
                     ],
                 };
                 let request = encode_sql_command(&command).unwrap();
-                let SqlEffectPreparation::Effect(payload) = db
-                    .prepare_sql_effect(&command, &request, index - 1, previous)
+                let preparation = db
+                    .prepare_sql_batch_effect(
+                        &[SqlBatchMember {
+                            command: &command,
+                            request_payload: &request,
+                        }],
+                        index - 1,
+                        previous,
+                    )
                     .unwrap();
+                preparation
+                    .results
+                    .into_iter()
+                    .next()
+                    .expect("one-member checkpoint fixture batch returns one result")
+                    .unwrap();
+                let payload = preparation
+                    .effect
+                    .expect("successful checkpoint fixture batch produces one QWAL v2 effect");
                 let hash = LogEntry::calculate_hash(
                     "rhiza:sql:cluster-a",
                     index,
@@ -6492,6 +6871,23 @@ mod tests {
                 entry
             })
             .collect()
+    }
+
+    #[test]
+    #[cfg(feature = "sql")]
+    fn checkpoint_fixture_entries_use_one_receipt_qwal_v2_effects() {
+        let entries = entries(3);
+
+        for (offset, entry) in entries.iter().enumerate() {
+            let effect = rhiza_sql::decode_qwal_v2(&entry.payload).unwrap();
+            assert_eq!(effect.base_index, offset as u64);
+            assert_eq!(effect.base_hash, entry.prev_hash);
+            assert_eq!(effect.receipts.len(), 1);
+            assert_eq!(
+                effect.receipts[0].request_id,
+                format!("checkpoint-entry-{}", offset + 1)
+            );
+        }
     }
 
     #[cfg(feature = "sql")]
@@ -6631,11 +7027,39 @@ mod tests {
 
     #[cfg(feature = "sql")]
     impl RecorderRpc for BlockingRecorder {
-        fn call(
+        fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+            self.inner.recorder_id()
+        }
+
+        fn store_command_for(
             &self,
-            request: rhiza_quepaxa::RecorderRequest,
-        ) -> rhiza_quepaxa::Result<RecorderReply> {
-            self.inner.call(request)
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+            command: StoredCommand,
+        ) -> rhiza_quepaxa::Result<()> {
+            self.inner.store_command_for(
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest,
+                command_hash,
+                command,
+            )
+        }
+
+        fn fetch_command_for(
+            &self,
+            cluster_id: String,
+            epoch: u64,
+            config_id: u64,
+            config_digest: LogHash,
+            command_hash: LogHash,
+        ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+            self.inner
+                .fetch_command_for(cluster_id, epoch, config_id, config_digest, command_hash)
         }
 
         fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
@@ -6664,10 +7088,6 @@ mod tests {
             slot: u64,
         ) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
             self.inner.inspect_record_summary(slot)
-        }
-
-        fn uses_typed_protocol(&self) -> bool {
-            true
         }
     }
 
@@ -7101,7 +7521,7 @@ mod tests {
             .await
             .unwrap(),
             StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_index: 2
+                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
             }
         );
         assert!(fresh_rejoin_dir.join("consensus/log").exists());
@@ -7295,6 +7715,324 @@ mod tests {
         listener.local_addr().unwrap().to_string()
     }
 
+    #[test]
+    fn remote_startup_direct_recorder_selection_preserves_peer_catchup_quarantine() {
+        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let root = LogAnchor::new(1, LogHash::from_bytes([1; 32]));
+
+        assert!(remote_startup_uses_direct_recorder(
+            &StartupPreparation::RecorderFirst
+        ));
+        assert!(remote_startup_uses_direct_recorder(
+            &StartupPreparation::VerifyLocalCheckpoint { identity, root }
+        ));
+        assert!(!remote_startup_uses_direct_recorder(
+            &StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: root,
+            }
+        ));
+    }
+
+    #[test]
+    fn startup_recorder_gate_allows_inspection_but_rejects_mutation_until_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            root.path().join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let gate = StartupRecorderGate::new(
+            recorder.clone(),
+            LogAnchor::new(2, LogHash::from_bytes([2; 32])),
+        );
+        let command = StoredCommand::new(EntryType::Noop, Vec::new());
+
+        assert!(gate.inspect_record_summary(1).is_err());
+        assert!(gate.inspect_decision_proof(2).is_err());
+        assert!(gate
+            .observe_read_fence(ReadFenceRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 2,
+            })
+            .is_err());
+        assert_eq!(gate.inspect_record_summary(3).unwrap(), None);
+        assert!(gate
+            .store_command_for(
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                membership.digest(),
+                command.hash(),
+                command.clone(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("quarantined"));
+        assert_eq!(
+            recorder
+                .fetch_command_for(
+                    "rhiza:sql:cluster-a".into(),
+                    1,
+                    1,
+                    membership.digest(),
+                    command.hash(),
+                )
+                .unwrap(),
+            None
+        );
+
+        gate.activate();
+        assert!(gate.inspect_record_summary(1).is_err());
+        gate.store_command_for(
+            "rhiza:sql:cluster-a".into(),
+            1,
+            1,
+            membership.digest(),
+            command.hash(),
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorder
+                .fetch_command_for(
+                    "rhiza:sql:cluster-a".into(),
+                    1,
+                    1,
+                    membership.digest(),
+                    command.hash(),
+                )
+                .unwrap(),
+            Some(command)
+        );
+    }
+
+    #[test]
+    fn divergent_fresh_checkpoint_roots_cannot_reclassify_an_existing_slot_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let committed = entries(3);
+        let checkpoint_roots = [
+            LogAnchor::new(2, committed[1].hash),
+            LogAnchor::new(3, committed[2].hash),
+            LogAnchor::new(3, committed[2].hash),
+        ];
+        let recorders = membership
+            .members()
+            .iter()
+            .zip(checkpoint_roots)
+            .map(|(node_id, checkpoint_root)| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.path().join(node_id),
+                    node_id.clone(),
+                    "rhiza:sql:cluster-a",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap();
+                (
+                    node_id.clone(),
+                    Box::new(StartupRecorderGate::new(recorder, checkpoint_root))
+                        as Box<dyn RecorderRpc>,
+                )
+            })
+            .collect();
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids_and_recovered_tip(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorders,
+            3,
+            committed[1].hash,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            consensus.inspect_decision_at(3, committed[1].hash).unwrap(),
+            rhiza_quepaxa::DecisionInspection::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sql")]
+    async fn recorder_rehydration_installs_a_real_suffix_before_gate_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_final_flush(root.path());
+        runtime.write("request-1", "key", "one").unwrap();
+        runtime.write("request-2", "key", "two").unwrap();
+        let suffix = runtime.log_store().read(2).unwrap().unwrap();
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            root.path().join("rehydrated-recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let checkpoint_root = runtime.log_store().read(1).unwrap().unwrap();
+        let gate = StartupRecorderGate::new(
+            recorder.clone(),
+            LogAnchor::new(checkpoint_root.index, checkpoint_root.hash),
+        );
+
+        rehydrate_recorder_with_retry(runtime, recorder.clone(), checkpoint_root.index)
+            .await
+            .unwrap();
+        assert!(gate.inspect_decision_proof(1).is_err());
+        assert!(gate.inspect_decision_proof(2).unwrap().is_some());
+
+        gate.activate();
+        assert!(gate.inspect_decision_proof(1).is_err());
+        let command = StoredCommand::new(suffix.entry_type, suffix.payload);
+        assert_eq!(
+            recorder.fetch_command(command.hash()).unwrap(),
+            Some(command)
+        );
+    }
+
+    #[test]
+    fn build_consensus_rejects_a_mismatched_direct_recorder_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = parse_serve_env(&base_serve_env()).unwrap();
+        config.data_dir = root.path().join("node-2");
+        let recorder = RecorderFileStore::new_with_membership(
+            root.path().join("wrong-recorder"),
+            "node-9",
+            config.cluster_id.clone(),
+            config.epoch,
+            config.bundle.config_id,
+            config.bundle.membership.clone(),
+        )
+        .unwrap();
+
+        let error = build_consensus(&config, Some(&recorder)).unwrap_err();
+
+        assert!(error.contains("local recorder identity"));
+        assert!(error.contains("node-2"));
+        assert!(error.contains("node-9"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_consensus_combines_direct_self_with_one_remote_recorder() {
+        let root = tempfile::tempdir().unwrap();
+        let self_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let self_address = self_listener.local_addr().unwrap();
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_address = remote_listener.local_addr().unwrap();
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        let peers = vec![
+            PeerConfig::new("node-1", format!("http://{self_address}"), "peer-1-secret").unwrap(),
+            PeerConfig::new(
+                "node-2",
+                format!("http://{remote_address}"),
+                "peer-2-secret",
+            )
+            .unwrap(),
+            PeerConfig::new(
+                "node-3",
+                format!("http://{unavailable_address}"),
+                "peer-3-secret",
+            )
+            .unwrap(),
+        ];
+        let membership =
+            Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_string())).unwrap();
+        let cluster_id = "rhiza:sql:direct-recorder-cluster";
+        let local_recorder = RecorderFileStore::new_with_membership(
+            root.path().join("local-recorder"),
+            "node-1",
+            cluster_id,
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let remote_recorder = RecorderFileStore::new_with_membership(
+            root.path().join("remote-recorder"),
+            "node-2",
+            cluster_id,
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let remote_app = recorder_router_for_generation(remote_recorder, peers.clone(), 1);
+        let unavailable_app = Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE });
+        let self_app = unavailable_app.clone();
+        let self_server = tokio::spawn(async move {
+            axum::serve(self_listener, self_app).await.unwrap();
+        });
+        let remote_server = tokio::spawn(async move {
+            axum::serve(remote_listener, remote_app).await.unwrap();
+        });
+        let unavailable_server = tokio::spawn(async move {
+            axum::serve(unavailable_listener, unavailable_app)
+                .await
+                .unwrap();
+        });
+        let (_, execution_profile, _) = compiled_profile_fixture();
+        let config = ServeConfig {
+            execution_profile,
+            logical_cluster_id: "direct-recorder-cluster".into(),
+            cluster_id: cluster_id.into(),
+            node_id: "node-1".into(),
+            data_dir: root.path().join("node-1"),
+            epoch: 1,
+            bundle: ConfigurationBundle {
+                config_id: 1,
+                peers,
+                recorder_tcp_peers: vec![None, None, None],
+                configuration_state: ConfigurationState::active(1, membership.digest()),
+                membership,
+                predecessor: None,
+            },
+            client_token: "client-secret".into(),
+            admin_token: None,
+            client_listen: unused_local_address(),
+            recorder_listen: unused_local_address(),
+            recorder_transport: RecorderTransport::Http,
+            recorder_tcp: None,
+            recovery_generation: 1,
+            remote: None,
+        };
+        let consensus = build_consensus(&config, Some(&local_recorder)).unwrap();
+
+        let entry = tokio::task::spawn_blocking(move || {
+            let entry = consensus
+                .propose_at(
+                    1,
+                    LogHash::ZERO,
+                    rhiza_core::Command::new(
+                        rhiza_core::CommandKind::Deterministic,
+                        b"direct-self".to_vec(),
+                    ),
+                )
+                .unwrap();
+            assert!(consensus.finish_pending_rpcs(Duration::from_secs(2)));
+            entry
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(entry.payload, b"direct-self");
+        assert!(local_recorder.inspect_record_summary(1).unwrap().is_some());
+        self_server.abort();
+        remote_server.abort();
+        unavailable_server.abort();
+    }
+
     #[cfg(feature = "sql")]
     async fn wait_for_tcp(address: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -7345,6 +8083,279 @@ mod tests {
     #[cfg(all(feature = "sql", feature = "recorder-postcard-rpc"))]
     async fn sequential_postcard_rpc_cluster_commits_without_process_restart() {
         sequential_cluster_start(RecorderTransport::TcpPostcardRpc).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "sql")]
+    async fn three_fresh_rejoin_nodes_restore_checkpoint_without_recorder_startup_deadlock() {
+        let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let archive_root = temp.path().join("archive");
+        let archive = local_checkpoint(&archive_root, 1);
+        archive.initialize_checkpoint().await.unwrap();
+        archive.publish_committed(&entries(2)).await.unwrap();
+
+        let recorder_addresses = [
+            unused_local_address(),
+            unused_local_address(),
+            unused_local_address(),
+        ];
+        let client_addresses = [
+            unused_local_address(),
+            unused_local_address(),
+            unused_local_address(),
+        ];
+        let peers = [
+            PeerConfig::new_with_log_url(
+                "node-1",
+                format!("http://{}", recorder_addresses[0]),
+                format!("http://{}", client_addresses[0]),
+                "peer-1-secret",
+            )
+            .unwrap(),
+            PeerConfig::new_with_log_url(
+                "node-2",
+                format!("http://{}", recorder_addresses[1]),
+                format!("http://{}", client_addresses[1]),
+                "peer-2-secret",
+            )
+            .unwrap(),
+            PeerConfig::new_with_log_url(
+                "node-3",
+                format!("http://{}", recorder_addresses[2]),
+                format!("http://{}", client_addresses[2]),
+                "peer-3-secret",
+            )
+            .unwrap(),
+        ];
+        let membership =
+            Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_string())).unwrap();
+        let configs: [ServeConfig; 3] = std::array::from_fn(|index| ServeConfig {
+            execution_profile: ExecutionProfile::Sqlite,
+            logical_cluster_id: "cluster-a".into(),
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            node_id: format!("node-{}", index + 1),
+            data_dir: temp.path().join(format!("node-{}", index + 1)),
+            epoch: 1,
+            bundle: ConfigurationBundle {
+                config_id: 1,
+                configuration_state: ConfigurationState::active(1, membership.digest()),
+                membership: membership.clone(),
+                peers: peers.to_vec(),
+                recorder_tcp_peers: vec![None, None, None],
+                predecessor: None,
+            },
+            client_token: "client-secret".into(),
+            admin_token: None,
+            client_listen: client_addresses[index].clone(),
+            recorder_listen: recorder_addresses[index].clone(),
+            recorder_transport: RecorderTransport::Http,
+            recorder_tcp: None,
+            recovery_generation: 1,
+            remote: Some(RemoteCheckpointConfig {
+                object_store: ObjStoreConfig::Local {
+                    root: archive_root.clone(),
+                },
+                durability: DurabilityMode::Sync,
+                lease_duration_ms: 300_000,
+                startup: StartupMode::Rejoin,
+            }),
+        });
+
+        let (first_shutdown, first_wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(serve_remote_with_archive_until(
+            configs[0].clone(),
+            configs[0].remote.clone().unwrap(),
+            archive.clone(),
+            async move {
+                let _ = first_wait.await;
+            },
+        ));
+        let (second_shutdown, second_wait) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(serve_remote_with_archive_until(
+            configs[1].clone(),
+            configs[1].remote.clone().unwrap(),
+            archive.clone(),
+            async move {
+                let _ = second_wait.await;
+            },
+        ));
+        let (third_shutdown, third_wait) = tokio::sync::oneshot::channel();
+        let third = tokio::spawn(serve_remote_with_archive_until(
+            configs[2].clone(),
+            configs[2].remote.clone().unwrap(),
+            archive.clone(),
+            async move {
+                let _ = third_wait.await;
+            },
+        ));
+
+        for address in &recorder_addresses {
+            wait_for_tcp(address).await;
+        }
+        let recorder_inspections = peers
+            .iter()
+            .map(|peer| {
+                HttpRecorderClient::new_with_recovery_generation(
+                    peer.base_url(),
+                    "node-1",
+                    "peer-1-secret",
+                    1,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            for recorder in recorder_inspections {
+                assert_eq!(recorder.inspect_record_summary(3).unwrap(), None);
+            }
+        })
+        .await
+        .unwrap();
+
+        let ready = tokio::time::timeout(Duration::from_secs(3), async {
+            wait_until_ready(&client_addresses[0]).await;
+            wait_until_ready(&client_addresses[1]).await;
+            wait_until_ready(&client_addresses[2]).await;
+        })
+        .await;
+        if ready.is_err() {
+            let first_finished = first.is_finished();
+            let second_finished = second.is_finished();
+            let third_finished = third.is_finished();
+            if first_finished && second_finished && third_finished {
+                panic!(
+                    "fresh rejoin servers exited before readiness: first={:?} second={:?} third={:?}",
+                    first.await, second.await, third.await
+                );
+            }
+            first.abort();
+            second.abort();
+            third.abort();
+        }
+        ready.expect("fresh rejoin nodes must form recorder quorum after checkpoint restore");
+        let restored = request_sql_query(&SqlQueryArgs {
+            urls: client_addresses
+                .iter()
+                .map(|address| format!("http://{address}"))
+                .collect(),
+            token: "client-secret".into(),
+            statement: SqlStatement {
+                sql: "SELECT id, value FROM checkpoint_fixture ORDER BY id".into(),
+                parameters: Vec::new(),
+            },
+            consistency: Some(ReadConsistency::ReadBarrier),
+            max_rows: Some(10),
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored.applied_index, 2);
+        assert_eq!(
+            restored.rows,
+            vec![
+                vec![SqlValue::Integer(1), SqlValue::Text("entry-1".into())],
+                vec![SqlValue::Integer(2), SqlValue::Text("entry-2".into())],
+            ]
+        );
+
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+        let _ = third_shutdown.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second, third)
+        })
+        .await
+        .expect("rejoined servers must stop within the graceful shutdown bound");
+        assert!(joined.0.unwrap().is_ok());
+        assert!(joined.1.unwrap().is_ok());
+        assert!(joined.2.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sql")]
+    async fn shutdown_while_runtime_first_waits_for_quorum_closes_the_recorder_listener() {
+        let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let archive_root = temp.path().join("archive");
+        let archive = local_checkpoint(&archive_root, 1);
+        archive.initialize_checkpoint().await.unwrap();
+        archive.publish_committed(&entries(2)).await.unwrap();
+        let recorder_addresses = [
+            unused_local_address(),
+            unused_local_address(),
+            unused_local_address(),
+        ];
+        let client_addresses = [
+            unused_local_address(),
+            unused_local_address(),
+            unused_local_address(),
+        ];
+        let peers = recorder_addresses
+            .iter()
+            .zip(&client_addresses)
+            .enumerate()
+            .map(|(index, (recorder, client))| {
+                PeerConfig::new_with_log_url(
+                    format!("node-{}", index + 1),
+                    format!("http://{recorder}"),
+                    format!("http://{client}"),
+                    format!("peer-{}-secret", index + 1),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let membership =
+            Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_string())).unwrap();
+        let config = ServeConfig {
+            execution_profile: ExecutionProfile::Sqlite,
+            logical_cluster_id: "cluster-a".into(),
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            node_id: "node-1".into(),
+            data_dir: temp.path().join("node-1"),
+            epoch: 1,
+            bundle: ConfigurationBundle {
+                config_id: 1,
+                configuration_state: ConfigurationState::active(1, membership.digest()),
+                membership,
+                peers,
+                recorder_tcp_peers: vec![None, None, None],
+                predecessor: None,
+            },
+            client_token: "client-secret".into(),
+            admin_token: None,
+            client_listen: client_addresses[0].clone(),
+            recorder_listen: recorder_addresses[0].clone(),
+            recorder_transport: RecorderTransport::Http,
+            recorder_tcp: None,
+            recovery_generation: 1,
+            remote: Some(RemoteCheckpointConfig {
+                object_store: ObjStoreConfig::Local { root: archive_root },
+                durability: DurabilityMode::Sync,
+                lease_duration_ms: 300_000,
+                startup: StartupMode::Rejoin,
+            }),
+        };
+        let remote = config.remote.clone().unwrap();
+        let (shutdown, wait) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(serve_remote_with_archive_until(
+            config,
+            remote,
+            archive,
+            async move {
+                let _ = wait.await;
+            },
+        ));
+
+        wait_for_tcp(&recorder_addresses[0]).await;
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("startup shutdown must not wait for recorder quorum")
+            .unwrap()
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(&recorder_addresses[0])
+            .await
+            .is_err());
     }
 
     #[cfg(feature = "sql")]

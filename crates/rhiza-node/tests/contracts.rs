@@ -18,16 +18,16 @@ use rhiza_node::{
     ClientErrorResponse, ConfigError, FetchLogError, FetchLogRequest, FetchLogResponse,
     HttpLogPeer, HttpRecorderClient, InMemoryLogPeer, LogPeer, NodeConfig, NodeError, NodeRuntime,
     PeerConfig, ReadConsistency, ReadRequest, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
-    DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_FETCH_ENTRIES, MAX_HTTP_BODY_BYTES,
-    NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
+    DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_COMMAND_BYTES, MAX_FETCH_ENTRIES,
+    MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
     RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
 };
 use rhiza_quepaxa::{
-    AcceptedSummary, Ballot, DecisionProof, DecisionRecord, FixedMembership, IsrState, Membership,
-    RecordRequest, RecordSummary, RecorderFileStore, RecorderReply, RecorderRequest, RecorderRpc,
-    ThreeNodeConsensus,
+    CertifiedDecisionInspection, DecisionProof, FixedMembership, IsrState, Membership,
+    ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary, RecorderFileStore,
+    RecorderRpc, ThreeNodeConsensus,
 };
-use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V1_MAGIC};
+use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V2_MAGIC};
 
 fn test_config_digest() -> LogHash {
     FixedMembership::new(["node-1", "node-2", "node-3"])
@@ -35,57 +35,16 @@ fn test_config_digest() -> LogHash {
         .digest()
 }
 
-fn assert_test_recorder_context(request: &RecorderRequest) {
-    let (cluster_id, epoch, config_id, config_digest) = match request {
-        RecorderRequest::Identity => return,
-        RecorderRequest::StoreCommand {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::FetchCommand {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Inspect {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Observe {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Converge {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        }
-        | RecorderRequest::Decide {
-            cluster_id,
-            epoch,
-            config_id,
-            config_digest,
-            ..
-        } => (cluster_id, epoch, config_id, config_digest),
-    };
-
+fn assert_test_recorder_context(
+    cluster_id: &str,
+    epoch: u64,
+    config_id: u64,
+    config_digest: LogHash,
+) {
     assert_eq!(cluster_id, "rhiza:sql:cluster-a");
-    assert_eq!(*epoch, 1);
-    assert_eq!(*config_id, 1);
-    assert_eq!(*config_digest, test_config_digest());
+    assert_eq!(epoch, 1);
+    assert_eq!(config_id, 1);
+    assert_eq!(config_digest, test_config_digest());
 }
 
 #[test]
@@ -103,7 +62,7 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
         ThreeNodeConsensus::from_recorders("rhiza:sql:cluster-a", "node-1", 1, 1, recorders)
             .unwrap();
 
-    consensus
+    let entry = consensus
         .propose_at(
             1,
             LogHash::ZERO,
@@ -114,6 +73,14 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
         )
         .unwrap();
     assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
+    let CertifiedDecisionInspection::Committed(certified) = consensus
+        .inspect_certified_decision_at(1, LogHash::ZERO)
+        .unwrap()
+    else {
+        panic!("typed ISR quorum did not reconstruct the ordinary decision");
+    };
+    assert_eq!(certified.entry, entry);
+    assert!(matches!(certified.proof, DecisionProof::FastPath { .. }));
 
     let calls = calls.lock().unwrap();
     let mut piggybacks = 0;
@@ -128,18 +95,9 @@ fn recorder_rpc_piggybacks_command_before_recording_isr_state() {
             _ => {}
         }
     }
-    let first_store = calls.iter().position(|call| *call == "store").unwrap();
-    assert!(
-        calls[..first_store]
-            .iter()
-            .filter(|call| **call == "record")
-            .count()
-            >= 2,
-        "proof-store ran before the decision quorum"
-    );
     assert_eq!(calls.iter().filter(|call| **call == "piggyback").count(), 3);
     assert_eq!(calls.iter().filter(|call| **call == "record").count(), 3);
-    assert_eq!(calls.iter().filter(|call| **call == "store").count(), 3);
+    assert_eq!(calls.iter().filter(|call| **call == "store").count(), 0);
 }
 
 #[test]
@@ -256,7 +214,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V1_MAGIC));
+        .starts_with(QWAL_V2_MAGIC));
     assert_eq!(
         runtime
             .query_sql(
@@ -271,6 +229,63 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
             .rows,
         [vec![SqlValue::Integer(1), SqlValue::Text("effect".into())]]
     );
+}
+
+#[test]
+fn sql_batch_reprepares_all_members_after_a_foreign_slot_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let shared_consensus = consensus(dir.path());
+    let runtime = NodeRuntime::open(config, Arc::clone(&shared_consensus), &[]).unwrap();
+    let schema = runtime
+        .execute_sql(SqlCommand {
+            request_id: "batch-winner-schema".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE batch_winner(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                    .into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let winner = shared_consensus
+        .propose_at(
+            2,
+            schema.hash,
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
+        )
+        .unwrap();
+    let commands = (1..=2)
+        .map(|id| SqlCommand {
+            request_id: format!("batch-winner-{id}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO batch_winner(id, value) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlValue::Integer(id), SqlValue::Text(format!("value-{id}"))],
+            }],
+        })
+        .collect::<Vec<_>>();
+
+    let results = runtime.execute_sql_batch(commands).unwrap();
+
+    assert_eq!(runtime.log_store().read(2).unwrap(), Some(winner));
+    assert!(results.iter().all(Result::is_ok));
+    assert!(results
+        .iter()
+        .all(|result| result.as_ref().unwrap().applied_index == 3));
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.as_ref().unwrap().hash)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1
+    );
+    assert!(runtime
+        .log_store()
+        .read(3)
+        .unwrap()
+        .unwrap()
+        .payload
+        .starts_with(QWAL_V2_MAGIC));
 }
 
 #[test]
@@ -683,14 +698,25 @@ async fn configured_generation_http_clients_reach_recorder_and_log_routes() {
     let recorder =
         HttpRecorderClient::new_with_recovery_generation(&base_url, "node-1", "peer-token-1", 7)
             .unwrap();
-    let (reply, summary) = tokio::task::spawn_blocking(move || {
-        (recorder.recorder_id(), recorder.inspect_record_summary(1))
+    let (reply, summary, fence) = tokio::task::spawn_blocking(move || {
+        (
+            recorder.recorder_id(),
+            recorder.inspect_record_summary(1),
+            recorder.observe_read_fence(ReadFenceRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+            }),
+        )
     })
     .await
     .unwrap();
     let reply = reply.unwrap();
     assert_eq!(reply, "node-1");
     assert!(summary.unwrap().is_none());
+    assert_eq!(fence.unwrap().slot_state, ReadFenceSlotState::Empty);
 
     let log_peer = HttpLogPeer::new(base_url, "node-1", "peer-token-1")
         .unwrap()
@@ -709,14 +735,77 @@ async fn configured_generation_http_clients_reach_recorder_and_log_routes() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn http_read_fence_fails_before_the_general_recorder_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let client =
+        HttpRecorderClient::new(format!("http://{address}"), "node-1", "peer-token-1").unwrap();
+
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        client.observe_read_fence(ReadFenceRequest {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::ZERO,
+            slot: 1,
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(rhiza_quepaxa::Error::Io(_))));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "read fence inherited the 10 second recorder deadline"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_record_transport_failure_releases_the_quorum_attempt_promptly() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let client =
+        HttpRecorderClient::new(format!("http://{address}"), "node-1", "peer-token-1").unwrap();
+
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        client.record(RecordRequest {
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: test_config_digest(),
+            slot: 1,
+            step: 1,
+            proposal: rhiza_quepaxa::Proposal::nil(),
+            command: None,
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(rhiza_quepaxa::Error::ProposeFailed)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "record inherited the 10 second recorder deadline"
+    );
+    server.abort();
+}
+
 #[derive(Clone)]
 struct TypedOnlyRecorder(RecorderFileStore);
 
 impl RecorderRpc for TypedOnlyRecorder {
-    fn call(&self, _request: RecorderRequest) -> rhiza_quepaxa::Result<RecorderReply> {
-        panic!("v2 recorder routes must not use the legacy adapter")
-    }
-
     fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
         self.0.recorder_id()
     }
@@ -762,6 +851,17 @@ impl RecorderRpc for TypedOnlyRecorder {
 
     fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         RecorderRpc::inspect_record_summary(&self.0, slot)
+    }
+
+    fn supports_context_read_fence(&self) -> bool {
+        true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
+        RecorderRpc::observe_read_fence(&self.0, request)
     }
 }
 
@@ -872,7 +972,7 @@ async fn unauthorized_request_is_rejected() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("wrong-token")
-        .json(&serde_json::json!({"version": 2, "body": null}))
+        .json(&serde_json::json!({"version": 3, "body": null}))
         .send()
         .await
         .unwrap()
@@ -1322,7 +1422,7 @@ async fn disconnected_client_holds_its_slot_without_starving_peer_rpc() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 2, "body": null}))
+        .json(&serde_json::json!({"version": 3, "body": null}))
         .send()
         .await
         .unwrap();
@@ -1354,7 +1454,7 @@ async fn disconnected_client_holds_its_slot_without_starving_peer_rpc() {
 }
 
 #[test]
-fn read_barrier_advances_index_without_changing_value() {
+fn read_barrier_empty_quorum_returns_current_anchor_without_advancing_qlog() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
     runtime.write("request-1", "alpha", "one").unwrap();
@@ -1362,11 +1462,500 @@ fn read_barrier_advances_index_without_changing_value() {
     let read = runtime.read("alpha", ReadConsistency::ReadBarrier).unwrap();
 
     assert_eq!(read.value.as_deref(), Some("one"));
-    assert_eq!(read.applied_index, 2);
+    assert_eq!(read.applied_index, 1);
+    assert_eq!(runtime.log_store().read(2).unwrap(), None);
+}
+
+#[test]
+fn read_barrier_on_fresh_node_keeps_qlog_at_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
+
+    let read = runtime
+        .read("missing", ReadConsistency::ReadBarrier)
+        .unwrap();
+
+    assert_eq!(read.value, None);
+    assert_eq!(read.applied_index, 0);
+    assert_eq!(read.hash, LogHash::ZERO);
+    assert_eq!(runtime.log_store().last_index().unwrap(), None);
+}
+
+#[test]
+fn read_barrier_inspects_after_an_identical_historical_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_consensus = consensus(dir.path());
+    let runtime =
+        NodeRuntime::open(node_config(dir.path()), Arc::clone(&shared_consensus), &[]).unwrap();
+    let written = runtime.write("request-1", "alpha", "one").unwrap();
+    let historical = shared_consensus
+        .propose_at(
+            written.applied_index + 1,
+            written.hash,
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
+        )
+        .unwrap();
+
+    let read = runtime.read("alpha", ReadConsistency::ReadBarrier).unwrap();
+
+    assert_eq!(historical.entry_type, EntryType::Noop);
+    assert!(historical.payload.is_empty());
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert_eq!(read.applied_index, historical.index);
+    assert_eq!(read.hash, historical.hash);
     assert_eq!(
-        runtime.log_store().read(2).unwrap().unwrap().entry_type,
-        EntryType::Noop
+        runtime.log_store().read(historical.index).unwrap(),
+        Some(historical.clone())
     );
+    assert_eq!(
+        runtime.log_store().read(historical.index + 1).unwrap(),
+        None
+    );
+    assert_eq!(runtime.applied_index().unwrap(), read.applied_index);
+    assert_eq!(runtime.applied_hash().unwrap(), read.hash);
+    for index in 1..=read.applied_index {
+        assert!(
+            runtime.log_store().read(index).unwrap().is_some(),
+            "read barrier left a gap at qlog index {index}"
+        );
+    }
+}
+
+#[derive(Clone)]
+struct FenceFaultRecorder {
+    inner: RecorderFileStore,
+    record_failure: bool,
+    read_fence_failure: Option<rhiza_quepaxa::Error>,
+}
+
+impl RecorderRpc for FenceFaultRecorder {
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.inner.recorder_id()
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::store_command_for(
+            &self.inner,
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+            command,
+        )
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        RecorderRpc::fetch_command_for(
+            &self.inner,
+            cluster_id,
+            epoch,
+            config_id,
+            config_digest,
+            command_hash,
+        )
+    }
+
+    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        if self.record_failure {
+            return Err(rhiza_quepaxa::Error::ProposeFailed);
+        }
+        RecorderRpc::record(&self.inner, request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        proof: DecisionProof,
+        membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        RecorderRpc::install_decision_proof(&self.inner, proof, membership)
+    }
+
+    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        RecorderRpc::inspect_decision_proof(&self.inner, slot)
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        RecorderRpc::inspect_record_summary(&self.inner, slot)
+    }
+
+    fn supports_context_read_fence(&self) -> bool {
+        true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
+        if let Some(error) = self.read_fence_failure.clone() {
+            return Err(error);
+        }
+        RecorderRpc::observe_read_fence(&self.inner, request)
+    }
+}
+
+fn consensus_with_fence_failures(root: &Path, unavailable: usize) -> Arc<ThreeNodeConsensus> {
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let recorders = ["node-1", "node-2", "node-3"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, recorder_id)| {
+            let inner = RecorderFileStore::new_with_membership(
+                root.join("fence-fault-recorders").join(recorder_id),
+                recorder_id,
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            (
+                recorder_id.to_string(),
+                Box::new(FenceFaultRecorder {
+                    inner,
+                    record_failure: false,
+                    read_fence_failure: (index < unavailable)
+                        .then(|| rhiza_quepaxa::Error::Io("injected read-fence outage".into())),
+                }) as Box<dyn RecorderRpc>,
+            )
+        })
+        .collect();
+    Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorders,
+        )
+        .unwrap(),
+    )
+}
+
+fn consensus_with_explicit_quorum_failures(
+    root: &Path,
+    failed: usize,
+    fail_records: bool,
+) -> Arc<ThreeNodeConsensus> {
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let recorders = ["node-1", "node-2", "node-3"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, recorder_id)| {
+            let inner = RecorderFileStore::new_with_membership(
+                root.join("explicit-quorum-fault-recorders")
+                    .join(recorder_id),
+                recorder_id,
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            let unavailable = index < failed;
+            (
+                recorder_id.to_string(),
+                Box::new(FenceFaultRecorder {
+                    inner,
+                    record_failure: unavailable && fail_records,
+                    read_fence_failure: unavailable.then_some(rhiza_quepaxa::Error::ProposeFailed),
+                }) as Box<dyn RecorderRpc>,
+            )
+        })
+        .collect();
+    Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+            recorders,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn read_barrier_returns_current_value_with_one_unavailable_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(
+        node_config(dir.path()),
+        consensus_with_fence_failures(dir.path(), 1),
+        &[],
+    )
+    .unwrap();
+    let written = runtime.write("request-1", "alpha", "one").unwrap();
+
+    let read = runtime.read("alpha", ReadConsistency::ReadBarrier).unwrap();
+
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (written.applied_index, written.hash)
+    );
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+}
+
+#[test]
+fn read_barrier_returns_retryable_unavailable_without_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(
+        node_config(dir.path()),
+        consensus_with_fence_failures(dir.path(), 2),
+        &[],
+    )
+    .unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+
+    assert!(matches!(
+        runtime.read("alpha", ReadConsistency::ReadBarrier),
+        Err(NodeError::Unavailable(_))
+    ));
+    assert_eq!(
+        runtime
+            .read("alpha", ReadConsistency::Local)
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("one")
+    );
+    assert!(runtime.is_ready());
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
+}
+
+#[test]
+fn explicit_read_fence_quorum_failure_is_retryable_and_does_not_latch_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(
+        node_config(dir.path()),
+        consensus_with_explicit_quorum_failures(dir.path(), 2, false),
+        &[],
+    )
+    .unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+
+    assert!(matches!(
+        runtime.read("alpha", ReadConsistency::ReadBarrier),
+        Err(NodeError::Unavailable(_))
+    ));
+    assert!(runtime.is_ready());
+    assert!(!runtime.is_fatal());
+}
+
+#[test]
+fn explicit_record_quorum_failure_is_retryable_and_does_not_latch_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(
+        node_config(dir.path()),
+        consensus_with_explicit_quorum_failures(dir.path(), 2, true),
+        &[],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        runtime.write("request-1", "alpha", "one"),
+        Err(NodeError::Unavailable(_))
+    ));
+    assert!(runtime.is_ready());
+    assert!(!runtime.is_fatal());
+}
+
+#[test]
+fn reopened_runtime_preserves_strong_read_value_and_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+    let written = runtime.write("request-1", "alpha", "one").unwrap();
+    drop(runtime);
+
+    let reopened = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+    let read = reopened
+        .read("alpha", ReadConsistency::ReadBarrier)
+        .unwrap();
+
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (written.applied_index, written.hash)
+    );
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+}
+
+#[test]
+fn stopped_configuration_rejects_read_barrier_without_advancing_qlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+    let before = runtime.read("alpha", ReadConsistency::ReadBarrier).unwrap();
+    let stop = runtime.stop_current_configuration().unwrap();
+
+    assert_eq!(before.value.as_deref(), Some("one"));
+    assert!(matches!(
+        runtime.read("alpha", ReadConsistency::ReadBarrier),
+        Err(NodeError::ConfigurationTransition { .. })
+    ));
+    assert_eq!(
+        runtime.log_store().last_index().unwrap(),
+        Some(stop.entry.index)
+    );
+}
+
+#[derive(Clone)]
+struct ProofDroppingRecorder(RecorderFileStore);
+
+impl RecorderRpc for ProofDroppingRecorder {
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        self.0.recorder_id()
+    }
+
+    fn store_command_for(
+        &self,
+        _cluster_id: String,
+        _epoch: u64,
+        _config_id: u64,
+        _config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        self.0.store_command(command_hash, command)
+    }
+
+    fn fetch_command_for(
+        &self,
+        _cluster_id: String,
+        _epoch: u64,
+        _config_id: u64,
+        _config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        self.0.fetch_command(command_hash)
+    }
+
+    fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        self.0.record_proposal(request)
+    }
+
+    fn install_decision_proof(
+        &self,
+        _proof: DecisionProof,
+        _membership: &Membership,
+    ) -> rhiza_quepaxa::Result<()> {
+        // Simulate a proposer process that returned a phase-2 decision before
+        // its asynchronous proof dissemination survived a crash.
+        Ok(())
+    }
+
+    fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
+        RecorderRpc::inspect_decision_proof(&self.0, slot)
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        RecorderRpc::inspect_record_summary(&self.0, slot)
+    }
+
+    fn supports_context_read_fence(&self) -> bool {
+        true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<rhiza_quepaxa::ReadFenceObservation> {
+        RecorderRpc::observe_read_fence(&self.0, request)
+    }
+}
+
+#[test]
+fn read_barrier_catches_up_past_a_historical_phase2_noop_without_an_installed_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+    let recorders = ["node-1", "node-2", "node-3"].map(|recorder_id| {
+        ProofDroppingRecorder(
+            RecorderFileStore::new_with_membership(
+                dir.path().join("phase2-recorders").join(recorder_id),
+                recorder_id,
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        )
+    });
+    let consensus_for = |proposer_id: &str| {
+        Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids(
+                "rhiza:sql:cluster-a",
+                proposer_id,
+                1,
+                1,
+                ["node-1", "node-2", "node-3"]
+                    .into_iter()
+                    .zip(recorders.iter().cloned())
+                    .map(|(recorder_id, recorder)| {
+                        (
+                            recorder_id.to_string(),
+                            Box::new(recorder) as Box<dyn RecorderRpc>,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    };
+    let writer_consensus = consensus_for("node-2");
+    let reader_consensus = consensus_for("node-1");
+    let writer_root = dir.path().join("writer");
+    let reader_root = dir.path().join("reader");
+    let writer = NodeRuntime::open(
+        node_config(&writer_root),
+        Arc::clone(&writer_consensus),
+        &[],
+    )
+    .unwrap();
+    let reader = NodeRuntime::open(node_config(&reader_root), reader_consensus, &[]).unwrap();
+
+    let historical = writer_consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
+        )
+        .unwrap();
+    assert!(matches!(
+        &historical,
+        LogEntry {
+            entry_type: EntryType::Noop,
+            payload,
+            ..
+        } if payload.is_empty()
+    ));
+    assert!(recorders
+        .iter()
+        .all(|recorder| recorder.inspect_decision_proof(1).unwrap().is_none()));
+
+    let written = writer.write("request-1", "alpha", "one").unwrap();
+    assert!(written.applied_index > historical.index);
+
+    let read = reader.read("alpha", ReadConsistency::ReadBarrier).unwrap();
+
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert!(read.applied_index >= written.applied_index);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1423,7 +2012,7 @@ async fn authenticated_http_write_and_read_use_runtime() {
 }
 
 #[test]
-fn sql_batch_commits_individual_qwal_entries_and_replays_results() {
+fn sql_batch_commits_one_qwal_entry_and_replays_results() {
     let dir = tempfile::tempdir().unwrap();
     let runtime =
         Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
@@ -1452,19 +2041,16 @@ fn sql_batch_commits_individual_qwal_entries_and_replays_results() {
     let first = results[0].as_ref().unwrap();
     let second = results[1].as_ref().unwrap();
 
-    let mut applied = [first.applied_index, second.applied_index];
-    applied.sort_unstable();
-    assert_eq!(applied, [2, 3]);
-    assert_ne!(first.hash, second.hash);
-    for index in applied {
-        assert!(runtime
-            .log_store()
-            .read(index)
-            .unwrap()
-            .unwrap()
-            .payload
-            .starts_with(QWAL_V1_MAGIC));
-    }
+    assert_eq!(first.applied_index, 2);
+    assert_eq!(second.applied_index, 2);
+    assert_eq!(first.hash, second.hash);
+    assert!(runtime
+        .log_store()
+        .read(2)
+        .unwrap()
+        .unwrap()
+        .payload
+        .starts_with(QWAL_V2_MAGIC));
     assert_eq!(first.results.len(), 1);
     assert_eq!(second.results.len(), 1);
     assert_ne!(first.results[0].returning, second.results[0].returning);
@@ -1492,7 +2078,7 @@ fn sql_batch_commits_individual_qwal_entries_and_replays_results() {
 }
 
 #[test]
-fn four_member_sql_batch_commits_four_exact_base_qwal_entries() {
+fn four_member_sql_batch_commits_one_exact_base_qwal_entry() {
     let dir = tempfile::tempdir().unwrap();
     let runtime =
         Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
@@ -1524,22 +2110,24 @@ fn four_member_sql_batch_commits_four_exact_base_qwal_entries() {
         .map(|(request_id, result)| (request_id, result.unwrap()))
         .collect::<HashMap<_, _>>();
 
-    let mut indices = responses
+    let indices = responses
         .values()
         .map(|response| response.applied_index)
         .collect::<Vec<_>>();
-    indices.sort_unstable();
-    assert_eq!(indices, [2, 3, 4, 5]);
-    for index in &indices {
-        assert!(runtime
-            .log_store()
-            .read(*index)
-            .unwrap()
-            .unwrap()
-            .payload
-            .starts_with(QWAL_V1_MAGIC));
-    }
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(5));
+    assert_eq!(indices, vec![2; 4]);
+    let hashes = responses
+        .values()
+        .map(|response| response.hash)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(hashes.len(), 1);
+    assert!(runtime
+        .log_store()
+        .read(2)
+        .unwrap()
+        .unwrap()
+        .payload
+        .starts_with(QWAL_V2_MAGIC));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
 
     for command in commands {
         let original = responses.get(&command.request_id).unwrap();
@@ -1568,7 +2156,82 @@ fn four_member_sql_batch_commits_four_exact_base_qwal_entries() {
             .map(|ordinal| vec![SqlValue::Integer(ordinal)])
             .collect::<Vec<_>>()
     );
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(5));
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
+}
+
+#[test]
+fn oversized_sql_batch_halves_until_each_qwal_effect_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
+    runtime
+        .execute_sql(SqlCommand {
+            request_id: "split-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE split_batch(id INTEGER PRIMARY KEY, value BLOB NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let commands = (0..4)
+        .map(|id| SqlCommand {
+            request_id: format!("split-{id}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO split_batch(id, value) VALUES (?1, randomblob(140000))".into(),
+                parameters: vec![SqlValue::Integer(id)],
+            }],
+        })
+        .collect::<Vec<_>>();
+
+    let results = runtime.execute_sql_batch(commands).unwrap();
+    let indices = results
+        .iter()
+        .map(|result| result.as_ref().unwrap().applied_index)
+        .collect::<Vec<_>>();
+
+    assert_eq!(indices, vec![2, 2, 3, 3]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+    assert!(runtime.log_store().read(2).unwrap().unwrap().payload.len() <= MAX_COMMAND_BYTES);
+    assert!(runtime.log_store().read(3).unwrap().unwrap().payload.len() <= MAX_COMMAND_BYTES);
+}
+
+#[test]
+fn sql_typed_batch_accepts_256_members_and_rejects_257_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
+    runtime
+        .execute_sql(SqlCommand {
+            request_id: "limit-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE batch_limit(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let command = |id| SqlCommand {
+        request_id: format!("limit-{id}"),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO batch_limit(id) VALUES (?1)".into(),
+            parameters: vec![SqlValue::Integer(id)],
+        }],
+    };
+
+    let results = runtime
+        .execute_sql_batch((0..256).map(command).collect())
+        .unwrap();
+
+    assert_eq!(results.len(), 256);
+    assert!(results.iter().all(Result::is_ok));
+    assert!(results
+        .iter()
+        .all(|result| result.as_ref().unwrap().applied_index == 2));
+    let last_index = runtime.log_store().last_index().unwrap();
+    let error = runtime
+        .execute_sql_batch((256..513).map(command).collect())
+        .unwrap_err();
+    assert!(matches!(error, NodeError::InvalidRequest(_)));
+    assert_eq!(runtime.log_store().last_index().unwrap(), last_index);
 }
 
 #[test]
@@ -1614,6 +2277,188 @@ fn failed_sql_member_does_not_prevent_a_valid_request_in_the_same_batch() {
         Err(NodeError::InvalidSqlStatement { .. }) | Err(NodeError::InvalidRequest(_))
     ));
     assert_eq!(results[1].as_ref().unwrap().applied_index, 3);
+}
+
+#[test]
+fn sql_exact_winner_fast_completion_preserves_retry_conflict_and_failure_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
+    runtime
+        .execute_sql(SqlCommand {
+            request_id: "fast-complete-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE fast_complete(id INTEGER PRIMARY KEY, value TEXT UNIQUE)".into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let stored_command = SqlCommand {
+        request_id: "fast-complete-stored".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO fast_complete(id, value) VALUES (1, 'stored')".into(),
+            parameters: vec![],
+        }],
+    };
+    let stored = runtime.execute_sql(stored_command.clone()).unwrap();
+    let valid = SqlCommand {
+        request_id: "fast-complete-valid".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO fast_complete(id, value) VALUES (2, 'valid') RETURNING id, value"
+                .into(),
+            parameters: vec![],
+        }],
+    };
+    let conflicting = SqlCommand {
+        request_id: stored_command.request_id.clone(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO fast_complete(id, value) VALUES (3, 'conflict')".into(),
+            parameters: vec![],
+        }],
+    };
+    let failed = SqlCommand {
+        request_id: "fast-complete-failed".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO fast_complete(id, value) VALUES (4, 'stored')".into(),
+            parameters: vec![],
+        }],
+    };
+
+    let results = runtime
+        .execute_sql_batch(vec![
+            stored_command,
+            conflicting,
+            failed,
+            valid.clone(),
+            valid,
+        ])
+        .unwrap();
+
+    assert_eq!(
+        results[0].as_ref().unwrap().applied_index,
+        stored.applied_index
+    );
+    assert_eq!(results[0].as_ref().unwrap().hash, stored.hash);
+    assert!(matches!(results[1], Err(NodeError::RequestConflict(_))));
+    assert!(matches!(
+        results[2],
+        Err(NodeError::InvalidSqlStatement { .. })
+    ));
+    let exact = results[3].as_ref().unwrap();
+    assert_eq!(exact.applied_index, 3);
+    assert_eq!(results[4].as_ref().unwrap(), exact);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+}
+
+#[test]
+fn sql_bulk_precheck_aligns_reverse_conflict_retry_absent_failure_and_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
+    runtime
+        .execute_sql(SqlCommand {
+            request_id: "bulk-aligned-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE bulk_aligned(id INTEGER PRIMARY KEY, value TEXT UNIQUE)".into(),
+                parameters: vec![],
+            }],
+        })
+        .unwrap();
+    let stored_command = SqlCommand {
+        request_id: "bulk-aligned-stored".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO bulk_aligned(id, value) VALUES (1, 'stored')".into(),
+            parameters: vec![],
+        }],
+    };
+    let stored = runtime.execute_sql(stored_command.clone()).unwrap();
+    let conflicting = SqlCommand {
+        request_id: stored_command.request_id.clone(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO bulk_aligned(id, value) VALUES (2, 'conflict')".into(),
+            parameters: vec![],
+        }],
+    };
+    let valid = SqlCommand {
+        request_id: "bulk-aligned-valid".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO bulk_aligned(id, value) VALUES (3, 'valid') RETURNING id, value"
+                .into(),
+            parameters: vec![],
+        }],
+    };
+    let failed = SqlCommand {
+        request_id: "bulk-aligned-failed".into(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO bulk_aligned(id, value) VALUES (4, 'stored')".into(),
+            parameters: vec![],
+        }],
+    };
+
+    let results = runtime
+        .execute_sql_batch(vec![
+            conflicting,
+            stored_command,
+            valid.clone(),
+            failed,
+            valid,
+        ])
+        .unwrap();
+
+    assert!(matches!(results[0], Err(NodeError::RequestConflict(_))));
+    assert_eq!(
+        results[1].as_ref().unwrap().applied_index,
+        stored.applied_index
+    );
+    assert_eq!(results[1].as_ref().unwrap().hash, stored.hash);
+    assert_eq!(results[2].as_ref().unwrap().applied_index, 3);
+    assert!(matches!(
+        results[3],
+        Err(NodeError::InvalidSqlStatement { .. })
+    ));
+    assert_eq!(results[4], results[2]);
+    assert_eq!(runtime.log_store().last_index().unwrap(), Some(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn sql_exact_winner_is_not_returned_when_materializer_apply_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let recorders = (1..=3)
+        .map(|index| {
+            Box::new(GatedRecorder::new(format!("node-{index}"), gate.clone()))
+                as Box<dyn RecorderRpc>
+        })
+        .collect();
+    let consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders("rhiza:sql:cluster-a", "node-1", 1, 1, recorders)
+            .unwrap(),
+    );
+    let runtime = Arc::new(NodeRuntime::open(node_config(dir.path()), consensus, &[]).unwrap());
+    let worker_runtime = runtime.clone();
+    let worker = std::thread::spawn(move || {
+        worker_runtime.execute_sql_batch(vec![SqlCommand {
+            request_id: "apply-must-succeed".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE apply_must_succeed(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        }])
+    });
+    gate.wait_until_started();
+    let sqlite_dir = dir.path().join("sqlite");
+    let original_permissions = std::fs::metadata(&sqlite_dir).unwrap().permissions();
+    std::fs::set_permissions(&sqlite_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    gate.release();
+    let outcome = worker.join();
+    std::fs::set_permissions(&sqlite_dir, original_permissions).unwrap();
+
+    let error = outcome.unwrap().unwrap_err();
+    assert!(matches!(error, NodeError::Fatal(_)));
+    assert!(runtime.is_fatal());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1690,7 +2535,7 @@ async fn log_fetch_saturation_does_not_consume_recorder_capacity() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 2, "body": null}))
+        .json(&serde_json::json!({"version": 3, "body": null}))
         .send()
         .await
         .unwrap();
@@ -1733,7 +2578,7 @@ async fn recorder_backend_errors_return_non_success_statuses() {
             .header(NODE_ID_HEADER, "node-1")
             .header(RECOVERY_GENERATION_HEADER, "1")
             .bearer_auth("peer-token-1")
-            .json(&serde_json::json!({"version": 2, "body": null}))
+            .json(&serde_json::json!({"version": 3, "body": null}))
             .send()
             .await
             .unwrap();
@@ -1876,7 +2721,7 @@ async fn unauthenticated_invalid_bodies_are_rejected_before_body_or_capacity() {
         .header(NODE_ID_HEADER, "node-1")
         .header(RECOVERY_GENERATION_HEADER, "1")
         .bearer_auth("peer-token-1")
-        .json(&serde_json::json!({"version": 2, "body": null}))
+        .json(&serde_json::json!({"version": 3, "body": null}))
         .send()
         .await
         .unwrap();
@@ -1977,7 +2822,7 @@ fn first_qwal_put_entry(root: &Path, request_id: &str, key: &str, value: &str) -
     let payload = state
         .prepare_put_effect(request_id, key, value, &request_payload, 0, LogHash::ZERO)
         .unwrap();
-    assert!(payload.starts_with(QWAL_V1_MAGIC));
+    assert!(payload.starts_with(QWAL_V2_MAGIC));
     entry(1, LogHash::ZERO, &payload)
 }
 
@@ -2039,83 +2884,48 @@ impl OrderingRecorder {
             calls,
         }
     }
-
-    fn reply(
-        &self,
-        slot: u64,
-        highest_promised: Option<Ballot>,
-        accepted: Option<AcceptedSummary>,
-        decided: Option<DecisionRecord>,
-        command: Option<StoredCommand>,
-    ) -> RecorderReply {
-        RecorderReply {
-            recorder_id: self.id.clone(),
-            slot,
-            config_id: 1,
-            config_digest: test_config_digest(),
-            step: 1,
-            highest_promised,
-            accepted,
-            decided,
-            command,
-        }
-    }
 }
 
 impl RecorderRpc for OrderingRecorder {
-    fn call(&self, request: RecorderRequest) -> rhiza_quepaxa::Result<RecorderReply> {
-        assert_test_recorder_context(&request);
-        match request {
-            RecorderRequest::Identity => Ok(self.reply(0, None, None, None, None)),
-            RecorderRequest::StoreCommand {
-                command_hash,
-                command,
-                ..
-            } => {
-                assert_eq!(command.hash(), command_hash);
-                self.commands.lock().unwrap().insert(command_hash, command);
-                self.calls.lock().unwrap().push("store");
-                Ok(self.reply(0, None, None, None, None))
-            }
-            RecorderRequest::FetchCommand { command_hash, .. } => Ok(self.reply(
-                0,
-                None,
-                None,
-                None,
-                self.commands.lock().unwrap().get(&command_hash).cloned(),
-            )),
-            RecorderRequest::Observe { slot, ballot, .. } => {
-                self.calls.lock().unwrap().push("observe");
-                Ok(self.reply(slot, Some(ballot), None, None, None))
-            }
-            RecorderRequest::Converge {
-                slot,
-                ballot,
-                value,
-                ..
-            } => {
-                assert!(self
-                    .commands
-                    .lock()
-                    .unwrap()
-                    .contains_key(&value.command_hash));
-                self.calls.lock().unwrap().push("observe");
-                Ok(self.reply(
-                    slot,
-                    Some(ballot.clone()),
-                    Some(AcceptedSummary { ballot, value }),
-                    None,
-                    None,
-                ))
-            }
-            RecorderRequest::Decide { slot, decision, .. } => {
-                Ok(self.reply(slot, None, None, Some(decision), None))
-            }
-            RecorderRequest::Inspect { slot, .. } => Ok(self.reply(slot, None, None, None, None)),
-        }
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        Ok(self.id.clone())
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        assert_test_recorder_context(&cluster_id, epoch, config_id, config_digest);
+        assert_eq!(command.hash(), command_hash);
+        self.commands.lock().unwrap().insert(command_hash, command);
+        self.calls.lock().unwrap().push("store");
+        Ok(())
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        assert_test_recorder_context(&cluster_id, epoch, config_id, config_digest);
+        Ok(self.commands.lock().unwrap().get(&command_hash).cloned())
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        assert_test_recorder_context(
+            &request.cluster_id,
+            request.epoch,
+            request.config_id,
+            request.config_digest,
+        );
         if let Some(command) = request.command.as_ref() {
             let value = request.proposal.value.as_ref().unwrap();
             assert_eq!(command.hash(), value.command_hash);
@@ -2162,6 +2972,23 @@ impl RecorderRpc for OrderingRecorder {
     fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         Ok(self.proofs.lock().unwrap().get(&slot).cloned())
     }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        let states = self.isr.lock().unwrap();
+        let Some(state) = states.get(&slot) else {
+            return Ok(None);
+        };
+        Ok(Some(RecordSummary {
+            recorder_id: self.id.clone(),
+            slot,
+            config_id: 1,
+            config_digest: test_config_digest(),
+            step: state.step(),
+            first_current: state.first_current().cloned(),
+            aggregate_prior: state.aggregate_prior().cloned(),
+            decided: self.proofs.lock().unwrap().get(&slot).cloned(),
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -2185,7 +3012,7 @@ struct FailingRecorder {
 }
 
 impl RecorderRpc for FailingRecorder {
-    fn call(&self, _request: RecorderRequest) -> rhiza_quepaxa::Result<RecorderReply> {
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
         Err(self.error.clone())
     }
 }
@@ -2227,6 +3054,22 @@ impl Gate {
         self.state.lock().unwrap().started
     }
 
+    fn wait_until_started(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while !state.started {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("recorder call did not reach the test gate");
+            let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "recorder call did not reach the test gate"
+            );
+            state = next;
+        }
+    }
+
     fn release(&self) {
         self.state.lock().unwrap().released = true;
         self.changed.notify_all();
@@ -2251,73 +3094,47 @@ impl GatedRecorder {
             gate,
         }
     }
-
-    fn reply(
-        &self,
-        slot: u64,
-        highest_promised: Option<Ballot>,
-        accepted: Option<AcceptedSummary>,
-        decided: Option<DecisionRecord>,
-        command: Option<StoredCommand>,
-    ) -> RecorderReply {
-        RecorderReply {
-            recorder_id: self.id.clone(),
-            slot,
-            config_id: 1,
-            config_digest: test_config_digest(),
-            step: 1,
-            highest_promised,
-            accepted,
-            decided,
-            command,
-        }
-    }
 }
 
 impl RecorderRpc for GatedRecorder {
-    fn call(&self, request: RecorderRequest) -> rhiza_quepaxa::Result<RecorderReply> {
-        assert_test_recorder_context(&request);
-        match request {
-            RecorderRequest::Identity => Ok(self.reply(0, None, None, None, None)),
-            RecorderRequest::StoreCommand {
-                command_hash,
-                command,
-                ..
-            } => {
-                self.gate.wait();
-                self.commands.lock().unwrap().insert(command_hash, command);
-                Ok(self.reply(0, None, None, None, None))
-            }
-            RecorderRequest::FetchCommand { command_hash, .. } => Ok(self.reply(
-                0,
-                None,
-                None,
-                None,
-                self.commands.lock().unwrap().get(&command_hash).cloned(),
-            )),
-            RecorderRequest::Inspect { slot, .. } => Ok(self.reply(slot, None, None, None, None)),
-            RecorderRequest::Observe { slot, ballot, .. } => {
-                Ok(self.reply(slot, Some(ballot), None, None, None))
-            }
-            RecorderRequest::Converge {
-                slot,
-                ballot,
-                value,
-                ..
-            } => Ok(self.reply(
-                slot,
-                Some(ballot.clone()),
-                Some(AcceptedSummary { ballot, value }),
-                None,
-                None,
-            )),
-            RecorderRequest::Decide { slot, decision, .. } => {
-                Ok(self.reply(slot, None, None, Some(decision), None))
-            }
-        }
+    fn recorder_id(&self) -> rhiza_quepaxa::Result<String> {
+        Ok(self.id.clone())
+    }
+
+    fn store_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+        command: StoredCommand,
+    ) -> rhiza_quepaxa::Result<()> {
+        assert_test_recorder_context(&cluster_id, epoch, config_id, config_digest);
+        self.gate.wait();
+        self.commands.lock().unwrap().insert(command_hash, command);
+        Ok(())
+    }
+
+    fn fetch_command_for(
+        &self,
+        cluster_id: String,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+        command_hash: LogHash,
+    ) -> rhiza_quepaxa::Result<Option<StoredCommand>> {
+        assert_test_recorder_context(&cluster_id, epoch, config_id, config_digest);
+        Ok(self.commands.lock().unwrap().get(&command_hash).cloned())
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
+        assert_test_recorder_context(
+            &request.cluster_id,
+            request.epoch,
+            request.config_id,
+            request.config_digest,
+        );
         if let Some(command) = request.command.as_ref() {
             let value = request.proposal.value.as_ref().unwrap();
             assert_eq!(command.hash(), value.command_hash);
@@ -2357,6 +3174,23 @@ impl RecorderRpc for GatedRecorder {
 
     fn inspect_decision_proof(&self, slot: u64) -> rhiza_quepaxa::Result<Option<DecisionProof>> {
         Ok(self.proofs.lock().unwrap().get(&slot).cloned())
+    }
+
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        let states = self.isr.lock().unwrap();
+        let Some(state) = states.get(&slot) else {
+            return Ok(None);
+        };
+        Ok(Some(RecordSummary {
+            recorder_id: self.id.clone(),
+            slot,
+            config_id: 1,
+            config_digest: test_config_digest(),
+            step: state.step(),
+            first_current: state.first_current().cloned(),
+            aggregate_prior: state.aggregate_prior().cloned(),
+            decided: self.proofs.lock().unwrap().get(&slot).cloned(),
+        }))
     }
 }
 

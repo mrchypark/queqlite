@@ -12,23 +12,26 @@ use std::{
 
 use rhiza_core::{LogHash, StoredCommand};
 use rhiza_quepaxa::{
-    DecisionProof, Error, Membership, RecordRequest, RecordSummary, RecorderRpc, RejectReason,
+    DecisionProof, Error, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
+    RecordSummary, RecorderRpc, RejectReason,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    authenticated_proposer_admitted, peer_credentials_authenticated, valid_recorder_command,
-    valid_recorder_record, PeerConfig, DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES,
+    authenticated_proposer_admitted, map_quorum_record_transport_error,
+    peer_credentials_authenticated, valid_recorder_command, valid_recorder_record, PeerConfig,
+    DEFAULT_PEER_CONCURRENCY, MAX_HTTP_BODY_BYTES, QUORUM_RECORD_REQUEST_TIMEOUT,
+    READ_FENCE_REQUEST_TIMEOUT,
 };
 
-const WIRE_VERSION: u16 = 1;
+const WIRE_VERSION: u16 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIONS_PER_LANE: usize = 2;
 const MAX_SERVER_CONNECTIONS: usize = DEFAULT_PEER_CONCURRENCY * 4;
-const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/1";
+const RECORDER_TLS_ALPN: &[u8] = b"rhiza-recorder/3";
 
 #[cfg(feature = "recorder-postcard-rpc")]
 mod postcard_rpc;
@@ -186,6 +189,7 @@ enum RecorderRequestBody {
     InspectRecordSummary {
         slot: u64,
     },
+    ObserveReadFence(ReadFenceRequest),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -204,6 +208,7 @@ enum RecorderResponseBody {
     InstallDecisionProof(RpcResult<()>),
     InspectDecisionProof(RpcResult<Option<DecisionProof>>),
     InspectRecordSummary(RpcResult<Option<RecordSummary>>),
+    ObserveReadFence(RpcResult<ReadFenceObservation>),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -481,6 +486,7 @@ enum Operation {
     InstallDecisionProof,
     InspectDecisionProof,
     InspectRecordSummary,
+    ObserveReadFence,
 }
 
 fn response_operation(request: &RecorderRequestBody) -> Operation {
@@ -492,6 +498,7 @@ fn response_operation(request: &RecorderRequestBody) -> Operation {
         RecorderRequestBody::InstallDecisionProof { .. } => Operation::InstallDecisionProof,
         RecorderRequestBody::InspectDecisionProof { .. } => Operation::InspectDecisionProof,
         RecorderRequestBody::InspectRecordSummary { .. } => Operation::InspectRecordSummary,
+        RecorderRequestBody::ObserveReadFence(_) => Operation::ObserveReadFence,
     }
 }
 
@@ -572,6 +579,9 @@ fn dispatch<R: RecorderRpc>(
                 recorder.inspect_record_summary(slot),
             ))
         }
+        RecorderRequestBody::ObserveReadFence(request) => RecorderResponseBody::ObserveReadFence(
+            RpcResult::from_result(recorder.observe_read_fence(request)),
+        ),
     }
 }
 
@@ -590,6 +600,9 @@ fn overloaded_response(operation: Operation) -> RecorderResponseBody {
         Operation::InspectRecordSummary => {
             RecorderResponseBody::InspectRecordSummary(RpcResult::Overloaded)
         }
+        Operation::ObserveReadFence => {
+            RecorderResponseBody::ObserveReadFence(RpcResult::Overloaded)
+        }
     }
 }
 
@@ -607,6 +620,9 @@ fn error_response(operation: Operation, message: String) -> RecorderResponseBody
         }
         Operation::InspectRecordSummary => {
             RecorderResponseBody::InspectRecordSummary(RpcResult::Error(message))
+        }
+        Operation::ObserveReadFence => {
+            RecorderResponseBody::ObserveReadFence(RpcResult::Error(message))
         }
     }
 }
@@ -975,7 +991,16 @@ impl TcpPostcardRecorderClient {
         request: RecorderRequestBody,
         consensus: bool,
     ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
-        let deadline = Instant::now() + self.call_timeout;
+        self.exchange_with_timeout(request, consensus, self.call_timeout)
+    }
+
+    fn exchange_with_timeout(
+        &self,
+        request: RecorderRequestBody,
+        consensus: bool,
+        timeout: Duration,
+    ) -> rhiza_quepaxa::Result<RecorderResponseBody> {
+        let deadline = Instant::now() + timeout.min(self.call_timeout);
         let pool = if consensus {
             &self.consensus
         } else {
@@ -1198,6 +1223,10 @@ fn response_matches(operation: Operation, response: &RecorderResponseBody) -> bo
                 Operation::InspectRecordSummary,
                 RecorderResponseBody::InspectRecordSummary(_)
             )
+            | (
+                Operation::ObserveReadFence,
+                RecorderResponseBody::ObserveReadFence(_)
+            )
     )
 }
 
@@ -1254,10 +1283,18 @@ impl RecorderRpc for TcpPostcardRecorderClient {
     }
 
     fn record(&self, request: RecordRequest) -> rhiza_quepaxa::Result<RecordSummary> {
-        match self.exchange(RecorderRequestBody::Record(request), true)? {
+        let response = self
+            .exchange_with_timeout(
+                RecorderRequestBody::Record(request),
+                true,
+                QUORUM_RECORD_REQUEST_TIMEOUT,
+            )
+            .map_err(map_quorum_record_transport_error)?;
+        match response {
             RecorderResponseBody::Record(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),
         }
+        .map_err(map_quorum_record_transport_error)
     }
 
     fn install_decision_proof(
@@ -1291,8 +1328,22 @@ impl RecorderRpc for TcpPostcardRecorderClient {
         }
     }
 
-    fn uses_typed_protocol(&self) -> bool {
+    fn supports_context_read_fence(&self) -> bool {
         true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        match self.exchange_with_timeout(
+            RecorderRequestBody::ObserveReadFence(request),
+            false,
+            READ_FENCE_REQUEST_TIMEOUT,
+        )? {
+            RecorderResponseBody::ObserveReadFence(result) => result.into_result(),
+            _ => Err(Error::Decode("recorder response operation mismatch".into())),
+        }
     }
 }
 
@@ -1540,6 +1591,75 @@ mod tests {
             elapsed < Duration::from_millis(550),
             "partial response exceeded the sender-owned deadline: {elapsed:?}"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_read_fence_uses_the_short_control_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        assert!(client
+            .observe_read_fence(ReadFenceRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: LogHash::ZERO,
+                slot: 1,
+            })
+            .is_err());
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_record_transport_failure_releases_the_quorum_attempt_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+        let client = TcpPostcardRecorderClient::new_with_transport_and_timeout(
+            address,
+            "node-1",
+            "node-2",
+            "peer-token-2",
+            7,
+            ClientTransport::Plain,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let result = client.record(RecordRequest {
+            cluster_id: "cluster".into(),
+            epoch: 1,
+            config_id: 1,
+            config_digest: LogHash::ZERO,
+            slot: 1,
+            step: 1,
+            proposal: rhiza_quepaxa::Proposal::nil(),
+            command: None,
+        });
+
+        assert!(matches!(result, Err(Error::ProposeFailed)));
+        assert!(started.elapsed() < Duration::from_millis(1_500));
         server.join().unwrap();
     }
 
@@ -1792,6 +1912,8 @@ mod tests {
 
     #[test]
     fn postcard_decoder_rejects_trailing_bytes_and_wrong_hello_version() {
+        assert_eq!(WIRE_VERSION, 3);
+        assert_eq!(RECORDER_TLS_ALPN, b"rhiza-recorder/3");
         let hello = Hello {
             version: WIRE_VERSION,
             node_id: "node-1".into(),

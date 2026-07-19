@@ -2,13 +2,87 @@ use std::fs;
 
 use rhiza_core::{EntryType, LogHash, StoredCommand};
 use rhiza_quepaxa::{
-    AcceptedValue, ConfigChange, Error, Membership, Proposal, ProposalPriority, RecordRequest,
-    RecorderFileStore, RejectReason, SealFaultPoint,
+    AcceptedValue, ConfigChange, Error, Membership, Proposal, ProposalPriority, ReadFenceRequest,
+    ReadFenceSlotState, RecordRequest, RecorderFileStore, RecorderRpc, RejectReason,
+    SealFaultPoint,
 };
 
 const CLUSTER_ID: &str = "cluster-a";
 const EPOCH: u64 = 2;
 const CONFIG_ID: u64 = 4;
+
+#[test]
+fn read_fence_observation_is_empty_only_beyond_the_durable_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
+    let recorder = store(dir.path(), membership.clone()).unwrap();
+    let request = |slot| ReadFenceRequest {
+        cluster_id: CLUSTER_ID.into(),
+        epoch: EPOCH,
+        config_id: CONFIG_ID,
+        config_digest: membership.digest(),
+        slot,
+    };
+
+    let fresh = recorder.observe_read_fence(request(8)).unwrap();
+    assert_eq!(fresh.max_head, None);
+    assert_eq!(fresh.slot_state, ReadFenceSlotState::Empty);
+
+    let command = StoredCommand::new(EntryType::Command, b"normal".to_vec());
+    let value =
+        AcceptedValue::from_command(CLUSTER_ID, 8, EPOCH, CONFIG_ID, LogHash::ZERO, &command);
+    recorder
+        .record_proposal(record(8, proposal("writer", 1, 1, value), Some(command)))
+        .unwrap();
+
+    let exact = recorder.observe_read_fence(request(8)).unwrap();
+    assert_eq!(exact.max_head, Some(8));
+    assert!(matches!(
+        exact.slot_state,
+        ReadFenceSlotState::Occupied {
+            summary: Some(summary)
+        } if summary.slot == 8 && summary.recorder_id == "r1"
+    ));
+
+    let gap_below_head = recorder.observe_read_fence(request(7)).unwrap();
+    assert_eq!(gap_below_head.max_head, Some(8));
+    assert_eq!(
+        gap_below_head.slot_state,
+        ReadFenceSlotState::Occupied { summary: None }
+    );
+
+    let beyond_head = recorder.observe_read_fence(request(9)).unwrap();
+    assert_eq!(beyond_head.max_head, Some(8));
+    assert_eq!(beyond_head.slot_state, ReadFenceSlotState::Empty);
+
+    drop(recorder);
+    let reopened = store(dir.path(), membership.clone()).unwrap();
+    let after_reopen = reopened.observe_read_fence(request(8)).unwrap();
+    assert_eq!(after_reopen.max_head, Some(8));
+    assert!(matches!(
+        after_reopen.slot_state,
+        ReadFenceSlotState::Occupied {
+            summary: Some(summary)
+        } if summary.slot == 8 && summary.recorder_id == "r1"
+    ));
+}
+
+#[test]
+fn read_fence_observation_rejects_a_mismatched_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let membership = Membership::new(["r1", "r2", "r3"]).unwrap();
+    let recorder = store(dir.path(), membership.clone()).unwrap();
+
+    let result = recorder.observe_read_fence(ReadFenceRequest {
+        cluster_id: "wrong-cluster".into(),
+        epoch: EPOCH,
+        config_id: CONFIG_ID,
+        config_digest: membership.digest(),
+        slot: 8,
+    });
+
+    assert_eq!(result, Err(Error::Rejected(RejectReason::WrongCluster)));
+}
 
 #[test]
 fn lock_only_partial_initialization_retries_as_fresh() {

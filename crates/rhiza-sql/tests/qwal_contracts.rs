@@ -1,8 +1,8 @@
 use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash};
 use rhiza_sql::{
-    decode_qwal_v1, encode_put_request, encode_sql_command, restore_recovery_snapshot_file,
-    restore_snapshot_file, ControlStore, Error, PendingApply, SqlCommand, SqlEffectPreparation,
-    SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
+    decode_qwal_v2, encode_put_request, encode_sql_command, restore_recovery_snapshot_file,
+    restore_snapshot_file, ControlStore, Error, PendingApply, SqlBatchMember, SqlCommand,
+    SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES, QWAL_V2_MAGIC,
 };
 use rusqlite::Connection;
 
@@ -47,11 +47,19 @@ fn prepared_qwal(
     base_hash: LogHash,
 ) -> (Vec<u8>, Vec<u8>) {
     let request = encode_sql_command(command).unwrap();
-    let effect = db
-        .prepare_sql_effect(command, &request, base_index, base_hash)
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command,
+                request_payload: &request,
+            }],
+            base_index,
+            base_hash,
+        )
         .unwrap();
-    let SqlEffectPreparation::Effect(effect) = effect;
-    assert!(effect.starts_with(b"QWAL\0\x01"));
+    preparation.results.into_iter().next().unwrap().unwrap();
+    let effect = preparation.effect.unwrap();
+    assert!(effect.starts_with(QWAL_V2_MAGIC));
     (request, effect)
 }
 
@@ -66,6 +74,213 @@ fn query(db: &SqliteStateMachine, sql: &str) -> Vec<Vec<SqlValue>> {
     )
     .unwrap()
     .rows
+}
+
+#[test]
+fn batch_preparation_commits_successes_once_and_isolates_failed_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+        .unwrap();
+    let commands = [
+        SqlCommand {
+            request_id: "batch-create".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE batch_items(value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        },
+        SqlCommand {
+            request_id: "batch-fail".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO absent_table VALUES ('must-rollback')".into(),
+                parameters: vec![],
+            }],
+        },
+        SqlCommand {
+            request_id: "batch-insert".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO batch_items VALUES ('kept') RETURNING value".into(),
+                parameters: vec![],
+            }],
+        },
+    ];
+    let payloads = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&payloads)
+        .map(|(command, request_payload)| SqlBatchMember {
+            command,
+            request_payload,
+        })
+        .collect::<Vec<_>>();
+
+    let preparation = db
+        .prepare_sql_batch_effect(&members, 0, LogHash::ZERO)
+        .unwrap();
+    assert_eq!(preparation.results.len(), 3);
+    assert!(preparation.results[0].is_ok());
+    assert!(preparation.results[1].is_err());
+    assert!(preparation.results[2].is_ok());
+    let payload = preparation.effect.unwrap();
+    let effect = decode_qwal_v2(&payload).unwrap();
+    assert_eq!(
+        effect
+            .receipts
+            .iter()
+            .map(|receipt| receipt.request_id.as_str())
+            .collect::<Vec<_>>(),
+        ["batch-create", "batch-insert"]
+    );
+
+    let entry = entry(1, LogHash::ZERO, &payload);
+    db.apply_entry(&entry).unwrap();
+    assert_eq!(
+        query(&db, "SELECT value FROM batch_items"),
+        [vec![SqlValue::Text("kept".into())]]
+    );
+    for (command, request) in [(&commands[0], &payloads[0]), (&commands[2], &payloads[2])] {
+        let (outcome, result) = db
+            .check_sql_request(&command.request_id, request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.original_log_index(), 1);
+        assert_eq!(outcome.original_log_hash(), entry.hash);
+        assert!(result.is_some());
+    }
+    assert!(db
+        .check_sql_request(&commands[1].request_id, &payloads[1])
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn one_thousand_twenty_four_successes_share_one_entry_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let setup = SqlCommand {
+        request_id: "batch-1024-setup".into(),
+        statements: vec![SqlStatement {
+            sql: "CREATE TABLE batch_1024(value INTEGER NOT NULL)".into(),
+            parameters: vec![],
+        }],
+    };
+    let (_, setup_effect) = prepared_qwal(&db, &setup, 0, LogHash::ZERO);
+    let setup_entry = entry(1, LogHash::ZERO, &setup_effect);
+    db.apply_entry(&setup_entry).unwrap();
+    let commands = (0usize..1024)
+        .map(|index| SqlCommand {
+            request_id: format!("batch-1024-{index:04}"),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO batch_1024(value) VALUES (?1)".into(),
+                parameters: vec![SqlValue::Integer(index as i64)],
+            }],
+        })
+        .collect::<Vec<_>>();
+    let requests = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&requests)
+        .map(|(command, request_payload)| SqlBatchMember {
+            command,
+            request_payload,
+        })
+        .collect::<Vec<_>>();
+
+    let preparation = db
+        .prepare_sql_batch_effect(&members, 1, setup_entry.hash)
+        .unwrap();
+    assert_eq!(preparation.results.len(), 1024);
+    assert!(preparation.results.iter().all(Result::is_ok));
+    let payload = preparation.effect.unwrap();
+    assert!(payload.len() <= MAX_SQL_EFFECT_BYTES);
+    assert_eq!(decode_qwal_v2(&payload).unwrap().receipts.len(), 1024);
+    let decided = entry(2, setup_entry.hash, &payload);
+    db.apply_entry(&decided).unwrap();
+    drop(db);
+
+    let reopened = SqliteStateMachine::open_existing(&path).unwrap();
+    for index in [0, 1023] {
+        let (outcome, _) = reopened
+            .check_sql_request(&commands[index].request_id, &requests[index])
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.original_log_index(), 2);
+        assert_eq!(outcome.original_log_hash(), decided.hash);
+    }
+    assert_eq!(
+        query(&reopened, "SELECT count(*) FROM batch_1024"),
+        [vec![SqlValue::Integer(1024)]]
+    );
+}
+
+#[test]
+fn all_failed_batch_produces_no_effect_and_leaves_the_database_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+        .unwrap();
+    let commands = ["missing_a", "missing_b"].map(|table| SqlCommand {
+        request_id: format!("fail-{table}"),
+        statements: vec![SqlStatement {
+            sql: format!("INSERT INTO {table} VALUES (1)"),
+            parameters: vec![],
+        }],
+    });
+    let payloads = commands
+        .iter()
+        .map(|command| encode_sql_command(command).unwrap())
+        .collect::<Vec<_>>();
+    let members = commands
+        .iter()
+        .zip(&payloads)
+        .map(|(command, request_payload)| SqlBatchMember {
+            command,
+            request_payload,
+        })
+        .collect::<Vec<_>>();
+    let before = db.canonical_db_digest().unwrap();
+
+    let preparation = db
+        .prepare_sql_batch_effect(&members, 0, LogHash::ZERO)
+        .unwrap();
+
+    assert!(preparation.effect.is_none());
+    assert!(preparation.results.iter().all(Result::is_err));
+    assert_eq!(db.canonical_db_digest().unwrap(), before);
+    assert_eq!(db.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+}
+
+#[test]
+fn batch_preparation_rejects_1025_members_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
+        .unwrap();
+    let command = SqlCommand {
+        request_id: "same".into(),
+        statements: vec![SqlStatement {
+            sql: "CREATE TABLE never_applied(value INTEGER)".into(),
+            parameters: vec![],
+        }],
+    };
+    let payload = encode_sql_command(&command).unwrap();
+    let members = (0..1025)
+        .map(|_| SqlBatchMember {
+            command: &command,
+            request_payload: &payload,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        db.prepare_sql_batch_effect(&members, 0, LogHash::ZERO),
+        Err(Error::InvalidCommand(_))
+    ));
+    assert_eq!(db.applied_tip_value().unwrap(), (0, LogHash::ZERO));
 }
 
 #[test]
@@ -324,7 +539,37 @@ fn qwal_apply_rejects_an_effect_prepared_from_a_stale_base() {
 }
 
 #[test]
+fn pure_noop_commit_survives_reopen_and_replay_but_rejects_a_different_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let winner = noop(1, LogHash::ZERO);
+    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+
+    assert_eq!(db.apply_entry(&winner).unwrap().applied_index(), 1);
+    assert_eq!(
+        ControlStore::open_existing_unchecked(path.with_extension("sqlite.control"))
+            .unwrap()
+            .pending()
+            .unwrap(),
+        None
+    );
+    drop(db);
+
+    let reopened = SqliteStateMachine::open_existing(&path).unwrap();
+    assert_eq!(reopened.apply_entry(&winner).unwrap().applied_index(), 1);
+    let mut conflicting = winner.clone();
+    conflicting.payload = b"different".to_vec();
+    conflicting.hash = conflicting.recompute_hash();
+    assert!(matches!(
+        reopened.apply_entry(&conflicting),
+        Err(Error::InvalidEntry(message)) if message.contains("different hash")
+    ));
+    assert_eq!(reopened.applied_tip_value().unwrap(), (1, winner.hash));
+}
+
+#[test]
 fn qwal_prepare_rejects_an_effect_larger_than_the_inline_limit() {
+    assert_eq!(MAX_SQL_EFFECT_BYTES, 512 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
         .unwrap();
@@ -348,7 +593,14 @@ fn qwal_prepare_rejects_an_effect_larger_than_the_inline_limit() {
     let before = db.canonical_db_digest().unwrap();
 
     assert!(matches!(
-        db.prepare_sql_effect(&command, &request, 0, LogHash::ZERO),
+        db.prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &command,
+                request_payload: &request,
+            }],
+            0,
+            LogHash::ZERO,
+        ),
         Err(Error::ResourceExhausted(_))
     ));
     assert_eq!(db.canonical_db_digest().unwrap(), before);
@@ -503,7 +755,7 @@ fn unresolved_pending_apply_blocks_reads_and_preparation_but_exact_replay_recove
         }],
     };
     let (request, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v1(&effect_bytes).unwrap();
+    let effect = decode_qwal_v2(&effect_bytes).unwrap();
     let decided = entry(1, LogHash::ZERO, &effect_bytes);
     let pending = PendingApply::new(
         LogAnchor::new(0, LogHash::ZERO),
@@ -533,7 +785,14 @@ fn unresolved_pending_apply_blocks_reads_and_preparation_but_exact_replay_recove
     ));
     assert!(matches!(db.create_snapshot(0), Err(Error::InvalidEntry(_))));
     assert!(matches!(
-        db.prepare_sql_effect(&command, &request, 0, LogHash::ZERO),
+        db.prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &command,
+                request_payload: &request,
+            }],
+            0,
+            LogHash::ZERO,
+        ),
         Err(Error::InvalidEntry(_))
     ));
 
@@ -563,7 +822,7 @@ fn open_rejects_a_pending_intent_that_no_longer_extends_the_committed_tip() {
         }],
     };
     let (_, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v1(&effect_bytes).unwrap();
+    let effect = decode_qwal_v2(&effect_bytes).unwrap();
     let decided = entry(1, LogHash::ZERO, &effect_bytes);
     drop(db);
 
@@ -627,5 +886,5 @@ fn recovery_restore_overrides_the_embedded_generation_for_the_next_effect() {
         }],
     };
     let (_, next_effect) = prepared_qwal(&target, &next, 1, setup_entry.hash);
-    assert_eq!(decode_qwal_v1(&next_effect).unwrap().recovery_generation, 7);
+    assert_eq!(decode_qwal_v2(&next_effect).unwrap().recovery_generation, 7);
 }

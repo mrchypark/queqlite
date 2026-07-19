@@ -18,8 +18,9 @@ use rhiza_node::{
     TcpPostcardRecorderClient, TcpPostcardRpcRecorderClient,
 };
 use rhiza_quepaxa::{
-    AcceptedValue, DecisionProof, Error, Membership, Proposal, ProposalPriority, RecordRequest,
-    RecordSummary, RecorderRpc, RejectReason,
+    AcceptedValue, DecisionProof, Error, Membership, Proposal, ProposalPriority,
+    ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
+    RecorderRpc, RejectReason,
 };
 
 fn peers() -> Vec<PeerConfig> {
@@ -169,6 +170,35 @@ impl RecorderRpc for ProbeRecorder {
     fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
         Ok(self.state.lock().unwrap().summaries.get(&slot).cloned())
     }
+
+    fn supports_context_read_fence(&self) -> bool {
+        true
+    }
+
+    fn observe_read_fence(
+        &self,
+        request: ReadFenceRequest,
+    ) -> rhiza_quepaxa::Result<ReadFenceObservation> {
+        let state = self.state.lock().unwrap();
+        let max_head = state.summaries.keys().copied().max();
+        let summary = state.summaries.get(&request.slot).cloned().map(Box::new);
+        let slot_state =
+            if summary.is_none() && max_head.is_none_or(|max_head| max_head < request.slot) {
+                ReadFenceSlotState::Empty
+            } else {
+                ReadFenceSlotState::Occupied { summary }
+            };
+        Ok(ReadFenceObservation {
+            recorder_id: "node-1".into(),
+            cluster_id: request.cluster_id,
+            epoch: request.epoch,
+            config_id: request.config_id,
+            config_digest: request.config_digest,
+            slot: request.slot,
+            max_head,
+            slot_state,
+        })
+    }
 }
 
 async fn server<R: RecorderRpc + Clone + Send + Sync + 'static>(
@@ -238,7 +268,7 @@ async fn postcard_rpc_accepts_member_relay_and_rejects_non_member_without_backen
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn postcard_rpc_round_trips_all_seven_recorder_operations() {
+async fn postcard_rpc_round_trips_all_eight_recorder_operations() {
     let recorder = ProbeRecorder::default();
     let (address, server) = server(recorder).await;
     let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
@@ -292,7 +322,21 @@ async fn postcard_rpc_round_trips_all_seven_recorder_operations() {
             .unwrap();
         assert_eq!(client.inspect_decision_proof(4).unwrap(), Some(proof));
         assert_eq!(client.inspect_record_summary(4).unwrap(), Some(recorded));
-        assert!(client.uses_typed_protocol());
+        assert!(matches!(
+            client
+                .observe_read_fence(ReadFenceRequest {
+                    cluster_id: "rhiza:sql:cluster-a".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: digest,
+                    slot: 4,
+                })
+                .unwrap()
+                .slot_state,
+            ReadFenceSlotState::Occupied {
+                summary: Some(summary)
+            } if summary.slot == 4
+        ));
     })
     .await
     .unwrap();

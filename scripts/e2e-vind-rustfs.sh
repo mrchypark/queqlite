@@ -11,6 +11,14 @@ rustfs_image="${RHIZA_RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.8}"
 aws_image="${RHIZA_AWS_CLI_IMAGE:-amazon/aws-cli:2.17.36}"
 cleanup="${RHIZA_VIND_CLEANUP:-1}"
 skip_build="${RHIZA_VIND_SKIP_BUILD:-0}"
+direct_cluster="${RHIZA_VIND_DIRECT_CLUSTER:-0}"
+skip_image_load="${RHIZA_VIND_SKIP_IMAGE_LOAD:-0}"
+recovery_matrix="${RHIZA_E2E_RECOVERY_MATRIX:-0}"
+recovery_matrix_only="${RHIZA_E2E_RECOVERY_MATRIX_ONLY:-0}"
+recovery_hold_csv="${RHIZA_RECOVERY_HOLD_SECONDS:-60,180,300}"
+recovery_fail_csv="${RHIZA_RECOVERY_FAIL_PEERS:-1,2,3}"
+recovery_timeout="${RHIZA_STATEFULSET_READY_TIMEOUT:-420}"
+recovery_auto_timeout="${RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS:-30}"
 target="${RHIZA_E2E_TARGET_DIR:-target/rhiza-e2e}/${profile:-missing}/$run_id"
 context=""
 previous_context=""
@@ -23,14 +31,33 @@ case "$profile" in
   sql|graph|kv) ;;
   *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
 esac
-for tool in docker kubectl vcluster jq yq openssl; do require "$tool"; done
+for tool in docker kubectl jq yq openssl; do require "$tool"; done
+[ "$direct_cluster" = 1 ] || require vcluster
 case "$cleanup" in 0|1) ;; *) die "RHIZA_VIND_CLEANUP must be 0 or 1";; esac
 case "$skip_build" in 0|1) ;; *) die "RHIZA_VIND_SKIP_BUILD must be 0 or 1";; esac
+case "$direct_cluster" in 0|1) ;; *) die "RHIZA_VIND_DIRECT_CLUSTER must be 0 or 1";; esac
+case "$skip_image_load" in 0|1) ;; *) die "RHIZA_VIND_SKIP_IMAGE_LOAD must be 0 or 1";; esac
+case "$recovery_matrix" in 0|1) ;; *) die "RHIZA_E2E_RECOVERY_MATRIX must be 0 or 1";; esac
+case "$recovery_matrix_only" in 0|1) ;; *) die "RHIZA_E2E_RECOVERY_MATRIX_ONLY must be 0 or 1";; esac
+[ "$recovery_matrix_only" = 0 ] || [ "$recovery_matrix" = 1 ] \
+  || die "RHIZA_E2E_RECOVERY_MATRIX_ONLY=1 requires RHIZA_E2E_RECOVERY_MATRIX=1"
+case "$recovery_timeout" in ''|*[!0-9]*|0) die "RHIZA_STATEFULSET_READY_TIMEOUT must be positive";; esac
+case "$recovery_auto_timeout" in ''|*[!0-9]*|0) die "RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS must be positive";; esac
+IFS=, read -r -a recovery_holds <<< "$recovery_hold_csv"
+IFS=, read -r -a recovery_failures <<< "$recovery_fail_csv"
+[ "${#recovery_holds[@]}" -gt 0 ] || die "RHIZA_RECOVERY_HOLD_SECONDS must not be empty"
+[ "${#recovery_failures[@]}" -gt 0 ] || die "RHIZA_RECOVERY_FAIL_PEERS must not be empty"
+for hold in "${recovery_holds[@]}"; do
+  case "$hold" in ''|*[!0-9]*|0) die "invalid RHIZA_RECOVERY_HOLD_SECONDS cell: $hold";; esac
+done
+for failed in "${recovery_failures[@]}"; do
+  case "$failed" in 1|2|3) ;; *) die "invalid RHIZA_RECOVERY_FAIL_PEERS cell: $failed";; esac
+done
 
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
 capture_ready_context() {
-  context="$(kubectl config current-context 2>/dev/null || true)"
-  [ -n "$context" ] || die "vcluster did not select a Kubernetes context"
+  [ -n "$context" ] || context="$(kubectl config current-context 2>/dev/null || true)"
+  [ -n "$context" ] || die "no Kubernetes context selected"
   for ((attempt=1; attempt<=120; attempt++)); do
     if kubectl --context "$context" get --raw=/readyz >/dev/null 2>&1; then
       return
@@ -48,7 +75,18 @@ cleanup_run() {
   if [ "$cleanup" = 1 ] && "$created_cluster"; then
     vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || true
   fi
-  [ -z "$previous_context" ] || kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
+  if [ "$cleanup" = 1 ] && [ "$direct_cluster" = 1 ] && [ -n "$context" ]; then
+    managed="$(kubectl --context "$context" get namespace "$namespace" \
+      -o go-template='{{index .metadata.labels "rhiza.dev/e2e-managed"}}' 2>/dev/null || true)"
+    owner="$(kubectl --context "$context" get namespace "$namespace" \
+      -o go-template='{{index .metadata.labels "rhiza.dev/e2e-run-id"}}' 2>/dev/null || true)"
+    if [ "$managed" = true ] && [ "$owner" = "$run_id" ]; then
+      kubectl --context "$context" delete namespace "$namespace" --wait=false >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ "$direct_cluster" = 0 ]; then
+    [ -z "$previous_context" ] || kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
+  fi
 }
 trap 'status=$?; cleanup_run "$status"; exit "$status"' EXIT
 
@@ -63,16 +101,21 @@ if [ "$skip_build" = 1 ]; then
 else
   docker build -t "$image" .
 fi
-vcluster use driver docker >/dev/null
-if vcluster list --driver docker --output json | grep -Fq "\"${cluster}\""; then
-  [ "${RHIZA_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
-  vcluster connect "$cluster" --driver docker >/dev/null
+if [ "$direct_cluster" = 1 ]; then
+  context="${RHIZA_VIND_CONTEXT:-}"
+  [ -n "$context" ] || die "RHIZA_VIND_DIRECT_CLUSTER=1 requires RHIZA_VIND_CONTEXT"
 else
-  vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster"
-  created_cluster=true
+  vcluster use driver docker >/dev/null
+  if vcluster list --driver docker --output json | grep -Fq "\"${cluster}\""; then
+    [ "${RHIZA_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
+    vcluster connect "$cluster" --driver docker >/dev/null
+  else
+    vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster"
+    created_cluster=true
+  fi
 fi
 capture_ready_context
-kubectl config use-context "$context" >/dev/null
+[ "$direct_cluster" = 1 ] || kubectl config use-context "$context" >/dev/null
 if kubectl --context "$context" get namespace "$namespace" >/dev/null 2>&1; then
   managed="$(kubectl --context "$context" get namespace "$namespace" \
     -o go-template='{{index .metadata.labels "rhiza.dev/e2e-managed"}}')"
@@ -85,7 +128,11 @@ kubectl --context "$context" label namespace "$namespace" \
 
 node="$(kubectl --context "$context" get nodes -o jsonpath='{.items[0].metadata.name}')"
 [ -n "$node" ] || die "cannot discover vind node for image loading"
-vcluster node load-image "$node" --image "$image"
+if [ "$skip_image_load" = 0 ]; then
+  [ "$direct_cluster" = 0 ] \
+    || die "direct-cluster mode requires RHIZA_VIND_SKIP_IMAGE_LOAD=1 and a preloaded node image"
+  vcluster node load-image "$node" --image "$image"
+fi
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
@@ -143,7 +190,7 @@ scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null
 RHIZA_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   1 3 "$target/config-c1.json" "$target/config-c1.yaml"
 k create -f "$target/config-c1.yaml" >/dev/null
-scripts/wait-k8s-statefulset-ready.sh "$name_c1" 3 1
+"$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c1" 3 1
 
 client() {
   pod="$1"; shift
@@ -194,6 +241,232 @@ client_http() {
   jq -e -s 'length == 1' "$response" >/dev/null
   cat "$response"
 }
+matrix_service_http() {
+  path="$1" body="$2"
+  request_id="$(date +%s)-$$-${RANDOM}"
+  job="rhiza-${profile}-matrix-${request_id}"
+  matrix_last_job="$job"
+  manifest="$target/${job}.yaml"
+  response="$target/${job}.response"
+  raw_response="${response}.raw"
+  matrix_last_http_status=""
+  matrix_last_http_body="$response"
+  sed \
+    -e "s|__JOB_NAME__|$job|g" \
+    -e "s|__EXECUTION_PROFILE__|$profile|g" \
+    -e 's|__CURL_IMAGE__|curlimages/curl:8.10.1|g' \
+    -e 's|__METHOD__|POST|g' \
+    -e 's|__BODY__|{}|g' \
+    -e 's|__POD__|pod|g' \
+    -e 's|__SERVICE__|service|g' \
+    -e 's|__PATH__|/|g' \
+    -e 's|__AUTH_SECRET__|rhiza-auth|g' \
+    deploy/k8s/rhiza-admin-job.yaml > "$manifest"
+  export RHIZA_E2E_HTTP_SERVICE="${matrix_http_target:-$name_c1-client}"
+  matrix_last_http_target="$RHIZA_E2E_HTTP_SERVICE"
+  matrix_last_http_raw="$raw_response"
+  export RHIZA_E2E_HTTP_PATH="$path" RHIZA_E2E_HTTP_BODY="$body"
+  # shellcheck disable=SC2016
+  export RHIZA_E2E_HTTP_COMMAND='http_status="$(curl --silent --show-error \
+    --connect-timeout 2 --max-time 8 -o /tmp/rhiza-http-body -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer ${RHIZA_ADMIN_TOKEN}" \
+    -H "x-rhiza-version: 1" -H "Content-Type: application/json" \
+    --data "$RHIZA_E2E_HTTP_BODY" \
+    "http://${RHIZA_E2E_HTTP_SERVICE}:8080${RHIZA_E2E_HTTP_PATH}")" \
+    && cat /tmp/rhiza-http-body \
+    && printf "\n__RHIZA_HTTP_STATUS__=%s\n" "$http_status"'
+  yq eval --inplace '
+    .spec.activeDeadlineSeconds = 12 |
+    .spec.template.spec.containers[0].args[0] = strenv(RHIZA_E2E_HTTP_COMMAND) |
+    (.spec.template.spec.containers[0].env[] |
+      select(.name == "RHIZA_ADMIN_TOKEN").valueFrom.secretKeyRef.key) = "client-token" |
+    .spec.template.spec.containers[0].env += [
+      {"name":"RHIZA_E2E_HTTP_SERVICE", "value":strenv(RHIZA_E2E_HTTP_SERVICE)},
+      {"name":"RHIZA_E2E_HTTP_PATH", "value":strenv(RHIZA_E2E_HTTP_PATH)},
+      {"name":"RHIZA_E2E_HTTP_BODY", "value":strenv(RHIZA_E2E_HTTP_BODY)}]
+  ' "$manifest"
+  k create -f "$manifest" >/dev/null
+  for ((attempt=1; attempt<=15; attempt++)); do
+    succeeded="$(k get "job/$job" -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
+    failed="$(k get "job/$job" -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
+    if [ "$succeeded" = 1 ]; then
+      k logs "job/$job" > "$raw_response"
+      matrix_last_http_status="$(sed -n 's/^__RHIZA_HTTP_STATUS__=//p' "$raw_response" | tail -1)"
+      case "$matrix_last_http_status" in
+        [1-5][0-9][0-9]) ;;
+        *) return 1 ;;
+      esac
+      sed '$d' "$raw_response" > "$response"
+      jq -e -s 'length == 1' "$response" >/dev/null
+      case "$matrix_last_http_status" in
+        2[0-9][0-9]) cat "$response"; return 0 ;;
+        *) return 1 ;;
+      esac
+    fi
+    if [ "${failed:-0}" -gt 0 ]; then
+      k logs "job/$job" > "$raw_response" 2>&1 || true
+      return 1
+    fi
+    sleep 1
+  done
+  k logs "job/$job" > "$raw_response" 2>&1 || true
+  return 1
+}
+matrix_prepare_write_request() {
+  key="$1" value="$2" request_id="$3"
+  case "$profile" in
+    sql)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$key" --arg value "$value" \
+        '{request_id:$request_id,key:$key,value:$value}')"
+      matrix_path=/v1/write
+      ;;
+    graph)
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg id "$key" --arg value "$value" \
+        '{request_id:$request_id,id:$id,value:{type:"string",value:$value}}')"
+      matrix_path=/v1/graph/documents/put
+      ;;
+    kv)
+      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
+      encoded_value="$(printf '%s' "$value" | openssl base64 -A)"
+      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$encoded_key" \
+        --arg value "$encoded_value" '{request_id:$request_id,key:$key,value:$value}')"
+      matrix_path=/v1/kv/put
+      ;;
+  esac
+}
+matrix_service_write_response() {
+  matrix_prepare_write_request "$1" "$2" "$3"
+  matrix_service_http "$matrix_path" "$matrix_body"
+}
+matrix_service_write() {
+  matrix_service_write_response "$1" "$2" "$3" >/dev/null
+}
+matrix_prepare_read_request() {
+  key="$1" expected="$2" consistency="$3"
+  case "$profile" in
+    sql)
+      matrix_body="$(jq -cn --arg key "$key" --arg consistency "$consistency" \
+        '{key:$key,consistency:$consistency}')"
+      matrix_path=/v1/read
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == $expected'
+      matrix_encoded_expected="$expected"
+      ;;
+    graph)
+      matrix_body="$(jq -cn --arg id "$key" --arg consistency "$consistency" \
+        '{id:$id,consistency:$consistency}')"
+      matrix_path=/v1/graph/documents/get
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == {type:"string",value:$expected}'
+      matrix_encoded_expected="$expected"
+      ;;
+    kv)
+      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
+      matrix_encoded_expected="$(printf '%s' "$expected" | openssl base64 -A)"
+      matrix_body="$(jq -cn --arg key "$encoded_key" --arg consistency "$consistency" \
+        '{key:$key,consistency:$consistency}')"
+      matrix_path=/v1/kv/get
+      # shellcheck disable=SC2016
+      matrix_read_filter='.value == $expected'
+      ;;
+  esac
+}
+matrix_service_read() {
+  matrix_prepare_read_request "$1" "$2" "$3"
+  if ! matrix_read_response="$(matrix_service_http "$matrix_path" "$matrix_body")"; then
+    return 1
+  fi
+  jq -e --arg expected "$matrix_encoded_expected" "$matrix_read_filter" \
+    <<< "$matrix_read_response" >/dev/null
+}
+matrix_expect_write_no_quorum() {
+  [ "$matrix_last_http_status" = 503 ] || return 1
+  jq -e '.retryable == true and
+    (.code == "write_timeout" or .code == "unavailable")' \
+    "$matrix_last_http_body" >/dev/null
+}
+matrix_expect_read_barrier_unavailable() {
+  [ "$matrix_last_http_status" = 503 ] || return 1
+  jq -e '.code == "unavailable" and .retryable == true' \
+    "$matrix_last_http_body" >/dev/null
+}
+matrix_expect_f2_read_barrier_timeout() {
+  local survivor="${name_c1}-0" survivor_ready endpoint_count exit_code
+  [ -z "$matrix_last_http_status" ] || return 1
+  [ "$matrix_last_http_target" = "${survivor}.${name_c1}" ] || return 1
+  survivor_ready="$(k get pod "$survivor" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')" || return 1
+  [ "$survivor_ready" = True ] || return 1
+  endpoint_count="$(k get endpoints "$name_c1-client" -o json |
+    jq --arg survivor "$survivor" '
+      [.subsets[]?.addresses[]?] as $addresses |
+      if ($addresses | length) == 1 and $addresses[0].targetRef.name == $survivor
+      then 1 else -1 end')" || return 1
+  [ "$endpoint_count" = 1 ] || return 1
+  exit_code="$(k get pod -l "job-name=$matrix_last_job" -o json |
+    jq -er 'if (.items | length) == 1 then
+      .items[0].status.containerStatuses[0].state.terminated.exitCode else empty end')" \
+    || return 1
+  case "$exit_code" in 28) ;; *) return 1;; esac
+  grep -Eq '^curl: \(28\) Operation timed out after [0-9]+ milliseconds with 0 bytes received$' \
+    "$matrix_last_http_raw"
+}
+matrix_expect_write_quorum_unavailable() {
+  matrix_prepare_write_request "$1" "$2" "$3"
+  matrix_http_target="${name_c1}-0.${name_c1}"
+  if matrix_service_http "$matrix_path" "$matrix_body" >/dev/null; then
+    unset matrix_http_target
+    return 1
+  fi
+  unset matrix_http_target
+  matrix_expect_write_no_quorum
+}
+matrix_expect_read_quorum_unavailable() {
+  matrix_prepare_read_request "$1" "$2" "$3"
+  matrix_http_target="${name_c1}-0.${name_c1}"
+  if matrix_service_http "$matrix_path" "$matrix_body" >/dev/null; then
+    unset matrix_http_target
+    return 1
+  fi
+  unset matrix_http_target
+  if matrix_expect_read_barrier_unavailable; then
+    matrix_last_read_failure_kind=unavailable
+    return 0
+  fi
+  if matrix_expect_f2_read_barrier_timeout; then
+    matrix_last_read_failure_kind=timeout
+    return 0
+  fi
+  return 1
+}
+matrix_expect_zero_endpoint_transport_failure() {
+  local path="$1" body="$2" endpoint_count exit_code attempt
+  endpoint_count=-1
+  for ((attempt=1; attempt<=15; attempt++)); do
+    endpoint_count="$(k get endpoints "$name_c1-client" -o json |
+      jq '[.subsets[]?.addresses[]?] | length')" || return 1
+    [ "$endpoint_count" != 0 ] || break
+    sleep 1
+  done
+  [ "$endpoint_count" = 0 ] || return 1
+  if matrix_service_http "$path" "$body" >/dev/null; then
+    return 1
+  fi
+  [ -z "$matrix_last_http_status" ] || return 1
+  exit_code="$(k get pod -l "job-name=$matrix_last_job" -o json |
+    jq -er 'if (.items | length) == 1 then
+      .items[0].status.containerStatuses[0].state.terminated.exitCode else empty end')" \
+    || return 1
+  case "$exit_code" in 7|28) return 0;; *) return 1;; esac
+}
+matrix_expect_write_zero_endpoint_failure() {
+  matrix_prepare_write_request "$1" "$2" "$3"
+  matrix_expect_zero_endpoint_transport_failure "$matrix_path" "$matrix_body"
+}
+matrix_expect_read_zero_endpoint_failure() {
+  matrix_prepare_read_request "$1" "$2" "$3"
+  matrix_expect_zero_endpoint_transport_failure "$matrix_path" "$matrix_body"
+}
 write_value() {
   pod="$1" key="$2" value="$3" request_id="$4"
   case "$profile" in
@@ -212,23 +485,28 @@ write_value() {
       ;;
   esac
 }
-read_value() {
-  pod="$1" key="$2" expected="$3"
+read_value_consistency() {
+  pod="$1" key="$2" expected="$3" consistency="$4"
   case "$profile" in
-    sql) client "$pod" read --key "$key" --consistency read_barrier --expect "$expected" ;;
+    sql) client "$pod" read --key "$key" --consistency "$consistency" --expect "$expected" ;;
     graph)
-      body="$(jq -cn --arg id "$key" '{id:$id,consistency:"read_barrier"}')"
+      body="$(jq -cn --arg id "$key" --arg consistency "$consistency" \
+        '{id:$id,consistency:$consistency}')"
       client_http "$pod" /v1/graph/documents/get "$body" |
         jq -e --arg expected "$expected" '.value == {type:"string",value:$expected}' >/dev/null
       ;;
     kv)
       encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
       encoded_expected="$(printf '%s' "$expected" | openssl base64 -A)"
-      body="$(jq -cn --arg key "$encoded_key" '{key:$key,consistency:"read_barrier"}')"
+      body="$(jq -cn --arg key "$encoded_key" --arg consistency "$consistency" \
+        '{key:$key,consistency:$consistency}')"
       client_http "$pod" /v1/kv/get "$body" |
         jq -e --arg expected "$encoded_expected" '.value == $expected' >/dev/null
       ;;
   esac
+}
+read_value() {
+  read_value_consistency "$1" "$2" "$3" read_barrier
 }
 retry_read_value() {
   pod="$1" key="$2" expected="$3"
@@ -239,6 +517,441 @@ retry_read_value() {
     [ "$attempt" -lt 60 ] || return 1
     sleep 1
   done
+}
+matrix_capture_uids() {
+  local ordinal uid result='[]'
+  for ordinal in 0 1 2; do
+    uid="$(k get pod "${name_c1}-$ordinal" -o jsonpath='{.metadata.uid}')" || return 1
+    [ -n "$uid" ] || return 1
+    result="$(jq -cn --argjson current "$result" --arg pod "${name_c1}-$ordinal" \
+      --arg uid "$uid" '$current + [{pod:$pod,uid:$uid}]')"
+  done
+  printf '%s\n' "$result"
+}
+matrix_emit_cell() {
+  jq -cn \
+    --arg run_id "$run_id" --arg profile "$profile" --arg status "$cell_status" \
+    --arg phase "$cell_phase" --arg error "$cell_error" \
+    --argjson failed_peers "$cell_failed" --argjson survivors "$cell_survivors" \
+    --argjson hold_requested_seconds "$cell_hold" \
+    --argjson hold_actual_seconds "$cell_hold_actual" \
+    --argjson release_epoch_seconds "$cell_release_epoch" \
+    --argjson service_rto_seconds "$cell_service_rto" \
+    --argjson full_rto_seconds "$cell_full_rto" \
+    --argjson failure_injected_at "$cell_failure_injected_at" \
+    --argjson all_target_pods_deleted_at "$cell_all_target_pods_deleted_at" \
+    --argjson quorum_lost_at "$cell_quorum_lost_at" \
+    --argjson failure_released_at "$cell_failure_released_at" \
+    --argjson old_pod_uids "$cell_old_uids" --argjson new_pod_uids "$cell_new_uids" \
+    --arg failure_write_expected "$cell_write_expected" \
+    --arg failure_write_actual "$cell_write_actual" \
+    --arg failure_read_barrier_expected "$cell_read_expected" \
+    --arg failure_read_barrier_actual "$cell_read_actual" \
+    --arg failure_read_barrier_actual_detail "$cell_read_actual_detail" \
+    --arg survivor_local_read "$cell_local_read" \
+    --argjson ack_sentinel_preserved "$cell_ack_preserved" \
+    --argjson markers_lost "$cell_markers_lost" \
+    --argjson pvc_count "$cell_pvc_count" \
+    --argjson ack_ledger "$cell_ack_ledger" \
+    --argjson idempotency_boundary_verified "$cell_idempotency_verified" \
+    --argjson auto_recovery_attempted "$cell_auto_recovery_attempted" \
+    --argjson auto_recovery_succeeded "$cell_auto_recovery_succeeded" \
+    --argjson operator_dr "$cell_operator_dr" \
+    --argjson checkpoint_root "$cell_checkpoint_root" \
+    --argjson tip_hashes_equal "$cell_tips_equal" --argjson tip_hashes "$cell_tips" \
+    '{record_type:"cell",run_id:$run_id,profile:$profile,status:$status,phase:$phase,
+      error:(if $error == "" then null else $error end),failed_peers:$failed_peers,
+      fault_target_policy:"statefulset_highest_ordinals",
+      same_pod_restart_covered:false,arbitrary_leader_failure_covered:false,
+      survivors:$survivors,hold_requested_seconds:$hold_requested_seconds,
+      hold_actual_seconds:$hold_actual_seconds,release_epoch_seconds:$release_epoch_seconds,
+      service_rto_seconds:$service_rto_seconds,full_rto_seconds:$full_rto_seconds,
+      failure_injected_at:$failure_injected_at,
+      all_target_pods_deleted_at:$all_target_pods_deleted_at,
+      quorum_lost_at:$quorum_lost_at,failure_released_at:$failure_released_at,
+      old_pod_uids:$old_pod_uids,new_pod_uids:$new_pod_uids,
+      failure_write_expected:$failure_write_expected,
+      failure_write_actual:$failure_write_actual,
+      failure_read_barrier_expected:$failure_read_barrier_expected,
+      failure_read_barrier_actual:$failure_read_barrier_actual,
+      failure_read_barrier_actual_detail:$failure_read_barrier_actual_detail,
+      read_no_quorum_latency_defect:($failure_read_barrier_actual_detail == "timeout"),
+      survivor_local_read:$survivor_local_read,
+      ack_sentinel_preserved:$ack_sentinel_preserved,ack_ledger:$ack_ledger,
+      idempotency_boundary_verified:$idempotency_boundary_verified,
+      auto_recovery_attempted:$auto_recovery_attempted,
+      auto_recovery_succeeded:$auto_recovery_succeeded,operator_dr:$operator_dr,
+      rpo_boundary:(if $operator_dr then "last_sync_checkpoint" else "zero" end),
+      checkpoint_root:$checkpoint_root,
+      markers_lost:$markers_lost,
+      pvc_count:$pvc_count,tip_hashes_equal:$tip_hashes_equal,tip_hashes:$tip_hashes}' \
+    >> "$recovery_matrix_jsonl"
+}
+matrix_emit_summary() {
+  local status="$1" error="${2-}"
+  jq -cn --arg run_id "$run_id" --arg profile "$profile" --arg status "$status" \
+    --arg error "$error" '
+    {record_type:"summary",run_id:$run_id,profile:$profile,status:$status,
+      error:(if $error == "" then null else $error end),
+      fault_target_policy:"statefulset_highest_ordinals",
+      same_pod_restart_covered:false,arbitrary_leader_failure_covered:false}' \
+    >> "$recovery_matrix_jsonl"
+}
+matrix_fail() {
+  cell_phase="$1"
+  cell_error="$2"
+  cell_status=failed
+  matrix_emit_cell
+  die "recovery matrix F${cell_failed}/${cell_hold}s failed in ${cell_phase}: ${cell_error}"
+}
+matrix_wait_pod_absent() {
+  local pod="$1" deadline=$((SECONDS + 180))
+  while k get pod "$pod" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+matrix_hold_until() {
+  local deadline="$1" remaining sleep_for
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    remaining=$((deadline - $(date +%s)))
+    sleep_for="$remaining"
+    [ "$sleep_for" -le 30 ] || sleep_for=30
+    sleep "$sleep_for"
+  done
+}
+matrix_ledger_append() {
+  local key="$1" value="$2" request_id="$3" response="${4-null}"
+  cell_ack_ledger="$(jq -cn --argjson ledger "$cell_ack_ledger" --arg key "$key" \
+    --arg value "$value" --arg request_id "$request_id" --argjson response "$response" \
+    --argjson acknowledged_at "$(date +%s)" \
+    '$ledger + [{key:$key,value:$value,request_id:$request_id,
+      acknowledged_at:$acknowledged_at,response:$response}]')"
+}
+matrix_check_recovery_deadline() {
+  [ "$SECONDS" -lt "$cell_recovery_deadline" ] \
+    || matrix_fail full_recovery recovery_deadline_exceeded
+}
+matrix_run_f1_availability_probe() {
+  local sequence="$1"
+  local key="matrix-f1-${cell_id}-${sequence}-${run_id}"
+  local value="available-${cell_id}-${sequence}"
+  local request_id="f1-${cell_id}-${sequence}-${run_id}"
+  local response
+  response="$(matrix_service_write_response "$key" "$value" "$request_id")" \
+    || matrix_fail failure_period f1_periodic_write_failed
+  matrix_service_read "$key" "$value" read_barrier \
+    || matrix_fail failure_period f1_periodic_read_barrier_failed
+  matrix_ledger_append "$key" "$value" "$request_id" "$response"
+  cell_fault_key="$key"
+  cell_fault_value="$value"
+  cell_fault_request_id="$request_id"
+  cell_fault_response="$response"
+}
+matrix_publish_sync_checkpoint() {
+  local cell_id="$1" status_file request_file response_file request
+  status_file="$target/matrix-${cell_id}-checkpoint-status.json"
+  request_file="$target/matrix-${cell_id}-checkpoint-request.json"
+  response_file="$target/matrix-${cell_id}-checkpoint-response.json"
+  scripts/k8s-admin-job.sh "$name_c1" "${name_c1}-0" GET \
+    /v1/admin/membership/status > "$status_file" || return 1
+  request="$(jq -cn \
+    --arg op "matrix-checkpoint-${cell_id}-${run_id}" \
+    --argjson root "$(jq -c '.qlog_root' "$status_file")" \
+    '{operation_id:$op,expected_config_id:1,expected_recovery_generation:1,
+      expected_root:$root}')" || return 1
+  printf '%s\n' "$request" > "$request_file"
+  scripts/k8s-admin-job.sh "$name_c1" "${name_c1}-0" POST \
+    /v1/admin/checkpoint/compact "$request" > "$response_file" || return 1
+  jq -e '.anchor.format_version == 2' "$response_file" >/dev/null || return 1
+  cell_checkpoint_root="$(jq -c '.qlog_root' "$status_file")"
+}
+run_recovery_matrix_cell() {
+  cell_failed="$1"
+  cell_hold="$2"
+  cell_survivors=$((3 - cell_failed))
+  cell_status=running
+  cell_phase=setup
+  cell_error=""
+  cell_hold_actual=null
+  cell_release_epoch=null
+  cell_service_rto=null
+  cell_full_rto=null
+  cell_failure_injected_at=null
+  cell_all_target_pods_deleted_at=null
+  cell_quorum_lost_at=null
+  cell_failure_released_at=null
+  cell_old_uids='[]'
+  cell_new_uids='[]'
+  cell_write_actual=not_run
+  cell_read_actual=not_run
+  cell_read_actual_detail=not_run
+  cell_local_read=not_applicable
+  cell_ack_preserved=false
+  cell_ack_ledger='[]'
+  cell_idempotency_verified=null
+  cell_auto_recovery_attempted=false
+  cell_auto_recovery_succeeded=false
+  cell_operator_dr=false
+  cell_checkpoint_root=null
+  cell_markers_lost=false
+  cell_pvc_count=null
+  cell_tips_equal=false
+  cell_tips='[]'
+  if [ "$cell_failed" = 1 ]; then
+    cell_write_expected=success
+    cell_read_expected=success
+  else
+    cell_write_expected=failure
+    cell_read_expected=failure
+  fi
+
+  local cell_id="f${cell_failed}-h${cell_hold}"
+  local ack_key="matrix-ack-${cell_id}-${run_id}"
+  local ack_value="preserved-${cell_id}"
+  local fault_key="matrix-fault-${cell_id}-${run_id}"
+  local fault_value="failure-period-${cell_id}"
+  local fault_request_id="fault-${cell_id}-${run_id}"
+  local post_key="matrix-post-${cell_id}-${run_id}"
+  local post_value="recovered-${cell_id}"
+  local ordinal hold_start hold_deadline status_file tip_attempt
+  local failure_probe_interval_seconds=10 next_probe probe_sequence now sleep_for
+  local service_rto_key="matrix-service-rto-${cell_id}-${run_id}"
+  local service_rto_value="service-restored-${cell_id}"
+  local service_rto_request_id="service-rto-${cell_id}-${run_id}"
+  local first_response second_response remaining_timeout uid_survivors
+
+  write_value "${name_c1}-0" "$ack_key" "$ack_value" "ack-${cell_id}-${run_id}" \
+    || matrix_fail setup ack_sentinel_write_failed
+  matrix_ledger_append "$ack_key" "$ack_value" "ack-${cell_id}-${run_id}"
+  for ordinal in 0 1 2; do
+    read_value "${name_c1}-$ordinal" "$ack_key" "$ack_value" \
+      || matrix_fail setup ack_sentinel_preflight_failed
+    # Re-seed every cell so prior cells cannot mask which emptyDirs this cell replaced.
+    # shellcheck disable=SC2016
+    k exec "${name_c1}-$ordinal" -- /bin/sh -ec 'printf marker > "$1"' sh "$marker" \
+      || matrix_fail setup marker_seed_failed
+  done
+  if [ "$cell_failed" -ge 2 ]; then
+    matrix_publish_sync_checkpoint "$cell_id" \
+      || matrix_fail setup sync_checkpoint_publish_failed
+  fi
+  cell_old_uids="$(matrix_capture_uids)" \
+    || matrix_fail setup old_pod_uid_capture_failed
+
+  cell_phase=failure_period
+  cell_failure_injected_at="$(date +%s)"
+  k scale statefulset "$name_c1" --replicas="$cell_survivors" >/dev/null \
+    || matrix_fail failure_period scale_down_failed
+  for ((ordinal=cell_survivors; ordinal<3; ordinal++)); do
+    matrix_wait_pod_absent "${name_c1}-$ordinal" \
+      || matrix_fail failure_period pod_emptydir_deletion_timeout
+  done
+  cell_all_target_pods_deleted_at="$(date +%s)"
+  if [ "$cell_failed" -ge 2 ]; then
+    cell_quorum_lost_at="$cell_all_target_pods_deleted_at"
+  fi
+  hold_start="$cell_all_target_pods_deleted_at"
+  hold_deadline=$((hold_start + cell_hold))
+
+  if [ "$cell_failed" = 2 ]; then
+    if read_value_consistency "${name_c1}-0" suffix replayed local >/dev/null; then
+      cell_local_read=success
+    else
+      cell_local_read=failure
+      matrix_fail failure_period survivor_local_read_failed
+    fi
+  fi
+  if [ "$cell_failed" = 1 ]; then
+    next_probe="$hold_start"
+    probe_sequence=0
+    while [ "$next_probe" -lt "$hold_deadline" ]; do
+      now="$(date +%s)"
+      if [ "$now" -gt "$next_probe" ]; then
+        [ $((now - next_probe)) -le 1 ] \
+          || matrix_fail failure_period f1_availability_probe_interval_exceeded
+      elif [ "$now" -lt "$next_probe" ]; then
+        sleep_for=$((next_probe - now))
+        [ "$sleep_for" -le "$failure_probe_interval_seconds" ] \
+          || matrix_fail failure_period f1_availability_probe_interval_exceeded
+        sleep "$sleep_for"
+      fi
+      matrix_run_f1_availability_probe "$probe_sequence"
+      probe_sequence=$((probe_sequence + 1))
+      next_probe=$((next_probe + failure_probe_interval_seconds))
+    done
+    matrix_hold_until "$hold_deadline"
+    cell_write_actual=success
+    cell_read_actual=success
+    cell_read_actual_detail=success
+  else
+    if { [ "$cell_failed" = 2 ] && matrix_expect_write_quorum_unavailable \
+      "$fault_key" "$fault_value" "$fault_request_id"; } || \
+      { [ "$cell_failed" = 3 ] && matrix_expect_write_zero_endpoint_failure \
+        "$fault_key" "$fault_value" "$fault_request_id"; }; then
+      cell_write_actual=failure
+    else
+      matrix_fail failure_period failure_write_was_not_expected_no_quorum_failure
+    fi
+    if { [ "$cell_failed" = 2 ] && matrix_expect_read_quorum_unavailable \
+      "$ack_key" "$ack_value" read_barrier; } || \
+      { [ "$cell_failed" = 3 ] && matrix_expect_read_zero_endpoint_failure \
+        "$ack_key" "$ack_value" read_barrier; }; then
+      cell_read_actual=failure
+      if [ "$cell_failed" = 2 ]; then
+        cell_read_actual_detail="$matrix_last_read_failure_kind"
+      else
+        cell_read_actual_detail=zero_endpoint_transport
+      fi
+    else
+      matrix_fail failure_period failure_read_was_not_expected_no_quorum_failure
+    fi
+    matrix_hold_until "$hold_deadline"
+  fi
+  cell_release_epoch="$(date +%s)"
+  cell_failure_released_at="$cell_release_epoch"
+  cell_hold_actual=$((cell_release_epoch - hold_start))
+  [ "$cell_hold_actual" -ge "$cell_hold" ] \
+    || matrix_fail failure_period hold_released_early
+
+  cell_phase=service_recovery
+  uid_survivors="$cell_survivors"
+  if [ "$cell_failed" = 2 ]; then
+    cell_auto_recovery_attempted=true
+    k scale statefulset "$name_c1" --replicas=3 >/dev/null \
+      || matrix_fail service_recovery scale_up_failed
+    if RHIZA_STATEFULSET_READY_TIMEOUT="$recovery_auto_timeout" \
+      "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c1" 3 1 >/dev/null 2>&1; then
+      cell_auto_recovery_succeeded=true
+    else
+      cell_operator_dr=true
+      k scale statefulset "$name_c1" --replicas=0 >/dev/null \
+        || matrix_fail service_recovery operator_dr_scale_zero_failed
+      for ordinal in 0 1 2; do
+        matrix_wait_pod_absent "${name_c1}-$ordinal" \
+          || matrix_fail service_recovery operator_dr_delete_timeout
+      done
+      uid_survivors=0
+      k scale statefulset "$name_c1" --replicas=3 >/dev/null \
+        || matrix_fail service_recovery operator_dr_scale_up_failed
+    fi
+  else
+    [ "$cell_failed" != 3 ] || cell_operator_dr=true
+    k scale statefulset "$name_c1" --replicas=3 >/dev/null \
+      || matrix_fail service_recovery scale_up_failed
+  fi
+  cell_recovery_deadline=$((SECONDS + recovery_timeout))
+  while true; do
+    if first_response="$(matrix_service_write_response \
+      "$service_rto_key" "$service_rto_value" "$service_rto_request_id")" \
+      && matrix_service_read "$service_rto_key" "$service_rto_value" read_barrier; then
+      matrix_ledger_append "$service_rto_key" "$service_rto_value" \
+        "$service_rto_request_id" "$first_response"
+      break
+    fi
+    [ "$SECONDS" -lt "$cell_recovery_deadline" ] \
+      || matrix_fail service_recovery recovery_deadline_exceeded
+    sleep 1
+  done
+  cell_service_rto=$(($(date +%s) - cell_release_epoch))
+
+  cell_phase=full_recovery
+  remaining_timeout=$((cell_recovery_deadline - SECONDS))
+  [ "$remaining_timeout" -gt 0 ] || matrix_fail full_recovery recovery_deadline_exceeded
+  if ! RHIZA_STATEFULSET_READY_TIMEOUT="$remaining_timeout" \
+    "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c1" 3 1; then
+    matrix_fail full_recovery recovery_deadline_exceeded
+  fi
+  matrix_check_recovery_deadline
+  cell_new_uids="$(matrix_capture_uids)" \
+    || matrix_fail full_recovery new_pod_uid_capture_failed
+  if ! jq -e --argjson survivors "$uid_survivors" --argjson new "$cell_new_uids" '
+    . as $old |
+    all(range(0; 3);
+      if . < $survivors then $old[.].uid == $new[.].uid
+      else $old[.].uid != $new[.].uid end)
+  ' <<< "$cell_old_uids" >/dev/null; then
+    matrix_fail full_recovery pod_uid_replacement_mismatch
+  fi
+  for ordinal in 0 1 2; do
+    if [ "$ordinal" -lt "$uid_survivors" ]; then
+      k exec "${name_c1}-$ordinal" -- test -e "$marker" \
+        || matrix_fail full_recovery survivor_marker_lost
+    else
+      k exec "${name_c1}-$ordinal" -- test ! -e "$marker" \
+        || matrix_fail full_recovery replaced_emptydir_marker_preserved
+    fi
+  done
+  cell_markers_lost=true
+  cell_pvc_count="$(k get persistentvolumeclaims -o json | jq '.items | length')"
+  [ "$cell_pvc_count" = 0 ] || matrix_fail full_recovery unexpected_pvc
+  matrix_check_recovery_deadline
+
+  if [ "$cell_failed" = 1 ]; then
+    first_response="$cell_fault_response"
+    second_response="$(matrix_service_write_response "$cell_fault_key" \
+      "$cell_fault_value" "$cell_fault_request_id")" \
+      || matrix_fail full_recovery acknowledged_request_id_retry_failed
+  else
+    first_response="$(matrix_service_write_response \
+      "$fault_key" "$fault_value" "$fault_request_id")" \
+      || matrix_fail full_recovery failed_request_id_recovery_retry_failed
+    second_response="$(matrix_service_write_response \
+      "$fault_key" "$fault_value" "$fault_request_id")" \
+      || matrix_fail full_recovery failed_request_id_idempotent_retry_failed
+    matrix_ledger_append "$fault_key" "$fault_value" "$fault_request_id" "$first_response"
+  fi
+  jq -e --argjson first "$first_response" '$first == .' <<< "$second_response" >/dev/null \
+    || matrix_fail full_recovery idempotency_response_mismatch
+  cell_idempotency_verified=true
+
+  while IFS=$'\t' read -r ledger_key ledger_value; do
+    for ordinal in 0 1 2; do
+      matrix_check_recovery_deadline
+      read_value "${name_c1}-$ordinal" "$ledger_key" "$ledger_value" \
+        || matrix_fail full_recovery acknowledged_ledger_entry_missing
+    done
+  done < <(jq -r '.[] | [.key,.value] | @tsv' <<< "$cell_ack_ledger")
+  cell_ack_preserved=true
+  write_value "${name_c1}-0" "$post_key" "$post_value" "post-${cell_id}-${run_id}" \
+    || matrix_fail full_recovery post_recovery_write_failed
+  for ordinal in 0 1 2; do
+    matrix_check_recovery_deadline
+    read_value "${name_c1}-$ordinal" "$post_key" "$post_value" \
+      || matrix_fail full_recovery post_recovery_strong_read_failed
+  done
+  tip_attempt=0
+  while true; do
+    tip_attempt=$((tip_attempt + 1))
+    for ordinal in 0 1 2; do
+      matrix_check_recovery_deadline
+      status_file="$target/matrix-${cell_id}-status-${ordinal}.json"
+      scripts/k8s-admin-job.sh "$name_c1" "${name_c1}-$ordinal" GET \
+        /v1/admin/membership/status > "$status_file" \
+        || matrix_fail full_recovery tip_capture_failed
+    done
+    matrix_check_recovery_deadline
+    cell_tips="$(jq -s 'map({active_config_id:.node.active_config_id,
+        state_config_id:.node.configuration_state.config_id,qlog_root})' \
+      "$target/matrix-${cell_id}-status-0.json" \
+      "$target/matrix-${cell_id}-status-1.json" \
+      "$target/matrix-${cell_id}-status-2.json")" \
+      || matrix_fail full_recovery tip_parse_failed
+    if jq -e 'length == 3 and
+      (map(.active_config_id) | unique == [1]) and
+      (map(.state_config_id) | unique == [1]) and
+      (map(.qlog_root) | unique | length == 1)' <<< "$cell_tips" >/dev/null; then
+      break
+    fi
+    matrix_check_recovery_deadline
+    sleep 1
+  done
+  cell_tips_equal=true
+  matrix_check_recovery_deadline
+  cell_full_rto=$(($(date +%s) - cell_release_epoch))
+  cell_status=passed
+  cell_phase=complete
+  matrix_emit_cell
 }
 write_value "${name_c1}-0" snapshot restored "snapshot-${run_id}"
 if [ "$profile" = sql ]; then
@@ -270,6 +983,33 @@ for ordinal in 0 1 2; do
   # shellcheck disable=SC2016
   k exec "${name_c1}-$ordinal" -- /bin/sh -ec 'printf marker > "$1"' sh "$marker"
 done
+
+if [ "$recovery_matrix" = 1 ]; then
+  recovery_matrix_jsonl="$target/recovery-matrix.jsonl"
+  : > "$recovery_matrix_jsonl"
+  chmod 600 "$recovery_matrix_jsonl"
+  echo "== run config-1 emptyDir recovery matrix =="
+  for hold in "${recovery_holds[@]}"; do
+    for failed in "${recovery_failures[@]}"; do
+      run_recovery_matrix_cell "$failed" "$hold"
+    done
+  done
+  jq -e -s 'length > 0 and all(.[]; .status == "passed")' \
+    "$recovery_matrix_jsonl" >/dev/null
+  if [ "$recovery_matrix_only" = 1 ]; then
+    if [ "$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0].metadata.uid}')" != "$rustfs_uid" ]; then
+      matrix_emit_summary failed rustfs_uid_changed
+      die "RustFS changed during the recovery matrix"
+    fi
+    if [ -n "$(k get persistentvolumeclaims -o name)" ]; then
+      matrix_emit_summary failed unexpected_pvc
+      die "vind recovery matrix created a PVC"
+    fi
+    matrix_emit_summary passed
+    echo "vind config-1 recovery matrix passed: $recovery_matrix_jsonl"
+    exit 0
+  fi
+fi
 
 echo "== compact locally, stop config 1, and replace 3 -> 3 =="
 RHIZA_RECONFIG_WORK_DIR="$target/reconfigure" \
@@ -349,10 +1089,10 @@ k scale statefulset "$name_c2" --replicas=0 >/dev/null
 k wait --for=delete pod -l "rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=2" --timeout=180s >/dev/null
 k set env "statefulset/$name_c2" RHIZA_RECOVERY_GENERATION=2 >/dev/null
 k scale statefulset "$name_c2" --replicas=3 >/dev/null
-scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
+"$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
 write_value "${name_c2}-0" generation two "generation-2-${run_id}"
 k delete pod "${name_c2}-1" --wait=true >/dev/null
-scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
+"$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
 retry_read_value "${name_c2}-1" generation two
 if [ "$profile" = sql ]; then
   client "${name_c2}-1" sql query --sql 'SELECT count(*) AS users FROM users' \
@@ -380,10 +1120,16 @@ jq -e --arg hash "$plan_hash" '.plan_hash == $hash and (.results | length > 0)' 
   "$report" >/dev/null
 
 k scale statefulset "$name_c2" --replicas=3 >/dev/null
-scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
+"$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
 retry_read_value "${name_c2}-0" generation two
 
-[ "$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0].metadata.uid}')" = "$rustfs_uid" ] \
-  || die "RustFS changed during the restore lifecycle"
-[ -z "$(k get persistentvolumeclaims -o name)" ] || die "vind E2E created a PVC"
+if [ "$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0].metadata.uid}')" != "$rustfs_uid" ]; then
+  [ "$recovery_matrix" != 1 ] || matrix_emit_summary failed rustfs_uid_changed
+  die "RustFS changed during the restore lifecycle"
+fi
+if [ -n "$(k get persistentvolumeclaims -o name)" ]; then
+  [ "$recovery_matrix" != 1 ] || matrix_emit_summary failed unexpected_pvc
+  die "vind E2E created a PVC"
+fi
+[ "$recovery_matrix" != 1 ] || matrix_emit_summary passed
 echo "vind RustFS emptyDir restore, V2 compact, 3->3 replacement, and exact-hash GC passed"

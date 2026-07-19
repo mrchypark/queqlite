@@ -1,7 +1,7 @@
 use rhiza_core::{EntryType, LogEntry, LogHash};
 use rhiza_sql::{
-    encode_sql_command, restore_snapshot_file, sql_executor_fingerprint, Error, SqlCommand,
-    SqlEffectPreparation, SqlStatement, SqlValue, SqliteStateMachine,
+    encode_sql_command, restore_snapshot_file, sql_executor_fingerprint, Error, SqlBatchMember,
+    SqlCommand, SqlStatement, SqlValue, SqliteStateMachine,
 };
 use rusqlite::Connection;
 
@@ -12,9 +12,18 @@ fn apply_command(
     prev_hash: LogHash,
 ) -> LogHash {
     let request = encode_sql_command(command).unwrap();
-    let SqlEffectPreparation::Effect(effect) = db
-        .prepare_sql_effect(command, &request, index - 1, prev_hash)
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command,
+                request_payload: &request,
+            }],
+            index - 1,
+            prev_hash,
+        )
         .unwrap();
+    preparation.results.into_iter().next().unwrap().unwrap();
+    let effect = preparation.effect.unwrap();
     let hash = LogEntry::calculate_hash(
         "cluster-a",
         1,
@@ -58,8 +67,19 @@ fn qsql_v2_rejects_a_mismatched_executor_fingerprint_before_preparation() {
     tampered.extend_from_slice(&serde_json::to_vec(&body).unwrap());
 
     assert_ne!(sql_executor_fingerprint().unwrap(), LogHash::ZERO);
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &command,
+                request_payload: &tampered,
+            }],
+            0,
+            LogHash::ZERO,
+        )
+        .unwrap();
+    assert!(preparation.effect.is_none());
     assert!(matches!(
-        db.prepare_sql_effect(&command, &tampered, 0, LogHash::ZERO),
+        &preparation.results[0],
         Err(Error::InvalidCommand(_))
     ));
 }
@@ -337,9 +357,18 @@ fn reserved_trigger_names_and_targets_are_rejected_without_changing_the_base() {
                 .collect(),
         };
         let request = encode_sql_command(&command).unwrap();
-        assert!(db
-            .prepare_sql_effect(&command, &request, 0, LogHash::ZERO)
-            .is_err());
+        let preparation = db
+            .prepare_sql_batch_effect(
+                &[SqlBatchMember {
+                    command: &command,
+                    request_payload: &request,
+                }],
+                0,
+                LogHash::ZERO,
+            )
+            .unwrap();
+        assert!(preparation.effect.is_none());
+        assert!(preparation.results[0].is_err());
         assert_eq!(db.canonical_db_digest().unwrap(), initial);
     }
 }
