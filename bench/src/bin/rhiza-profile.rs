@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    env,
+    env, fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -15,7 +16,10 @@ use rhiza::{
     GraphParameterValue, GraphValueV1, ReadConsistency, Rhiza, RhizaHandle, SqlCommand,
     SqlStatement, SqlValue,
 };
-use rhiza_core::{Command as ConsensusCommand, CommandKind, EntryType, LogEntry, LogHash};
+use rhiza_core::{
+    Command as ConsensusCommand, CommandKind, ConfigurationState, EntryType, LogEntry, LogHash,
+    Snapshot, SnapshotManifest,
+};
 use rhiza_graph::{encode_replicated_graph_command, GraphResultValue, LadybugStateMachine};
 use rhiza_kv::{encode_replicated_kv_command, KvCommandV1, RedbStateMachine};
 use rhiza_node::{NodeConfig, NodeRuntime, SqlWriteProfileSnapshot, SqlWriteProfiler};
@@ -26,14 +30,25 @@ use rhiza_sql::{
     encode_sql_command, restore_snapshot_file, SqlBatchMember, SqlBatchPreparation,
     SqliteStateMachine, QWAL_V3_MAGIC,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const KEYSPACE: u64 = 256;
 const MAX_SQL_PADDING_MIB: usize = 1_024;
 const SQL_PADDING_CHUNK_BYTES: usize = 128 * 1024;
 const RAW_RESULT_BYTES: usize = 1024 * 1024;
 const RAW_GRAPH_TIMEOUT_MS: u64 = 5_000;
-const REPORT_SCHEMA_VERSION: u32 = 5;
+const REPORT_SCHEMA_VERSION: u32 = 6;
+const SQL_SEED_CACHE_MAGIC: &[u8] = b"RHIZA-SQL-SEED\0";
+const SQL_SEED_CACHE_FORMAT_VERSION: u32 = 1;
+const SQL_SEED_CACHE_HARNESS_VERSION: &str = "rhiza-profile-qwal-v3-seed-cache-v1";
+const SQL_SEED_RECIPE_ID: &str = "sql-follower-padding-v1";
+const SQL_SEED_ITEMS_DDL: &str =
+    "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)";
+const SQL_SEED_PADDING_DDL: &str =
+    "CREATE TABLE bench_padding(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)";
+const SQL_SEED_PADDING_INSERT: &str = "INSERT INTO bench_padding(id, payload) VALUES (?1, ?2)";
+const MAX_SQL_SEED_CACHE_HEADER_BYTES: usize = 64 * 1024;
+const SQL_SEED_CACHE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 type RecorderSet = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -209,6 +224,7 @@ struct Config {
     read_consistency: BenchmarkReadConsistency,
     sql_write_profile: bool,
     sql_padding_mib: usize,
+    sql_seed_cache: Option<PathBuf>,
 }
 
 impl Config {
@@ -227,6 +243,7 @@ impl Config {
         let mut sql_write_profile = false;
         let mut sql_padding_mib = 0;
         let mut sql_padding_was_explicit = false;
+        let mut sql_seed_cache = None;
         let mut index = 0;
         while index < values.len() {
             let flag = &values[index];
@@ -252,6 +269,13 @@ impl Config {
                 "--sql-padding-mib" => {
                     sql_padding_mib = parse_usize_allow_zero(next()?, flag)?;
                     sql_padding_was_explicit = true;
+                }
+                "--sql-seed-cache" => {
+                    let path = PathBuf::from(next()?);
+                    if path.as_os_str().is_empty() {
+                        return Err("--sql-seed-cache requires a non-empty file path".into());
+                    }
+                    sql_seed_cache = Some(path);
                 }
                 "--consistency" => {
                     read_consistency = BenchmarkReadConsistency::parse(next()?)?;
@@ -305,6 +329,9 @@ impl Config {
         }
         if sql_padding_was_explicit && layer != Layer::FollowerApply {
             return Err("--sql-padding-mib requires --layer follower-apply".into());
+        }
+        if sql_seed_cache.is_some() && layer != Layer::FollowerApply {
+            return Err("--sql-seed-cache requires --layer follower-apply".into());
         }
         if consistency_was_explicit
             && (workload == Workload::Write || !matches!(layer, Layer::Handle | Layer::Runtime))
@@ -373,6 +400,7 @@ impl Config {
             read_consistency,
             sql_write_profile,
             sql_padding_mib,
+            sql_seed_cache,
         })
     }
 }
@@ -415,7 +443,7 @@ fn usage() -> String {
     "usage: rhiza-profile --profile sql|graph|kv --workload write|get|document-get|native-read \
      [--layer handle|runtime|raw|qwal|follower-apply|consensus] [--operations N] [--warmup N] [--concurrency N] \
      [--batch-size 1|2|4|8|16|32|64|128|256|512|1024] [--value-bytes N] [--consistency local|read_barrier] \
-     [--sql-write-profile] [--sql-padding-mib 0..1024]"
+     [--sql-write-profile] [--sql-padding-mib 0..1024] [--sql-seed-cache FILE]"
         .into()
 }
 
@@ -864,6 +892,42 @@ struct FollowerSeedState {
     follower_control_bytes: u64,
     leader_embedded_qlog_entries: u64,
     follower_embedded_qlog_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed_cache: Option<SqlSeedCacheProvenance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SqlSeedCacheProvenance {
+    disposition: &'static str,
+    path: String,
+    digest: String,
+    bytes: u64,
+    snapshot_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SqlSeedCacheHeader {
+    format_version: u32,
+    harness_version: String,
+    report_schema_version: u32,
+    seed_recipe_id: String,
+    seed_recipe_digest: String,
+    profile: String,
+    workload: String,
+    padding_mib: usize,
+    value_bytes: usize,
+    keyspace: u64,
+    receipt_count: u64,
+    snapshot_bytes: u64,
+    snapshot_digest: String,
+    configuration_state: ConfigurationState,
+    snapshot_manifest: SnapshotManifest,
+}
+
+struct LoadedSqlSeedCache {
+    snapshot: Snapshot,
+    provenance: SqlSeedCacheProvenance,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1001,8 +1065,7 @@ async fn run(config: Config) -> Result<Report, String> {
             (samples, elapsed, None, None)
         }
         Layer::FollowerApply => {
-            let (samples, elapsed, seed_state) =
-                measure_follower(SqlFollowerTarget::open(root.path())?, &config)?;
+            let (samples, elapsed, seed_state) = measure_follower(root.path(), &config)?;
             (samples, elapsed, None, Some(seed_state))
         }
         Layer::Consensus => {
@@ -1035,6 +1098,11 @@ async fn run(config: Config) -> Result<Report, String> {
         limitations.push(
             "SQL padding is seeded before a recovery-snapshot restore into fresh leader/follower views; seed receipts remain in control and are reported, while embedded qlog is cleared",
         );
+        if config.sql_seed_cache.is_some() {
+            limitations.push(
+                "the explicit SQL seed cache affects setup time only: a cache hit skips QWAL seeding, while both cache hits and misses restore and fully validate fresh leader/follower materializers before warmup",
+            );
+        }
     }
     if config.workload == Workload::Write {
         limitations.push(
@@ -2464,7 +2532,6 @@ impl RawTarget {
 }
 
 struct SqlFollowerTarget {
-    root: PathBuf,
     leader: RawTarget,
     follower: RawTarget,
     leader_path: PathBuf,
@@ -2472,117 +2539,166 @@ struct SqlFollowerTarget {
 }
 
 impl SqlFollowerTarget {
-    fn open(root: &Path) -> Result<Self, String> {
-        let leader_path = root.join("raw/leader-seed.db");
-        let follower_path = root.join("raw/follower-seed.db");
-        Ok(Self {
-            root: root.to_path_buf(),
-            leader: RawTarget::open_sql(root, "leader-seed.db", "node-1")?,
-            follower: RawTarget::open_sql(root, "follower-seed.db", "node-2")?,
-            leader_path,
-            follower_path,
-        })
-    }
-
     fn seed(
-        &mut self,
+        root: &Path,
         value_bytes: usize,
         padding_mib: usize,
-    ) -> Result<FollowerSeedState, String> {
+        seed_cache: Option<&Path>,
+    ) -> Result<(Self, FollowerSeedState), String> {
+        let receipt_count = expected_seed_receipt_count(padding_mib)?;
+        if let Some(cache_path) = seed_cache {
+            let cache_path = absolute_cache_path(cache_path)?;
+            if cache_path.try_exists().map_err(|error| error.to_string())? {
+                let loaded =
+                    load_sql_seed_cache(&cache_path, padding_mib, value_bytes, receipt_count)?;
+                let (target, mut state) = Self::restore_compacted_seed(
+                    root,
+                    &loaded.snapshot,
+                    value_bytes,
+                    padding_mib,
+                    receipt_count,
+                )?;
+                state.seed_cache = Some(loaded.provenance);
+                return Ok((target, state));
+            }
+        }
+
+        let mut seed_leader = RawTarget::open_sql(root, "leader-seed.db", "node-1")?;
         let mut receipt_count = 0u64;
-        self.apply_seed_command(SqlCommand {
-            request_id: "profile-bench-schema".into(),
-            statements: vec![
-                SqlStatement {
-                    sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-                        .into(),
-                    parameters: vec![],
-                },
-                SqlStatement {
-                    sql:
-                        "CREATE TABLE bench_padding(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
-                            .into(),
-                    parameters: vec![],
-                },
-            ],
+        visit_seed_commands(value_bytes, padding_mib, |command| {
+            apply_seed_command(&mut seed_leader, command)?;
+            receipt_count += 1;
+            Ok(())
         })?;
-        receipt_count += 1;
-
-        let padding_bytes = padding_mib
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
-        let mut inserted = 0usize;
-        let mut chunk_id = 0u64;
-        while inserted < padding_bytes {
-            let bytes = SQL_PADDING_CHUNK_BYTES.min(padding_bytes - inserted);
-            self.apply_seed_command(SqlCommand {
-                request_id: format!("profile-bench-padding-{chunk_id:016x}"),
-                statements: vec![SqlStatement {
-                    sql: "INSERT INTO bench_padding(id, payload) VALUES (?1, ?2)".into(),
-                    parameters: vec![
-                        SqlValue::Integer(i64::try_from(chunk_id).map_err(|_| {
-                            "SQL padding chunk id exceeds SQLite INTEGER".to_string()
-                        })?),
-                        SqlValue::Blob(vec![0; bytes]),
-                    ],
-                }],
-            })?;
-            receipt_count += 1;
-            inserted += bytes;
-            chunk_id += 1;
+        let expected_receipts = expected_seed_receipt_count(padding_mib)?;
+        if receipt_count != expected_receipts {
+            return Err("SQL follower seed receipt count invariant failed".into());
         }
-
-        for index in 0..KEYSPACE {
-            self.apply_seed_command(sql_write_command(index, "setup", value_bytes))?;
-            receipt_count += 1;
-        }
-        self.restore_compacted_seed(receipt_count)
-    }
-
-    fn restore_compacted_seed(&mut self, receipt_count: u64) -> Result<FollowerSeedState, String> {
-        let snapshot = self
-            .leader
+        let snapshot = seed_leader
             .sql_state()?
             .create_recovery_snapshot(1)
             .map_err(|error| error.to_string())?;
-        let leader_path = self.root.join("raw/leader-measured.db");
-        let follower_path = self.root.join("raw/follower-measured.db");
-        restore_snapshot_file(&leader_path, snapshot.snapshot(), "node-1")
-            .map_err(|error| error.to_string())?;
-        restore_snapshot_file(&follower_path, snapshot.snapshot(), "node-2")
-            .map_err(|error| error.to_string())?;
-
-        self.leader = RawTarget::open_sql(&self.root, "leader-measured.db", "node-1")?;
-        self.follower = RawTarget::open_sql(&self.root, "follower-measured.db", "node-2")?;
-        self.leader_path = leader_path;
-        self.follower_path = follower_path;
-        self.verify_aligned_anchor()?;
-
-        verify_snapshot_cleared_embedded_qlog(self.leader.sql_state()?)?;
-        verify_snapshot_cleared_embedded_qlog(self.follower.sql_state()?)?;
-
-        Ok(FollowerSeedState {
+        Self::restore_validated_seed(
+            root,
+            snapshot.snapshot(),
+            value_bytes,
+            padding_mib,
             receipt_count,
-            leader_database_bytes: file_bytes(&self.leader_path)?,
-            follower_database_bytes: file_bytes(&self.follower_path)?,
-            leader_control_bytes: file_bytes(&control_sidecar_path(&self.leader_path))?,
-            follower_control_bytes: file_bytes(&control_sidecar_path(&self.follower_path))?,
-            leader_embedded_qlog_entries: 0,
-            follower_embedded_qlog_entries: 0,
-        })
+            seed_cache,
+        )
     }
 
-    fn apply_seed_command(&mut self, command: SqlCommand) -> Result<(), String> {
-        let prepared = self.leader.prepare_sql_batch(&[command])?;
-        if prepared.results.iter().any(Result::is_err) {
-            return Err("SQL follower benchmark seed command failed".into());
+    fn restore_validated_seed(
+        root: &Path,
+        snapshot: &Snapshot,
+        value_bytes: usize,
+        padding_mib: usize,
+        receipt_count: u64,
+        seed_cache: Option<&Path>,
+    ) -> Result<(Self, FollowerSeedState), String> {
+        let (target, mut state) =
+            Self::restore_compacted_seed(root, snapshot, value_bytes, padding_mib, receipt_count)?;
+        if let Some(cache_path) = seed_cache {
+            state.seed_cache = Some(publish_sql_seed_cache(
+                &absolute_cache_path(cache_path)?,
+                snapshot,
+                padding_mib,
+                value_bytes,
+                receipt_count,
+            )?);
         }
-        let payload = prepared
-            .payload
-            .ok_or_else(|| "SQL follower benchmark seed produced no QWAL effect".to_string())?;
-        self.follower.apply(payload.clone())?;
-        self.leader.apply(payload)?;
-        self.verify_aligned_anchor()
+        Ok((target, state))
+    }
+
+    fn restore_compacted_seed(
+        root: &Path,
+        snapshot: &Snapshot,
+        value_bytes: usize,
+        padding_mib: usize,
+        receipt_count: u64,
+    ) -> Result<(Self, FollowerSeedState), String> {
+        let leader_path = root.join("raw/leader-measured.db");
+        let follower_path = root.join("raw/follower-measured.db");
+        restore_snapshot_file(&leader_path, snapshot, "node-1")
+            .map_err(|error| error.to_string())?;
+        restore_snapshot_file(&follower_path, snapshot, "node-2")
+            .map_err(|error| error.to_string())?;
+
+        let target = Self {
+            leader: RawTarget::open_sql(root, "leader-measured.db", "node-1")?,
+            follower: RawTarget::open_sql(root, "follower-measured.db", "node-2")?,
+            leader_path,
+            follower_path,
+        };
+        target.verify_aligned_anchor()?;
+
+        verify_snapshot_cleared_embedded_qlog(target.leader.sql_state()?)?;
+        verify_snapshot_cleared_embedded_qlog(target.follower.sql_state()?)?;
+        target.validate_restored_seed(value_bytes, padding_mib, receipt_count)?;
+
+        let state = FollowerSeedState {
+            receipt_count,
+            leader_database_bytes: file_bytes(&target.leader_path)?,
+            follower_database_bytes: file_bytes(&target.follower_path)?,
+            leader_control_bytes: file_bytes(&control_sidecar_path(&target.leader_path))?,
+            follower_control_bytes: file_bytes(&control_sidecar_path(&target.follower_path))?,
+            leader_embedded_qlog_entries: 0,
+            follower_embedded_qlog_entries: 0,
+            seed_cache: None,
+        };
+        Ok((target, state))
+    }
+
+    fn validate_restored_seed(
+        &self,
+        value_bytes: usize,
+        padding_mib: usize,
+        expected_receipts: u64,
+    ) -> Result<(), String> {
+        self.verify_aligned_anchor()?;
+        let expected_tip = expected_receipts;
+        if self.leader.next_index != expected_tip.saturating_add(1) {
+            return Err("restored SQL seed tip does not match expected receipt count".into());
+        }
+        for state in [self.leader.sql_state()?, self.follower.sql_state()?] {
+            if state
+                .configuration_state_value()
+                .map_err(|error| error.to_string())?
+                != ConfigurationState::active(1, LogHash::ZERO)
+            {
+                return Err("restored SQL seed does not use the exact active configuration".into());
+            }
+            validate_seed_database(state, value_bytes, padding_mib)?;
+        }
+        let mut validated_receipts = 0u64;
+        visit_seed_commands(value_bytes, padding_mib, |command| {
+            let request_id = command.request_id.clone();
+            let encoded = encode_sql_command(&command).map_err(|error| error.to_string())?;
+            for state in [self.leader.sql_state()?, self.follower.sql_state()?] {
+                let Some(outcome) = state
+                    .check_request(&request_id, &encoded)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Err(format!("restored SQL seed is missing receipt {request_id}"));
+                };
+                let expected_index = validated_receipts + 1;
+                if outcome.original_log_index() != expected_index {
+                    return Err(format!(
+                        "restored SQL seed receipt {request_id} belongs to index {}, expected {expected_index}",
+                        outcome.original_log_index()
+                    ));
+                }
+            }
+            validated_receipts += 1;
+            Ok(())
+        })?;
+        if validated_receipts != expected_receipts {
+            return Err(
+                "restored SQL seed expected-receipt validation count does not match metadata"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     fn verify_aligned_anchor(&self) -> Result<(), String> {
@@ -2651,6 +2767,562 @@ impl SqlFollowerTarget {
     }
 }
 
+fn apply_seed_command(leader: &mut RawTarget, command: SqlCommand) -> Result<(), String> {
+    let prepared = leader.prepare_sql_batch(&[command])?;
+    if prepared.results.iter().any(Result::is_err) {
+        return Err("SQL follower benchmark seed command failed".into());
+    }
+    let payload = prepared
+        .payload
+        .ok_or_else(|| "SQL follower benchmark seed produced no QWAL effect".to_string())?;
+    leader.apply(payload)
+}
+
+fn expected_seed_receipt_count(padding_mib: usize) -> Result<u64, String> {
+    let padding_bytes = padding_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
+    let padding_receipts = padding_bytes.div_ceil(SQL_PADDING_CHUNK_BYTES);
+    u64::try_from(padding_receipts)
+        .ok()
+        .and_then(|count| count.checked_add(KEYSPACE + 1))
+        .ok_or_else(|| "SQL seed receipt count overflows".to_string())
+}
+
+fn visit_seed_commands(
+    value_bytes: usize,
+    padding_mib: usize,
+    mut visit: impl FnMut(SqlCommand) -> Result<(), String>,
+) -> Result<(), String> {
+    visit(SqlCommand {
+        request_id: "profile-bench-schema".into(),
+        statements: vec![
+            SqlStatement {
+                sql: SQL_SEED_ITEMS_DDL.into(),
+                parameters: vec![],
+            },
+            SqlStatement {
+                sql: SQL_SEED_PADDING_DDL.into(),
+                parameters: vec![],
+            },
+        ],
+    })?;
+
+    let padding_bytes = padding_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
+    let mut inserted = 0usize;
+    let mut chunk_id = 0u64;
+    while inserted < padding_bytes {
+        let bytes = SQL_PADDING_CHUNK_BYTES.min(padding_bytes - inserted);
+        visit(SqlCommand {
+            request_id: format!("profile-bench-padding-{chunk_id:016x}"),
+            statements: vec![SqlStatement {
+                sql: SQL_SEED_PADDING_INSERT.into(),
+                parameters: vec![
+                    SqlValue::Integer(
+                        i64::try_from(chunk_id)
+                            .map_err(|_| "SQL padding chunk id exceeds SQLite INTEGER")?,
+                    ),
+                    SqlValue::Blob(vec![0; bytes]),
+                ],
+            }],
+        })?;
+        inserted += bytes;
+        chunk_id += 1;
+    }
+    for index in 0..KEYSPACE {
+        visit(sql_write_command(index, "setup", value_bytes))?;
+    }
+    Ok(())
+}
+
+fn sql_seed_recipe_digest(value_bytes: usize, padding_mib: usize) -> Result<String, String> {
+    let value_bytes = u64::try_from(value_bytes)
+        .map_err(|_| "SQL seed recipe value size exceeds u64".to_string())?
+        .to_be_bytes();
+    let padding_mib = u64::try_from(padding_mib)
+        .map_err(|_| "SQL seed recipe padding size exceeds u64".to_string())?
+        .to_be_bytes();
+    let keyspace = KEYSPACE.to_be_bytes();
+    let padding_chunk_bytes = u64::try_from(SQL_PADDING_CHUNK_BYTES)
+        .map_err(|_| "SQL seed recipe padding chunk size exceeds u64".to_string())?
+        .to_be_bytes();
+    Ok(LogHash::digest(&[
+        SQL_SEED_RECIPE_ID.as_bytes(),
+        SQL_SEED_ITEMS_DDL.as_bytes(),
+        SQL_SEED_PADDING_DDL.as_bytes(),
+        SQL_SEED_PADDING_INSERT.as_bytes(),
+        b"sql_write_command:setup:v1",
+        &keyspace,
+        &padding_chunk_bytes,
+        &padding_mib,
+        &value_bytes,
+    ])
+    .to_hex())
+}
+
+fn validate_seed_database(
+    state: &SqliteStateMachine,
+    value_bytes: usize,
+    padding_mib: usize,
+) -> Result<(), String> {
+    let expected_padding_rows = padding_mib
+        .checked_mul(1024 * 1024)
+        .map(|bytes| bytes.div_ceil(SQL_PADDING_CHUNK_BYTES))
+        .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
+    let padding = state
+        .query_sql(
+            &SqlStatement {
+                sql: "SELECT id, length(payload), \
+                      CASE WHEN payload = zeroblob(length(payload)) THEN 1 ELSE 0 END \
+                      FROM bench_padding ORDER BY id"
+                    .into(),
+                parameters: vec![],
+            },
+            expected_padding_rows.saturating_add(1),
+            RAW_RESULT_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+    validate_padding_rows(&padding.rows, padding_mib)?;
+
+    let items = state
+        .query_sql(
+            &SqlStatement {
+                sql: "SELECT key, value FROM bench_items ORDER BY key".into(),
+                parameters: vec![],
+            },
+            KEYSPACE as usize,
+            2 * RAW_RESULT_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+    if items.rows.len() != KEYSPACE as usize {
+        return Err(format!(
+            "restored SQL seed has {} hot rows; expected {KEYSPACE}",
+            items.rows.len()
+        ));
+    }
+    for (index, row) in items.rows.iter().enumerate() {
+        let expected_index = index as u64;
+        let expected = [
+            SqlValue::Text(key(expected_index)),
+            SqlValue::Text(setup_value(expected_index, value_bytes)),
+        ];
+        if row != &expected {
+            return Err(format!(
+                "restored SQL seed hot row {expected_index} does not match --value-bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_padding_rows(rows: &[Vec<SqlValue>], padding_mib: usize) -> Result<(), String> {
+    let padding_bytes = padding_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
+    let expected_rows = padding_bytes.div_ceil(SQL_PADDING_CHUNK_BYTES);
+    if rows.len() != expected_rows {
+        return Err(format!(
+            "restored SQL seed has {} padding rows; expected {expected_rows}",
+            rows.len()
+        ));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let offset = index
+            .checked_mul(SQL_PADDING_CHUNK_BYTES)
+            .ok_or_else(|| "SQL padding offset overflows".to_string())?;
+        let expected_bytes = SQL_PADDING_CHUNK_BYTES.min(padding_bytes - offset);
+        let expected = [
+            SqlValue::Integer(
+                i64::try_from(index)
+                    .map_err(|_| "SQL padding row id exceeds SQLite INTEGER".to_string())?,
+            ),
+            SqlValue::Integer(
+                i64::try_from(expected_bytes)
+                    .map_err(|_| "SQL padding row size exceeds SQLite INTEGER".to_string())?,
+            ),
+            SqlValue::Integer(1),
+        ];
+        if row != &expected {
+            return Err(format!(
+                "restored SQL padding row {index} must have its exact id, size, and all-zero content"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn absolute_cache_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| format!("failed to resolve SQL seed cache path: {error}"))
+    }
+}
+
+fn sql_seed_cache_header(
+    snapshot: &Snapshot,
+    padding_mib: usize,
+    value_bytes: usize,
+    receipt_count: u64,
+) -> Result<SqlSeedCacheHeader, String> {
+    if snapshot.manifest().index() != receipt_count {
+        return Err("SQL seed snapshot index does not match receipt count".into());
+    }
+    let configuration_state = ConfigurationState::active(1, LogHash::ZERO);
+    if snapshot.manifest().configuration_state() != &configuration_state {
+        return Err("SQL seed snapshot does not use the exact active configuration".into());
+    }
+    Ok(SqlSeedCacheHeader {
+        format_version: SQL_SEED_CACHE_FORMAT_VERSION,
+        harness_version: SQL_SEED_CACHE_HARNESS_VERSION.into(),
+        report_schema_version: REPORT_SCHEMA_VERSION,
+        seed_recipe_id: SQL_SEED_RECIPE_ID.into(),
+        seed_recipe_digest: sql_seed_recipe_digest(value_bytes, padding_mib)?,
+        profile: "sql".into(),
+        workload: "follower-apply-write".into(),
+        padding_mib,
+        value_bytes,
+        keyspace: KEYSPACE,
+        receipt_count,
+        snapshot_bytes: u64::try_from(snapshot.db_bytes().len())
+            .map_err(|_| "SQL seed snapshot size exceeds u64".to_string())?,
+        snapshot_digest: LogHash::digest(&[snapshot.db_bytes()]).to_hex(),
+        configuration_state,
+        snapshot_manifest: snapshot.manifest().clone(),
+    })
+}
+
+fn encode_sql_seed_cache_parts(
+    header: &SqlSeedCacheHeader,
+    snapshot_bytes: &[u8],
+) -> Result<(Vec<u8>, [u8; 4], String, u64), String> {
+    let header_bytes = serde_json::to_vec(header).map_err(|error| error.to_string())?;
+    if header_bytes.len() > MAX_SQL_SEED_CACHE_HEADER_BYTES {
+        return Err("SQL seed cache header exceeds its bounded size".into());
+    }
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| "SQL seed cache header length exceeds u32".to_string())?
+        .to_be_bytes();
+    let total_bytes = SQL_SEED_CACHE_MAGIC
+        .len()
+        .checked_add(header_len.len())
+        .and_then(|bytes| bytes.checked_add(header_bytes.len()))
+        .and_then(|bytes| bytes.checked_add(snapshot_bytes.len()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| "SQL seed cache size overflows".to_string())?;
+    let digest = LogHash::digest(&[
+        SQL_SEED_CACHE_MAGIC,
+        &header_len,
+        &header_bytes,
+        snapshot_bytes,
+    ])
+    .to_hex();
+    Ok((header_bytes, header_len, digest, total_bytes))
+}
+
+fn sql_seed_cache_max_snapshot_bytes(
+    padding_mib: usize,
+    value_bytes: usize,
+) -> Result<u64, String> {
+    let padding_bytes = u64::try_from(
+        padding_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "SQL seed cache padding size overflows".to_string())?,
+    )
+    .map_err(|_| "SQL seed cache padding size exceeds u64".to_string())?;
+    let hot_value_bytes = KEYSPACE
+        .checked_mul(
+            u64::try_from(value_bytes)
+                .map_err(|_| "SQL seed cache value size exceeds u64".to_string())?,
+        )
+        .ok_or_else(|| "SQL seed cache hot value size overflows".to_string())?;
+    padding_bytes
+        .checked_add(hot_value_bytes)
+        .and_then(|bytes| bytes.checked_add(SQL_SEED_CACHE_FIXED_OVERHEAD_BYTES))
+        .ok_or_else(|| "SQL seed cache snapshot bound overflows".to_string())
+}
+
+fn sql_seed_cache_max_file_bytes(padding_mib: usize, value_bytes: usize) -> Result<u64, String> {
+    sql_seed_cache_max_snapshot_bytes(padding_mib, value_bytes)?
+        .checked_add(SQL_SEED_CACHE_MAGIC.len() as u64)
+        .and_then(|bytes| bytes.checked_add(4))
+        .and_then(|bytes| bytes.checked_add(MAX_SQL_SEED_CACHE_HEADER_BYTES as u64))
+        .ok_or_else(|| "SQL seed cache file bound overflows".to_string())
+}
+
+fn publish_sql_seed_cache(
+    path: &Path,
+    snapshot: &Snapshot,
+    padding_mib: usize,
+    value_bytes: usize,
+    receipt_count: u64,
+) -> Result<SqlSeedCacheProvenance, String> {
+    let header = sql_seed_cache_header(snapshot, padding_mib, value_bytes, receipt_count)?;
+    let (header_bytes, header_len, digest, bytes) =
+        encode_sql_seed_cache_parts(&header, snapshot.db_bytes())?;
+    if bytes > sql_seed_cache_max_file_bytes(padding_mib, value_bytes)? {
+        return Err("generated SQL seed cache exceeds its configuration-derived size bound".into());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create SQL seed cache directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "failed to canonicalize SQL seed cache directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "SQL seed cache requires a file name".to_string())?;
+    let canonical_path = canonical_parent.join(file_name);
+    let mut temporary = tempfile::NamedTempFile::new_in(&canonical_parent).map_err(|error| {
+        format!(
+            "failed to create SQL seed cache temporary file in {}: {error}",
+            canonical_parent.display()
+        )
+    })?;
+    temporary
+        .write_all(SQL_SEED_CACHE_MAGIC)
+        .and_then(|_| temporary.write_all(&header_len))
+        .and_then(|_| temporary.write_all(&header_bytes))
+        .and_then(|_| temporary.write_all(snapshot.db_bytes()))
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("failed to write SQL seed cache: {error}"))?;
+    match temporary.persist_noclobber(&canonical_path) {
+        Ok(file) => {
+            file.sync_all()
+                .map_err(|error| format!("failed to sync SQL seed cache: {error}"))?;
+            sync_cache_parent(&canonical_parent)?;
+            Ok(SqlSeedCacheProvenance {
+                disposition: "created",
+                path: canonical_path.display().to_string(),
+                digest,
+                bytes,
+                snapshot_digest: header.snapshot_digest,
+            })
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let loaded =
+                load_sql_seed_cache(&canonical_path, padding_mib, value_bytes, receipt_count)?;
+            if loaded.provenance.digest != digest
+                || loaded.provenance.snapshot_digest != header.snapshot_digest
+                || loaded.provenance.bytes != bytes
+            {
+                return Err(
+                    "concurrent SQL seed cache publication produced different exact bytes".into(),
+                );
+            }
+            Ok(loaded.provenance)
+        }
+        Err(error) => Err(format!(
+            "failed to publish SQL seed cache {}: {}",
+            canonical_path.display(),
+            error.error
+        )),
+    }
+}
+
+fn load_sql_seed_cache(
+    path: &Path,
+    padding_mib: usize,
+    value_bytes: usize,
+    receipt_count: u64,
+) -> Result<LoadedSqlSeedCache, String> {
+    let expected_recipe_digest = sql_seed_recipe_digest(value_bytes, padding_mib)?;
+    let expected_configuration = ConfigurationState::active(1, LogHash::ZERO);
+    let maximum_file_bytes = sql_seed_cache_max_file_bytes(padding_mib, value_bytes)?;
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect SQL seed cache {}: {error}",
+            path.display()
+        )
+    })?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err("SQL seed cache must be a regular non-symlink file".into());
+    }
+    if before.len() > maximum_file_bytes {
+        return Err(format!(
+            "SQL seed cache is {} bytes; configuration-derived maximum is {maximum_file_bytes}",
+            before.len()
+        ));
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("failed to open SQL seed cache {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened SQL seed cache: {error}"))?;
+    if !same_opened_file(&before, &opened) {
+        return Err("SQL seed cache changed while it was being opened".into());
+    }
+
+    let minimum = SQL_SEED_CACHE_MAGIC.len() + 4;
+    if opened.len() < minimum as u64 {
+        return Err("SQL seed cache header is truncated".into());
+    }
+    let mut magic = vec![0; SQL_SEED_CACHE_MAGIC.len()];
+    file.read_exact(&mut magic)
+        .map_err(|error| format!("failed to read SQL seed cache magic: {error}"))?;
+    if magic != SQL_SEED_CACHE_MAGIC {
+        return Err("SQL seed cache magic is invalid".into());
+    }
+    let mut header_len_bytes = [0; 4];
+    file.read_exact(&mut header_len_bytes)
+        .map_err(|error| format!("failed to read SQL seed cache header length: {error}"))?;
+    let header_len = u32::from_be_bytes(header_len_bytes) as usize;
+    if header_len == 0 || header_len > MAX_SQL_SEED_CACHE_HEADER_BYTES {
+        return Err("SQL seed cache header length is invalid".into());
+    }
+    let header_end = minimum
+        .checked_add(header_len)
+        .ok_or_else(|| "SQL seed cache header size overflows".to_string())?;
+    if opened.len() < header_end as u64 {
+        return Err("SQL seed cache header is truncated".into());
+    }
+    let mut header_bytes = vec![0; header_len];
+    file.read_exact(&mut header_bytes)
+        .map_err(|error| format!("failed to read SQL seed cache header: {error}"))?;
+    let header: SqlSeedCacheHeader =
+        serde_json::from_slice(&header_bytes).map_err(|error| error.to_string())?;
+    if serde_json::to_vec(&header).map_err(|error| error.to_string())? != header_bytes {
+        return Err("SQL seed cache header is not canonically encoded".into());
+    }
+    if header.format_version != SQL_SEED_CACHE_FORMAT_VERSION
+        || header.harness_version != SQL_SEED_CACHE_HARNESS_VERSION
+        || header.report_schema_version != REPORT_SCHEMA_VERSION
+        || header.seed_recipe_id != SQL_SEED_RECIPE_ID
+        || header.seed_recipe_digest != expected_recipe_digest
+        || header.profile != "sql"
+        || header.workload != "follower-apply-write"
+        || header.padding_mib != padding_mib
+        || header.value_bytes != value_bytes
+        || header.keyspace != KEYSPACE
+        || header.receipt_count != receipt_count
+    {
+        return Err("SQL seed cache metadata does not match this benchmark configuration".into());
+    }
+    let maximum_snapshot_bytes = sql_seed_cache_max_snapshot_bytes(padding_mib, value_bytes)?;
+    if header.snapshot_bytes > maximum_snapshot_bytes {
+        return Err("SQL seed cache snapshot exceeds its configuration-derived size bound".into());
+    }
+    let exact_file_bytes = (header_end as u64)
+        .checked_add(header.snapshot_bytes)
+        .ok_or_else(|| "SQL seed cache declared size overflows".to_string())?;
+    if exact_file_bytes != opened.len() {
+        return Err("SQL seed cache length does not match its canonical header".into());
+    }
+    if header.configuration_state != expected_configuration
+        || header.snapshot_manifest.configuration_state() != &header.configuration_state
+        || header.snapshot_manifest.index() != receipt_count
+        || header.snapshot_manifest.epoch() != 1
+        || header.snapshot_manifest.config_id() != 1
+        || header.snapshot_manifest.schema_version() != 1
+        || header.snapshot_manifest.created_by() != "node-1"
+    {
+        return Err("SQL seed cache snapshot identity or digest is invalid".into());
+    }
+    let expected_cluster = effective_cluster_id(ExecutionProfile::Sqlite, "profile-bench")
+        .map_err(|error| error.to_string())?;
+    if header.snapshot_manifest.cluster_id() != expected_cluster {
+        return Err("SQL seed cache snapshot cluster identity is invalid".into());
+    }
+    let snapshot_len = usize::try_from(header.snapshot_bytes)
+        .map_err(|_| "SQL seed cache snapshot size exceeds usize".to_string())?;
+    let mut snapshot_bytes = Vec::new();
+    snapshot_bytes
+        .try_reserve_exact(snapshot_len)
+        .map_err(|error| format!("failed to reserve SQL seed cache snapshot: {error}"))?;
+    snapshot_bytes.resize(snapshot_len, 0);
+    file.read_exact(&mut snapshot_bytes)
+        .map_err(|error| format!("failed to read SQL seed cache snapshot: {error}"))?;
+    if header.snapshot_digest != LogHash::digest(&[&snapshot_bytes]).to_hex() {
+        return Err("SQL seed cache snapshot digest is invalid".into());
+    }
+    let (canonical_header, canonical_len, digest, bytes) =
+        encode_sql_seed_cache_parts(&header, &snapshot_bytes)?;
+    if canonical_header != header_bytes
+        || canonical_len != header_len_bytes
+        || bytes != opened.len()
+    {
+        return Err("SQL seed cache canonical framing is invalid".into());
+    }
+    let opened_after = file
+        .metadata()
+        .map_err(|error| format!("failed to reseal opened SQL seed cache: {error}"))?;
+    if !same_opened_file(&opened, &opened_after) {
+        return Err("SQL seed cache was rewritten while it was being read".into());
+    }
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to revalidate SQL seed cache path: {error}"))?;
+    if !after.file_type().is_file()
+        || after.file_type().is_symlink()
+        || !same_opened_file(&opened_after, &after)
+    {
+        return Err("SQL seed cache path changed while it was being read".into());
+    }
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("failed to canonicalize SQL seed cache path: {error}"))?;
+    let canonical_metadata = fs::symlink_metadata(&canonical_path)
+        .map_err(|error| format!("failed to inspect canonical SQL seed cache path: {error}"))?;
+    if !same_opened_file(&opened_after, &canonical_metadata) {
+        return Err("canonical SQL seed cache path does not identify the opened file".into());
+    }
+    Ok(LoadedSqlSeedCache {
+        snapshot: Snapshot::new(header.snapshot_manifest, snapshot_bytes),
+        provenance: SqlSeedCacheProvenance {
+            disposition: "hit",
+            path: canonical_path.display().to_string(),
+            digest,
+            bytes,
+            snapshot_digest: header.snapshot_digest,
+        },
+    })
+}
+
+#[cfg(unix)]
+fn same_opened_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_opened_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file() && right.file_type().is_file() && left.len() == right.len()
+}
+
+#[cfg(unix)]
+fn sync_cache_parent(parent: &Path) -> Result<(), String> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync SQL seed cache directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_cache_parent(_parent: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn control_sidecar_path(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(".control");
@@ -2678,10 +3350,15 @@ fn verify_snapshot_cleared_embedded_qlog(state: &SqliteStateMachine) -> Result<(
 }
 
 fn measure_follower(
-    mut target: SqlFollowerTarget,
+    root: &Path,
     config: &Config,
 ) -> Result<(Samples, Duration, FollowerSeedState), String> {
-    let seed_state = target.seed(config.value_bytes, config.sql_padding_mib)?;
+    let (mut target, seed_state) = SqlFollowerTarget::seed(
+        root,
+        config.value_bytes,
+        config.sql_padding_mib,
+        config.sql_seed_cache.as_deref(),
+    )?;
     if config.warmup > 0 {
         let (warmup, _) = run_phase_follower(&mut target, config, config.warmup, "warmup");
         if warmup.errors > 0 {
@@ -2968,6 +3645,15 @@ fn command_output(program: &str, args: &[&str]) -> String {
 mod tests {
     use super::*;
 
+    fn write_test_seed_cache(path: &Path, header: Vec<u8>, snapshot: &[u8]) {
+        let header_len = u32::try_from(header.len()).unwrap().to_be_bytes();
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(SQL_SEED_CACHE_MAGIC).unwrap();
+        file.write_all(&header_len).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(snapshot).unwrap();
+    }
+
     #[test]
     fn config_parses_required_and_optional_values() {
         let config = Config::parse(
@@ -3002,6 +3688,7 @@ mod tests {
                 read_consistency: BenchmarkReadConsistency::Local,
                 sql_write_profile: false,
                 sql_padding_mib: 0,
+                sql_seed_cache: None,
             }
         );
     }
@@ -3376,11 +4063,285 @@ mod tests {
     }
 
     #[test]
+    fn follower_seed_cache_is_explicit_and_follower_apply_only() {
+        let cache = tempfile::tempdir().unwrap().path().join("seed.cache");
+        let cache_text = cache.to_str().unwrap();
+        let config = Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "follower-apply",
+                "--sql-seed-cache",
+                cache_text,
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(config.sql_seed_cache, Some(cache.clone()));
+
+        assert!(Config::parse(
+            [
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "qwal",
+                "--sql-seed-cache",
+                cache_text,
+            ]
+            .map(str::to_owned),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn follower_seed_cache_miss_then_hit_restores_the_same_seed_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache/sql-padding-0.cache");
+        let first_root = tempfile::tempdir().unwrap();
+        let (_, created) = SqlFollowerTarget::seed(first_root.path(), 64, 0, Some(&cache)).unwrap();
+
+        let second_root = tempfile::tempdir().unwrap();
+        let (_, hit) = SqlFollowerTarget::seed(second_root.path(), 64, 0, Some(&cache)).unwrap();
+
+        let created_cache = created.seed_cache.as_ref().unwrap();
+        let hit_cache = hit.seed_cache.as_ref().unwrap();
+        assert_eq!(created_cache.disposition, "created");
+        assert_eq!(hit_cache.disposition, "hit");
+        assert_eq!(created_cache.path, hit_cache.path);
+        assert_eq!(created_cache.digest, hit_cache.digest);
+        assert_eq!(created_cache.snapshot_digest, hit_cache.snapshot_digest);
+        assert_eq!(created_cache.bytes, hit_cache.bytes);
+        assert_eq!(created.receipt_count, hit.receipt_count);
+        assert_eq!(created.leader_database_bytes, hit.leader_database_bytes);
+        assert_eq!(created.leader_control_bytes, hit.leader_control_bytes);
+        assert!(first_root.path().join("raw/leader-seed.db").is_file());
+        assert!(!first_root.path().join("raw/follower-seed.db").exists());
+        assert!(!second_root.path().join("raw/leader-seed.db").exists());
+        assert!(!second_root.path().join("raw/follower-seed.db").exists());
+    }
+
+    #[test]
+    fn follower_seed_cache_rejects_tampering_and_wrong_seed_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("seed.cache");
+        let seed_root = tempfile::tempdir().unwrap();
+        SqlFollowerTarget::seed(seed_root.path(), 64, 0, Some(&cache)).unwrap();
+
+        let wrong_padding_root = tempfile::tempdir().unwrap();
+        assert!(SqlFollowerTarget::seed(wrong_padding_root.path(), 64, 1, Some(&cache)).is_err());
+        let wrong_value_root = tempfile::tempdir().unwrap();
+        assert!(SqlFollowerTarget::seed(wrong_value_root.path(), 65, 0, Some(&cache)).is_err());
+
+        let mut bytes = std::fs::read(&cache).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0xff;
+        std::fs::write(&cache, bytes).unwrap();
+        let tampered_root = tempfile::tempdir().unwrap();
+        assert!(SqlFollowerTarget::seed(tampered_root.path(), 64, 0, Some(&cache)).is_err());
+    }
+
+    #[test]
+    fn invalid_generated_seed_is_validated_before_cache_publication() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_cache = source_root.path().join("source.seed");
+        SqlFollowerTarget::seed(source_root.path(), 64, 0, Some(&source_cache)).unwrap();
+        let loaded = load_sql_seed_cache(
+            &source_cache,
+            0,
+            64,
+            expected_seed_receipt_count(0).unwrap(),
+        )
+        .unwrap();
+        let mut invalid_bytes = loaded.snapshot.db_bytes().to_vec();
+        invalid_bytes[0] ^= 0xff;
+        let invalid = Snapshot::new(loaded.snapshot.manifest().clone(), invalid_bytes);
+        let restore_root = tempfile::tempdir().unwrap();
+        let cache = restore_root.path().join("must-not-exist.seed");
+
+        assert!(SqlFollowerTarget::restore_validated_seed(
+            restore_root.path(),
+            &invalid,
+            64,
+            0,
+            expected_seed_receipt_count(0).unwrap(),
+            Some(&cache),
+        )
+        .is_err());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn follower_seed_cache_rejects_unsafe_files_before_snapshot_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt_count = expected_seed_receipt_count(0).unwrap();
+
+        let huge = root.path().join("huge.seed");
+        let huge_file = fs::File::create(&huge).unwrap();
+        huge_file
+            .set_len(sql_seed_cache_max_file_bytes(0, 64).unwrap() + 1)
+            .unwrap();
+        drop(huge_file);
+        assert!(load_sql_seed_cache(&huge, 0, 64, receipt_count).is_err());
+
+        let directory = root.path().join("directory.seed");
+        fs::create_dir(&directory).unwrap();
+        assert!(load_sql_seed_cache(&directory, 0, 64, receipt_count).is_err());
+
+        let truncated = root.path().join("truncated.seed");
+        fs::write(&truncated, SQL_SEED_CACHE_MAGIC).unwrap();
+        assert!(load_sql_seed_cache(&truncated, 0, 64, receipt_count).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = root.path().join("target.seed");
+            fs::write(&target, b"not a cache").unwrap();
+            let link = root.path().join("link.seed");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(load_sql_seed_cache(&link, 0, 64, receipt_count).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_file_seal_rejects_same_inode_same_length_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("same-length.seed");
+        fs::write(&path, b"before").unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        let before = opened.metadata().unwrap();
+
+        fs::write(&path, b"after!").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap();
+        let after = opened.metadata().unwrap();
+
+        assert_eq!(before.len(), after.len());
+        assert!(!same_opened_file(&before, &after));
+    }
+
+    #[test]
+    fn follower_seed_cache_rejects_noncanonical_and_wrong_format_headers() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("valid.seed");
+        let seed_root = tempfile::tempdir().unwrap();
+        SqlFollowerTarget::seed(seed_root.path(), 64, 0, Some(&cache)).unwrap();
+        let encoded = fs::read(&cache).unwrap();
+        let length_offset = SQL_SEED_CACHE_MAGIC.len();
+        let header_len = u32::from_be_bytes(
+            encoded[length_offset..length_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let header_start = length_offset + 4;
+        let header_end = header_start + header_len;
+        let header: SqlSeedCacheHeader =
+            serde_json::from_slice(&encoded[header_start..header_end]).unwrap();
+
+        let noncanonical = root.path().join("noncanonical.seed");
+        write_test_seed_cache(
+            &noncanonical,
+            [serde_json::to_vec(&header).unwrap(), b"\n".to_vec()].concat(),
+            &encoded[header_end..],
+        );
+        assert!(load_sql_seed_cache(
+            &noncanonical,
+            0,
+            64,
+            expected_seed_receipt_count(0).unwrap(),
+        )
+        .is_err());
+
+        let mut wrong_format = header.clone();
+        wrong_format.format_version += 1;
+        let mut wrong_recipe = header.clone();
+        wrong_recipe.seed_recipe_id.push_str("-wrong");
+        let mut wrong_configuration = header;
+        wrong_configuration.configuration_state = ConfigurationState::active(2, LogHash::ZERO);
+        for (name, wrong_header) in [
+            ("wrong-format.seed", wrong_format),
+            ("wrong-recipe.seed", wrong_recipe),
+            ("wrong-configuration.seed", wrong_configuration),
+        ] {
+            let path = root.path().join(name);
+            write_test_seed_cache(
+                &path,
+                serde_json::to_vec(&wrong_header).unwrap(),
+                &encoded[header_end..],
+            );
+            assert!(
+                load_sql_seed_cache(&path, 0, 64, expected_seed_receipt_count(0).unwrap(),)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn follower_seed_cache_never_clobbers_an_existing_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("occupied.seed");
+        let original = b"keep this exact file";
+        fs::write(&cache, original).unwrap();
+        let seed_root = tempfile::tempdir().unwrap();
+
+        assert!(SqlFollowerTarget::seed(seed_root.path(), 64, 0, Some(&cache)).is_err());
+        assert_eq!(fs::read(cache).unwrap(), original);
+    }
+
+    #[test]
+    fn padding_rows_require_exact_ids_lengths_and_zero_content() {
+        let chunk_count = 1024 * 1024 / SQL_PADDING_CHUNK_BYTES;
+        let valid = (0..chunk_count)
+            .map(|index| {
+                vec![
+                    SqlValue::Integer(index as i64),
+                    SqlValue::Integer(SQL_PADDING_CHUNK_BYTES as i64),
+                    SqlValue::Integer(1),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_padding_rows(&valid, 1).is_ok());
+
+        for invalid in [
+            {
+                let mut rows = valid.clone();
+                rows[2][0] = SqlValue::Integer(3);
+                rows
+            },
+            {
+                let mut rows = valid.clone();
+                rows[2][1] = SqlValue::Integer((SQL_PADDING_CHUNK_BYTES - 1) as i64);
+                rows
+            },
+            {
+                let mut rows = valid.clone();
+                rows[2][2] = SqlValue::Integer(0);
+                rows
+            },
+            valid[..valid.len() - 1].to_vec(),
+        ] {
+            assert!(validate_padding_rows(&invalid, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn seed_recipe_digest_binds_order_padding_and_values() {
+        let digest = sql_seed_recipe_digest(64, 0).unwrap();
+        assert_eq!(digest, sql_seed_recipe_digest(64, 0).unwrap());
+        assert_ne!(digest, sql_seed_recipe_digest(65, 0).unwrap());
+        assert_ne!(digest, sql_seed_recipe_digest(64, 1).unwrap());
+    }
+
+    #[test]
     fn follower_apply_seed_restores_identical_compacted_states_with_exact_padding() {
         let root = tempfile::tempdir().unwrap();
-        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
-
-        let seed = target.seed(64, 1).unwrap();
+        let (target, seed) = SqlFollowerTarget::seed(root.path(), 64, 1, None).unwrap();
 
         assert_eq!(seed.receipt_count, KEYSPACE + 9);
         assert_eq!(seed.leader_embedded_qlog_entries, 0);
@@ -3430,8 +4391,7 @@ mod tests {
     #[test]
     fn follower_apply_replays_the_prebuilt_leader_entry_and_reports_apply_latency() {
         let root = tempfile::tempdir().unwrap();
-        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
-        target.seed(64, 0).unwrap();
+        let (mut target, _) = SqlFollowerTarget::seed(root.path(), 64, 0, None).unwrap();
 
         let outcome = target
             .write_sql_qwal_batch(7, 1, "follower-test", 64)
@@ -3466,8 +4426,7 @@ mod tests {
     #[test]
     fn follower_hot_row_effect_excludes_untouched_padding_root_page() {
         let root = tempfile::tempdir().unwrap();
-        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
-        target.seed(64, 1).unwrap();
+        let (mut target, _) = SqlFollowerTarget::seed(root.path(), 64, 1, None).unwrap();
         let padding_root = sql_scalar_integer(
             target.leader.sql_state().unwrap(),
             "SELECT rootpage FROM sqlite_schema WHERE name = 'bench_padding'",
@@ -3727,7 +4686,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_sql_profile_reports_validated_phase_histograms() {
+    fn schema_v6_sql_profile_reports_validated_phase_histograms() {
         let mut samples = SqlWritePhaseSamples::default();
         samples
             .record_snapshot(
@@ -3741,7 +4700,7 @@ mod tests {
             .unwrap();
 
         let metrics = samples.metrics().unwrap();
-        assert_eq!(REPORT_SCHEMA_VERSION, 5);
+        assert_eq!(REPORT_SCHEMA_VERSION, 6);
         assert_eq!(metrics.sample_count, 1);
         assert_eq!(metrics.member_count, 4);
         assert_eq!(metrics.dropped_samples, 0);
