@@ -5406,6 +5406,7 @@ impl Materializer {
         }
     }
 
+    #[cfg_attr(not(feature = "sql"), allow(unused_variables))]
     fn open(
         config: &NodeConfig,
         configuration_state: &ConfigurationState,
@@ -7669,6 +7670,7 @@ impl NodeRuntime {
     }
 
     #[cfg(feature = "kv")]
+    #[allow(clippy::infallible_destructuring_match)]
     fn check_kv_members_bulk(
         &self,
         members: &[RuntimeBatchMember],
@@ -7678,17 +7680,36 @@ impl NodeRuntime {
             return Ok(Vec::new());
         }
         let materializer = self.lock_materializer()?;
-        let Materializer::Kv(kv) = &*materializer else {
-            return Err(NodeError::ExecutionProfileMismatch {
-                expected: ExecutionProfile::Kv,
-                actual: materializer.profile(),
-            });
+        let kv = match &*materializer {
+            Materializer::Kv(kv) => kv,
+            #[cfg(feature = "sql")]
+            Materializer::Sql(_) => {
+                return Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Kv,
+                    actual: ExecutionProfile::Sqlite,
+                });
+            }
+            #[cfg(feature = "graph")]
+            Materializer::Graph(_) => {
+                return Err(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Kv,
+                    actual: ExecutionProfile::Graph,
+                });
+            }
         };
         let requests = indices
             .iter()
             .map(|index| {
-                let QueuedOperation::Kv(command) = &members[*index].operation else {
-                    unreachable!("KV receipt lookup contains only KV members");
+                let command = match &members[*index].operation {
+                    QueuedOperation::Kv(command) => command,
+                    #[cfg(feature = "sql")]
+                    QueuedOperation::KeyValue { .. } | QueuedOperation::Sql(_) => {
+                        unreachable!("KV receipt lookup contains only KV members")
+                    }
+                    #[cfg(feature = "graph")]
+                    QueuedOperation::Graph(_) => {
+                        unreachable!("KV receipt lookup contains only KV members")
+                    }
                 };
                 (command.request_id(), members[*index].payload.as_slice())
             })
@@ -8417,6 +8438,7 @@ impl NodeRuntime {
         coordinator.checkpoint_compact(self).await
     }
 
+    #[cfg_attr(not(any(feature = "sql", feature = "kv")), allow(unused_variables))]
     pub(crate) fn compact_embedded_log_before(
         &self,
         anchor_index: LogIndex,
@@ -8755,6 +8777,7 @@ impl NodeRuntime {
         Ok(())
     }
 
+    #[cfg(feature = "sql")]
     fn validate_read_barrier_descendant_locked(&self, anchor: LogAnchor) -> Result<(), NodeError> {
         let (applied_index, applied_hash) = self.ensure_materialized_tip()?;
         self.validate_read_barrier_descendant_from_tip(
@@ -12030,7 +12053,7 @@ fn reconcile_local_storage(
         }
     }
     if applied_index > log_last_index {
-        let entries = match materializer {
+        let entries: Option<Vec<LogEntry>> = match materializer {
             #[cfg(feature = "sql")]
             Materializer::Sql(sql) => Some(
                 sql.embedded_log_entries(log_last_index.saturating_add(1), applied_index)

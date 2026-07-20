@@ -4272,6 +4272,7 @@ async fn prepare_remote_startup(
     }
 }
 
+#[cfg_attr(not(feature = "sql"), allow(unused_variables))]
 fn validate_local_materializer(
     data_dir: &Path,
     execution_profile: ExecutionProfile,
@@ -7551,6 +7552,7 @@ mod tests {
         assert_eq!(restored.suffix(), &committed[2..]);
     }
 
+    #[cfg(feature = "sql")]
     #[tokio::test]
     async fn startup_preparation_enforces_bootstrap_rejoin_and_disaster_guards() {
         let root = tempfile::tempdir().unwrap();
