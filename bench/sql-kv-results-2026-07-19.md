@@ -258,3 +258,46 @@ the SQL/KV structural-change binary
 Every run completed all logical writes with zero errors. The unchanged qlog
 density isolates the removed sync. The batch-256 pair had a common low third
 run on the loaded host, so the median is diagnostic rather than release-grade.
+
+## Recorder-authoritative SQL follow-up — 2026-07-20
+
+Generation-5 SQL makes the 2/3 Recorder WAL the authoritative durable redo
+source. SQLite, control, and file qlog are non-durable local views; ACK waits
+for local apply visibility but not a second storage flush. Startup quarantines
+an invalid or checkpoint-behind SQL pair, restores the verified checkpoint,
+and recovers the Recorder tail before readiness. QCMD files have no deletion
+path. Mixed empty/occupied Recorder evidence that cannot form a quorum
+certificate is now unavailable rather than being classified as an empty slot.
+
+The local path also removes the common-path canonical checkpoint, staging and
+rename syncs, full integrity scan, promotion-time target rehash, and the
+pre-install control transaction. A complete QWAL VFS recording narrows the
+base comparison to candidate pages while retaining the target-wide digest;
+large bases use clonefile/FICLONE with copy fallback. Full target hashing and
+the staging checkpoint remain and are the next incremental-capture boundary.
+
+Raw JSON is under the ignored directory
+`target/rhiza-bench/quorum-authoritative-local-apply/`. The final SQL batch
+matrix binary was
+`f44d1e532c74fffb918d95400adb3322ef94aee2b9e9fb8463579cb6d633f260`.
+All cells used one in-process node with three file-backed Recorder voters and
+completed with zero errors.
+
+| Profile/workload | c1 median ops/s | c4 median ops/s | Qlog entries |
+| --- | ---: | ---: | ---: |
+| SQL b1 | — | 300.93 | 501 |
+| SQL b256 | 11,446.44 | 22,512.06 | c1 50; c4 13–14 |
+| KV b64 | 4,866.71 | 15,316.06 | c1 200; c4 50–51 |
+
+The retained pre-change SQL b1/c4 median was 175.34 ops/s, so the current
+300.93 diagnostic median is +71.63% at unchanged group density. Phase p50 fell
+to approximately 2.87ms for QWAL preparation and 1.86ms for local apply.
+
+The physical strict floor is separately visible: SQL QWAL-only b1/c1 measured
+279.58–285.19 ops/s, while three-Recorder consensus-only b1/c1 measured
+34.36–34.85 ops/s on this macOS host. Consequently c4 single-request traffic
+cannot reach Hiqlite's 5,760 INSERT/s while retaining a quorum durable flush;
+there are only four operations available to share that barrier. Logical b256
+does exceed 5,760 by 1.99x at c1 and 3.91x at c4 because 256–1,024 operations
+share each physical group. These are dirty-worktree diagnostic results, not
+release claims.

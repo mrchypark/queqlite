@@ -234,10 +234,12 @@ domain v3, so this is a clean-install breaking boundary. One `Immediate` redb
 transaction durably stores the full qlog entry with the KV state, receipts, and
 applied tip. The file qlog is a buffered serving mirror and can be rehydrated
 from redb, removing its separate hot-path sync without weakening strict ACK.
-SQL uses the same serving-mirror pattern: its generation-4 FULL-synchronous
-control-sidecar transaction stores the full qlog entry with the durable pending
-apply intent. Both profiles remove embedded prefixes only after a verified
-checkpoint and durable file-qlog compaction anchor.
+SQL uses a Recorder-authoritative model: the 2/3 Recorder WAL sync is the only
+durability boundary on the common path. SQLite, the generation-5 control
+sidecar, and the file qlog are non-durable local views rebuilt from a verified
+checkpoint plus Recorder tail. ACK waits for local SQLite visibility, while
+readiness remains closed until tip validation and catch-up finish. Recorder
+QCMD files currently are retained without a GC path.
 The 512 KiB replicated command ceiling still applies: an oversized flattened
 group is emitted as the largest fitting ordered prefixes. HTTP writes use their
 existing async writer batch directly and do not enter the KV queue a second

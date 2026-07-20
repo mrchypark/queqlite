@@ -263,18 +263,21 @@ that winner, rechecks stored receipts, and prepares the remaining requests from
 the new exact base. An effect that exceeds the 512 KiB command cap is retried
 with a halved prefix until it fits or one command alone is rejected. Receipt and
 request-ID duplicate validation uses pre-sized `HashSet`s in one pass rather
-than rescanning every preceding member. QWAL v2, the current generation-4
-control sidecar, and generation-4 `QSNP` snapshots require a clean installation:
+than rescanning every preceding member. QWAL v2, the current generation-5
+control sidecar, and generation-5 `QSNP` snapshots require a clean installation:
 older files and payloads fail closed, with no migration or rolling dual decoder.
 
-Strict SQL writes insert the complete qlog entry into the FULL-synchronous
-control-sidecar transaction that already makes the physical-apply intent
-durable. The file qlog is therefore a buffered serving/catch-up mirror and is
-rehydrated from the control sidecar after a crash. ACK still waits for Recorder
-quorum, the durable pending intent, physical SQLite apply, and the durable
-control commit; only the redundant file-qlog sync is removed. Verified
-checkpoint compaction deletes the corresponding embedded prefix only after the
-serving qlog has durably installed its compaction anchor.
+Strict SQL durability is owned by the Recorder quorum: ACK waits until at least
+2/3 Recorder WALs contain the complete QWAL and receipts behind their
+platform-safe file sync. SQLite, its generation-5 control sidecar, and the file
+qlog are non-durable, rebuildable local views. ACK still waits for SQLite apply
+so local read-after-write is visible, but it does not wait for another
+SQLite/control flush. Startup validates the SQLite/control pair and its tip
+before readiness; damage or a tip behind the verified checkpoint quarantines
+the complete local node directory, restores the checkpoint, and catches up the
+exact Recorder tail. A quorum that cannot certify a mixed or missing tail fails
+closed. QCMD segments currently have no deletion path, so Recorder command GC
+cannot outrun verified checkpoint coverage.
 
 Read-only SQL runs only against the selected local materialization, so it may
 use nondeterministic and runtime-introspection functions such as `random()`,

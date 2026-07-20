@@ -57,7 +57,7 @@ use rhiza_quepaxa::{
     RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
-use rhiza_sql::{SqlStatement, SqlValue};
+use rhiza_sql::{SqlStatement, SqlValue, SqliteStateMachine};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[tokio::main]
@@ -4197,13 +4197,9 @@ async fn prepare_remote_startup(
                     .checkpoint_identity()
                     .map_err(|error| error.to_string())?,
             )?;
-            if tip.index() == 0 {
-                Ok(StartupPreparation::RecorderFirst)
-            } else {
-                Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
-                })
-            }
+            Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+            })
         }
         StartupMode::Rejoin => {
             let loaded = archive
@@ -4216,6 +4212,39 @@ async fn prepare_remote_startup(
                 execution_profile,
                 loaded.manifest().identity(),
             )?;
+            let checkpoint_root = LogAnchor::new(
+                loaded.manifest().tip().index(),
+                loaded.manifest().tip().hash(),
+            );
+            if let Err(error) =
+                validate_local_materializer(data_dir, execution_profile, checkpoint_root)
+            {
+                let quarantine = quarantine_local_data_dir(data_dir)?;
+                eprintln!(
+                    "local materializer is not trustworthy ({error}); quarantined {} and restoring the verified checkpoint",
+                    quarantine.display()
+                );
+                let tip = restore_checkpoint_to_fresh_data_dir_for_node(
+                    archive.clone(),
+                    data_dir,
+                    node_id,
+                )
+                .await
+                .map_err(|restore_error| {
+                    format!(
+                        "local materializer was quarantined at {} but verified checkpoint restore failed: {restore_error}",
+                        quarantine.display()
+                    )
+                })?;
+                write_local_checkpoint_identity_marker(
+                    data_dir,
+                    execution_profile,
+                    loaded.manifest().identity(),
+                )?;
+                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+                });
+            }
             Ok(StartupPreparation::VerifyLocalCheckpoint {
                 identity: loaded.manifest().identity().clone(),
                 root: LogAnchor::new(
@@ -4241,6 +4270,75 @@ async fn prepare_remote_startup(
             Ok(StartupPreparation::RecorderFirst)
         }
     }
+}
+
+fn validate_local_materializer(
+    data_dir: &Path,
+    execution_profile: ExecutionProfile,
+    checkpoint_root: LogAnchor,
+) -> Result<(), String> {
+    match execution_profile {
+        ExecutionProfile::Sqlite => {
+            #[cfg(feature = "sql")]
+            {
+                let materializer =
+                    SqliteStateMachine::open_existing(data_dir.join("sqlite/db.sqlite"))
+                        .map_err(|error| error.to_string())?;
+                let applied_index = materializer
+                    .applied_index_value()
+                    .map_err(|error| error.to_string())?;
+                let applied_hash = materializer
+                    .applied_hash_value()
+                    .map_err(|error| error.to_string())?;
+                if applied_index < checkpoint_root.index()
+                    || (applied_index == checkpoint_root.index()
+                        && applied_hash != checkpoint_root.hash())
+                {
+                    return Err(format!(
+                        "SQL materializer tip {applied_index}/{} does not cover checkpoint root {}/{}",
+                        applied_hash.to_hex(),
+                        checkpoint_root.index(),
+                        checkpoint_root.hash().to_hex()
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(feature = "sql"))]
+            Err("sql execution profile is not compiled in".into())
+        }
+        ExecutionProfile::Graph | ExecutionProfile::Kv => Ok(()),
+    }
+}
+
+fn quarantine_local_data_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    let parent = data_dir
+        .parent()
+        .ok_or_else(|| "local data directory has no parent for quarantine".to_string())?;
+    let name = data_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "local data directory has no safe quarantine name".to_string())?;
+    for _ in 0..128 {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = parent.join(format!(
+            ".{name}.quarantine-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::rename(data_dir, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to quarantine local data directory {}: {error}",
+                    data_dir.display()
+                ))
+            }
+        }
+    }
+    Err("could not allocate a local data quarantine path".into())
 }
 
 fn marker_from_identity(
@@ -7494,8 +7592,40 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RecorderFirst
+            StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: LogAnchor::new(0, LogHash::ZERO)
+            }
         );
+        let valid_nonfresh_dir = root.path().join("valid-nonfresh");
+        write_local_checkpoint_identity_marker(
+            &valid_nonfresh_dir,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+        )
+        .unwrap();
+        drop(
+            SqliteStateMachine::open(
+                valid_nonfresh_dir.join("sqlite/db.sqlite"),
+                "rhiza:sql:cluster-a",
+                "node-1",
+                1,
+                1,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &valid_nonfresh_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::VerifyLocalCheckpoint { root, .. }
+                if root == LogAnchor::new(0, LogHash::ZERO)
+        ));
         archive.publish_committed(&entries(2)).await.unwrap();
         let fresh_bootstrap_dir = root.path().join("fresh-bootstrap-nonempty");
         assert!(prepare_remote_startup(
@@ -7528,7 +7658,16 @@ mod tests {
         assert!(fresh_rejoin_dir
             .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
             .is_file());
-        assert!(matches!(
+        let state = SqliteStateMachine::open(
+            fresh_rejoin_dir.join("sqlite/db.sqlite"),
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap();
+        drop(state);
+        assert_eq!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
                 &archive,
@@ -7536,12 +7675,37 @@ mod tests {
                 "node-1",
                 ExecutionProfile::Sqlite,
             )
-                .await
-                .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { identity, root }
-                if identity == *archive.checkpoint_identity().unwrap()
-                    && root == LogAnchor::new(2, entries(2)[1].hash)
-        ));
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
+            }
+        );
+
+        std::fs::create_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
+        std::fs::write(fresh_rejoin_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
+        assert_eq!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
+            }
+        );
+        assert!(fresh_rejoin_dir.join("consensus/log").exists());
+        assert!(std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fresh-rejoin.quarantine-")));
 
         let disaster_dir = root.path().join("disaster");
         std::fs::create_dir_all(disaster_dir.join("sqlite")).unwrap();

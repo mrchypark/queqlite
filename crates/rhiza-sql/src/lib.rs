@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -20,6 +20,8 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
+
+use crate::qwal::diff_closed_databases_from_candidates;
 
 mod control;
 mod qwal;
@@ -45,8 +47,8 @@ CREATE TABLE IF NOT EXISTS __rhiza_kv (
 const SQL_COMMAND_V2_MAGIC: &[u8] = b"QSQL\0\x02";
 const SQL_RESULT_V1_MAGIC: &[u8] = b"QRES\0\x01";
 const QWAL_SNAPSHOT_V2_MAGIC: &[u8] = b"QSNP\0\x03";
-const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v2-policy-v5-embedded-qlog";
-const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v2;wal_autocheckpoint=0;canonical_synchronous=FULL;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
+const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v2-policy-v6-quorum-authoritative";
+const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v2;wal_autocheckpoint=0;canonical_synchronous=OFF;control_synchronous=OFF;local_cache=rebuildable;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
 pub const MAX_SQL_STATEMENTS: usize = 64;
 pub const MAX_SQL_PARAMETERS: usize = 999;
 pub const MAX_SQL_TEXT_BYTES: usize = 64 * 1024;
@@ -332,6 +334,7 @@ pub struct SqliteStateMachine {
 
 struct PreparedTarget {
     artifact: NamedTempFile,
+    target_seal: Option<PreparedBaseSeal>,
     base_file: File,
     base_seal: Option<PreparedBaseSeal>,
     cluster_id: String,
@@ -754,10 +757,9 @@ impl SqliteStateMachine {
             effect.target_db_digest,
             effect.target_file_bytes,
         );
-        self.control.begin_pending_with_entry(&pending, entry)?;
-        self.install_qwal_effect(&effect, &entry.payload, &pending)?;
+        self.install_qwal_effect(&effect, &entry.payload)?;
         self.control
-            .commit_applied(&pending, &next_configuration, &receipts)?;
+            .commit_rebuildable_apply(&pending, entry, &next_configuration, &receipts)?;
         Ok(ApplyOutcome {
             progress: ApplyProgress::new(entry.index, entry.hash),
             sql_result: if results.len() == 1 {
@@ -768,17 +770,10 @@ impl SqliteStateMachine {
         })
     }
 
-    fn install_qwal_effect(
-        &self,
-        effect: &QwalEnvelopeV2,
-        effect_payload: &[u8],
-        pending: &PendingApply,
-    ) -> Result<()> {
+    fn install_qwal_effect(&self, effect: &QwalEnvelopeV2, effect_payload: &[u8]) -> Result<()> {
         #[cfg(test)]
         begin_prepared_base_reuse_audit(&self.path);
-        if let Some(prepared) =
-            self.take_matching_prepared_target(effect, effect_payload, pending)?
-        {
+        if let Some(prepared) = self.take_matching_prepared_target(effect, effect_payload)? {
             self.close_connection()?;
             match self.promote_prepared_target(&prepared, effect) {
                 Ok(true) => {
@@ -831,7 +826,6 @@ impl SqliteStateMachine {
                     .close()
                     .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
                 fs::rename(&temp_path, &self.path).map_err(io_error)?;
-                sync_parent(parent_dir(&self.path))?;
                 #[cfg(test)]
                 note_prepared_install(&self.path, PreparedInstallPath::Rebuilt);
                 Ok(())
@@ -876,13 +870,7 @@ impl SqliteStateMachine {
         &self,
         effect: &QwalEnvelopeV2,
         effect_payload: &[u8],
-        pending: &PendingApply,
     ) -> Result<Option<PreparedTarget>> {
-        if self.control.pending()?.as_ref() != Some(pending) {
-            return Err(Error::InvalidEntry(
-                "prepared target promotion requires the exact pending entry anchor".into(),
-            ));
-        }
         let identity = self.control.identity()?;
         let mut prepared = self
             .prepared_target
@@ -903,25 +891,28 @@ impl SqliteStateMachine {
         {
             return Ok(false);
         }
-        prepared.artifact.as_file().sync_all().map_err(io_error)?;
         let owned_metadata = prepared.artifact.as_file().metadata().map_err(io_error)?;
         let Some(named_metadata) = symlink_metadata_if_exists(prepared.artifact.path())? else {
             return Ok(false);
         };
-        if !owned_regular_file_still_named(&owned_metadata, &named_metadata) {
+        if !prepared_base_metadata_matches(
+            prepared.target_seal.as_ref(),
+            &owned_metadata,
+            &named_metadata,
+        ) {
             return Ok(false);
         }
-        let owned_digest = open_file_digest(prepared.artifact.as_file())?;
-        if owned_metadata.len() != effect.target_file_bytes
-            || owned_digest != effect.target_db_digest
-        {
+        if owned_metadata.len() != effect.target_file_bytes {
             return Ok(false);
         }
         let Some(rename_metadata) = symlink_metadata_if_exists(prepared.artifact.path())? else {
             return Ok(false);
         };
-        if !owned_regular_file_still_named(&owned_metadata, &rename_metadata)
-            || !prepared_base_still_sealed(&self.path, prepared)?
+        if !prepared_base_metadata_matches(
+            prepared.target_seal.as_ref(),
+            &owned_metadata,
+            &rename_metadata,
+        ) || !prepared_base_still_sealed(&self.path, prepared)?
         {
             return Ok(false);
         }
@@ -934,7 +925,6 @@ impl SqliteStateMachine {
             }
             return Err(io_error(error));
         }
-        sync_parent(parent_dir(&self.path))?;
         Ok(true)
     }
 
@@ -1229,11 +1219,8 @@ impl SqliteStateMachine {
             ));
         }
         let identity = self.control.identity()?;
-        let staging_artifact = NamedTempFile::new_in(parent_dir(&self.path)).map_err(io_error)?;
-        let staging_path = staging_artifact.path();
 
         let prepare_result = (|| {
-            self.with_connection(checkpoint_truncate)?;
             self.close_connection()?;
 
             let (base_file, actual_base_digest, base_seal) = open_hashed_prepared_base(&self.path)?;
@@ -1243,10 +1230,12 @@ impl SqliteStateMachine {
                 ));
             }
             let base_file_bytes = fs::metadata(&self.path).map_err(io_error)?.len();
-            let copied = fs::copy(&self.path, staging_path).map_err(io_error)?;
+            let staging_artifact = clone_or_copy_to_temp(&self.path)?;
+            let staging_path = staging_artifact.path();
+            let copied = fs::metadata(staging_path).map_err(io_error)?.len();
             if copied != base_file_bytes {
                 return Err(Error::Io(
-                    "speculative SQLite copy did not reproduce the closed base size".into(),
+                    "speculative SQLite clone did not reproduce the closed base size".into(),
                 ));
             }
             #[cfg(test)]
@@ -1274,7 +1263,7 @@ impl SqliteStateMachine {
                 staging
                     .close()
                     .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
-                return Ok((None, mutation.results, None, None));
+                return Ok((None, mutation.results, None, None, None));
             }
             if let Some(recording) = &recording {
                 let _ = recording.mark_commit_observed();
@@ -1283,20 +1272,29 @@ impl SqliteStateMachine {
             if let Some(recording) = &recording {
                 let _ = recording.mark_checkpoint_succeeded();
             }
-            integrity_check(&staging)?;
             staging
                 .close()
                 .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
             let recording = recording.and_then(|recording| recording.seal().ok());
-            let (pages, target_db_digest) = diff_closed_databases(&self.path, staging_path)?;
-            let recorder_covers_diff = recording
-                .as_ref()
-                .is_some_and(|recording| recording_covers_diff(recording, &pages));
+            let (pages, target_db_digest, _recorder_covers_diff) = if let Some(recording) =
+                recording
+                    .as_ref()
+                    .filter(|recording| recording.is_complete())
+            {
+                let (pages, target_db_digest) = diff_closed_databases_from_candidates(
+                    &self.path,
+                    staging_path,
+                    &recording.candidate_pages,
+                )?;
+                (pages, target_db_digest, true)
+            } else {
+                let (pages, target_db_digest) = diff_closed_databases(&self.path, staging_path)?;
+                (pages, target_db_digest, false)
+            };
             #[cfg(test)]
-            if recorder_covers_diff {
+            if _recorder_covers_diff {
                 note_recorder_audit(&self.path);
             }
-            let _ = recorder_covers_diff;
 
             let effect = QwalEnvelopeV2 {
                 cluster_id: identity.cluster_id().to_owned(),
@@ -1320,6 +1318,7 @@ impl SqliteStateMachine {
                 mutation.results,
                 Some(effect),
                 Some((base_file, base_seal)),
+                Some(staging_artifact),
             ))
         })();
 
@@ -1334,7 +1333,7 @@ impl SqliteStateMachine {
                 reopen_result?;
             }
         }
-        let (encoded, results, effect, prepared_base) = prepare_result?;
+        let (encoded, results, effect, prepared_base, staging_artifact) = prepare_result?;
         let (Some(encoded), Some(effect)) = (encoded, effect) else {
             self.discard_prepared_target()?;
             return Ok(SqlBatchPreparation {
@@ -1344,8 +1343,14 @@ impl SqliteStateMachine {
         };
         let (base_file, base_seal) =
             prepared_base.expect("a prepared QWAL effect retains its hashed canonical base");
+        let staging_artifact =
+            staging_artifact.expect("a prepared QWAL effect retains its speculative target");
+        let target_owned = staging_artifact.as_file().metadata().map_err(io_error)?;
+        let target_named = fs::symlink_metadata(staging_artifact.path()).map_err(io_error)?;
+        let target_seal = prepared_base_seal(&target_owned, &target_named)?;
         let prepared = PreparedTarget {
             artifact: staging_artifact,
+            target_seal,
             base_file,
             base_seal,
             cluster_id: effect.cluster_id.clone(),
@@ -1802,7 +1807,7 @@ fn open_connection_with_vfs(path: &Path, vfs: Option<&str>) -> Result<Connection
             "SQLite refused WAL journal mode: {journal_mode}"
         )));
     }
-    conn.pragma_update(None, "synchronous", "FULL")
+    conn.pragma_update(None, "synchronous", "OFF")
         .map_err(sqlite_error)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error)?;
@@ -1823,16 +1828,6 @@ fn checkpoint_truncate(conn: &Connection) -> Result<()> {
         return Err(Error::Sqlite("SQLite WAL checkpoint is busy".into()));
     }
     Ok(())
-}
-
-fn recording_covers_diff(recording: &SealedQwalRecording, pages: &[QwalPageV2]) -> bool {
-    recording.is_complete()
-        && pages.iter().all(|page| {
-            recording
-                .candidate_pages
-                .binary_search(&page.page_no)
-                .is_ok()
-        })
 }
 
 #[cfg(test)]
@@ -2009,6 +2004,94 @@ fn open_file_digest(file: &File) -> Result<LogHash> {
         hasher.update(&buffer[..read]);
     }
     Ok(LogHash::from_bytes(hasher.finalize().into()))
+}
+
+fn clone_or_copy_to_temp(base: &Path) -> Result<NamedTempFile> {
+    const COW_CLONE_MIN_BYTES: u64 = 256 * 1024;
+    let placeholder = NamedTempFile::new_in(parent_dir(base)).map_err(io_error)?;
+    let (placeholder_file, temp_path) = placeholder.into_parts();
+    drop(placeholder_file);
+    fs::remove_file(&temp_path).map_err(io_error)?;
+
+    let clone_result = if fs::metadata(base).map_err(io_error)?.len() >= COW_CLONE_MIN_BYTES {
+        try_platform_clone(base, &temp_path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "small SQLite bases are cheaper to copy than clone",
+        ))
+    };
+    let file = match clone_result {
+        Ok(file) => file,
+        Err(_) => {
+            if temp_path.exists() {
+                fs::remove_file(&temp_path).map_err(io_error)?;
+            }
+            fs::copy(base, &temp_path).map_err(io_error)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&temp_path)
+                .map_err(io_error)?
+        }
+    };
+    Ok(NamedTempFile::from_parts(file, temp_path))
+}
+
+#[cfg(target_os = "macos")]
+fn try_platform_clone(base: &Path, target: &Path) -> io::Result<File> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    unsafe extern "C" {
+        fn clonefile(
+            source: *const std::os::raw::c_char,
+            target: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = CString::new(base.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let target_c = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL"))?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+    if unsafe { clonefile(source.as_ptr(), target_c.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    OpenOptions::new().read(true).write(true).open(target)
+}
+
+#[cfg(target_os = "linux")]
+fn try_platform_clone(base: &Path, target: &Path) -> io::Result<File> {
+    use std::os::{fd::AsRawFd, raw::c_ulong};
+
+    unsafe extern "C" {
+        fn ioctl(fd: std::os::raw::c_int, request: c_ulong, ...) -> std::os::raw::c_int;
+    }
+
+    const FICLONE: c_ulong = 0x4004_9409;
+    let source = File::open(base)?;
+    let cloned = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    // SAFETY: FICLONE expects a valid destination fd and source fd argument.
+    if unsafe { ioctl(cloned.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+        return Ok(cloned);
+    }
+    let error = io::Error::last_os_error();
+    drop(cloned);
+    let _ = fs::remove_file(target);
+    Err(error)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_platform_clone(_base: &Path, _target: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "copy-on-write cloning is not supported on this platform",
+    ))
 }
 
 fn open_hashed_prepared_base(path: &Path) -> Result<(File, LogHash, Option<PreparedBaseSeal>)> {
@@ -2795,7 +2878,7 @@ mod query_policy_tests {
         let audit = speculative_prepare_audit(&path).expect("prepare records its test audit");
         assert_eq!(audit.copy_count, 1);
         assert_eq!(audit.synchronous, 0);
-        assert_eq!(database.connection_pragmas().unwrap(), ("wal".into(), 2));
+        assert_eq!(database.connection_pragmas().unwrap(), ("wal".into(), 0));
         assert_eq!(database.canonical_db_digest().unwrap(), base_digest);
         let prepared = database.prepared_target.lock().unwrap();
         assert!(
@@ -3063,7 +3146,7 @@ mod query_policy_tests {
     }
 
     #[test]
-    fn non_durable_staging_falls_back_to_the_authoritative_full_diff() {
+    fn non_durable_staging_uses_complete_candidate_page_capture() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
@@ -3084,9 +3167,9 @@ mod query_policy_tests {
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
 
-        // synchronous=OFF deliberately omits the xSync evidence needed for a
-        // complete recorder audit. The closed-file diff remains authoritative.
-        assert!(!recorder_audited(&path));
+        // The speculative database is disposable, so logical commit and
+        // checkpoint completion are sufficient for candidate-page capture.
+        assert!(recorder_audited(&path));
         let effect = decode_qwal_v2(&payload).unwrap();
         let hash = LogEntry::calculate_hash(
             "cluster-a",
@@ -3388,7 +3471,7 @@ mod query_policy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepared_base_same_inode_mutation_rejects_apply_and_retains_pending() {
+    fn prepared_base_same_inode_mutation_rejects_rebuildable_apply() {
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3404,9 +3487,7 @@ mod query_policy_tests {
         let request = encode_sql_command(&command).unwrap();
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
-        let effect = decode_qwal_v2(&payload).unwrap();
         let entry = command_entry(1, LogHash::ZERO, payload);
-        let pending = pending_for(&entry, &effect);
         let original_inode = fs::metadata(&path).unwrap().ino();
         {
             let _lifecycle = database.lock_lifecycle().unwrap();
@@ -3423,7 +3504,7 @@ mod query_policy_tests {
 
         assert!(database.apply_entry(&entry).is_err());
 
-        assert_eq!(database.control.pending().unwrap(), Some(pending));
+        assert_eq!(database.control.pending().unwrap(), None);
         assert_ne!(
             prepared_install_path(&path),
             Some(PreparedInstallPath::Promoted)
@@ -3694,7 +3775,7 @@ mod query_policy_tests {
             database.with_connection(checkpoint_truncate).unwrap();
             database.close_connection().unwrap();
             let prepared = database
-                .take_matching_prepared_target(&effect, &entry.payload, &pending)
+                .take_matching_prepared_target(&effect, &entry.payload)
                 .unwrap()
                 .unwrap();
             assert!(database

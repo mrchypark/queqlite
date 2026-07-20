@@ -191,6 +191,165 @@ fn sql_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
 }
 
 #[test]
+fn startup_rebuilds_corrupt_sql_materializer_from_recorder_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+
+    let committed = runtime.write("request-1", "alpha", "one").unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
+    std::fs::write(dir.path().join("sqlite/db.sqlite"), b"corrupt local cache").unwrap();
+
+    let reopened = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+    let read = reopened.read("alpha", ReadConsistency::Local).unwrap();
+    assert_eq!(read.value.as_deref(), Some("one"));
+    assert_eq!((read.applied_index, read.hash), (1, committed.hash));
+    assert_eq!(reopened.log_store().last_index().unwrap(), Some(1));
+}
+
+#[test]
+fn startup_rebuilds_every_torn_sql_cache_pair_from_recorder_quorum() {
+    #[derive(Clone, Copy, Debug)]
+    enum TornCache {
+        DatabaseBehind,
+        ControlBehind,
+        DatabaseCorrupt,
+        ControlCorrupt,
+        BothMissing,
+    }
+
+    for fault in [
+        TornCache::DatabaseBehind,
+        TornCache::ControlBehind,
+        TornCache::DatabaseCorrupt,
+        TornCache::ControlCorrupt,
+        TornCache::BothMissing,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = node_config(dir.path());
+        let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+        let db_path = dir.path().join("sqlite/db.sqlite");
+        let control_path = dir.path().join("sqlite/db.sqlite.control");
+        let base_db = std::fs::read(&db_path).unwrap();
+        let base_control = std::fs::read(&control_path).unwrap();
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+        drop(runtime);
+
+        std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let path = dir.path().join(format!("sqlite/db.sqlite{suffix}"));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        match fault {
+            TornCache::DatabaseBehind => std::fs::write(&db_path, &base_db).unwrap(),
+            TornCache::ControlBehind => std::fs::write(&control_path, &base_control).unwrap(),
+            TornCache::DatabaseCorrupt => std::fs::write(&db_path, b"corrupt database").unwrap(),
+            TornCache::ControlCorrupt => std::fs::write(&control_path, b"corrupt control").unwrap(),
+            TornCache::BothMissing => std::fs::remove_dir_all(dir.path().join("sqlite")).unwrap(),
+        }
+
+        let reopened = NodeRuntime::open(config, consensus(dir.path()), &[])
+            .unwrap_or_else(|error| panic!("{fault:?} did not rebuild: {error}"));
+        let read = reopened.read("alpha", ReadConsistency::Local).unwrap();
+        assert_eq!(read.value.as_deref(), Some("one"), "fault={fault:?}");
+        assert_eq!(
+            (read.applied_index, read.hash),
+            (committed.applied_index, committed.hash),
+            "fault={fault:?}"
+        );
+        assert_eq!(
+            reopened.write("request-1", "alpha", "one").unwrap(),
+            committed,
+            "fault={fault:?}"
+        );
+        assert!(matches!(
+            reopened.write("request-1", "alpha", "different"),
+            Err(NodeError::RequestConflict(_))
+        ));
+    }
+}
+
+#[test]
+fn startup_recovers_after_recorder_rotation_and_one_permanent_voter_loss() {
+    if std::env::var_os("RUN_EXPENSIVE").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+    let mut last = None;
+
+    for index in 1..=1_100 {
+        let request_id = format!("rotation-request-{index}");
+        let key = format!("rotation-key-{index}");
+        let value = format!("rotation-value-{index}");
+        last = Some((
+            request_id.clone(),
+            key.clone(),
+            value.clone(),
+            runtime.write(&request_id, &key, &value).unwrap(),
+        ));
+        if index >= 40
+            && ["node-1", "node-2"].into_iter().all(|node| {
+                std::fs::read_dir(dir.path().join("recorders").join(node))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("command-"))
+            })
+        {
+            break;
+        }
+    }
+    let (request_id, key, value, committed) = last.unwrap();
+    assert!(["node-1", "node-2"].into_iter().all(|node| {
+        std::fs::read_dir(dir.path().join("recorders").join(node))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("command-"))
+    }));
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("recorders/node-3")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("sqlite")).unwrap();
+
+    let reopened = NodeRuntime::open(config, consensus(dir.path()), &[]).unwrap();
+    let read = reopened.read(&key, ReadConsistency::Local).unwrap();
+    assert_eq!(read.value.as_deref(), Some(value.as_str()));
+    assert_eq!(
+        (read.applied_index, read.hash),
+        (committed.applied_index, committed.hash)
+    );
+    assert_eq!(
+        reopened.write(&request_id, &key, &value).unwrap(),
+        committed
+    );
+}
+
+#[test]
+fn startup_fails_closed_when_only_one_recorder_remembers_the_lost_local_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus(dir.path()), &[]).unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("recorders/node-2")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("recorders/node-3")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("consensus/log")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("sqlite")).unwrap();
+
+    assert!(matches!(
+        NodeRuntime::open(config, consensus(dir.path()), &[]),
+        Err(NodeError::Unavailable(_))
+    ));
+}
+
+#[test]
 fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());

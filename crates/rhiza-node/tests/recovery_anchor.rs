@@ -42,6 +42,37 @@ async fn restart_accepts_sqlite_exactly_at_compacted_anchor() {
 }
 
 #[tokio::test]
+async fn corrupt_materializer_after_compaction_requires_snapshot_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = node_config(dir.path());
+    let consensus = consensus(dir.path());
+    let runtime = NodeRuntime::open(config.clone(), consensus.clone(), &[]).unwrap();
+    runtime.write("request-1", "alpha", "one").unwrap();
+    let snapshot = runtime.create_recovery_snapshot().unwrap();
+    let publication = publish(dir.path(), &snapshot).await;
+    let verified = runtime
+        .verify_snapshot_publication(&snapshot, &publication)
+        .unwrap();
+    runtime.compact_log(&verified).unwrap();
+    drop(runtime);
+
+    std::fs::write(config.data_dir().join("sqlite/db.sqlite"), b"corrupt cache").unwrap();
+
+    assert_eq!(
+        NodeRuntime::open(config.clone(), consensus, &[]).unwrap_err(),
+        NodeError::SnapshotRequired(Box::new(snapshot.anchor().clone()))
+    );
+    assert!(config.data_dir().join("sqlite").is_dir());
+    assert!(!std::fs::read_dir(config.data_dir())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sqlite.quarantine-")));
+}
+
+#[tokio::test]
 async fn restart_accepts_sqlite_at_anchor_and_replays_retained_tail() {
     let dir = tempfile::tempdir().unwrap();
     let config = node_config(dir.path());

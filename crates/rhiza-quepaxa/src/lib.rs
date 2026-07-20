@@ -4534,9 +4534,6 @@ impl ThreeNodeConsensus {
                 Ok(_) | Err(_) => {}
             }
             if successful >= quorum {
-                if summaries.is_empty() {
-                    return Ok(CertifiedDecisionInspection::Empty);
-                }
                 if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
                     return self.certified_inspection_from_proof(slot, prev_hash, proof);
                 }
@@ -4550,6 +4547,9 @@ impl ThreeNodeConsensus {
         }
         if summaries.is_empty() {
             return Ok(CertifiedDecisionInspection::Empty);
+        }
+        if summaries.len() < quorum {
+            return Ok(CertifiedDecisionInspection::Unavailable);
         }
         if let Some(proof) = self.proof_from_record_summaries(slot, &summaries)? {
             return self.certified_inspection_from_proof(slot, prev_hash, proof);

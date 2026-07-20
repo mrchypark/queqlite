@@ -2071,7 +2071,10 @@ mod snapshot_tests {
 
         state.compact_embedded_log_before(2).unwrap();
 
-        assert_eq!(state.embedded_log_entries(2, 2).unwrap(), [second.clone()]);
+        assert_eq!(
+            state.embedded_log_entries(2, 2).unwrap(),
+            std::slice::from_ref(&second)
+        );
         assert!(state.embedded_log_entries(1, 1).is_err());
         state.apply_entry(&second).unwrap();
         assert!(state.compact_embedded_log_before(3).is_err());

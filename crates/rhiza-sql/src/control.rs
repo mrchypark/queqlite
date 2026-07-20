@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{ApplyProgress, Error, RequestConflict, RequestOutcome, Result};
 
-const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x04";
-const CONTROL_SCHEMA_VERSION: u64 = 4;
-const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x04";
+const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x05";
+const CONTROL_SCHEMA_VERSION: u64 = 5;
+const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x05";
 const MAX_RESULT_BLOB_BYTES: usize = super::MAX_SQL_EFFECT_BYTES;
 const SQLITE_VARIABLE_LIMIT: usize = 999;
 const RECEIPT_LOOKUP_CHUNK_SIZE: usize = SQLITE_VARIABLE_LIMIT;
@@ -323,7 +323,7 @@ impl ControlStore {
                 "control sidecar refused DELETE journal mode: {journal}"
             )));
         }
-        conn.pragma_update(None, "synchronous", "FULL")
+        conn.pragma_update(None, "synchronous", "OFF")
             .map_err(sqlite_error)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(sqlite_error)?;
@@ -700,63 +700,34 @@ impl ControlStore {
                 "pending apply intent is missing or different".into(),
             ));
         }
-        if configuration_state.config_id() < meta_configuration(&tx)?.config_id() {
+        commit_applied_transaction(tx, pending, configuration_state, receipts)
+    }
+
+    /// Atomically publishes a locally installed QWAL target, its receipts, and
+    /// its rebuildable qlog mirror without a pre-install durability intent.
+    pub fn commit_rebuildable_apply(
+        &self,
+        pending: &PendingApply,
+        entry: &LogEntry,
+        configuration_state: &ConfigurationState,
+        receipts: &[RequestReceipt],
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        if pending_from(&tx)?
+            .as_ref()
+            .is_some_and(|existing| existing != pending)
+            || meta_anchor(&tx, "applied_tip")? != pending.base
+            || meta_hash(&tx, "user_db_digest")? != pending.base_db_digest
+            || LogAnchor::new(entry.index, entry.hash) != pending.entry
+            || entry.recompute_hash() != entry.hash
+        {
             return Err(Error::InvalidEntry(
-                "configuration state moved backwards".into(),
+                "rebuildable apply does not exactly extend the committed base".into(),
             ));
         }
-        let mut result_bytes = 0usize;
-        let mut request_ids = HashSet::with_capacity(receipts.len());
-        for receipt in receipts {
-            validate_receipt(receipt)?;
-            result_bytes = result_bytes
-                .checked_add(receipt.result_blob.len())
-                .ok_or_else(|| Error::ResourceExhausted("receipt result bytes overflow".into()))?;
-            if result_bytes > super::MAX_QWAL_V2_BYTES {
-                return Err(Error::ResourceExhausted(format!(
-                    "receipt results exceed {} bytes",
-                    super::MAX_QWAL_V2_BYTES
-                )));
-            }
-            if receipt.original_anchor != pending.entry {
-                return Err(Error::InvalidEntry(
-                    "request receipt anchor does not match applied entry".into(),
-                ));
-            }
-            if !request_ids.insert(receipt.request_id.as_str()) {
-                return Err(Error::InvalidEntry(
-                    "applied receipt request ids must be unique".into(),
-                ));
-            }
-        }
-        let lookups = receipts
-            .iter()
-            .map(|receipt| (receipt.request_id(), receipt.request_digest()))
-            .collect::<Vec<_>>();
-        let existing = lookup_requests_from(&tx, &lookups)?;
-        let mut absent = Vec::with_capacity(receipts.len());
-        for (receipt, existing) in receipts.iter().zip(existing) {
-            match existing? {
-                None => absent.push(receipt),
-                Some(existing) if existing == *receipt => {}
-                Some(existing) => {
-                    return Err(Error::RequestConflict(RequestConflict {
-                        request_id: receipt.request_id.clone(),
-                        original_outcome: RequestOutcome::new(
-                            existing.original_anchor.index(),
-                            existing.original_anchor.hash(),
-                        ),
-                    }));
-                }
-            }
-        }
-        insert_receipts_bulk(&tx, pending.entry, &absent)?;
-        put_anchor(&tx, "applied_tip", pending.entry)?;
-        put_configuration(&tx, configuration_state)?;
-        put_hash(&tx, "user_db_digest", pending.target_db_digest)?;
-        tx.execute("DELETE FROM pending_apply WHERE singleton = 1", [])
-            .map_err(sqlite_error)?;
-        tx.commit().map_err(sqlite_error)
+        insert_or_validate_embedded_entry(&tx, entry)?;
+        commit_applied_transaction(tx, pending, configuration_state, receipts)
     }
 
     pub fn export_replicated_snapshot(&self) -> Result<Vec<u8>> {
@@ -1021,6 +992,77 @@ fn normalize_schema_sql(sql: &str) -> String {
         .filter(|character| !character.is_ascii_whitespace() && *character != ';')
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn commit_applied_transaction(
+    tx: Transaction<'_>,
+    pending: &PendingApply,
+    configuration_state: &ConfigurationState,
+    receipts: &[RequestReceipt],
+) -> Result<()> {
+    if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+        return Err(Error::ResourceExhausted(format!(
+            "applied receipt batch exceeds {} members",
+            super::MAX_QWAL_V2_RECEIPTS
+        )));
+    }
+    if configuration_state.config_id() < meta_configuration(&tx)?.config_id() {
+        return Err(Error::InvalidEntry(
+            "configuration state moved backwards".into(),
+        ));
+    }
+    let mut result_bytes = 0usize;
+    let mut request_ids = HashSet::with_capacity(receipts.len());
+    for receipt in receipts {
+        validate_receipt(receipt)?;
+        result_bytes = result_bytes
+            .checked_add(receipt.result_blob.len())
+            .ok_or_else(|| Error::ResourceExhausted("receipt result bytes overflow".into()))?;
+        if result_bytes > super::MAX_QWAL_V2_BYTES {
+            return Err(Error::ResourceExhausted(format!(
+                "receipt results exceed {} bytes",
+                super::MAX_QWAL_V2_BYTES
+            )));
+        }
+        if receipt.original_anchor != pending.entry {
+            return Err(Error::InvalidEntry(
+                "request receipt anchor does not match applied entry".into(),
+            ));
+        }
+        if !request_ids.insert(receipt.request_id.as_str()) {
+            return Err(Error::InvalidEntry(
+                "applied receipt request ids must be unique".into(),
+            ));
+        }
+    }
+    let lookups = receipts
+        .iter()
+        .map(|receipt| (receipt.request_id(), receipt.request_digest()))
+        .collect::<Vec<_>>();
+    let existing = lookup_requests_from(&tx, &lookups)?;
+    let mut absent = Vec::with_capacity(receipts.len());
+    for (receipt, existing) in receipts.iter().zip(existing) {
+        match existing? {
+            None => absent.push(receipt),
+            Some(existing) if existing == *receipt => {}
+            Some(existing) => {
+                return Err(Error::RequestConflict(RequestConflict {
+                    request_id: receipt.request_id.clone(),
+                    original_outcome: RequestOutcome::new(
+                        existing.original_anchor.index(),
+                        existing.original_anchor.hash(),
+                    ),
+                }));
+            }
+        }
+    }
+    insert_receipts_bulk(&tx, pending.entry, &absent)?;
+    put_anchor(&tx, "applied_tip", pending.entry)?;
+    put_configuration(&tx, configuration_state)?;
+    put_hash(&tx, "user_db_digest", pending.target_db_digest)?;
+    tx.execute("DELETE FROM pending_apply WHERE singleton = 1", [])
+        .map_err(sqlite_error)?;
+    tx.commit().map_err(sqlite_error)
 }
 
 fn validate_receipt(receipt: &RequestReceipt) -> Result<()> {
@@ -1516,12 +1558,26 @@ mod tests {
     }
 
     #[test]
-    fn v4_control_and_snapshot_reject_v3_without_migration() {
+    fn quorum_authoritative_control_cache_disables_local_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
+
+        let synchronous: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(synchronous, 0);
+    }
+
+    #[test]
+    fn v5_control_and_snapshot_reject_v4_without_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sqlite.control");
         let store = ControlStore::create(&path, &identity("node-a")).unwrap();
         let mut old_snapshot = store.export_replicated_snapshot().unwrap();
-        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 3;
+        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 4;
         assert!(matches!(
             store.import_replicated_snapshot(&old_snapshot),
             Err(Error::InvalidSnapshot(_))
@@ -1531,7 +1587,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE control_meta SET value=?1 WHERE key='schema_version'",
-            [3_u64.to_be_bytes().as_slice()],
+            [4_u64.to_be_bytes().as_slice()],
         )
         .unwrap();
         drop(conn);

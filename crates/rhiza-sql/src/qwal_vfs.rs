@@ -64,8 +64,8 @@ pub struct SealedQwalRecording {
 
 impl SealedQwalRecording {
     /// Whether the candidate set is eligible to narrow a closed-file diff.
-    ///
-    /// The final target digest and a full-diff fallback remain mandatory.
+    /// Durability syncs are deliberately not required: this VFS observes a
+    /// disposable speculative file whose bytes are consumed before ACK.
     pub fn is_complete(&self) -> bool {
         self.complete
     }
@@ -267,9 +267,7 @@ impl QwalRecordingSession {
         let candidate_page_ranges = collapse_page_ranges(&candidate_pages);
         let complete = state.incomplete_reason.is_none()
             && state.commit_observed
-            && state.checkpoint_succeeded
-            && state.main_sync_observed
-            && (!state.wal_write_observed || state.wal_sync_observed);
+            && state.checkpoint_succeeded;
         Ok(SealedQwalRecording {
             candidate_pages,
             candidate_page_ranges,
@@ -1453,6 +1451,38 @@ mod tests {
         assert!(sealed.wal_write_observed);
         assert!(sealed.main_sync_observed);
         assert!(!sealed.candidate_pages.is_empty());
+        assert!(sealed.is_complete());
+    }
+
+    #[test]
+    fn synchronous_off_recording_is_complete_without_a_durability_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        create_staging_database(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        let recording = QwalRecordingSession::begin(&path, 4096).unwrap();
+        let connection = open_recorded(&path);
+        connection
+            .execute_batch(
+                "PRAGMA synchronous=OFF; \
+                 INSERT INTO seed DEFAULT VALUES;",
+            )
+            .unwrap();
+        recording.mark_commit_observed().unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        recording.mark_checkpoint_succeeded().unwrap();
+        drop(connection);
+
+        let sealed = recording.seal().unwrap();
+        assert!(sealed.commit_observed);
+        assert!(sealed.checkpoint_succeeded);
+        assert!(!sealed.main_sync_observed);
         assert!(sealed.is_complete());
     }
 

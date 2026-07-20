@@ -156,11 +156,11 @@ impl Layer {
                 "Recorder quorum durability plus one atomic redb commit containing the KV state and full qlog entry; file qlog is a buffered rehydratable mirror"
             }
             Self::Handle | Self::Runtime => {
-                "Recorder quorum durability plus durable local qlog and materializer"
+                "Recorder quorum is the authoritative durable redo log; SQLite, control, and file qlog are non-durable rebuildable local views"
             }
             Self::Raw => "materializer-native local commit only",
             Self::Qwal => {
-                "local QWAL v2 batch preparation and SQLite materializer apply; excludes consensus and qlog"
+                "non-durable local QWAL batch preparation and SQLite materializer apply; excludes consensus and qlog"
             }
             Self::Consensus => {
                 "three RecorderFileStore voter commits; excludes local qlog and materializer"

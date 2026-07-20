@@ -326,6 +326,8 @@ pub const MAX_SQL_RESULT_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "sql")]
 pub const MAX_SQL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "kv")]
+type KvMemberCheck = (usize, Result<Option<KvRequestRecord>, NodeError>);
+#[cfg(feature = "kv")]
 pub const DEFAULT_KV_SCAN_LIMIT: u32 = 100;
 #[cfg(feature = "kv")]
 pub const MAX_KV_SCAN_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -5354,6 +5356,27 @@ enum Materializer {
 }
 
 #[cfg(feature = "sql")]
+fn quarantine_sql_materializer(data_dir: &Path) -> Result<(), NodeError> {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let source = data_dir.join("sqlite");
+    if !source.exists() {
+        return Ok(());
+    }
+    loop {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let target = data_dir.join(format!(
+            "sqlite.quarantine-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::rename(&source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(NodeError::Storage(error.to_string())),
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
 struct SqlMaterializerGuard<'a>(MutexGuard<'a, Materializer>);
 
 #[cfg(feature = "sql")]
@@ -5386,20 +5409,34 @@ impl Materializer {
     fn open(
         config: &NodeConfig,
         configuration_state: &ConfigurationState,
+        recovery_anchor: Option<&RecoveryAnchor>,
     ) -> Result<Self, NodeError> {
         match config.execution_profile() {
             ExecutionProfile::Sqlite => {
                 #[cfg(feature = "sql")]
                 {
                     let path = config.data_dir().join("sqlite/db.sqlite");
-                    let state = SqliteStateMachine::open_with_configuration(
-                        path,
-                        config.cluster_id(),
-                        config.node_id(),
-                        config.epoch(),
-                        configuration_state.clone(),
-                    )
-                    .map_err(|error| NodeError::Storage(error.to_string()))?;
+                    let open = || {
+                        SqliteStateMachine::open_with_configuration(
+                            &path,
+                            config.cluster_id(),
+                            config.node_id(),
+                            config.epoch(),
+                            configuration_state.clone(),
+                        )
+                    };
+                    let state = match open() {
+                        Ok(state) => state,
+                        Err(_) => match recovery_anchor {
+                            Some(anchor) => {
+                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())))
+                            }
+                            None => {
+                                quarantine_sql_materializer(config.data_dir())?;
+                                open().map_err(|error| NodeError::Storage(error.to_string()))?
+                            }
+                        },
+                    };
                     Ok(Self::Sql(Box::new(state)))
                 }
                 #[cfg(not(feature = "sql"))]
@@ -6067,7 +6104,12 @@ impl NodeRuntime {
         let persisted_configuration = log_store
             .configuration_state()
             .map_err(|error| NodeError::Storage(error.to_string()))?;
-        let materializer = Materializer::open(&config, &persisted_configuration)?;
+        let recovery_anchor = log_store
+            .logical_state()
+            .map_err(|error| NodeError::Storage(error.to_string()))?
+            .anchor;
+        let materializer =
+            Materializer::open(&config, &persisted_configuration, recovery_anchor.as_ref())?;
         reconcile_local_storage(&config, &log_store, &materializer)?;
         recover_peer_candidates(
             &config,
@@ -7631,7 +7673,7 @@ impl NodeRuntime {
         &self,
         members: &[RuntimeBatchMember],
         indices: &[usize],
-    ) -> Result<Vec<(usize, Result<Option<KvRequestRecord>, NodeError>)>, NodeError> {
+    ) -> Result<Vec<KvMemberCheck>, NodeError> {
         if indices.is_empty() {
             return Ok(Vec::new());
         }
