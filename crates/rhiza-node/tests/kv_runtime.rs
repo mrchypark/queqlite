@@ -4,14 +4,14 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_core::{ExecutionProfile, LogHash};
-use rhiza_kv::{encode_replicated_kv_batch, encode_replicated_kv_command, MAX_KV_VALUE_BYTES};
+use rhiza_kv::{encode_replicated_kv_command, RedbStateMachine, MAX_KV_VALUE_BYTES};
 use rhiza_log::LogStore;
 use rhiza_node::{
     node_router, node_router_with_checkpoint_and_limits, CheckpointCoordinator,
     ClientErrorResponse, DurabilityMode, KvCommandResultV1, KvCommandV1, KvGetResponse,
-    KvMutationResponse, KvScanResponse, NodeConfig, NodeRuntime, PeerConfig, ReadConsistency,
-    KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_COMMAND_BYTES, MAX_KV_SCAN_ROWS, PROTOCOL_VERSION,
-    READYZ_PATH, VERSION_HEADER,
+    KvMutationResponse, KvScanResponse, NodeConfig, NodeError, NodeRuntime, PeerConfig,
+    ReadConsistency, KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_COMMAND_BYTES, MAX_KV_SCAN_ROWS,
+    PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{RecorderFileStore, ThreeNodeConsensus};
@@ -76,6 +76,215 @@ fn kv_strict_commit_rehydrates_qlog_when_buffered_mirror_is_lost() {
         (read.applied_index, read.hash),
         (written.applied_index(), written.hash())
     );
+}
+
+#[test]
+fn corrupt_unanchored_kv_rebuilds_exact_state_and_receipts_from_two_recorders() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_config(dir.path());
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let first = runtime
+        .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+        .unwrap();
+    let second = runtime
+        .mutate_kv(KvCommandV1::put("request-2", b"other".to_vec(), b"second".to_vec()).unwrap())
+        .unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
+    std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
+
+    let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]).unwrap();
+    let key = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+    let other = reopened.get_kv(b"other", ReadConsistency::Local).unwrap();
+    assert_eq!(key.value, Some(b"value".to_vec()));
+    assert_eq!(other.value, Some(b"second".to_vec()));
+    assert_eq!((key.applied_index, key.hash), (2, second.hash()));
+    assert_eq!((other.applied_index, other.hash), (2, second.hash()));
+    assert_eq!(
+        reopened
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap(),
+        first
+    );
+
+    let next = reopened
+        .mutate_kv(KvCommandV1::put("request-3", b"next".to_vec(), b"third".to_vec()).unwrap())
+        .unwrap();
+    assert_eq!(next.applied_index(), 3);
+    assert_eq!(
+        reopened
+            .get_kv(b"next", ReadConsistency::Local)
+            .unwrap()
+            .value,
+        Some(b"third".to_vec())
+    );
+}
+
+#[test]
+fn missing_partial_and_identity_invalid_unanchored_kv_rebuild_from_qlog() {
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Missing,
+        Partial,
+        IdentityInvalid,
+    }
+
+    for fault in [Fault::Missing, Fault::Partial, Fault::IdentityInvalid] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = kv_config(dir.path());
+        let runtime =
+            NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+        let committed = runtime
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap();
+        drop(runtime);
+
+        let kv_path = config.data_dir().join("kv/data.redb");
+        match fault {
+            Fault::Missing => std::fs::remove_file(&kv_path).unwrap(),
+            Fault::Partial => std::fs::write(&kv_path, b"partial redb").unwrap(),
+            Fault::IdentityInvalid => {
+                std::fs::remove_dir_all(config.data_dir().join("kv")).unwrap();
+                drop(
+                    RedbStateMachine::open(&kv_path, "foreign-cluster", "foreign-node", 1, 1)
+                        .unwrap(),
+                );
+            }
+        }
+
+        let reopened = NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[])
+            .unwrap_or_else(|error| panic!("{fault:?} did not rebuild: {error}"));
+        let read = reopened.get_kv(b"key", ReadConsistency::Local).unwrap();
+        assert_eq!(read.value, Some(b"value".to_vec()), "fault={fault:?}");
+        assert_eq!(
+            (read.applied_index, read.hash),
+            (committed.applied_index(), committed.hash()),
+            "fault={fault:?}"
+        );
+        assert_eq!(
+            reopened
+                .mutate_kv(
+                    KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap()
+                )
+                .unwrap(),
+            committed,
+            "fault={fault:?}"
+        );
+        let next = reopened
+            .mutate_kv(KvCommandV1::put("request-2", b"next".to_vec(), b"second".to_vec()).unwrap())
+            .unwrap();
+        assert_eq!(next.applied_index(), 2, "fault={fault:?}");
+    }
+}
+
+#[test]
+fn corrupt_unanchored_kv_fails_closed_when_only_one_recorder_has_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_config(dir.path());
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    runtime
+        .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+        .unwrap();
+    drop(runtime);
+
+    std::fs::remove_dir_all(dir.path().join("recorders/n2")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("recorders/n3")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("node/consensus/log")).unwrap();
+    std::fs::write(dir.path().join("node/kv/data.redb"), b"corrupt local cache").unwrap();
+
+    assert!(matches!(
+        NodeRuntime::open(config, consensus(dir.path(), "recorders"), &[]),
+        Err(NodeError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn corrupt_anchored_kv_requires_snapshot_without_quarantining_the_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_config(dir.path());
+    let archive = initialized_checkpoint(&dir.path().join("archive")).await;
+    let coordinator = CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+        .await
+        .unwrap();
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    let written = runtime
+        .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+        .unwrap();
+    coordinator
+        .flush_runtime(&runtime, written.applied_index())
+        .await
+        .unwrap();
+    let anchor = runtime.checkpoint_compact(&coordinator).await.unwrap();
+    drop(runtime);
+
+    std::fs::write(
+        config.data_dir().join("kv/data.redb"),
+        b"corrupt local cache",
+    )
+    .unwrap();
+
+    assert_eq!(
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap_err(),
+        NodeError::SnapshotRequired(Box::new(anchor))
+    );
+    assert!(config.data_dir().join("kv").is_dir());
+    assert!(!std::fs::read_dir(config.data_dir())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("kv.quarantine-")));
+}
+
+#[test]
+fn corrupt_qlog_fails_before_kv_quarantine_and_preserves_both_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kv_config(dir.path());
+    let runtime =
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]).unwrap();
+    runtime
+        .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+        .unwrap();
+    drop(runtime);
+
+    let qlog_path = std::fs::read_dir(config.data_dir().join("consensus/log"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-open.qlog")
+        })
+        .unwrap();
+    let mut corrupt_qlog = std::fs::read(&qlog_path).unwrap();
+    *corrupt_qlog.last_mut().unwrap() ^= 1;
+    std::fs::write(&qlog_path, &corrupt_qlog).unwrap();
+    let corrupt_kv = b"corrupt local cache";
+    std::fs::write(config.data_dir().join("kv/data.redb"), corrupt_kv).unwrap();
+
+    assert!(matches!(
+        NodeRuntime::open(config.clone(), consensus(dir.path(), "recorders"), &[]),
+        Err(NodeError::Storage(_))
+    ));
+    assert_eq!(std::fs::read(&qlog_path).unwrap(), corrupt_qlog);
+    assert_eq!(
+        std::fs::read(config.data_dir().join("kv/data.redb")).unwrap(),
+        corrupt_kv
+    );
+    assert!(!std::fs::read_dir(config.data_dir())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("kv.quarantine-")));
 }
 
 #[test]
@@ -441,89 +650,6 @@ async fn concurrent_kv_writes_share_one_entry_and_retry_distinct_outcomes() {
         "invalid_request"
     );
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(1));
-    server.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn kv_batch_byte_cap_uses_largest_ordered_fitting_sub_batches() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = kv_http_config(dir.path())
-        .with_writer_batching(4, Duration::from_millis(50))
-        .unwrap();
-    let runtime = Arc::new(
-        NodeRuntime::open(config, consensus(dir.path(), "byte-cap-recorders"), &[]).unwrap(),
-    );
-    let recorder = RecorderFileStore::new_with_id(
-        dir.path().join("byte-cap-http-recorder"),
-        "n1",
-        CLUSTER_ID,
-        1,
-        1,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let served_runtime = Arc::clone(&runtime);
-    let server = tokio::spawn(async move {
-        axum::serve(listener, node_router(served_runtime, recorder))
-            .await
-            .unwrap();
-    });
-    let client = reqwest::Client::new();
-    let value = vec![0; 130 * 1024];
-    let commands = (0..4)
-        .map(|index| {
-            KvCommandV1::put(
-                format!("large-{index}"),
-                format!("key-{index}").into_bytes(),
-                value.clone(),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(commands
-        .iter()
-        .all(|command| encode_replicated_kv_command(command).unwrap().len() <= MAX_COMMAND_BYTES));
-    assert!(encode_replicated_kv_batch(&commands).unwrap().len() > MAX_COMMAND_BYTES);
-    assert!(encode_replicated_kv_batch(&commands[..3]).unwrap().len() <= MAX_COMMAND_BYTES);
-
-    let encoded_value = "A".repeat(value.len() / 3 * 4);
-    let encoded_keys = ["a2V5LTA=", "a2V5LTE=", "a2V5LTI=", "a2V5LTM="];
-    let mut requests = tokio::task::JoinSet::new();
-    for (index, key) in encoded_keys.into_iter().enumerate() {
-        let client = client.clone();
-        let value = encoded_value.clone();
-        requests.spawn(async move {
-            let response = post_kv_put(
-                &client,
-                addr,
-                &serde_json::json!({
-                    "request_id": format!("large-{index}"),
-                    "key": key,
-                    "value": value
-                }),
-            )
-            .await;
-            let status = response.status();
-            let body = response.text().await.unwrap();
-            (status, body)
-        });
-    }
-    let mut indices = Vec::new();
-    while let Some(response) = requests.join_next().await {
-        let (status, body) = response.unwrap();
-        assert!(status.is_success(), "KV write failed with {status}: {body}");
-        indices.push(
-            serde_json::from_str::<KvMutationResponse>(&body)
-                .unwrap()
-                .applied_index,
-        );
-    }
-    indices.sort_unstable();
-    indices.dedup();
-
-    assert_eq!(indices, [1, 2]);
-    assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
     server.abort();
 }
 

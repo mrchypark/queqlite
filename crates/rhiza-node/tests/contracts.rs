@@ -27,7 +27,7 @@ use rhiza_quepaxa::{
     ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary, RecorderFileStore,
     RecorderRpc, ThreeNodeConsensus,
 };
-use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V2_MAGIC};
+use rhiza_sql::{SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, QWAL_V3_MAGIC};
 
 fn test_config_digest() -> LogHash {
     FixedMembership::new(["node-1", "node-2", "node-3"])
@@ -391,7 +391,7 @@ fn runtime_regenerates_sql_effect_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V2_MAGIC));
+        .starts_with(QWAL_V3_MAGIC));
     assert_eq!(
         runtime
             .query_sql(
@@ -462,7 +462,7 @@ fn sql_batch_reprepares_all_members_after_a_foreign_slot_winner() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V2_MAGIC));
+        .starts_with(QWAL_V3_MAGIC));
 }
 
 #[test]
@@ -2227,7 +2227,7 @@ fn sql_batch_commits_one_qwal_entry_and_replays_results() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V2_MAGIC));
+        .starts_with(QWAL_V3_MAGIC));
     assert_eq!(first.results.len(), 1);
     assert_eq!(second.results.len(), 1);
     assert_ne!(first.results[0].returning, second.results[0].returning);
@@ -2303,7 +2303,7 @@ fn four_member_sql_batch_commits_one_exact_base_qwal_entry() {
         .unwrap()
         .unwrap()
         .payload
-        .starts_with(QWAL_V2_MAGIC));
+        .starts_with(QWAL_V3_MAGIC));
     assert_eq!(runtime.log_store().last_index().unwrap(), Some(2));
 
     for command in commands {
@@ -2999,7 +2999,7 @@ fn first_qwal_put_entry(root: &Path, request_id: &str, key: &str, value: &str) -
     let payload = state
         .prepare_put_effect(request_id, key, value, &request_payload, 0, LogHash::ZERO)
         .unwrap();
-    assert!(payload.starts_with(QWAL_V2_MAGIC));
+    assert!(payload.starts_with(QWAL_V3_MAGIC));
     entry(1, LogHash::ZERO, &payload)
 }
 

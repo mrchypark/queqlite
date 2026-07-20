@@ -22,7 +22,7 @@ compile_error!("rhiza-node requires at least one execution profile feature: sql,
 
 #[cfg(feature = "graph")]
 use std::collections::BTreeMap;
-#[cfg(any(feature = "sql", test))]
+#[cfg(any(feature = "sql", feature = "kv", test))]
 use std::sync::atomic::AtomicUsize;
 
 use axum::{
@@ -66,10 +66,10 @@ use rhiza_quepaxa::{
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{
-    decode_qwal_v2, encode_put_request, encode_sql_command, restore_snapshot_file,
+    decode_qwal_v3, encode_put_request, encode_sql_command, restore_snapshot_file,
     RecoverySnapshot, RequestConflict, RequestOutcome, SqlBatchMember, SqlCommand,
     SqlCommandResult, SqlQueryResult, SqlStatement, SqlValue, SqliteStateMachine,
-    MAX_QWAL_V2_RECEIPTS, MAX_SQL_STATEMENTS, QWAL_V2_MAGIC,
+    MAX_QWAL_V3_RECEIPTS, MAX_SQL_STATEMENTS, QWAL_V3_MAGIC,
 };
 #[cfg(not(feature = "sql"))]
 type SqlCommandResult = ();
@@ -113,7 +113,7 @@ pub const DEFAULT_PEER_CONCURRENCY: usize = 32;
 pub const DEFAULT_WRITER_BATCH_MAX: usize = 8;
 const MAX_WRITE_BATCH_MEMBERS: usize = 64;
 #[cfg(feature = "sql")]
-const MAX_SQL_WRITE_BATCH_MEMBERS: usize = MAX_QWAL_V2_RECEIPTS;
+const MAX_SQL_WRITE_BATCH_MEMBERS: usize = MAX_QWAL_V3_RECEIPTS;
 #[cfg(feature = "sql")]
 pub const MAX_TYPED_SQL_WRITE_BATCH_MEMBERS: usize = 256;
 #[cfg(feature = "sql")]
@@ -5355,17 +5355,17 @@ enum Materializer {
     Kv(Arc<RedbStateMachine>),
 }
 
-#[cfg(feature = "sql")]
-fn quarantine_sql_materializer(data_dir: &Path) -> Result<(), NodeError> {
+#[cfg(any(feature = "sql", feature = "kv"))]
+fn quarantine_materializer(data_dir: &Path, directory: &str) -> Result<(), NodeError> {
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-    let source = data_dir.join("sqlite");
+    let source = data_dir.join(directory);
     if !source.exists() {
         return Ok(());
     }
     loop {
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let target = data_dir.join(format!(
-            "sqlite.quarantine-{}-{sequence}",
+            "{directory}.quarantine-{}-{sequence}",
             std::process::id()
         ));
         match fs::rename(&source, target) {
@@ -5433,7 +5433,7 @@ impl Materializer {
                                 return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())))
                             }
                             None => {
-                                quarantine_sql_materializer(config.data_dir())?;
+                                quarantine_materializer(config.data_dir(), "sqlite")?;
                                 open().map_err(|error| NodeError::Storage(error.to_string()))?
                             }
                         },
@@ -5467,16 +5467,28 @@ impl Materializer {
             ExecutionProfile::Kv => {
                 #[cfg(feature = "kv")]
                 {
-                    RedbStateMachine::open(
-                        config.data_dir().join("kv/data.redb"),
-                        config.cluster_id(),
-                        config.node_id(),
-                        config.epoch(),
-                        configuration_state.config_id(),
-                    )
-                    .map(Arc::new)
-                    .map(Self::Kv)
-                    .map_err(|error| NodeError::Storage(error.to_string()))
+                    let open = || {
+                        RedbStateMachine::open(
+                            config.data_dir().join("kv/data.redb"),
+                            config.cluster_id(),
+                            config.node_id(),
+                            config.epoch(),
+                            configuration_state.config_id(),
+                        )
+                    };
+                    let state = match open() {
+                        Ok(state) => state,
+                        Err(_) => match recovery_anchor {
+                            Some(anchor) => {
+                                return Err(NodeError::SnapshotRequired(Box::new(anchor.clone())))
+                            }
+                            _ => {
+                                quarantine_materializer(config.data_dir(), "kv")?;
+                                open().map_err(|error| NodeError::Storage(error.to_string()))?
+                            }
+                        },
+                    };
+                    Ok(Self::Kv(Arc::new(state)))
                 }
                 #[cfg(not(feature = "kv"))]
                 Err(NodeError::Unavailable(
@@ -6906,9 +6918,9 @@ impl NodeRuntime {
                         }
                         break (None, Vec::new());
                     }
-                    Some(payload) if !payload.starts_with(QWAL_V2_MAGIC) => {
+                    Some(payload) if !payload.starts_with(QWAL_V3_MAGIC) => {
                         let error = self.latch(NodeError::Invariant(
-                            "SQLite materializer prepared a non-QWAL v2 SQL batch".into(),
+                            "SQLite materializer prepared a non-QWAL v3 SQL batch".into(),
                         ));
                         for index in pending.drain(..) {
                             results[index] = Some(Err(error.clone()));
@@ -7900,12 +7912,12 @@ impl NodeRuntime {
         }
         let payload = preparation.effect.ok_or_else(|| {
             self.latch(NodeError::Invariant(
-                "successful SQL preparation omitted its QWAL v2 effect".into(),
+                "successful SQL preparation omitted its QWAL v3 effect".into(),
             ))
         })?;
-        if !payload.starts_with(QWAL_V2_MAGIC) {
+        if !payload.starts_with(QWAL_V3_MAGIC) {
             return Err(self.latch(NodeError::Invariant(
-                "SQLite materializer prepared a non-QWAL v2 SQL proposal".into(),
+                "SQLite materializer prepared a non-QWAL v3 SQL proposal".into(),
             )));
         }
         if payload.len() > MAX_COMMAND_BYTES {
@@ -7940,9 +7952,9 @@ impl NodeRuntime {
                 .lock_sqlite()?
                 .prepare_put_effect(request_id, key, value, &payload, last_index, last_hash)
                 .map_err(|error| self.map_sqlite_error(error))?;
-            if !proposal_payload.starts_with(QWAL_V2_MAGIC) {
+            if !proposal_payload.starts_with(QWAL_V3_MAGIC) {
                 return Err(self.latch(NodeError::Invariant(
-                    "SQLite materializer prepared a non-QWAL v2 legacy put proposal".into(),
+                    "SQLite materializer prepared a non-QWAL v3 legacy put proposal".into(),
                 )));
             }
             if proposal_payload.len() > MAX_COMMAND_BYTES {
@@ -9378,7 +9390,7 @@ mod tests {
         client_authenticated, next_sync_flush_retry, run_read_operation, sql_query_http_response,
         valid_recorder_record, Duration, HeaderMap, NodeError, ReadConsistency, SqlCommand,
         SqlQueryResponse, SqlStatement, SqlValue, SqlWriteProfiler, MAX_COMMAND_BYTES,
-        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V2_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
+        MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
         VERSION_HEADER,
     };
     use super::{NodeConfig, NodeRuntime, NodeService};
@@ -11011,7 +11023,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            rhiza_sql::decode_qwal_v2(&entry.payload)
+            rhiza_sql::decode_qwal_v3(&entry.payload)
                 .unwrap()
                 .receipts
                 .len(),
@@ -11080,14 +11092,14 @@ mod tests {
             .iter()
             .all(|result| result.as_ref().unwrap().applied_index == 3));
         assert_eq!(
-            rhiza_sql::decode_qwal_v2(&runtime.log_store().read(2).unwrap().unwrap().payload)
+            rhiza_sql::decode_qwal_v3(&runtime.log_store().read(2).unwrap().unwrap().payload)
                 .unwrap()
                 .receipts
                 .len(),
             1024
         );
         assert_eq!(
-            rhiza_sql::decode_qwal_v2(&runtime.log_store().read(3).unwrap().unwrap().payload)
+            rhiza_sql::decode_qwal_v3(&runtime.log_store().read(3).unwrap().unwrap().payload)
                 .unwrap()
                 .receipts
                 .len(),
@@ -11556,7 +11568,7 @@ mod tests {
             .read(response.applied_index)
             .unwrap()
             .unwrap();
-        assert!(entry.payload.starts_with(QWAL_V2_MAGIC));
+        assert!(entry.payload.starts_with(QWAL_V3_MAGIC));
         assert!(!entry.payload.starts_with(b"put\t"));
         assert_eq!(
             runtime.read("key", ReadConsistency::Local).unwrap().value,
@@ -11606,7 +11618,7 @@ mod tests {
         );
         for index in 1..=2 {
             let entry = runtime.log_store().read(index).unwrap().unwrap();
-            assert!(entry.payload.starts_with(QWAL_V2_MAGIC));
+            assert!(entry.payload.starts_with(QWAL_V3_MAGIC));
         }
         assert_eq!(
             replay
@@ -12381,8 +12393,8 @@ pub(crate) fn validate_profile_entry_shape(
     validate_entry_shape(entry)?;
     #[cfg(feature = "sql")]
     if _profile == ExecutionProfile::Sqlite && entry.entry_type == EntryType::Command {
-        decode_qwal_v2(&entry.payload)
-            .map_err(|error| format!("SQLite command is not canonical QWAL v2: {error}"))?;
+        decode_qwal_v3(&entry.payload)
+            .map_err(|error| format!("SQLite command is not canonical QWAL v3: {error}"))?;
     }
     Ok(())
 }
