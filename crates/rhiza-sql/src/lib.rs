@@ -12,6 +12,7 @@ use rhiza_core::{
     Snapshot, SnapshotIdentity, SnapshotManifest,
 };
 use rusqlite::{
+    config::DbConfig,
     hooks::{AuthAction, AuthContext, Authorization},
     params, params_from_iter,
     types::{ToSql, ToSqlOutput, Value, ValueRef},
@@ -21,11 +22,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::qwal::diff_closed_databases_from_candidates;
+use crate::wal_capture::{capture_wal, WalCapture, WalCommit};
 
 mod control;
 mod qwal;
-mod qwal_vfs;
+mod wal_capture;
 
 pub use control::{ControlIdentity, ControlStore, PendingApply, RequestReceipt};
 pub use qwal::{
@@ -33,10 +34,6 @@ pub use qwal::{
     sqlite_page_size, QwalEnvelopeV2, QwalPageV2, QwalReceiptV2, MAX_QWAL_V2_BYTES,
     MAX_QWAL_V2_RECEIPTS, QWAL_V2_MAGIC,
 };
-pub use qwal_vfs::{
-    PageRange, QwalRecordingSession, QwalVfsError, SealedQwalRecording, QWAL_RECORDING_VFS_NAME,
-};
-
 const CREATE_KV_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS __rhiza_kv (
     key TEXT PRIMARY KEY,
@@ -1241,18 +1238,28 @@ impl SqliteStateMachine {
             #[cfg(test)]
             note_speculative_copy(&self.path);
             let page_size = sqlite_page_size(&self.path)?;
-            let mut recording = QwalRecordingSession::begin(staging_path, page_size).ok();
-            let mut staging = if recording.is_some() {
-                match open_connection_with_vfs(staging_path, Some(QWAL_RECORDING_VFS_NAME)) {
-                    Ok(connection) => connection,
-                    Err(_) => {
-                        recording = None;
-                        open_connection(staging_path)?
-                    }
-                }
-            } else {
-                open_connection(staging_path)?
-            };
+            let base_db_pages = u32::try_from(base_file_bytes / u64::from(page_size))
+                .map_err(|_| Error::ResourceExhausted("SQLite base page count overflows".into()))?;
+            if !sqlite_sidecars_absent(staging_path)? {
+                return Err(Error::InvalidEntry(
+                    "fresh speculative SQLite clone has inherited sidecars".into(),
+                ));
+            }
+            let sidecar_cleanup = StagingSidecarCleanup::new(staging_path);
+            let mut staging = open_connection(staging_path)?;
+            if !staging
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+                .map_err(sqlite_error)?
+                || !staging
+                    .db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+                    .map_err(sqlite_error)?
+            {
+                return Err(Error::Sqlite(
+                    "SQLite refused to disable checkpoint-on-close for QWAL capture".into(),
+                ));
+            }
+            #[cfg(test)]
+            note_native_wal_capture(&self.path);
             staging
                 .pragma_update(None, "synchronous", "OFF")
                 .map_err(sqlite_error)?;
@@ -1263,37 +1270,41 @@ impl SqliteStateMachine {
                 staging
                     .close()
                     .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
+                sidecar_cleanup.cleanup()?;
                 return Ok((None, mutation.results, None, None, None));
             }
-            if let Some(recording) = &recording {
-                let _ = recording.mark_commit_observed();
-            }
-            checkpoint_truncate(&staging)?;
-            if let Some(recording) = &recording {
-                let _ = recording.mark_checkpoint_succeeded();
-            }
+            let held_wal = open_fresh_staging_wal(staging_path)?;
             staging
                 .close()
                 .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
-            let recording = recording.and_then(|recording| recording.seal().ok());
-            let (pages, target_db_digest, _recorder_covers_diff) = if let Some(recording) =
-                recording
-                    .as_ref()
-                    .filter(|recording| recording.is_complete())
-            {
-                let (pages, target_db_digest) = diff_closed_databases_from_candidates(
-                    &self.path,
-                    staging_path,
-                    &recording.candidate_pages,
-                )?;
-                (pages, target_db_digest, true)
-            } else {
-                let (pages, target_db_digest) = diff_closed_databases(&self.path, staging_path)?;
-                (pages, target_db_digest, false)
-            };
             #[cfg(test)]
-            if _recorder_covers_diff {
-                note_recorder_audit(&self.path);
+            inject_wal_capture_fault(&self.path, held_wal.as_ref())?;
+            let capture = match held_wal {
+                Some((mut wal, seal)) => {
+                    verify_staging_wal_seal(&wal, seal)?;
+                    let capture = capture_wal(&mut wal, base_db_pages, MAX_QWAL_V2_BYTES)?;
+                    verify_staging_wal_seal(&wal, seal)?;
+                    capture
+                }
+                None => WalCapture::NoChange,
+            };
+            let pages = materialize_wal_capture(
+                &base_file,
+                staging_path,
+                page_size,
+                base_file_bytes,
+                capture,
+            )?;
+            sidecar_cleanup.cleanup()?;
+            let target_file_bytes = fs::metadata(staging_path).map_err(io_error)?.len();
+            let target_db_digest = file_digest(staging_path)?;
+            if pages.is_empty()
+                && target_file_bytes == base_file_bytes
+                && target_db_digest != actual_base_digest
+            {
+                return Err(Error::InvalidEntry(
+                    "no-change SQLite WAL target differs from its closed base".into(),
+                ));
             }
 
             let effect = QwalEnvelopeV2 {
@@ -1306,7 +1317,7 @@ impl SqliteStateMachine {
                 base_db_digest: actual_base_digest,
                 base_file_bytes,
                 target_db_digest,
-                target_file_bytes: fs::metadata(staging_path).map_err(io_error)?.len(),
+                target_file_bytes,
                 materializer_fingerprint: identity.materializer_fingerprint().to_hex(),
                 page_size,
                 receipts: mutation.receipts,
@@ -1789,16 +1800,8 @@ pub fn restore_recovery_snapshot_file(
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
-    open_connection_with_vfs(path, None)
-}
-
-fn open_connection_with_vfs(path: &Path, vfs: Option<&str>) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = match vfs {
-        Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs),
-        None => Connection::open_with_flags(path, flags),
-    }
-    .map_err(sqlite_error)?;
+    let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
         .map_err(sqlite_error)?;
@@ -1831,30 +1834,12 @@ fn checkpoint_truncate(conn: &Connection) -> Result<()> {
 }
 
 #[cfg(test)]
-fn recorder_audits() -> &'static Mutex<Vec<PathBuf>> {
-    static AUDITS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    AUDITS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-#[cfg(test)]
-fn note_recorder_audit(path: &Path) {
-    if let Ok(mut audits) = recorder_audits().lock() {
-        audits.push(path.to_path_buf());
-    }
-}
-
-#[cfg(test)]
-fn recorder_audited(path: &Path) -> bool {
-    recorder_audits()
-        .lock()
-        .is_ok_and(|audits| audits.iter().any(|audited| audited == path))
-}
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SpeculativePrepareAudit {
     copy_count: usize,
     synchronous: i64,
+    native_vfs: bool,
+    no_checkpoint_on_close: bool,
 }
 
 #[cfg(test)]
@@ -1871,8 +1856,20 @@ fn note_speculative_copy(path: &Path) {
             SpeculativePrepareAudit {
                 copy_count: 1,
                 synchronous: -1,
+                native_vfs: false,
+                no_checkpoint_on_close: false,
             },
         ));
+    }
+}
+
+#[cfg(test)]
+fn note_native_wal_capture(path: &Path) {
+    if let Ok(mut audits) = speculative_prepare_audits().lock() {
+        if let Some((_, audit)) = audits.iter_mut().rev().find(|(audited, _)| audited == path) {
+            audit.native_vfs = true;
+            audit.no_checkpoint_on_close = true;
+        }
     }
 }
 
@@ -1980,15 +1977,253 @@ fn prepared_base_reuse_audit(path: &Path) -> Option<PreparedBaseReuseAudit> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagingWalSeal {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix: PreparedBaseSeal,
+}
+
+impl StagingWalSeal {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            unix: unix_metadata_seal(metadata),
+        }
+    }
+}
+
+struct StagingSidecarCleanup {
+    path: PathBuf,
+}
+
+impl StagingSidecarCleanup {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&self.path, suffix);
+            match fs::symlink_metadata(&sidecar) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    fs::remove_file(&sidecar).map_err(io_error)?;
+                }
+                Ok(_) => {
+                    return Err(Error::InvalidEntry(format!(
+                        "owned speculative SQLite sidecar {} is not a regular file",
+                        sidecar.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagingSidecarCleanup {
+    fn drop(&mut self) {
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(sqlite_sidecar_path(&self.path, suffix));
+        }
+    }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 fn sqlite_sidecars_absent(path: &Path) -> Result<bool> {
     for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        if Path::new(&sidecar).try_exists().map_err(io_error)? {
+        if sqlite_sidecar_path(path, suffix)
+            .try_exists()
+            .map_err(io_error)?
+        {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn open_fresh_staging_wal(path: &Path) -> Result<Option<(File, StagingWalSeal)>> {
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(test)]
+    options.write(true);
+    let wal = match options.open(&wal_path) {
+        Ok(wal) => wal,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let owned = wal.metadata().map_err(io_error)?;
+    let named = fs::symlink_metadata(&wal_path).map_err(io_error)?;
+    if !owned.file_type().is_file() || !named.file_type().is_file() {
+        return Err(Error::InvalidEntry(
+            "fresh speculative SQLite WAL is not a regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    if !same_file(&owned, &named) {
+        return Err(Error::InvalidEntry(
+            "held speculative SQLite WAL inode is no longer named by its path".into(),
+        ));
+    }
+    let seal = StagingWalSeal::from_metadata(&owned);
+    if StagingWalSeal::from_metadata(&named) != seal {
+        return Err(Error::InvalidEntry(
+            "fresh speculative SQLite WAL metadata is unstable".into(),
+        ));
+    }
+    Ok(Some((wal, seal)))
+}
+
+fn verify_staging_wal_seal(wal: &File, seal: StagingWalSeal) -> Result<()> {
+    if StagingWalSeal::from_metadata(&wal.metadata().map_err(io_error)?) != seal {
+        return Err(Error::InvalidEntry(
+            "held speculative SQLite WAL changed after capture was sealed".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalCaptureFault {
+    ChangeHeldWalAfterSeal,
+}
+
+#[cfg(test)]
+fn wal_capture_faults() -> &'static Mutex<Vec<(PathBuf, WalCaptureFault)>> {
+    static FAULTS: OnceLock<Mutex<Vec<(PathBuf, WalCaptureFault)>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn arm_wal_capture_fault(path: &Path, fault: WalCaptureFault) {
+    wal_capture_faults()
+        .lock()
+        .unwrap()
+        .push((path.to_path_buf(), fault));
+}
+
+#[cfg(test)]
+fn inject_wal_capture_fault(path: &Path, held_wal: Option<&(File, StagingWalSeal)>) -> Result<()> {
+    let fault = {
+        let mut faults = wal_capture_faults()
+            .lock()
+            .map_err(|_| Error::Sqlite("WAL capture fault lock is poisoned".into()))?;
+        faults
+            .iter()
+            .position(|(armed, _)| armed == path)
+            .map(|position| faults.swap_remove(position).1)
+    };
+    match (fault, held_wal) {
+        (Some(WalCaptureFault::ChangeHeldWalAfterSeal), Some((wal, seal))) => wal
+            .set_len(
+                seal.len
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ResourceExhausted("test WAL length overflow".into()))?,
+            )
+            .map_err(io_error),
+        (Some(_), None) => Err(Error::InvalidEntry(
+            "test expected a held speculative SQLite WAL".into(),
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
+fn materialize_wal_capture(
+    base: &File,
+    target_path: &Path,
+    expected_page_size: u32,
+    base_file_bytes: u64,
+    capture: WalCapture,
+) -> Result<Vec<QwalPageV2>> {
+    let WalCapture::Committed(WalCommit {
+        page_size,
+        target_db_pages,
+        target_file_bytes,
+        pages: captured_pages,
+    }) = capture
+    else {
+        if fs::metadata(target_path).map_err(io_error)?.len() != base_file_bytes
+            || sqlite_page_size(target_path)? != expected_page_size
+        {
+            return Err(Error::InvalidEntry(
+                "no-change SQLite WAL capture does not reproduce its closed base".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    if page_size != expected_page_size {
+        return Err(Error::InvalidEntry(
+            "SQLite WAL page size differs from its closed base".into(),
+        ));
+    }
+    let expected_target_bytes = u64::from(target_db_pages)
+        .checked_mul(u64::from(page_size))
+        .ok_or_else(|| Error::InvalidEntry("SQLite WAL target size overflows".into()))?;
+    if target_file_bytes != expected_target_bytes {
+        return Err(Error::InvalidEntry(
+            "SQLite WAL target size does not match its commit page count".into(),
+        ));
+    }
+
+    let page_bytes = u64::from(page_size);
+    let base_pages = base_file_bytes / page_bytes;
+    let mut base = base.try_clone().map_err(io_error)?;
+    let mut target = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target_path)
+        .map_err(io_error)?;
+    target.set_len(target_file_bytes).map_err(io_error)?;
+    let mut changed = Vec::with_capacity(captured_pages.len());
+    let mut base_page = vec![0; page_size as usize];
+    for page in captured_pages {
+        let page_no = u64::from(page.page_no);
+        let offset = page_no
+            .checked_sub(1)
+            .and_then(|index| index.checked_mul(page_bytes))
+            .ok_or_else(|| Error::InvalidEntry("SQLite WAL page offset overflows".into()))?;
+        let differs_from_base = if page_no <= base_pages {
+            base.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+            base.read_exact(&mut base_page).map_err(io_error)?;
+            base_page != page.after_image
+        } else {
+            true
+        };
+        target.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        target.write_all(&page.after_image).map_err(io_error)?;
+        if differs_from_base {
+            changed.push(QwalPageV2 {
+                page_no,
+                after_image: page.after_image,
+            });
+        }
+    }
+    drop(target);
+
+    // sqlite_page_size also validates the SQLite header database-size field
+    // at bytes 28..32 against this exact target file length.
+    if fs::metadata(target_path).map_err(io_error)?.len() != target_file_bytes
+        || sqlite_page_size(target_path)? != page_size
+    {
+        return Err(Error::InvalidEntry(
+            "materialized SQLite WAL does not match its committed header and target size".into(),
+        ));
+    }
+    Ok(changed)
 }
 
 fn open_file_digest(file: &File) -> Result<LogHash> {
@@ -3146,7 +3381,7 @@ mod query_policy_tests {
     }
 
     #[test]
-    fn non_durable_staging_uses_complete_candidate_page_capture() {
+    fn non_durable_staging_uses_native_wal_capture_without_checkpoint_or_full_diff() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
@@ -3167,9 +3402,13 @@ mod query_policy_tests {
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
 
-        // The speculative database is disposable, so logical commit and
-        // checkpoint completion are sufficient for candidate-page capture.
-        assert!(recorder_audited(&path));
+        let audit = speculative_prepare_audit(&path).unwrap();
+        assert!(audit.native_vfs);
+        assert!(audit.no_checkpoint_on_close);
+        {
+            let prepared = database.prepared_target.lock().unwrap();
+            assert!(sqlite_sidecars_absent(prepared.as_ref().unwrap().artifact.path()).unwrap());
+        }
         let effect = decode_qwal_v2(&payload).unwrap();
         let hash = LogEntry::calculate_hash(
             "cluster-a",
@@ -3196,6 +3435,93 @@ mod query_policy_tests {
             database.canonical_db_digest().unwrap(),
             effect.target_db_digest
         );
+    }
+
+    #[test]
+    fn prepare_fails_closed_without_changing_canonical_or_control_when_held_wal_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let command = SqlCommand {
+            request_id: "unstable-held-wal".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE unstable(value INTEGER NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let base_digest = database.canonical_db_digest().unwrap();
+        arm_wal_capture_fault(&path, WalCaptureFault::ChangeHeldWalAfterSeal);
+
+        let error =
+            prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                Error::InvalidEntry(message) if message.contains("changed after capture was sealed")
+            ),
+            "{error:?}"
+        );
+        assert_eq!(database.canonical_db_digest().unwrap(), base_digest);
+        assert_eq!(database.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+        assert_eq!(
+            database
+                .check_sql_request("unstable-held-wal", &request)
+                .unwrap(),
+            None
+        );
+        assert!(database.prepared_target.lock().unwrap().is_none());
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("state.sqlite")
+        }));
+    }
+
+    #[test]
+    fn successful_noop_uses_explicit_no_change_effect_and_still_replays_its_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let setup = SqlCommand {
+            request_id: "no-physical-change-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE noop_target(value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let setup_request = encode_sql_command(&setup).unwrap();
+        let setup_payload =
+            prepare_single_sql_effect(&database, &setup, &setup_request, 0, LogHash::ZERO).unwrap();
+        let setup_entry = command_entry(1, LogHash::ZERO, setup_payload);
+        database.apply_entry(&setup_entry).unwrap();
+        let command = SqlCommand {
+            request_id: "no-physical-change".into(),
+            statements: vec![SqlStatement {
+                sql: "UPDATE noop_target SET value = 'unused' WHERE rowid = -1".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let base_digest = database.canonical_db_digest().unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 1, setup_entry.hash).unwrap();
+        let effect = decode_qwal_v2(&payload).unwrap();
+        assert!(effect.pages.is_empty());
+        assert_eq!(effect.base_db_digest, base_digest);
+        assert_eq!(effect.target_db_digest, base_digest);
+
+        let entry = command_entry(2, setup_entry.hash, payload);
+        database.apply_entry(&entry).unwrap();
+
+        assert_eq!(database.canonical_db_digest().unwrap(), base_digest);
+        assert!(database
+            .check_sql_request("no-physical-change", &request)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

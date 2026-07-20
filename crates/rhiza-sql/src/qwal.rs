@@ -297,72 +297,6 @@ pub fn diff_closed_databases(
     Ok((pages, LogHash::from_bytes(target_hasher.finalize().into())))
 }
 
-/// Produces final page images from a complete VFS candidate set while still
-/// hashing every target byte. The caller must only use a recording which
-/// observed the successful commit and its complete checkpoint.
-pub(crate) fn diff_closed_databases_from_candidates(
-    base_path: impl AsRef<Path>,
-    target_path: impl AsRef<Path>,
-    candidate_pages: &[u64],
-) -> Result<(Vec<QwalPageV2>, LogHash)> {
-    if candidate_pages.windows(2).any(|pair| pair[0] >= pair[1])
-        || candidate_pages.first() == Some(&0)
-    {
-        return invalid("QWAL candidate pages must be sorted, unique, and one-based");
-    }
-    let base_path = base_path.as_ref();
-    let target_path = target_path.as_ref();
-    let base_page_size = sqlite_page_size(base_path)?;
-    let target_page_size = sqlite_page_size(target_path)?;
-    if base_page_size != target_page_size {
-        return invalid("SQLite base and target page sizes differ");
-    }
-
-    let page_size = base_page_size as usize;
-    let mut base = File::open(base_path).map_err(io_error)?;
-    let mut target = File::open(target_path).map_err(io_error)?;
-    let base_pages = base.metadata().map_err(io_error)?.len() / u64::from(base_page_size);
-    let target_pages = target.metadata().map_err(io_error)?.len() / u64::from(base_page_size);
-    if target_pages > base_pages
-        && (base_pages + 1..=target_pages).any(|page| candidate_pages.binary_search(&page).is_err())
-    {
-        return invalid("QWAL candidate recording omitted a newly allocated target page");
-    }
-
-    let mut target_page = vec![0; page_size];
-    let mut base_page = vec![0; page_size];
-    let mut target_hasher = Sha256::new();
-    let mut pages = Vec::new();
-    let mut changed_bytes = 0usize;
-    for page_no in 1..=target_pages {
-        target.read_exact(&mut target_page).map_err(io_error)?;
-        target_hasher.update(&target_page);
-        let base_has_page = page_no <= base_pages;
-        if base_has_page {
-            base.read_exact(&mut base_page).map_err(io_error)?;
-        }
-        if base_has_page && base_page == target_page {
-            continue;
-        }
-        if candidate_pages.binary_search(&page_no).is_err() {
-            return invalid("QWAL candidate recording omitted a changed target page");
-        }
-        changed_bytes = changed_bytes
-            .checked_add(page_size)
-            .ok_or_else(|| Error::ResourceExhausted("QWAL diff size overflows".into()))?;
-        if changed_bytes > MAX_QWAL_V2_BYTES {
-            return Err(Error::ResourceExhausted(format!(
-                "QWAL changed pages exceed {MAX_QWAL_V2_BYTES} bytes"
-            )));
-        }
-        pages.push(QwalPageV2 {
-            page_no,
-            after_image: target_page.clone(),
-        });
-    }
-    Ok((pages, LogHash::from_bytes(target_hasher.finalize().into())))
-}
-
 /// Copies `base_path` to a new temp path and applies a validated page effect.
 ///
 /// `temp_path` must not already exist. On any error, a partially written temp
@@ -617,48 +551,6 @@ mod tests {
 
             assert_eq!(target_digest, file_digest(&target).unwrap());
         }
-    }
-
-    #[test]
-    fn candidate_diff_matches_full_diff_for_update_growth_and_shrink() {
-        for (base_fills, target_fills, candidates) in [
-            (vec![1, 2, 3], vec![1, 9, 3], vec![2]),
-            (vec![1], vec![1, 2, 3], vec![1, 2, 3]),
-            (vec![1, 2, 3], vec![1], vec![1]),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let base = dir.path().join("base.db");
-            let target = dir.path().join("target.db");
-            write_pages(&base, 512, &base_fills);
-            write_pages(&target, 512, &target_fills);
-
-            assert_eq!(
-                diff_closed_databases_from_candidates(&base, &target, &candidates).unwrap(),
-                diff_closed_databases(&base, &target).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn candidate_diff_fails_closed_when_growth_page_was_not_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.db");
-        let target = dir.path().join("target.db");
-        write_pages(&base, 512, &[1]);
-        write_pages(&target, 512, &[1, 2]);
-
-        assert!(diff_closed_databases_from_candidates(&base, &target, &[]).is_err());
-    }
-
-    #[test]
-    fn candidate_diff_fails_closed_when_changed_existing_page_was_not_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.db");
-        let target = dir.path().join("target.db");
-        write_pages(&base, 512, &[1, 2, 3]);
-        write_pages(&target, 512, &[1, 9, 3]);
-
-        assert!(diff_closed_databases_from_candidates(&base, &target, &[1, 3]).is_err());
     }
 
     #[test]
