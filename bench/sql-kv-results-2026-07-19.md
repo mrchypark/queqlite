@@ -301,3 +301,97 @@ there are only four operations available to share that barrier. Logical b256
 does exceed 5,760 by 1.99x at c1 and 3.91x at c4 because 256–1,024 operations
 share each physical group. These are dirty-worktree diagnostic results, not
 release claims.
+
+## QWAL v3 final paired regression — 2026-07-20
+
+This section supersedes the earlier generation-5/full-file-diff diagnostics.
+The current SQL format is QWAL v3 with native SQLite-WAL page capture, a sealed
+incremental page-state tree, and in-place follower apply. Recorder quorum remains
+the sole authoritative durable redo source. SQLite, control, and file qlog are
+rebuildable views, and strict ACK still waits for local apply visibility.
+
+The paired benchmark alternated these exact binaries on the same Apple M3 host:
+
+- baseline source `a01e16c2767b9fd9bf4ae21d46065a4bac393437`, using the schema-v6
+  follower harness linked to its QWAL v2 implementation; binary SHA-256
+  `0351a3072ac22e1230506a242dfebe327bc4c18b48f9690be688d5406d1ae7ab`
+- current source `780d861ef37c3bc2c2a5ea0a0551d25e76178c38`; binary SHA-256
+  `dbba3bb87a7a27ae18f7f0b6598101e5790ab348095f34ada79652a38e340690`
+
+Raw JSON and independently bound baseline/current seed caches are under the
+ignored directory `target/rhiza-bench/qwal-v3-final-780d861/`. Only the
+`ab-follower-*`, `ab-final-read-*`, `ab-final-write-*`, and
+`final-read-kv-*` files are retained evidence. Every retained run completed
+all requested operations with zero errors. Every read reported zero qlog
+entries. Values below are medians; brackets are nearest-rank Q1–Q3.
+
+### Follower apply scaling
+
+`follower_apply_latency_us` times only `SqliteStateMachine::apply_entry` for a
+prebuilt leader entry. Seed creation, snapshot restore, leader prepare, payload
+clone/hash, and leader catch-up are outside this latency. Five paired runs were
+used at 0 and 8 MiB; current-only 32 and 64 MiB cells used three runs.
+
+| Restored SQLite size | Baseline apply p50 | Current apply p50 | Apply speedup | Baseline whole ops/s | Current whole ops/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 73,728 B | 2,093 us | 998 us | 2.10x | 187.67 [183.72–194.29] | 257.59 [252.70–259.63] |
+| 8,495,104 B | 74,670 us | 1,033 us | 72.28x | 8.40 [8.36–8.40] | 249.86 [248.85–252.09] |
+| 33,759,232 B | — | 1,019 us | — | — | 196.59 [195.22–197.03] |
+| 67,444,736 B | — | 965 us | — | — | 171.42 [167.37–174.43] |
+
+The current follower apply p50 remains approximately one millisecond from
+73 KiB through 67 MiB. The lower whole-operation rate at 32/64 MiB is outside
+the timed follower apply and comes mainly from leader-side preparation and
+state-seal verification. The old follower path scales with database size
+because it reconstructs and validates the whole file; QWAL v3 applies only the
+captured page effects.
+
+### SQL and KV reads
+
+SQL values are paired baseline/current medians. Removing the control-sidecar
+`pending_apply` query from every read and replacing it with a lifecycle-bound
+atomic fence is the only production change between the previous QWAL v3 binary
+and the final current binary. Fault tests prove that the fence remains closed
+through page/control failure and opens only after exact replay.
+
+| SQL read | Baseline ops/s | Current ops/s | Change |
+| --- | ---: | ---: | ---: |
+| raw local c1 | 113,009.32 | 317,872.67 | +181.28% |
+| runtime local c1 | 73,585.70 | 120,182.27 | +63.32% |
+| runtime local c4 | 59,995.12 | 90,355.02 | +50.60% |
+| runtime local c16 | 60,223.58 | 92,027.06 | +52.81% |
+| runtime ReadBarrier c1 | 7,963.29 | 8,375.36 | +5.17% |
+| runtime ReadBarrier c4 | 31,041.32 | 32,821.48 | +5.74% |
+| runtime ReadBarrier c16 | 38,832.10 | 50,522.84 | +30.10% |
+
+Final current-only KV medians were 868,633.01 raw-local c1 and
+606,984.42/731,406.50/635,983.98 runtime-local c1/c4/c16. KV ReadBarrier was
+10,191.79/40,002.50/146,001.43 ops/s. SQL and KV local reads have the same
+consistency boundary—one materializer snapshot at its applied tip—but not the
+same engine cost: SQLite statement/row decoding remains heavier than redb key
+lookup. ReadBarrier first obtains a read-only 2/3 Recorder fence and then reads
+that same local snapshot. It appends no qlog entry. At c1 the network/quorum
+round trip dominates; concurrent callers amortize it through the shared barrier
+generation.
+
+### Three-voter strict writes
+
+All write cells use one in-process QuePaxa node with three file-backed Recorder
+voters. The Q1–Q3 ranges overlap strongly for the unchanged write paths.
+
+| Workload | Baseline median ops/s | Current median ops/s | Change | Median qlog entries |
+| --- | ---: | ---: | ---: | ---: |
+| SQL b1 c4, 2,000 writes | 267.38 | 274.58 | +2.69% | 501 |
+| SQL b256 c1, 102,400 writes | 10,551.02 | 10,674.14 | +1.17% | 400 |
+| SQL b256 c4, 102,400 writes | 20,882.00 | 20,676.26 | -0.99% | 100–101 |
+| KV b1 c4, 2,000 writes | 354.08 | 350.65 | -0.97% | 502 |
+| KV b256 c4, 102,400 writes | 35,226.30 | 35,244.01 | +0.05% | 100–101 |
+
+The pending-read fence has no material write regression. Against the supplied
+Hiqlite c4 baseline of 5,760 INSERT/s, current SQL b256 is 1.85x at c1 and
+3.59x at c4; KV b256/c4 is 6.12x. These are logical-batch comparisons. Strict
+single-request SQL c4 remains 274.58 ops/s because only four outstanding calls
+share each quorum `fdatasync`; reaching 5,760 single INSERT/s at c4 would require
+more outstanding requests, a client logical batch, faster durable media/Linux,
+or weaker ACK semantics. QWAL v3 removes the database-size-dependent follower
+cost, but it cannot remove the required Recorder quorum flush for RPO=0.
