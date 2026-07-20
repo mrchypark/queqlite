@@ -19,6 +19,7 @@ recovery_hold_csv="${RHIZA_RECOVERY_HOLD_SECONDS:-60,180,300}"
 recovery_fail_csv="${RHIZA_RECOVERY_FAIL_PEERS:-1,2,3}"
 recovery_timeout="${RHIZA_STATEFULSET_READY_TIMEOUT:-420}"
 recovery_auto_timeout="${RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS:-30}"
+recovery_f1_probe_interval="${RHIZA_RECOVERY_F1_PROBE_INTERVAL_SECONDS:-10}"
 target="${RHIZA_E2E_TARGET_DIR:-target/rhiza-e2e}/${profile:-missing}/$run_id"
 context=""
 previous_context=""
@@ -43,6 +44,7 @@ case "$recovery_matrix_only" in 0|1) ;; *) die "RHIZA_E2E_RECOVERY_MATRIX_ONLY m
   || die "RHIZA_E2E_RECOVERY_MATRIX_ONLY=1 requires RHIZA_E2E_RECOVERY_MATRIX=1"
 case "$recovery_timeout" in ''|*[!0-9]*|0) die "RHIZA_STATEFULSET_READY_TIMEOUT must be positive";; esac
 case "$recovery_auto_timeout" in ''|*[!0-9]*|0) die "RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS must be positive";; esac
+case "$recovery_f1_probe_interval" in ''|*[!0-9]*|0) die "RHIZA_RECOVERY_F1_PROBE_INTERVAL_SECONDS must be positive";; esac
 IFS=, read -r -a recovery_holds <<< "$recovery_hold_csv"
 IFS=, read -r -a recovery_failures <<< "$recovery_fail_csv"
 [ "${#recovery_holds[@]}" -gt 0 ] || die "RHIZA_RECOVERY_HOLD_SECONDS must not be empty"
@@ -534,6 +536,7 @@ matrix_emit_cell() {
     --arg phase "$cell_phase" --arg error "$cell_error" \
     --argjson failed_peers "$cell_failed" --argjson survivors "$cell_survivors" \
     --argjson hold_requested_seconds "$cell_hold" \
+    --argjson failure_probe_interval_seconds "$recovery_f1_probe_interval" \
     --argjson hold_actual_seconds "$cell_hold_actual" \
     --argjson release_epoch_seconds "$cell_release_epoch" \
     --argjson service_rto_seconds "$cell_service_rto" \
@@ -564,6 +567,7 @@ matrix_emit_cell() {
       fault_target_policy:"statefulset_highest_ordinals",
       same_pod_restart_covered:false,arbitrary_leader_failure_covered:false,
       survivors:$survivors,hold_requested_seconds:$hold_requested_seconds,
+      failure_probe_interval_seconds:$failure_probe_interval_seconds,
       hold_actual_seconds:$hold_actual_seconds,release_epoch_seconds:$release_epoch_seconds,
       service_rto_seconds:$service_rto_seconds,full_rto_seconds:$full_rto_seconds,
       failure_injected_at:$failure_injected_at,
@@ -715,7 +719,7 @@ run_recovery_matrix_cell() {
   local post_key="matrix-post-${cell_id}-${run_id}"
   local post_value="recovered-${cell_id}"
   local ordinal hold_start hold_deadline status_file tip_attempt
-  local failure_probe_interval_seconds=10 next_probe probe_sequence now sleep_for
+  local failure_probe_interval_seconds="$recovery_f1_probe_interval" next_probe probe_sequence now sleep_for
   local service_rto_key="matrix-service-rto-${cell_id}-${run_id}"
   local service_rto_value="service-restored-${cell_id}"
   local service_rto_request_id="service-rto-${cell_id}-${run_id}"
