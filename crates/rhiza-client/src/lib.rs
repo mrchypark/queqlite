@@ -542,10 +542,17 @@ impl ClientError {
     }
 
     fn http_status(status: StatusCode) -> Self {
+        let retryable = matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        );
         Self::new(
             "http_error",
             ErrorCategory::Internal,
-            false,
+            retryable,
             None,
             ClientErrorDetail::Http {
                 status,
@@ -800,6 +807,70 @@ mod tests {
         let second = second.0.lock().unwrap();
         assert_eq!(first[0].1, second[0].1);
         assert_eq!(first[0].1, serde_json::to_string(&write_request()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn write_uses_next_endpoint_after_bare_service_unavailable() {
+        for (status, should_fail_over) in [
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::BAD_GATEWAY, true),
+            (StatusCode::GATEWAY_TIMEOUT, true),
+            (StatusCode::BAD_REQUEST, false),
+        ] {
+            let first = CapturedRequests::default();
+            let first_app = Router::new()
+                .route(
+                    rhiza_node::WRITE_PATH,
+                    post(
+                        move |State(captured): State<CapturedRequests>,
+                              headers: HeaderMap,
+                              body: String| async move {
+                            captured.0.lock().unwrap().push((headers, body));
+                            (status, "<html>proxy response</html>")
+                        },
+                    ),
+                )
+                .with_state(first.clone());
+            let (first_endpoint, first_server) = serve(first_app).await;
+
+            let second = CapturedRequests::default();
+            let second_app = Router::new()
+                .route(
+                    rhiza_node::WRITE_PATH,
+                    post(
+                        |State(captured): State<CapturedRequests>,
+                         headers: HeaderMap,
+                         body: String| async move {
+                            captured.0.lock().unwrap().push((headers, body));
+                            write_response(2)
+                        },
+                    ),
+                )
+                .with_state(second.clone());
+            let (second_endpoint, second_server) = serve(second_app).await;
+
+            let result = RhizaClient::new(vec![first_endpoint, second_endpoint], "client-secret")
+                .unwrap()
+                .write(write_request())
+                .await;
+
+            first_server.abort();
+            second_server.abort();
+            let first = first.0.lock().unwrap();
+            let second = second.0.lock().unwrap();
+            assert_eq!(first.len(), 1, "status {status}");
+            if should_fail_over {
+                assert_eq!(result.unwrap().applied_index, 2, "status {status}");
+                assert_eq!(second.len(), 1, "status {status}");
+                assert_eq!(first[0].1, second[0].1, "status {status}");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), "http_error");
+                assert!(!error.retryable());
+                assert!(second.is_empty(), "status {status}");
+            }
+        }
     }
 
     #[tokio::test]
