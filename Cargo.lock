@@ -2091,8 +2091,6 @@ dependencies = [
  "reqwest",
  "rhiza-archive",
  "rhiza-core",
- "rhiza-graph",
- "rhiza-kv",
  "rhiza-log",
  "rhiza-obj-store",
  "rhiza-quepaxa",
@@ -2161,8 +2159,6 @@ version = "0.1.0"
 dependencies = [
  "rhiza-archive",
  "rhiza-core",
- "rhiza-graph",
- "rhiza-kv",
  "rhiza-node",
  "rhiza-obj-store",
  "rhiza-quepaxa",

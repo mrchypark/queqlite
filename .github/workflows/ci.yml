@@ -8,84 +8,49 @@ permissions:
   contents: read
 
 jobs:
-  profile-checks:
-    name: Cargo profile (${{ matrix.profile }})
+  sql-checks:
+    name: Cargo SQL profile
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [sql, graph, kv, all]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Check, lint, and test profile
-        env:
-          RHIZA_PROFILE: ${{ matrix.profile }}
+      - name: Check, lint, and test SQL profile
         run: |
-          case "$RHIZA_PROFILE" in
-            sql|graph|kv) cargo_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc") ;;
-            all) cargo_features=(--all-features) ;;
-            *) exit 64 ;;
-          esac
-          cargo check --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
-          if [ "$RHIZA_PROFILE" != all ]; then
-            dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-dependencies.txt"
-            cargo tree --locked -p rhiza-cli -e normal "${cargo_features[@]}" \
-              --prefix none --format '{p}' > "$dependency_tree"
-            case "$RHIZA_PROFILE" in
-              sql) forbidden=(rhiza-graph lbug rhiza-kv redb) ;;
-              graph) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-kv redb) ;;
-              kv) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-graph lbug) ;;
-            esac
-            for dependency in "${forbidden[@]}"; do
-              if awk -v package="$dependency" \
-                '$1 == package { found=1 } END { exit !found }' "$dependency_tree"; then
-                echo "$RHIZA_PROFILE unexpectedly includes $dependency" >&2
-                exit 1
-              fi
-            done
-          fi
-          cargo clippy --locked -p rhiza-cli --all-targets "${cargo_features[@]}" -- -D warnings
-          cargo test --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
+          cargo check --locked -p rhiza-cli --all-targets --features recorder-postcard-rpc
+          dependency_tree="$RUNNER_TEMP/rhiza-sql-dependencies.txt"
+          cargo tree --locked -p rhiza-cli -e normal --prefix none --format '{p}' > "$dependency_tree"
+          for dependency in rhiza-graph lbug rhiza-kv redb; do
+            if awk -v package="$dependency" '$1 == package { found=1 } END { exit !found }' "$dependency_tree"; then
+              echo "SQL profile unexpectedly includes $dependency" >&2
+              exit 1
+            fi
+          done
+          cargo clippy --locked -p rhiza-cli --all-targets --features recorder-postcard-rpc -- -D warnings
+          cargo test --locked -p rhiza-cli --all-targets --features recorder-postcard-rpc
 
   container-images:
-    name: Container image (${{ matrix.artifact }})
+    name: Container image (rhiza-sql)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - artifact: rhiza-sql
-            profile: sql
-          - artifact: rhiza-graph
-            profile: graph
-          - artifact: rhiza-kv
-            profile: kv
-          - artifact: rhiza-all
-            profile: all
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build ${{ matrix.artifact }}
+      - name: Build rhiza-sql
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           load: true
-          tags: ${{ matrix.artifact }}:ci
-          build-args: RHIZA_PROFILE=${{ matrix.profile }}
+          tags: rhiza-sql:ci
+          build-args: RHIZA_PROFILE=sql
           cache-from: |
             type=gha,scope=rhiza-sql
-            type=gha,scope=rhiza-graph
-            type=gha,scope=rhiza-kv
-            type=gha,scope=rhiza-all
-          cache-to: type=gha,mode=max,scope=rhiza-${{ matrix.profile }}
+          cache-to: type=gha,mode=max,scope=rhiza-sql
       - name: Verify image profile and entrypoint
         env:
-          RHIZA_IMAGE: ${{ matrix.artifact }}:ci
-          RHIZA_PROFILE: ${{ matrix.profile }}
+          RHIZA_IMAGE: rhiza-sql:ci
+          RHIZA_PROFILE: sql
         run: |
           test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ index .Config.Labels "io.rhiza.build-profile" }}')" = "$RHIZA_PROFILE"
           test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ json .Config.Entrypoint }}')" = '["rhiza"]'
@@ -98,9 +63,17 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo build --release --locked --workspace --all-features --bin rhiza
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --all-targets --all-features
+      - run: cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc
+      - run: |
+          cargo clippy --locked --all-targets \
+            -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
+            -p rhiza-archive -p rhiza-sql -p rhiza-node -p rhizadb \
+            -p rhiza-client -p rhiza-cli -- -D warnings
+      - run: |
+          cargo test --locked --all-targets \
+            -p rhiza-core -p rhiza-log -p rhiza-obj-store -p rhiza-quepaxa \
+            -p rhiza-archive -p rhiza-sql -p rhiza-node -p rhizadb \
+            -p rhiza-client -p rhiza-cli
       - run: cargo fmt --manifest-path bench/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path bench/Cargo.toml --locked --all-targets

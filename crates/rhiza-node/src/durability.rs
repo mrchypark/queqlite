@@ -1818,12 +1818,9 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::{
         completed_successor_identity_matches, mark_durable_state, observe_durable_tip,
-        restore_checkpoint_for_rejoin_preserving_recorder,
-        restore_checkpoint_to_fresh_data_dir_for_node, snapshot_profile, validate_local_qlog,
-        validate_local_recovery_view, validate_materializer_tip, validate_restored_suffix,
-        CheckpointCoordinator, CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth,
-        DurabilityMode, ExecutionProfile, LogHash, PendingLag, RESTORE_INTENT_CONTENTS,
-        RESTORE_INTENT_FILE,
+        snapshot_profile, validate_local_qlog, validate_materializer_tip, validate_restored_suffix,
+        CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth, ExecutionProfile,
+        LogHash, PendingLag, RESTORE_INTENT_CONTENTS, RESTORE_INTENT_FILE,
     };
     #[cfg(feature = "kv")]
     use crate::{KvCommandV1, NodeConfig, NodeRuntime};

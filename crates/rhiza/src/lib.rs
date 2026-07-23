@@ -1,5 +1,3 @@
-#[cfg(feature = "graph")]
-use std::collections::BTreeMap;
 use std::{
     fmt,
     path::PathBuf,
@@ -10,8 +8,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "kv")]
-use rhiza_node::run_read_operation;
 use rhiza_node::{confirm_write_durability, ConfigError, NodeConfig, NodeRuntime, NodeService};
 use rhiza_quepaxa::{Error as ConsensusError, Membership, RecorderFileStore, ThreeNodeConsensus};
 use tokio::{
@@ -20,23 +16,11 @@ use tokio::{
 };
 
 pub use rhiza_core::{ErrorCategory, ErrorClassification, ExecutionProfile};
-#[cfg(feature = "graph")]
-pub use rhiza_graph::{
-    CanonicalF64, GraphColumn, GraphCommandResultV1, GraphCommandV1, GraphInternalId,
-    GraphLogicalType, GraphNode, GraphParameterValue, GraphQueryResult, GraphRel, GraphResultValue,
-    GraphValueV1,
-};
-#[cfg(feature = "kv")]
-pub use rhiza_kv::{KvCommandResultV1, KvCommandV1, KvReadTip, KvScanResult, KvScanRow};
 pub use rhiza_node::{
     effective_cluster_id, CheckpointCoordinator, DurabilityError, DurabilityHealth, DurabilityMode,
     LogPeer, NodeError, NodeStatus, ReadConsistency, ReadResponse, SqlExecuteResponse,
     SqlQueryResponse, SqlStatementResult, WriteRequest, WriteResponse,
 };
-#[cfg(feature = "graph")]
-pub use rhiza_node::{GraphMutationOutcome, GraphReadResponse};
-#[cfg(feature = "kv")]
-pub use rhiza_node::{KvMutationOutcome, KvReadResponse};
 pub use rhiza_quepaxa::RecorderRpc;
 pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
@@ -89,6 +73,7 @@ impl EmbeddedConfig {
         root: impl Into<PathBuf>,
         execution_profile: ExecutionProfile,
     ) -> Result<Self, Error> {
+        require_sql_embedded_profile(execution_profile)?;
         let logical_cluster_id = logical_cluster_id.into();
         let cluster_id = effective_cluster_id(execution_profile, &logical_cluster_id)?;
         let root = root.into();
@@ -324,6 +309,7 @@ impl Rhiza {
             log_peers,
             coordinator,
         } = config;
+        require_sql_embedded_profile(execution_profile)?;
         let node_config = NodeConfig::new_embedded(
             identity.cluster_id.clone(),
             identity.node_id.clone(),
@@ -486,196 +472,6 @@ impl RhizaHandle {
             .await?)
     }
 
-    #[cfg(feature = "graph")]
-    pub async fn mutate_graph(
-        &self,
-        command: GraphCommandV1,
-    ) -> Result<GraphMutationOutcome, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Graph)?;
-        embedded_write_allowed(&inner)?;
-        let runtime = inner.runtime.clone();
-        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_graph(command))
-            .await
-            .map_err(Error::Worker)??;
-        confirm_embedded_write(&inner, outcome.applied_index()).await?;
-        Ok(outcome)
-    }
-
-    /// Executes an ordered, non-atomic graph batch that may coalesce commands into fewer log entries.
-    ///
-    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
-    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
-    /// vector with the same request IDs.
-    #[cfg(feature = "graph")]
-    pub async fn mutate_graph_batch(
-        &self,
-        commands: Vec<GraphCommandV1>,
-    ) -> Result<Vec<Result<GraphMutationOutcome, NodeError>>, BatchWriteError> {
-        self.execute_typed_batch(
-            ExecutionProfile::Graph,
-            move |runtime| runtime.mutate_graph_batch(commands),
-            GraphMutationOutcome::applied_index,
-        )
-        .await
-    }
-
-    #[cfg(feature = "graph")]
-    pub async fn query_graph(
-        &self,
-        statement: impl Into<String>,
-        parameters: BTreeMap<String, GraphParameterValue>,
-        consistency: ReadConsistency,
-        max_rows: u32,
-    ) -> Result<GraphQueryResult, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Graph)?;
-        let runtime = inner.runtime.clone();
-        let statement = statement.into();
-        tokio::task::spawn_blocking(move || {
-            runtime.query_graph(&statement, &parameters, consistency, max_rows)
-        })
-        .await
-        .map_err(Error::Worker)?
-        .map_err(Error::Node)
-    }
-
-    #[cfg(feature = "graph")]
-    pub async fn get_graph_document(
-        &self,
-        id: impl Into<String>,
-        consistency: ReadConsistency,
-    ) -> Result<GraphReadResponse, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Graph)?;
-        let runtime = inner.runtime.clone();
-        let id = id.into();
-        tokio::task::spawn_blocking(move || runtime.get_graph_document(&id, consistency))
-            .await
-            .map_err(Error::Worker)?
-            .map_err(Error::Node)
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn put_kv(
-        &self,
-        request_id: impl Into<String>,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> Result<KvMutationOutcome, Error> {
-        let command = KvCommandV1::put(request_id, key, value)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
-        self.mutate_kv(command).await
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn delete_kv(
-        &self,
-        request_id: impl Into<String>,
-        key: Vec<u8>,
-    ) -> Result<KvMutationOutcome, Error> {
-        let command = KvCommandV1::delete(request_id, key)
-            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
-        self.mutate_kv(command).await
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn mutate_kv(&self, command: KvCommandV1) -> Result<KvMutationOutcome, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Kv)?;
-        embedded_write_allowed(&inner)?;
-        let runtime = inner.runtime.clone();
-        let outcome = tokio::task::spawn_blocking(move || runtime.mutate_kv(command))
-            .await
-            .map_err(Error::Worker)??;
-        confirm_embedded_write(&inner, outcome.applied_index()).await?;
-        Ok(outcome)
-    }
-
-    /// Executes an ordered, non-atomic KV batch that may coalesce commands into fewer log entries.
-    ///
-    /// The returned vector has the same length and order as `commands`. An outer `NotAttempted`
-    /// guarantees that no command was attempted. After `Indeterminate`, retry the entire unchanged
-    /// vector with the same request IDs.
-    #[cfg(feature = "kv")]
-    pub async fn mutate_kv_batch(
-        &self,
-        commands: Vec<KvCommandV1>,
-    ) -> Result<Vec<Result<KvMutationOutcome, NodeError>>, BatchWriteError> {
-        self.execute_typed_batch(
-            ExecutionProfile::Kv,
-            move |runtime| runtime.mutate_kv_batch(commands),
-            KvMutationOutcome::applied_index,
-        )
-        .await
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn get_kv(
-        &self,
-        key: &[u8],
-        consistency: ReadConsistency,
-    ) -> Result<KvReadResponse, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Kv)?;
-        let runtime = inner.runtime.clone();
-        let key = key.to_vec();
-        run_read_operation(consistency, move || runtime.get_kv(&key, consistency))
-            .await
-            .map_err(Error::Worker)?
-            .map_err(Error::Node)
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn scan_kv_range(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        limit: usize,
-        cursor: Option<&[u8]>,
-        consistency: ReadConsistency,
-    ) -> Result<KvScanResult, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Kv)?;
-        let runtime = inner.runtime.clone();
-        let start = start.to_vec();
-        let end = end.map(<[u8]>::to_vec);
-        let cursor = cursor.map(<[u8]>::to_vec);
-        tokio::task::spawn_blocking(move || {
-            runtime.scan_kv_range(
-                &start,
-                end.as_deref(),
-                limit,
-                cursor.as_deref(),
-                consistency,
-            )
-        })
-        .await
-        .map_err(Error::Worker)?
-        .map_err(Error::Node)
-    }
-
-    #[cfg(feature = "kv")]
-    pub async fn scan_kv_prefix(
-        &self,
-        prefix: &[u8],
-        limit: usize,
-        cursor: Option<&[u8]>,
-        consistency: ReadConsistency,
-    ) -> Result<KvScanResult, Error> {
-        let (inner, _operation) = self.begin_operation().await?;
-        require_profile(&inner, ExecutionProfile::Kv)?;
-        let runtime = inner.runtime.clone();
-        let prefix = prefix.to_vec();
-        let cursor = cursor.map(<[u8]>::to_vec);
-        tokio::task::spawn_blocking(move || {
-            runtime.scan_kv_prefix(&prefix, limit, cursor.as_deref(), consistency)
-        })
-        .await
-        .map_err(Error::Worker)?
-        .map_err(Error::Node)
-    }
-
     pub async fn status(&self) -> Result<NodeStatus, Error> {
         let (inner, _operation) = self.begin_operation().await?;
         let runtime = inner.runtime.clone();
@@ -745,6 +541,17 @@ fn require_profile(inner: &Inner, expected: ExecutionProfile) -> Result<(), Erro
         Err(Error::ExecutionProfileMismatch {
             expected,
             actual: inner.execution_profile,
+        })
+    }
+}
+
+fn require_sql_embedded_profile(execution_profile: ExecutionProfile) -> Result<(), Error> {
+    if execution_profile == ExecutionProfile::Sqlite {
+        Ok(())
+    } else {
+        Err(Error::ExecutionProfileMismatch {
+            expected: ExecutionProfile::Sqlite,
+            actual: execution_profile,
         })
     }
 }
@@ -852,6 +659,29 @@ mod tests {
         assert!(matches!(
             Rhiza::open(config).await,
             Err(Error::Config(ConfigError::PeerMembershipMismatch))
+        ));
+        assert!(!root.path().join("node").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_rejects_non_sql_profile_before_creating_runtime_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let config = EmbeddedConfig::new(
+            EmbeddedIdentity::new("cluster-a", "node-1", 1, 1),
+            root.path().join("node"),
+            ExecutionProfile::Graph,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        assert!(matches!(
+            Rhiza::open(config).await,
+            Err(Error::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual: ExecutionProfile::Graph,
+            })
         ));
         assert!(!root.path().join("node").exists());
     }

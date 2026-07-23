@@ -32,8 +32,8 @@ object_secret="${RHIZA_OBJECT_SECRET-}"
 object_secret_set="${RHIZA_OBJECT_SECRET+x}"
 
 case "$profile" in
-  sql|graph|kv) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+  sql) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
 esac
 
 for tool in kubectl jq yq openssl; do command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 127; }; done
