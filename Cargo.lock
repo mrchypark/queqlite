@@ -1986,7 +1986,6 @@ dependencies = [
 name = "rhiza"
 version = "0.1.0"
 dependencies = [
- "axum",
  "rhiza-archive",
  "rhiza-core",
  "rhiza-graph",
@@ -1995,11 +1994,8 @@ dependencies = [
  "rhiza-obj-store",
  "rhiza-quepaxa",
  "rhiza-sql",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
- "tower",
 ]
 
 [[package]]
@@ -2013,6 +2009,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rhiza-basic-app-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rhiza",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

@@ -3441,34 +3441,81 @@ fn node_error_response(error: NodeError) -> Response {
         | NodeError::Fatal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
     };
     let classification = error.classification();
+    if !matches!(&error, NodeError::Fatal(_)) {
+        eprintln!(
+            "node request failed (code={}, retryable={}): {}",
+            classification.code(),
+            classification.retryable(),
+            escaped_error_detail(&error)
+        );
+    }
     client_error_response(
         status,
         classification.code(),
         classification.retryable(),
-        error.to_string(),
+        node_error_message(status),
         statement_index,
     )
+}
+
+fn node_error_message(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "request could not be processed",
+        StatusCode::CONFLICT => "request conflicts with current state",
+        StatusCode::SERVICE_UNAVAILABLE => "service is temporarily unavailable",
+        _ => "internal server error",
+    }
+}
+
+const MAX_ESCAPED_ERROR_DETAIL_BYTES: usize = 4 * 1024;
+const ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER: &str = "...[truncated]";
+
+fn escaped_error_detail(error: &dyn fmt::Display) -> String {
+    let detail = error.to_string();
+    let mut escaped = String::with_capacity(detail.len().min(MAX_ESCAPED_ERROR_DETAIL_BYTES));
+    for character in detail.chars() {
+        let character_start = escaped.len();
+        for escaped_character in character.escape_default() {
+            if escaped.len()
+                + escaped_character.len_utf8()
+                + ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER.len()
+                > MAX_ESCAPED_ERROR_DETAIL_BYTES
+            {
+                escaped.truncate(character_start);
+                escaped.push_str(ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER);
+                return escaped;
+            }
+            escaped.push(escaped_character);
+        }
+    }
+    escaped
 }
 
 #[allow(clippy::result_large_err)]
 fn client_json<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
     request.map(|Json(request)| request).map_err(|rejection| {
         let status = rejection.status();
-        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "payload_too_large"
-        } else {
-            "invalid_json"
-        };
-        client_error_response(status, code, false, rejection.body_text(), None)
+        eprintln!("invalid JSON request: {}", escaped_error_detail(&rejection));
+        client_json_error_response(status)
     })
 }
 
+fn client_json_error_response(status: StatusCode) -> Response {
+    let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        "payload_too_large"
+    } else {
+        "invalid_json"
+    };
+    client_error_response(status, code, false, "request body is invalid", None)
+}
+
 fn client_task_error(error: tokio::task::JoinError) -> Response {
+    eprintln!("request task failed: {}", escaped_error_detail(&error));
     client_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "task_failed",
         false,
-        format!("request task failed: {error}"),
+        "request task failed",
         None,
     )
 }
@@ -3581,9 +3628,7 @@ fn runtime_readiness_response(runtime: &NodeRuntime) -> Option<Response> {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fatal",
             false,
-            runtime
-                .fatal_reason()
-                .unwrap_or_else(|| "node is fatally unavailable".into()),
+            "node is fatally unavailable",
             None,
         ))
     } else if !runtime.is_ready() {
@@ -9254,6 +9299,10 @@ impl NodeRuntime {
     fn latch(&self, error: NodeError) -> NodeError {
         self.ready.store(false, Ordering::Release);
         if !self.fatal.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "node runtime entered fatal state: {}",
+                escaped_error_detail(&error)
+            );
             if let Ok(mut reason) = self.fatal_reason.lock() {
                 *reason = Some(error.to_string());
             }
@@ -9549,7 +9598,152 @@ mod tests {
             assert_eq!(error.retryable, retryable);
             assert_eq!(error.statement_index, statement_index);
             assert!(value.get("category").is_none());
+            assert!(matches!(
+                error.message.as_str(),
+                "request could not be processed"
+                    | "request conflicts with current state"
+                    | "service is temporarily unavailable"
+                    | "internal server error"
+            ));
         }
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn node_error_http_response_hides_display_details() {
+        let detail = "/srv/rhiza/private/consensus/log: checksum mismatch";
+        let cases = [
+            (
+                NodeError::Storage(detail.into()),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                None,
+                "internal server error",
+            ),
+            (
+                NodeError::Reconciliation(detail.into()),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "reconciliation_error",
+                None,
+                "internal server error",
+            ),
+            (
+                NodeError::InvalidSqlStatement {
+                    statement_index: 7,
+                    message: detail.into(),
+                },
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some(7),
+                "request could not be processed",
+            ),
+        ];
+
+        for (node_error, status, code, statement_index, message) in cases {
+            let response = node_error_response(node_error);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: super::ClientErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.statement_index, statement_index);
+            assert_eq!(error.message, message);
+            assert!(!String::from_utf8(body.to_vec()).unwrap().contains(detail));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_json_error_response_uses_a_stable_message() {
+        for (status, code) in [
+            (axum::http::StatusCode::BAD_REQUEST, "invalid_json"),
+            (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+            ),
+        ] {
+            let response = super::client_json_error_response(status);
+
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: super::ClientErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, code);
+            assert!(!error.retryable);
+            assert_eq!(error.message, "request body is invalid");
+            assert_eq!(error.statement_index, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_task_error_hides_join_error_details() {
+        let detail = "private task detail\nforged log entry";
+        let error = tokio::spawn(async move { panic!("{detail}") })
+            .await
+            .unwrap_err();
+        let response = super::client_task_error(error);
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: super::ClientErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "task_failed");
+        assert!(!error.retryable);
+        assert_eq!(error.message, "request task failed");
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains(detail));
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn fatal_readiness_response_hides_fatal_reason() {
+        let (_dir, runtime) = sql_test_runtime();
+        let detail = "/srv/rhiza/private\nforged log entry";
+        runtime.latch(NodeError::Storage(detail.into()));
+        let response = super::runtime_readiness_response(&runtime).unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: super::ClientErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "fatal");
+        assert!(!error.retryable);
+        assert_eq!(error.message, "node is fatally unavailable");
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains(detail));
+    }
+
+    #[test]
+    fn escaped_error_detail_escapes_control_characters() {
+        let detail = "checksum mismatch\nforged entry\r\u{1b}[2J";
+
+        assert_eq!(
+            super::escaped_error_detail(&detail),
+            r"checksum mismatch\nforged entry\r\u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn escaped_error_detail_bounds_escape_expansion() {
+        let detail = "\n".repeat(super::MAX_ESCAPED_ERROR_DETAIL_BYTES / 2 + 1);
+        let escaped = super::escaped_error_detail(&detail);
+
+        assert!(
+            escaped.len() <= super::MAX_ESCAPED_ERROR_DETAIL_BYTES,
+            "escaped detail must stay within the log budget"
+        );
+        assert!(
+            escaped.ends_with(super::ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER),
+            "truncated details must be explicit"
+        );
+        assert!(!escaped.contains('\n'));
     }
 
     #[tokio::test]

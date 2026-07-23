@@ -103,6 +103,41 @@ alive while serving requests, drain the server first during planned shutdown,
 then call `shutdown().await` so durability and worker errors are reported.
 Dropping the owner only signals shutdown and cannot report those errors.
 
+### 5-minute consumer app
+
+`examples/basic-app-server` is a separate Cargo package that depends only on
+the public `rhiza` API. Start its local HTTP server with an explicit loopback
+address and data directory:
+
+```bash
+RHIZA_BIND_ADDR=127.0.0.1:3000 \
+RHIZA_DATA_DIR=./rhiza-data \
+cargo run -p rhiza-basic-app-server
+```
+
+In another terminal:
+
+```bash
+curl http://127.0.0.1:3000/ready
+curl -X PUT http://127.0.0.1:3000/items/greeting \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"put-greeting-1","value":"hello"}'
+curl http://127.0.0.1:3000/items/greeting
+```
+
+Stop the process, run the same command again with the same `RHIZA_DATA_DIR`,
+and both the value and an exact replay of the PUT survive. Reusing a
+`request_id` with a different key or value returns HTTP 409 with Rhiza's
+original classification, for example
+`{"error":"request_conflict","retryable":false,...}`. HTTP status is selected
+from the classification category; the body preserves its stable code and
+retry guidance.
+
+This package intentionally rejects non-loopback `RHIZA_BIND_ADDR` values.
+Its three file-backed recorders share one process and data directory, so it is
+for local development and consumer integration—not a highly available or
+remote-facing deployment.
+
 For local development, `local_file_backed` creates a fixed three-recorder
 configuration below one root directory. All recorders share the process and
 failure domain, so this configuration is not highly available:
@@ -128,8 +163,12 @@ Ok(())
 }
 ```
 
-For custom or remote recorder and log transports, construct `EmbeddedConfig`
-with `EmbeddedConfig::new` instead.
+`EmbeddedConfig::new` is an advanced extension point for custom or remote
+recorder and log transports. It accepts `RecorderRpc` and `LogPeer` trait
+objects, which `rhiza` re-exports as the narrow extension boundary. Implementing
+those traits or using the broader transport vocabulary still requires direct
+dependencies on `rhiza-quepaxa` and `rhiza-node`. Normal local consumers should
+use `local_file_backed`.
 
 For the SQL profile, `execute_sql` and `query` expose typed SQL, `RETURNING`,
 consistency, and persistent idempotency. With the corresponding crate features,
