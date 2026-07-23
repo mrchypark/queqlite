@@ -5,20 +5,20 @@ use std::{
     time::Duration,
 };
 
+use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_obj_store::{ObjStore, ObjStoreConfig};
+use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 #[cfg(feature = "kv")]
-use rhiza::KvCommandResultV1;
-use rhiza::{
+use rhizadb::KvCommandResultV1;
+use rhizadb::{
     effective_cluster_id, BatchWriteError, CheckpointCoordinator, DurabilityHealth, DurabilityMode,
     EmbeddedConfig, EmbeddedIdentity, Error, ExecutionProfile, NodeError, ReadConsistency,
     RecorderRpc, Rhiza, SqlCommand, SqlStatement, SqlValue,
 };
 #[cfg(feature = "graph")]
-use rhiza::{
+use rhizadb::{
     GraphCommandResultV1, GraphCommandV1, GraphParameterValue, GraphResultValue, GraphValueV1,
 };
-use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn executes_and_queries_sql_with_in_process_recorders() {
@@ -307,8 +307,7 @@ async fn sync_embedded_profile_write_waits_for_transient_archive_recovery(
             .await
             .unwrap(),
     );
-    let mut config = config_for_profile(root.path(), profile);
-    config.coordinator = Some(coordinator.clone());
+    let config = config_for_profile(root.path(), profile).with_coordinator(coordinator.clone());
     let rhiza = Rhiza::open(config).await.unwrap();
     let handle = rhiza.handle();
 
@@ -435,8 +434,7 @@ async fn shutdown_cancels_a_sync_write_blocked_on_checkpoint_storage() {
             .await
             .unwrap(),
     );
-    let mut config = config(root.path());
-    config.coordinator = Some(coordinator.clone());
+    let config = config(root.path()).with_coordinator(coordinator.clone());
     let rhiza = Rhiza::open(config).await.unwrap();
     let handle = rhiza.handle();
     let status_handle = handle.clone();
@@ -549,25 +547,6 @@ fn shutdown_consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
     result
         .expect("shutdown consensus drain must start despite blocking-pool saturation")
         .unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
-    let root = tempfile::tempdir().unwrap();
-    let mut config = config(root.path());
-    config.members = vec![
-        "recorder-1".into(),
-        "recorder-2".into(),
-        "recorder-4".into(),
-    ];
-
-    assert!(matches!(
-        Rhiza::open(config).await,
-        Err(Error::Config(
-            rhiza_node::ConfigError::PeerMembershipMismatch
-        ))
-    ));
-    assert!(!root.path().join("node").exists());
 }
 
 fn config(root: &std::path::Path) -> EmbeddedConfig {

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Durable log primitives for rhiza"
 
 [dependencies]
-rhiza-core = { path = "../rhiza-core" }
+rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
 
 [dev-dependencies]
 proptest = "1"

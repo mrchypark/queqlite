@@ -9,6 +9,10 @@ pub type NodeId = String;
 pub type ClusterId = String;
 
 /// A transport-neutral category for a public error.
+///
+/// Downstream matches must include a wildcard arm because new categories may be
+/// added in future releases.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorCategory {
     InvalidRequest,

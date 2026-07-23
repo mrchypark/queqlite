@@ -11,11 +11,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rhiza::{
-    effective_cluster_id, EmbeddedConfig, EmbeddedIdentity, ExecutionProfile, GraphCommandV1,
-    GraphParameterValue, GraphValueV1, ReadConsistency, Rhiza, RhizaHandle, SqlCommand,
-    SqlStatement, SqlValue,
-};
 use rhiza_core::{
     Command as ConsensusCommand, CommandKind, ConfigurationState, EntryType, LogEntry, LogHash,
     Snapshot, SnapshotManifest,
@@ -29,6 +24,11 @@ use rhiza_sql::decode_qwal_v3;
 use rhiza_sql::{
     encode_sql_command, restore_snapshot_file, SqlBatchMember, SqlBatchPreparation,
     SqliteStateMachine, QWAL_V3_MAGIC,
+};
+use rhizadb::{
+    effective_cluster_id, EmbeddedConfig, EmbeddedIdentity, ExecutionProfile, GraphCommandV1,
+    GraphParameterValue, GraphValueV1, ReadConsistency, Rhiza, RhizaHandle, SqlCommand,
+    SqlStatement, SqlValue,
 };
 use serde::{Deserialize, Serialize};
 

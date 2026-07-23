@@ -46,10 +46,10 @@ const LOCAL_RECORDER_IDS: [&str; 3] = ["recorder-1", "recorder-2", "recorder-3"]
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddedIdentity {
-    pub cluster_id: String,
-    pub node_id: String,
-    pub epoch: u64,
-    pub config_id: u64,
+    cluster_id: String,
+    node_id: String,
+    epoch: u64,
+    config_id: u64,
 }
 
 impl EmbeddedIdentity {
@@ -69,13 +69,13 @@ impl EmbeddedIdentity {
 }
 
 pub struct EmbeddedConfig {
-    pub identity: EmbeddedIdentity,
-    pub data_dir: PathBuf,
-    pub execution_profile: ExecutionProfile,
-    pub members: Vec<String>,
-    pub recorders: Vec<(String, Box<dyn RecorderRpc>)>,
-    pub log_peers: Vec<Box<dyn LogPeer>>,
-    pub coordinator: Option<Arc<CheckpointCoordinator>>,
+    identity: EmbeddedIdentity,
+    data_dir: PathBuf,
+    execution_profile: ExecutionProfile,
+    members: Vec<String>,
+    recorders: Vec<(String, Box<dyn RecorderRpc>)>,
+    log_peers: Vec<Box<dyn LogPeer>>,
+    coordinator: Option<Arc<CheckpointCoordinator>>,
 }
 
 impl EmbeddedConfig {
@@ -120,6 +120,12 @@ impl EmbeddedConfig {
         ))
     }
 
+    /// Creates an embedded configuration from explicitly supplied transports.
+    ///
+    /// This is an advanced extension point for custom or remote deployments. The facade
+    /// re-exports its `RecorderRpc` and `LogPeer` trait boundaries, but implementing them or
+    /// using the component-specific transport vocabulary requires direct dependencies on
+    /// `rhiza-quepaxa` and `rhiza-node`. Most applications should use [`Self::local_file_backed`].
     pub fn new(
         identity: EmbeddedIdentity,
         data_dir: impl Into<PathBuf>,
@@ -138,6 +144,12 @@ impl EmbeddedConfig {
             log_peers,
             coordinator,
         }
+    }
+
+    /// Adds a checkpoint coordinator to this configuration.
+    pub fn with_coordinator(mut self, coordinator: Arc<CheckpointCoordinator>) -> Self {
+        self.coordinator = Some(coordinator);
+        self
     }
 }
 
@@ -819,4 +831,28 @@ fn stop_inner(inner: &Inner) {
     inner.closed.store(true, Ordering::Release);
     inner.runtime.cancel_operations();
     let _ = inner.shutdown.send(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config =
+            EmbeddedConfig::local_file_backed("cluster-a", root.path(), ExecutionProfile::Sqlite)
+                .unwrap();
+        config.members = vec![
+            "recorder-1".into(),
+            "recorder-2".into(),
+            "recorder-4".into(),
+        ];
+
+        assert!(matches!(
+            Rhiza::open(config).await,
+            Err(Error::Config(ConfigError::PeerMembershipMismatch))
+        ));
+        assert!(!root.path().join("node").exists());
+    }
 }

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! RHIZA_BIND_ADDR=127.0.0.1:3000 RHIZA_DATA_DIR=./rhiza-data \
-//!   cargo run -p rhiza --example basic_app_server
+//!   cargo run -p rhiza-basic-app-server
 //! ```
 //!
 //! All three file-backed recorders run in this process and data directory. This demonstrates the
@@ -12,7 +12,7 @@ use std::{
     env,
     error::Error as StdError,
     ffi::OsString,
-    io,
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -24,12 +24,14 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use rhiza::{
+use rhizadb::{
     EmbeddedConfig, Error, ErrorCategory, ExecutionProfile, ReadConsistency, Rhiza, RhizaHandle,
 };
 use serde::{Deserialize, Serialize};
 
 const CLUSTER_ID: &str = "basic-app";
+const MAX_ESCAPED_ERROR_DETAIL_BYTES: usize = 4 * 1024;
+const ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER: &str = "...[truncated]";
 
 fn parse_bind_addr(value: &str) -> io::Result<SocketAddr> {
     let address: SocketAddr = value.parse().map_err(|error| {
@@ -80,7 +82,8 @@ struct ReadyResponse {
 
 #[derive(Serialize)]
 struct ErrorResponse {
-    error: &'static str,
+    error: String,
+    retryable: bool,
     message: String,
 }
 
@@ -99,11 +102,13 @@ async fn put_item(
     let Json(request) = match request {
         Ok(request) => request,
         Err(error) => {
+            eprintln!("invalid item request: {}", escaped_error_detail(&error));
             return (
                 error.status(),
                 Json(ErrorResponse {
-                    error: "invalid_request",
-                    message: error.body_text(),
+                    error: "invalid_request".to_owned(),
+                    retryable: false,
+                    message: "request body is invalid".to_owned(),
                 }),
             )
                 .into_response();
@@ -126,7 +131,8 @@ async fn get_item(AxumPath(key): AxumPath<String>, State(handle): State<RhizaHan
             None => (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "not_found",
+                    error: "not_found".to_owned(),
+                    retryable: false,
                     message: format!("item {key:?} was not found"),
                 }),
             )
@@ -155,27 +161,67 @@ async fn ready(State(handle): State<RhizaHandle>) -> Response {
 
 fn rhiza_error(error: Error) -> Response {
     let classification = error.classification();
-    let (status, code) = match classification.category() {
-        ErrorCategory::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request"),
-        ErrorCategory::Conflict => (StatusCode::CONFLICT, "conflict"),
-        ErrorCategory::Unavailable | ErrorCategory::ResourceExhausted => {
-            (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
-        }
-        ErrorCategory::Unknown if classification.retryable() => {
-            (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
-        }
-        ErrorCategory::Authentication | ErrorCategory::Internal | ErrorCategory::Unknown => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        }
-    };
+    let (status, message) =
+        rhiza_error_details(classification.category(), classification.retryable());
+    if should_log_rhiza_error(&error) {
+        eprintln!(
+            "Rhiza request failed (code={}, retryable={}): {}",
+            classification.code(),
+            classification.retryable(),
+            escaped_error_detail(&error)
+        );
+    }
     (
         status,
         Json(ErrorResponse {
-            error: code,
-            message: error.to_string(),
+            error: classification.code().to_owned(),
+            retryable: classification.retryable(),
+            message: message.to_owned(),
         }),
     )
         .into_response()
+}
+
+fn should_log_rhiza_error(error: &Error) -> bool {
+    !matches!(error, Error::Node(rhizadb::NodeError::Fatal(_)))
+}
+
+fn escaped_error_detail(error: &dyn std::fmt::Display) -> String {
+    let detail = error.to_string();
+    let mut escaped = String::with_capacity(detail.len().min(MAX_ESCAPED_ERROR_DETAIL_BYTES));
+    for character in detail.chars() {
+        let character_start = escaped.len();
+        for escaped_character in character.escape_default() {
+            if escaped.len()
+                + escaped_character.len_utf8()
+                + ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER.len()
+                > MAX_ESCAPED_ERROR_DETAIL_BYTES
+            {
+                escaped.truncate(character_start);
+                escaped.push_str(ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER);
+                return escaped;
+            }
+            escaped.push(escaped_character);
+        }
+    }
+    escaped
+}
+
+fn rhiza_error_details(category: ErrorCategory, retryable: bool) -> (StatusCode, &'static str) {
+    match category {
+        ErrorCategory::InvalidRequest => (StatusCode::BAD_REQUEST, "request is invalid"),
+        ErrorCategory::Authentication => (StatusCode::UNAUTHORIZED, "authentication failed"),
+        ErrorCategory::Conflict => (StatusCode::CONFLICT, "request conflicts with current state"),
+        ErrorCategory::Unavailable | ErrorCategory::ResourceExhausted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service is temporarily unavailable",
+        ),
+        _ if retryable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service is temporarily unavailable",
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+    }
 }
 
 async fn open_rhiza(data_dir: &Path) -> Result<Rhiza, Box<dyn StdError>> {
@@ -194,10 +240,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let rhiza = open_rhiza(&data_dir).await?;
     let app = build_router(rhiza.handle());
+    let listener_addr = listener.local_addr()?;
+
+    {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "RHIZA_LISTEN_ADDR={listener_addr}")?;
+        stdout.flush()?;
+    }
 
     eprintln!(
         "basic Rhiza app listening on http://{} with data in {}",
-        listener.local_addr()?,
+        listener_addr,
         data_dir.display()
     );
     eprintln!("local development only: all three recorders share one process and failure domain");
@@ -222,7 +275,10 @@ async fn shutdown_signal() {
                 }
             }
             Err(error) => {
-                eprintln!("failed to install SIGTERM handler: {error}");
+                eprintln!(
+                    "failed to install SIGTERM handler: {}",
+                    escaped_error_detail(&error)
+                );
                 wait_for_ctrl_c().await;
             }
         }
@@ -238,13 +294,16 @@ async fn wait_for_ctrl_c() {
 
 fn report_ctrl_c_error(result: io::Result<()>) {
     if let Err(error) = result {
-        eprintln!("failed to install Ctrl-C handler: {error}");
+        eprintln!(
+            "failed to install Ctrl-C handler: {}",
+            escaped_error_detail(&error)
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{ffi::OsString, path::PathBuf};
 
     use axum::{
         body::{to_bytes, Body},
@@ -255,7 +314,12 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::{build_router, open_rhiza, parse_bind_addr, parse_data_dir};
+    use rhizadb::{Error, NodeError};
+
+    use super::{
+        build_router, escaped_error_detail, open_rhiza, parse_bind_addr, parse_data_dir,
+        rhiza_error, should_log_rhiza_error,
+    };
 
     async fn get(app: &Router, uri: &str) -> Response {
         app.clone()
@@ -366,13 +430,14 @@ mod tests {
         );
         let response = put(&app, "greeting", "same-request", "goodbye").await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(json_body(response).await["error"], "conflict");
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "request_conflict");
+        assert_eq!(body["retryable"], false);
 
         rhiza.shutdown().await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn items_returns_client_error_when_json_has_unknown_field() {
+    async fn assert_invalid_request_body(body: String) {
         let root = tempfile::tempdir().unwrap();
         let rhiza = open_rhiza(root.path()).await.unwrap();
         let response = build_router(rhiza.handle())
@@ -381,18 +446,88 @@ mod tests {
                     .method(Method::PUT)
                     .uri("/items/greeting")
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({"request_id": "put-greeting", "value": "hello", "extra": true})
-                            .to_string(),
-                    ))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert!(response.status().is_client_error());
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "invalid_request");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["message"], "request body is invalid");
 
         rhiza.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn items_returns_client_error_when_json_is_malformed() {
+        assert_invalid_request_body(String::from("{")).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn items_returns_client_error_when_json_has_unknown_field() {
+        assert_invalid_request_body(
+            json!({"request_id": "put-greeting", "value": "hello", "extra": true}).to_string(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rhiza_error_response_does_not_expose_node_display_details() {
+        let detail = "/srv/rhiza/private/consensus/log: checksum mismatch";
+        let response = rhiza_error(Error::Node(NodeError::Storage(detail.into())));
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "storage_error");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["message"], "internal server error");
+        assert!(!body.to_string().contains(detail));
+
+        let response = rhiza_error(Error::Node(NodeError::DataRootLocked(PathBuf::from(
+            "/srv/rhiza/private",
+        ))));
+        let body = json_body(response).await;
+        assert_eq!(body["message"], "internal server error");
+        assert!(!body.to_string().contains("/srv/rhiza/private"));
+    }
+
+    #[test]
+    fn rhiza_error_log_decision_skips_only_fatal_node_errors() {
+        assert!(!should_log_rhiza_error(&Error::Node(NodeError::Fatal(
+            "fatal runtime detail".into(),
+        ))));
+        assert!(should_log_rhiza_error(&Error::Node(NodeError::Storage(
+            "storage detail".into(),
+        ))));
+    }
+
+    #[test]
+    fn escaped_error_detail_escapes_control_characters() {
+        let detail = "checksum mismatch\nforged entry\r\u{1b}[2J";
+
+        assert_eq!(
+            escaped_error_detail(&detail),
+            r"checksum mismatch\nforged entry\r\u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn escaped_error_detail_bounds_escape_expansion() {
+        let detail = "\n".repeat(super::MAX_ESCAPED_ERROR_DETAIL_BYTES / 2 + 1);
+        let escaped = escaped_error_detail(&detail);
+
+        assert!(
+            escaped.len() <= super::MAX_ESCAPED_ERROR_DETAIL_BYTES,
+            "escaped detail must stay within the log budget"
+        );
+        assert!(
+            escaped.ends_with(super::ESCAPED_ERROR_DETAIL_TRUNCATION_MARKER),
+            "truncated details must be explicit"
+        );
+        assert!(!escaped.contains('\n'));
     }
 
     #[test]

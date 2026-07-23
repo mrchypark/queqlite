@@ -1,0 +1,18 @@
+[package]
+name = "rhiza-basic-app-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = "0.8"
+rhizadb = { version = "0.1.0", path = "../../crates/rhiza" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

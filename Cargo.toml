@@ -13,6 +13,7 @@ members = [
     "crates/rhiza-quepaxa",
     "crates/rhiza-sql",
     "crates/rhiza-testkit",
+    "examples/basic-app-server",
 ]
 resolver = "2"
 

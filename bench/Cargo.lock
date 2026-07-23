@@ -1995,19 +1995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rhiza"
-version = "0.1.0"
-dependencies = [
- "rhiza-core",
- "rhiza-graph",
- "rhiza-kv",
- "rhiza-node",
- "rhiza-quepaxa",
- "rhiza-sql",
- "tokio",
-]
-
-[[package]]
 name = "rhiza-archive"
 version = "0.1.0"
 dependencies = [
@@ -2033,13 +2020,13 @@ dependencies = [
  "quinn",
  "rcgen",
  "reqwest",
- "rhiza",
  "rhiza-core",
  "rhiza-graph",
  "rhiza-kv",
  "rhiza-node",
  "rhiza-quepaxa",
  "rhiza-sql",
+ "rhizadb",
  "rustls",
  "serde",
  "serde_json",
@@ -2141,6 +2128,19 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "rhizadb"
+version = "0.1.0"
+dependencies = [
+ "rhiza-core",
+ "rhiza-graph",
+ "rhiza-kv",
+ "rhiza-node",
+ "rhiza-quepaxa",
+ "rhiza-sql",
+ "tokio",
 ]
 
 [[package]]
