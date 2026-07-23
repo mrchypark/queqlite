@@ -36,8 +36,8 @@ use axum::{
 #[cfg(feature = "sql")]
 use rhiza_archive::SnapshotRecord;
 use rhiza_core::{
-    Command, CommandKind, ConfigChange, ConfigurationState, EntryType, ExecutionProfile, LogAnchor,
-    LogEntry, LogHash, LogIndex, RecoveryAnchor, StoredCommand,
+    Command, CommandKind, ConfigChange, ConfigurationState, EntryType, ErrorClassification,
+    ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, RecoveryAnchor, StoredCommand,
 };
 #[cfg(feature = "graph")]
 use rhiza_graph::{
@@ -3417,87 +3417,37 @@ fn secrets_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn node_error_response(error: NodeError) -> Response {
-    let (status, code, retryable, statement_index) = match &error {
-        NodeError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", false, None),
+    let (status, statement_index) = match &error {
+        NodeError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, None),
         #[cfg(feature = "sql")]
         NodeError::InvalidSqlStatement {
             statement_index, ..
-        } => (
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            false,
-            Some(*statement_index),
-        ),
+        } => (StatusCode::BAD_REQUEST, Some(*statement_index)),
         #[cfg(feature = "sql")]
-        NodeError::RequestConflict(_) => (StatusCode::CONFLICT, "request_conflict", false, None),
-        NodeError::PreconditionFailed(_) => {
-            (StatusCode::CONFLICT, "precondition_failed", false, None)
-        }
-        NodeError::SnapshotRequired(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "snapshot_required",
-            false,
-            None,
-        ),
-        NodeError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable", true, None),
-        NodeError::ResourceExhausted(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "resource_exhausted",
-            true,
-            None,
-        ),
-        NodeError::ConfigurationTransition { .. } => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "configuration_transition",
-            true,
-            None,
-        ),
-        NodeError::Contention(_) => (StatusCode::SERVICE_UNAVAILABLE, "contention", true, None),
-        NodeError::WinnerLimitExceeded => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "winner_limit_exceeded",
-            true,
-            None,
-        ),
-        NodeError::DataRootLocked(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "data_root_locked",
-            false,
-            None,
-        ),
-        NodeError::UnsupportedAckMode(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unsupported_ack_mode",
-            false,
-            None,
-        ),
-        NodeError::ExecutionProfileMismatch { .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "execution_profile_mismatch",
-            false,
-            None,
-        ),
-        NodeError::Storage(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            false,
-            None,
-        ),
-        NodeError::Reconciliation(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reconciliation_error",
-            false,
-            None,
-        ),
-        NodeError::Invariant(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "invariant_violation",
-            false,
-            None,
-        ),
-        NodeError::Fatal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "fatal", false, None),
+        NodeError::RequestConflict(_) => (StatusCode::CONFLICT, None),
+        NodeError::PreconditionFailed(_) => (StatusCode::CONFLICT, None),
+        NodeError::SnapshotRequired(_)
+        | NodeError::Unavailable(_)
+        | NodeError::ResourceExhausted(_)
+        | NodeError::ConfigurationTransition { .. }
+        | NodeError::Contention(_)
+        | NodeError::WinnerLimitExceeded => (StatusCode::SERVICE_UNAVAILABLE, None),
+        NodeError::DataRootLocked(_)
+        | NodeError::UnsupportedAckMode(_)
+        | NodeError::ExecutionProfileMismatch { .. }
+        | NodeError::Storage(_)
+        | NodeError::Reconciliation(_)
+        | NodeError::Invariant(_)
+        | NodeError::Fatal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
     };
-    client_error_response(status, code, retryable, error.to_string(), statement_index)
+    let classification = error.classification();
+    client_error_response(
+        status,
+        classification.code(),
+        classification.retryable(),
+        error.to_string(),
+        statement_index,
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -4100,11 +4050,14 @@ impl NodeConfig {
             configuration_state.config_id(),
             configuration_state.digest(),
         );
-        let logical_cluster_id = cluster_id
-            .strip_prefix("rhiza:sql:")
+        let execution_profile =
+            canonical_cluster_profile(&cluster_id).unwrap_or(ExecutionProfile::Sqlite);
+        let logical_cluster_id = ["rhiza:sql:", "rhiza:graph:", "rhiza:kv:"]
+            .into_iter()
+            .find_map(|prefix| cluster_id.strip_prefix(prefix))
             .unwrap_or(&cluster_id)
             .to_owned();
-        let effective_cluster_id = effective_cluster_id(ExecutionProfile::Sqlite, &cluster_id)?;
+        let effective_cluster_id = effective_cluster_id(execution_profile, &cluster_id)?;
         Ok(Self {
             cluster_id_source: cluster_id,
             cluster_id: effective_cluster_id,
@@ -4123,7 +4076,7 @@ impl NodeConfig {
             ack_mode: AckMode::HaFirst,
             writer_batch_max: DEFAULT_WRITER_BATCH_MAX,
             writer_batch_window: DEFAULT_WRITER_BATCH_WINDOW,
-            execution_profile: ExecutionProfile::Sqlite,
+            execution_profile,
             #[cfg(feature = "sql")]
             sql_write_profiler: None,
             #[cfg(feature = "sql")]
@@ -4418,6 +4371,33 @@ impl fmt::Display for NodeError {
 }
 
 impl std::error::Error for NodeError {}
+
+impl NodeError {
+    pub fn classification(&self) -> ErrorClassification {
+        let (code, retryable) = match self {
+            Self::InvalidRequest(_) => ("invalid_request", false),
+            #[cfg(feature = "sql")]
+            Self::InvalidSqlStatement { .. } => ("invalid_request", false),
+            #[cfg(feature = "sql")]
+            Self::RequestConflict(_) => ("request_conflict", false),
+            Self::PreconditionFailed(_) => ("precondition_failed", false),
+            Self::SnapshotRequired(_) => ("snapshot_required", false),
+            Self::Unavailable(_) => ("unavailable", true),
+            Self::ResourceExhausted(_) => ("resource_exhausted", true),
+            Self::ConfigurationTransition { .. } => ("configuration_transition", true),
+            Self::Contention(_) => ("contention", true),
+            Self::WinnerLimitExceeded => ("winner_limit_exceeded", true),
+            Self::DataRootLocked(_) => ("data_root_locked", false),
+            Self::UnsupportedAckMode(_) => ("unsupported_ack_mode", false),
+            Self::ExecutionProfileMismatch { .. } => ("execution_profile_mismatch", false),
+            Self::Storage(_) => ("storage_error", false),
+            Self::Reconciliation(_) => ("reconciliation_error", false),
+            Self::Invariant(_) => ("invariant_violation", false),
+            Self::Fatal(_) => ("fatal", false),
+        };
+        ErrorClassification::from_server_code(code, retryable)
+    }
+}
 
 pub type RuntimeError = NodeError;
 
@@ -9366,7 +9346,8 @@ mod tests {
     use axum::http::HeaderValue;
 
     use rhiza_core::{
-        Command, CommandKind, EntryType, ExecutionProfile, LogAnchor, LogHash, StoredCommand,
+        Command, CommandKind, EntryType, ErrorCategory, ErrorClassification, ExecutionProfile,
+        LogAnchor, LogHash, RecoveryAnchor, SnapshotIdentity, StoredCommand,
     };
     #[cfg(feature = "graph")]
     use rhiza_graph::{GraphCommandV1, GraphValueV1};
@@ -9381,7 +9362,7 @@ mod tests {
         mpsc, Arc, Barrier,
     };
 
-    #[cfg(any(feature = "graph", feature = "kv"))]
+    #[cfg(any(feature = "sql", feature = "graph", feature = "kv"))]
     use super::node_error_response;
     #[cfg(feature = "graph")]
     use super::with_graph_client_permit;
@@ -9393,7 +9374,217 @@ mod tests {
         MAX_SQL_RESPONSE_BYTES, PROTOCOL_VERSION, QWAL_V3_MAGIC, SYNC_FLUSH_RETRY_INITIAL,
         VERSION_HEADER,
     };
-    use super::{NodeConfig, NodeRuntime, NodeService};
+    use super::{ConfigError, NodeConfig, NodeRuntime, NodeService};
+
+    #[test]
+    fn embedded_config_accepts_matching_canonical_profile_ids() {
+        for (cluster_id, profile) in [
+            ("rhiza:graph:embedded", ExecutionProfile::Graph),
+            ("rhiza:kv:embedded", ExecutionProfile::Kv),
+        ] {
+            let config = NodeConfig::new_embedded(
+                cluster_id,
+                "n1",
+                std::env::temp_dir().join(profile.as_str()),
+                1,
+                1,
+                ["n1", "n2", "n3"],
+            )
+            .unwrap()
+            .with_execution_profile(profile)
+            .unwrap();
+
+            assert_eq!(config.cluster_id(), cluster_id);
+            assert_eq!(config.logical_cluster_id(), "embedded");
+        }
+    }
+
+    #[test]
+    fn embedded_config_rejects_conflicting_canonical_profile_and_preserves_logical_ids() {
+        let conflicting = NodeConfig::new_embedded(
+            "rhiza:graph:embedded",
+            "n1",
+            std::env::temp_dir().join("conflicting-profile"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Sqlite)
+        .unwrap_err();
+        assert!(matches!(
+            conflicting,
+            ConfigError::ClusterIdProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual: ExecutionProfile::Graph,
+            }
+        ));
+
+        let logical = NodeConfig::new_embedded(
+            "embedded",
+            "n1",
+            std::env::temp_dir().join("logical-profile"),
+            1,
+            1,
+            ["n1", "n2", "n3"],
+        )
+        .unwrap();
+        assert_eq!(logical.cluster_id(), "rhiza:sql:embedded");
+        assert_eq!(logical.logical_cluster_id(), "embedded");
+    }
+
+    #[test]
+    fn node_error_classification_reports_observable_retry_semantics() {
+        let cases = [
+            (
+                NodeError::InvalidRequest("missing key".into()),
+                "invalid_request",
+                ErrorCategory::InvalidRequest,
+                false,
+            ),
+            (
+                NodeError::PreconditionFailed("stale version".into()),
+                "precondition_failed",
+                ErrorCategory::Conflict,
+                false,
+            ),
+            (
+                NodeError::Unavailable("no quorum".into()),
+                "unavailable",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            (
+                NodeError::ResourceExhausted("result too large".into()),
+                "resource_exhausted",
+                ErrorCategory::ResourceExhausted,
+                true,
+            ),
+            (
+                NodeError::Invariant("invalid log".into()),
+                "invariant_violation",
+                ErrorCategory::Internal,
+                false,
+            ),
+        ];
+
+        for (error, code, category, retryable) in cases {
+            let classification = error.classification();
+
+            assert_eq!(classification.code(), code);
+            assert_eq!(classification.category(), category);
+            assert_eq!(classification.retryable(), retryable);
+        }
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_batch_error_classification_preserves_statement_index_category() {
+        let error = NodeError::InvalidSqlStatement {
+            statement_index: 3,
+            message: "syntax error".into(),
+        };
+
+        let classification = error.classification();
+
+        assert_eq!(classification.code(), "invalid_request");
+        assert_eq!(classification.category(), ErrorCategory::InvalidRequest);
+        assert!(!classification.retryable());
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn node_error_http_response_preserves_v1_contract() {
+        let snapshot = RecoveryAnchor::new(
+            "cluster",
+            1,
+            1,
+            1,
+            LogAnchor::new(1, LogHash::ZERO),
+            SnapshotIdentity::new("snapshot", LogHash::ZERO, 0),
+        );
+        let cases = vec![
+            (
+                NodeError::InvalidSqlStatement {
+                    statement_index: 3,
+                    message: "syntax error".into(),
+                },
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request",
+                false,
+                Some(3),
+            ),
+            (
+                NodeError::PreconditionFailed("stale version".into()),
+                axum::http::StatusCode::CONFLICT,
+                "precondition_failed",
+                false,
+                None,
+            ),
+            (
+                NodeError::SnapshotRequired(Box::new(snapshot)),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "snapshot_required",
+                false,
+                None,
+            ),
+            (
+                NodeError::Storage("disk failed".into()),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                false,
+                None,
+            ),
+        ];
+
+        for (node_error, status, code, retryable, statement_index) in cases {
+            let response = node_error_response(node_error);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let error: super::ClientErrorResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.statement_index, statement_index);
+            assert!(value.get("category").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn client_error_responses_preserve_payload_and_authentication_wire_codes() {
+        for (status, code, retryable, category) in [
+            (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                false,
+                ErrorCategory::ResourceExhausted,
+            ),
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                false,
+                ErrorCategory::Authentication,
+            ),
+        ] {
+            let response =
+                super::client_error_response(status, code, retryable, "request failed", None);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let error: super::ClientErrorResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert!(value.get("category").is_none());
+            assert_eq!(
+                ErrorClassification::from_server_code(code, retryable).category(),
+                category
+            );
+        }
+    }
 
     #[test]
     fn concurrent_read_barriers_registered_before_cutoff_share_one_generation() {
@@ -11688,6 +11879,10 @@ mod tests {
 
         assert!(results[0].is_ok());
         assert!(matches!(results[1], Err(NodeError::RequestConflict(_))));
+        let conflict = results[1].as_ref().unwrap_err().classification();
+        assert_eq!(conflict.code(), "request_conflict");
+        assert_eq!(conflict.category(), ErrorCategory::Conflict);
+        assert!(!conflict.retryable());
         assert!(results[2].is_ok());
         assert_eq!(
             results[0].as_ref().unwrap().applied_index,

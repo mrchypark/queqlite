@@ -20,6 +20,11 @@ rhiza-sql = { path = "../rhiza-sql" }
 tokio.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 rhiza-archive = { path = "../rhiza-archive" }
 rhiza-obj-store = { path = "../rhiza-obj-store" }
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tower.workspace = true

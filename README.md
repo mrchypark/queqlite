@@ -34,7 +34,8 @@ The Rust workspace is Kubernetes-independent. Its primary crates are:
 - `rhiza-kv`: the `rhiza kv` redb state boundary.
 - `rhiza-archive`: checkpoint V2, object metadata, and GC plans.
 - `rhiza-node`: runtime, HTTP RPC, recovery, and authenticated live admin HTTP.
-- `rhiza-cli`: client and object-store administration commands.
+- `rhiza-client`: typed remote client for public SQL, graph, and KV routes.
+- `rhiza-cli`: thin remote-client and object-store administration commands.
 - `rhiza-testkit`: shared integration-test support.
 
 ## Execution Profiles
@@ -96,26 +97,25 @@ owner. Its default feature set is SQL-only; graph and KV are explicit opt-ins:
 | `--features kv` | SQL and KV |
 | `--all-features` | SQL, graph, and KV |
 
-`Rhiza` owns the node runtime and background workers;
-cloneable `RhizaHandle` values are weak handles that stop working after
-owner shutdown. Applications inject recorder and log transports without
-configuring HTTP or Kubernetes:
+`Rhiza` owns the node runtime and background workers; cloneable `RhizaHandle`
+values are weak handles that stop working after owner shutdown. Keep the owner
+alive while serving requests, drain the server first during planned shutdown,
+then call `shutdown().await` so durability and worker errors are reported.
+Dropping the owner only signals shutdown and cannot report those errors.
+
+For local development, `local_file_backed` creates a fixed three-recorder
+configuration below one root directory. All recorders share the process and
+failure domain, so this configuration is not highly available:
 
 ```rust,no_run
-use rhiza::{EmbeddedConfig, EmbeddedIdentity, ExecutionProfile, Rhiza, ReadConsistency};
+use rhiza::{EmbeddedConfig, ExecutionProfile, Rhiza, ReadConsistency};
 
-# async fn example(
-#     recorders: Vec<(String, Box<dyn rhiza::RecorderRpc>)>,
-# ) -> Result<(), rhiza::Error> {
-let config = EmbeddedConfig::new(
-    EmbeddedIdentity::new("cluster-a", "node-1", 1, 1),
-    "./data/node-1",
+async fn example() -> Result<(), rhiza::Error> {
+let config = EmbeddedConfig::local_file_backed(
+    "cluster-a",
+    "./data",
     ExecutionProfile::Sqlite,
-    vec!["node-1".into(), "node-2".into(), "node-3".into()],
-    recorders,
-    vec![],
-    None,
-);
+)?;
 let owner = Rhiza::open(config).await?;
 let db = owner.handle();
 
@@ -124,9 +124,12 @@ let value = db.read("key", ReadConsistency::Local).await?;
 assert_eq!(value.value.as_deref(), Some("value"));
 
 owner.shutdown().await?;
-# Ok(())
-# }
+Ok(())
+}
 ```
+
+For custom or remote recorder and log transports, construct `EmbeddedConfig`
+with `EmbeddedConfig::new` instead.
 
 For the SQL profile, `execute_sql` and `query` expose typed SQL, `RETURNING`,
 consistency, and persistent idempotency. With the corresponding crate features,
@@ -134,6 +137,49 @@ graph profiles expose `mutate_graph` and `query_graph`; KV profiles expose
 `put_kv`, `delete_kv`, `get_kv`, `scan_kv_range`, and `scan_kv_prefix`. Every
 method checks the configured `ExecutionProfile`. HTTP routes and the CLI are
 secondary adapters over the same node service contracts.
+
+## Remote Rust Client
+
+The `rhiza-client` crate is the typed remote counterpart to the embedded API.
+Its default `sql` feature provides write, read, and SQL methods; opt into
+`graph`, `kv`, or both for the other execution profiles. The wire DTOs are
+re-exported for convenience but currently come from `rhiza-node`, so the
+client is logically separate from the server while still coupled to its DTOs.
+
+```rust,no_run
+use rhiza_client::{
+    wire::{ReadConsistency, ReadRequest, WriteRequest},
+    RhizaClient,
+};
+
+async fn remote_example() -> Result<(), rhiza_client::ClientError> {
+    let client = RhizaClient::new(
+        vec!["https://rhiza.example.com".to_owned()],
+        "client-token",
+    )?;
+    client
+        .write(WriteRequest {
+            request_id: "request-1".to_owned(),
+            key: "key".to_owned(),
+            value: "value".to_owned(),
+        })
+        .await?;
+    let value = client
+        .read(ReadRequest {
+            key: "key".to_owned(),
+            consistency: Some(ReadConsistency::Local),
+        })
+        .await?;
+    assert_eq!(value.value.as_deref(), Some("value"));
+    Ok(())
+}
+```
+
+Transport policy is intentionally fixed: 2-second connect, 5-second attempt,
+and 15-second operation deadlines; retryable failures advance through the
+endpoint list. Mutations and local/applied-index reads hedge after 100
+milliseconds, while read-barrier and unspecified-consistency reads retry
+sequentially. There are no public framework hooks or policy knobs.
 
 Kubernetes provides stable process identity, DNS, secrets, and orchestration;
 the runtime does not call Kubernetes APIs and receives no service-account

@@ -12,6 +12,7 @@ use rhiza_archive::{
     CheckpointIdentity, CheckpointPublisherOptions, CheckpointTip, GcPlan, GcPolicy,
     ObjectArchiveStore,
 };
+use rhiza_client::RhizaClient;
 use rhiza_core::{
     ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, StoredCommand,
 };
@@ -35,8 +36,7 @@ use rhiza_node::{
 #[cfg(feature = "sql")]
 use rhiza_node::{
     run_e2e, E2eConfig, ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse,
-    SqlQueryRequest, SqlQueryResponse, WriteRequest, WriteResponse, READ_PATH, SQL_EXECUTE_PATH,
-    SQL_QUERY_PATH, WRITE_PATH,
+    SqlQueryRequest, SqlQueryResponse, WriteRequest, WriteResponse,
 };
 #[cfg(feature = "recorder-postcard-rpc")]
 use rhiza_node::{
@@ -45,11 +45,11 @@ use rhiza_node::{
     TcpPostcardRpcRecorderClient,
 };
 #[cfg(feature = "graph")]
-use rhiza_node::{GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto, GRAPH_QUERY_PATH};
+use rhiza_node::{GraphQueryRequest, GraphQueryResponse, GraphQueryStatementDto};
 #[cfg(feature = "kv")]
 use rhiza_node::{
     KvDeleteRequest, KvGetRequest, KvGetResponse, KvMutationResponse, KvPutRequest, KvScanRequest,
-    KvScanResponse, KV_DELETE_PATH, KV_GET_PATH, KV_PUT_PATH, KV_SCAN_PATH, MAX_KV_SCAN_ROWS,
+    KvScanResponse, MAX_KV_SCAN_ROWS,
 };
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
@@ -4601,7 +4601,10 @@ async fn request_write(args: &WriteArgs) -> Result<WriteResponse, String> {
         key: args.key.clone(),
         value: args.value.clone(),
     };
-    client_json_request(&args.urls, &args.token, WRITE_PATH, &request, true).await
+    remote_client(&args.urls, &args.token)?
+        .write(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "sql")]
@@ -4610,14 +4613,10 @@ async fn request_read(args: &ReadArgs) -> Result<ReadResponse, String> {
         key: args.key.clone(),
         consistency: args.consistency,
     };
-    client_json_request(
-        &args.urls,
-        &args.token,
-        READ_PATH,
-        &request,
-        read_can_hedge(request.consistency),
-    )
-    .await
+    remote_client(&args.urls, &args.token)?
+        .read(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "sql")]
@@ -4626,7 +4625,10 @@ async fn request_sql_execute(args: &SqlExecuteArgs) -> Result<SqlExecuteResponse
         request_id: args.request_id.clone(),
         statements: vec![args.statement.clone()],
     };
-    client_json_request(&args.urls, &args.token, SQL_EXECUTE_PATH, &request, true).await
+    remote_client(&args.urls, &args.token)?
+        .sql_execute(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "sql")]
@@ -4636,14 +4638,10 @@ async fn request_sql_query(args: &SqlQueryArgs) -> Result<SqlQueryResponse, Stri
         consistency: args.consistency,
         max_rows: args.max_rows,
     };
-    client_json_request(
-        &args.urls,
-        &args.token,
-        SQL_QUERY_PATH,
-        &request,
-        read_can_hedge(request.consistency),
-    )
-    .await
+    remote_client(&args.urls, &args.token)?
+        .sql_query(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "graph")]
@@ -4653,268 +4651,46 @@ async fn request_graph_query(args: &GraphQueryArgs) -> Result<GraphQueryResponse
         consistency: args.consistency,
         max_rows: args.max_rows,
     };
-    client_json_request(
-        &args.urls,
-        &args.token,
-        GRAPH_QUERY_PATH,
-        &request,
-        read_can_hedge(request.consistency),
-    )
-    .await
+    remote_client(&args.urls, &args.token)?
+        .graph_query(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "kv")]
 async fn request_kv_get(args: &KvGetArgs) -> Result<KvGetResponse, String> {
-    client_json_request(
-        &args.urls,
-        &args.token,
-        KV_GET_PATH,
-        &args.request,
-        read_can_hedge(args.request.consistency),
-    )
-    .await
+    remote_client(&args.urls, &args.token)?
+        .kv_get(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "kv")]
 async fn request_kv_scan(args: &KvScanArgs) -> Result<KvScanResponse, String> {
-    client_json_request(
-        &args.urls,
-        &args.token,
-        KV_SCAN_PATH,
-        &args.request,
-        read_can_hedge(args.request.consistency),
-    )
-    .await
+    remote_client(&args.urls, &args.token)?
+        .kv_scan(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "kv")]
 async fn request_kv_put(args: &KvPutArgs) -> Result<KvMutationResponse, String> {
-    client_json_request(&args.urls, &args.token, KV_PUT_PATH, &args.request, true).await
+    remote_client(&args.urls, &args.token)?
+        .kv_put(args.request.clone())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "kv")]
 async fn request_kv_delete(args: &KvDeleteArgs) -> Result<KvMutationResponse, String> {
-    client_json_request(&args.urls, &args.token, KV_DELETE_PATH, &args.request, true).await
-}
-
-const CLIENT_HEDGE_DELAY: Duration = Duration::from_millis(100);
-const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const CLIENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-const CLIENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Copy)]
-struct ClientPolicy {
-    connect_timeout: Duration,
-    attempt_timeout: Duration,
-    operation_timeout: Duration,
-    hedge_delay: Duration,
-}
-
-impl Default for ClientPolicy {
-    fn default() -> Self {
-        Self {
-            connect_timeout: CLIENT_CONNECT_TIMEOUT,
-            attempt_timeout: CLIENT_ATTEMPT_TIMEOUT,
-            operation_timeout: CLIENT_OPERATION_TIMEOUT,
-            hedge_delay: CLIENT_HEDGE_DELAY,
-        }
-    }
-}
-
-#[cfg(all(test, feature = "sql"))]
-impl ClientPolicy {
-    fn test(hedge_delay: Duration, operation_timeout: Duration) -> Self {
-        Self {
-            connect_timeout: Duration::from_millis(20),
-            attempt_timeout: operation_timeout,
-            operation_timeout,
-            hedge_delay,
-        }
-    }
-}
-
-fn read_can_hedge(consistency: Option<ReadConsistency>) -> bool {
-    matches!(
-        consistency,
-        Some(ReadConsistency::Local | ReadConsistency::AppliedIndex(_))
-    )
-}
-
-enum ClientAttemptError {
-    Retryable(String),
-    Fatal(String),
-}
-
-async fn client_json_request<B, T>(
-    urls: &[String],
-    token: &str,
-    path: &str,
-    body: &B,
-    hedge: bool,
-) -> Result<T, String>
-where
-    B: Serialize,
-    T: DeserializeOwned + Send + 'static,
-{
-    client_json_request_with_policy(urls, token, path, body, hedge, ClientPolicy::default()).await
-}
-
-async fn client_json_request_with_policy<B, T>(
-    urls: &[String],
-    token: &str,
-    path: &str,
-    body: &B,
-    hedge: bool,
-    policy: ClientPolicy,
-) -> Result<T, String>
-where
-    B: Serialize,
-    T: DeserializeOwned + Send + 'static,
-{
-    let body = serde_json::to_vec(body).map_err(|_| "cannot encode request".to_string())?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(policy.connect_timeout)
-        .build()
-        .map_err(|error| format!("cannot build HTTP client: {error}"))?;
-    let mut attempts = tokio::task::JoinSet::new();
-    let mut next = 0;
-    let mut last_error = None;
-
-    if let Some(url) = urls.get(next) {
-        spawn_client_attempt(
-            &mut attempts,
-            &client,
-            url,
-            token,
-            path,
-            &body,
-            policy.attempt_timeout,
-        );
-        next += 1;
-    }
-
-    let hedge_delay = tokio::time::sleep(policy.hedge_delay);
-    let operation_deadline = tokio::time::sleep(policy.operation_timeout);
-    tokio::pin!(hedge_delay, operation_deadline);
-
-    loop {
-        if attempts.is_empty() && next == urls.len() {
-            return Err(last_error.unwrap_or_else(|| "missing request endpoint".into()));
-        }
-
-        tokio::select! {
-            result = attempts.join_next(), if !attempts.is_empty() => {
-                match result.expect("a nonempty attempt set must yield a result") {
-                    Ok(Ok(response)) => {
-                        attempts.abort_all();
-                        return Ok(response);
-                    }
-                    Ok(Err(ClientAttemptError::Fatal(error))) => {
-                        attempts.abort_all();
-                        return Err(error);
-                    }
-                    Ok(Err(ClientAttemptError::Retryable(error))) => {
-                        last_error = Some(error);
-                        if let Some(url) = urls.get(next) {
-                            spawn_client_attempt(
-                                &mut attempts,
-                                &client,
-                                url,
-                                token,
-                                path,
-                                &body,
-                                policy.attempt_timeout,
-                            );
-                            next += 1;
-                            hedge_delay.as_mut().reset(tokio::time::Instant::now() + policy.hedge_delay);
-                        }
-                    }
-                    Err(error) => {
-                        attempts.abort_all();
-                        return Err(format!("request task failed: {error}"));
-                    }
-                }
-            }
-            () = &mut hedge_delay, if hedge && next < urls.len() => {
-                spawn_client_attempt(
-                    &mut attempts,
-                    &client,
-                    &urls[next],
-                    token,
-                    path,
-                    &body,
-                    policy.attempt_timeout,
-                );
-                next += 1;
-                hedge_delay.as_mut().reset(tokio::time::Instant::now() + policy.hedge_delay);
-            }
-            () = &mut operation_deadline => {
-                attempts.abort_all();
-                return Err(last_error.unwrap_or_else(|| {
-                    "request failed: operation deadline exceeded".into()
-                }));
-            }
-        }
-    }
-}
-
-fn spawn_client_attempt<T>(
-    attempts: &mut tokio::task::JoinSet<Result<T, ClientAttemptError>>,
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-    path: &str,
-    body: &[u8],
-    attempt_timeout: Duration,
-) where
-    T: DeserializeOwned + Send + 'static,
-{
-    let client = client.clone();
-    let url = url.to_string();
-    let token = token.to_string();
-    let path = path.to_string();
-    let body = body.to_vec();
-    attempts.spawn(async move {
-        tokio::time::timeout(attempt_timeout, async {
-            let response = protocol_request(&client, Method::POST, &url, &path)
-                .bearer_auth(token)
-                .body(body)
-                .send()
-                .await
-                .map_err(|error| ClientAttemptError::Retryable(request_error(error)))?;
-            client_attempt_response(response).await
-        })
+    remote_client(&args.urls, &args.token)?
+        .kv_delete(args.request.clone())
         .await
-        .unwrap_or_else(|_| {
-            Err(ClientAttemptError::Retryable(
-                "request failed: attempt deadline exceeded".into(),
-            ))
-        })
-    });
+        .map_err(|error| error.to_string())
 }
 
-async fn client_attempt_response<T: DeserializeOwned>(
-    response: Response,
-) -> Result<T, ClientAttemptError> {
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| ClientAttemptError::Retryable(request_error(error)))?;
-    if status.is_success() {
-        return serde_json::from_slice(&body)
-            .map_err(|_| ClientAttemptError::Fatal("invalid JSON response".into()));
-    }
-    let Ok(error) = serde_json::from_slice::<ServerErrorResponse>(&body) else {
-        return Err(ClientAttemptError::Fatal(format!("HTTP {status}")));
-    };
-    let retryable = error.retryable;
-    let detail = server_error_detail(status, error);
-    if retryable {
-        Err(ClientAttemptError::Retryable(detail))
-    } else {
-        Err(ClientAttemptError::Fatal(detail))
-    }
+fn remote_client(urls: &[String], token: &str) -> Result<RhizaClient, String> {
+    RhizaClient::new(urls.iter().cloned(), token).map_err(|error| error.to_string())
 }
 
 async fn request_health(args: &HealthArgs) -> Result<(), String> {
@@ -4958,8 +4734,6 @@ fn request_error(error: reqwest::Error) -> String {
 #[derive(Deserialize)]
 struct ServerErrorResponse {
     code: String,
-    #[serde(default)]
-    retryable: bool,
     #[serde(default)]
     message: Option<String>,
 }
@@ -5103,17 +4877,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     #[cfg(feature = "sql")]
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    #[cfg(feature = "sql")]
     use std::sync::{mpsc, Condvar};
     #[cfg(any(feature = "sql", all(feature = "graph", feature = "kv")))]
     use std::sync::{Arc, Mutex};
 
-    #[cfg(feature = "sql")]
-    use axum::extract::State;
-    #[cfg(feature = "sql")]
-    use axum::http::HeaderMap;
-    #[cfg(any(feature = "sql", all(feature = "graph", feature = "kv")))]
+    #[cfg(all(feature = "graph", feature = "kv"))]
     use axum::routing::post;
     use axum::{http::StatusCode, routing::get, Json, Router};
     use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
@@ -5125,8 +4893,8 @@ mod tests {
     #[cfg(feature = "graph")]
     use rhiza_node::GraphQueryParameterDto;
     use rhiza_node::{NodeStatus, RuntimeConfigurationStatus};
-    #[cfg(feature = "sql")]
-    use rhiza_node::{ReadRequest, WriteRequest, PROTOCOL_VERSION, VERSION_HEADER};
+    #[cfg(all(feature = "graph", feature = "kv"))]
+    use rhiza_node::{GRAPH_QUERY_PATH, KV_SCAN_PATH};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
     use rhiza_quepaxa::AcceptedValue;
     #[cfg(feature = "sql")]
@@ -8911,738 +8679,6 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    #[cfg(feature = "sql")]
-    #[derive(Clone, Default)]
-    struct CapturedWrite(Arc<Mutex<Option<(HeaderMap, WriteRequest)>>>);
-
-    #[cfg(feature = "sql")]
-    async fn capture_write(
-        State(captured): State<CapturedWrite>,
-        headers: HeaderMap,
-        Json(request): Json<WriteRequest>,
-    ) -> Json<serde_json::Value> {
-        *captured.0.lock().unwrap() = Some((headers, request));
-        Json(serde_json::json!({
-            "applied_index": 1,
-            "hash": vec![0_u8; 32],
-        }))
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn write_sends_protocol_json_and_bearer_headers() {
-        let captured = CapturedWrite::default();
-        let app = Router::new()
-            .route("/v1/write", post(capture_write))
-            .with_state(captured.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let response = request_write(&WriteArgs {
-            urls: vec![format!("http://{address}")],
-            token: "client-secret".into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap();
-
-        server.abort();
-        assert_eq!(response.applied_index, 1);
-        let (headers, request) = captured.0.lock().unwrap().take().unwrap();
-        assert_eq!(headers[VERSION_HEADER], PROTOCOL_VERSION);
-        assert_eq!(headers["authorization"], "Bearer client-secret");
-        assert_eq!(headers["content-type"], "application/json");
-        assert_eq!(
-            request,
-            WriteRequest {
-                request_id: "request-1".into(),
-                key: "alpha".into(),
-                value: "one".into(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn write_retries_retryable_endpoint_with_the_same_request_id() {
-        let first = CapturedWrite::default();
-        let first_app = Router::new()
-            .route(
-                WRITE_PATH,
-                post(
-                    |State(captured): State<CapturedWrite>,
-                     headers: HeaderMap,
-                     Json(request): Json<WriteRequest>| async move {
-                        *captured.0.lock().unwrap() = Some((headers, request));
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(serde_json::json!({
-                                "code": "unavailable",
-                                "retryable": true,
-                                "message": "preferred proposer unavailable",
-                            })),
-                        )
-                    },
-                ),
-            )
-            .with_state(first.clone());
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let second = CapturedWrite::default();
-        let second_app = Router::new()
-            .route(WRITE_PATH, post(capture_write))
-            .with_state(second.clone());
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let response = request_write(&WriteArgs {
-            urls: vec![
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            token: "client-secret".into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.applied_index, 1);
-        let first_request = first.0.lock().unwrap().take().unwrap().1;
-        let second_request = second.0.lock().unwrap().take().unwrap().1;
-        assert_eq!(first_request, second_request);
-        assert_eq!(first_request.request_id, "request-1");
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn write_retries_the_next_endpoint_after_a_transport_failure() {
-        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let unavailable_address = unavailable_listener.local_addr().unwrap();
-        drop(unavailable_listener);
-
-        let fallback = CapturedWrite::default();
-        let app = Router::new()
-            .route(WRITE_PATH, post(capture_write))
-            .with_state(fallback.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let response = request_write(&WriteArgs {
-            urls: vec![
-                format!("http://{unavailable_address}"),
-                format!("http://{address}"),
-            ],
-            token: "client-secret".into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap();
-
-        server.abort();
-        assert_eq!(response.applied_index, 1);
-        assert_eq!(
-            fallback.0.lock().unwrap().take().unwrap().1.request_id,
-            "request-1"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn write_does_not_retry_a_non_retryable_endpoint_error() {
-        let first_app = Router::new().route(
-            WRITE_PATH,
-            post(|| async {
-                (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "code": "request_conflict",
-                        "retryable": false,
-                        "message": "request id has a different payload",
-                    })),
-                )
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let fallback = CapturedWrite::default();
-        let second_app = Router::new()
-            .route(WRITE_PATH, post(capture_write))
-            .with_state(fallback.clone());
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let error = request_write(&WriteArgs {
-            urls: vec![
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            token: "client-secret".into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap_err();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(
-            error,
-            "HTTP 409 Conflict code=request_conflict message=request id has a different payload"
-        );
-        assert!(fallback.0.lock().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn write_hedges_a_slow_preferred_endpoint_with_the_same_request_id() {
-        let first = CapturedWrite::default();
-        let first_app = Router::new()
-            .route(
-                WRITE_PATH,
-                post(
-                    |State(captured): State<CapturedWrite>,
-                     headers: HeaderMap,
-                     Json(request): Json<WriteRequest>| async move {
-                        *captured.0.lock().unwrap() = Some((headers, request));
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        Json(serde_json::json!({
-                            "applied_index": 2,
-                            "hash": vec![0_u8; 32],
-                        }))
-                    },
-                ),
-            )
-            .with_state(first.clone());
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let second = CapturedWrite::default();
-        let second_app = Router::new()
-            .route(WRITE_PATH, post(capture_write))
-            .with_state(second.clone());
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let response = tokio::time::timeout(
-            Duration::from_millis(500),
-            request_write(&WriteArgs {
-                urls: vec![
-                    format!("http://{first_address}"),
-                    format!("http://{second_address}"),
-                ],
-                token: "client-secret".into(),
-                request_id: "request-1".into(),
-                key: "alpha".into(),
-                value: "one".into(),
-            }),
-        )
-        .await
-        .expect("the fallback endpoint should be hedged before the preferred request finishes")
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.applied_index, 1);
-        let first_request = first.0.lock().unwrap().take().unwrap().1;
-        let second_request = second.0.lock().unwrap().take().unwrap().1;
-        assert_eq!(first_request, second_request);
-        assert_eq!(first_request.request_id, "request-1");
-    }
-
-    #[cfg(feature = "sql")]
-    #[derive(Clone, Default)]
-    struct CapturedRead(Arc<Mutex<Option<ReadRequest>>>);
-
-    #[test]
-    #[cfg(feature = "sql")]
-    fn only_idempotent_reads_are_hedged() {
-        assert!(!read_can_hedge(None));
-        assert!(!read_can_hedge(Some(ReadConsistency::ReadBarrier)));
-        assert!(read_can_hedge(Some(ReadConsistency::Local)));
-        assert!(read_can_hedge(Some(ReadConsistency::AppliedIndex(7))));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn read_retry_preserves_requested_consistency() {
-        let first_app = Router::new().route(
-            READ_PATH,
-            post(|| async {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "code": "unavailable",
-                        "retryable": true,
-                        "message": "preferred proposer unavailable",
-                    })),
-                )
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let captured = CapturedRead::default();
-        let second_app = Router::new()
-            .route(
-                READ_PATH,
-                post(
-                    |State(captured): State<CapturedRead>,
-                     Json(request): Json<ReadRequest>| async move {
-                        *captured.0.lock().unwrap() = Some(request);
-                        Json(serde_json::json!({
-                            "value": "one",
-                            "applied_index": 1,
-                            "hash": vec![0_u8; 32],
-                        }))
-                    },
-                ),
-            )
-            .with_state(captured.clone());
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let response = request_read(&ReadArgs {
-            urls: vec![
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            token: "client-secret".into(),
-            key: "alpha".into(),
-            consistency: Some(ReadConsistency::ReadBarrier),
-            expect: None,
-        })
-        .await
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.value.as_deref(), Some("one"));
-        assert_eq!(
-            captured.0.lock().unwrap().take().unwrap().consistency,
-            Some(ReadConsistency::ReadBarrier)
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn read_barrier_waits_for_the_current_attempt_before_retrying() {
-        let first_app = Router::new().route(
-            READ_PATH,
-            post(|| async {
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                Json(serde_json::json!({
-                    "value": "one",
-                    "applied_index": 1,
-                    "hash": vec![0_u8; 32],
-                }))
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let fallback_requests = Arc::new(AtomicUsize::new(0));
-        let fallback_count = Arc::clone(&fallback_requests);
-        let second_app = Router::new().route(
-            READ_PATH,
-            post(move || {
-                let fallback_count = Arc::clone(&fallback_count);
-                async move {
-                    fallback_count.fetch_add(1, Ordering::SeqCst);
-                    Json(serde_json::json!({
-                        "value": "one",
-                        "applied_index": 2,
-                        "hash": vec![0_u8; 32],
-                    }))
-                }
-            }),
-        );
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let request = ReadRequest {
-            key: "alpha".into(),
-            consistency: Some(ReadConsistency::ReadBarrier),
-        };
-        let response: ReadResponse = client_json_request_with_policy(
-            &[
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            "client-secret",
-            READ_PATH,
-            &request,
-            read_can_hedge(request.consistency),
-            ClientPolicy::test(Duration::from_millis(10), Duration::from_millis(200)),
-        )
-        .await
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.applied_index, 1);
-        assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn applied_index_read_hedges_and_preserves_consistency() {
-        let first_app = Router::new().route(
-            READ_PATH,
-            post(|| async {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                Json(serde_json::json!({
-                    "value": "late",
-                    "applied_index": 7,
-                    "hash": vec![0_u8; 32],
-                }))
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let captured = CapturedRead::default();
-        let second_app = Router::new()
-            .route(
-                READ_PATH,
-                post(
-                    |State(captured): State<CapturedRead>,
-                     Json(request): Json<ReadRequest>| async move {
-                        *captured.0.lock().unwrap() = Some(request);
-                        Json(serde_json::json!({
-                            "value": "one",
-                            "applied_index": 7,
-                            "hash": vec![0_u8; 32],
-                        }))
-                    },
-                ),
-            )
-            .with_state(captured.clone());
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let request = ReadRequest {
-            key: "alpha".into(),
-            consistency: Some(ReadConsistency::AppliedIndex(7)),
-        };
-        let response: ReadResponse = client_json_request_with_policy(
-            &[
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            "client-secret",
-            READ_PATH,
-            &request,
-            read_can_hedge(request.consistency),
-            ClientPolicy::test(Duration::from_millis(10), Duration::from_millis(500)),
-        )
-        .await
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.value.as_deref(), Some("one"));
-        assert_eq!(
-            captured.0.lock().unwrap().take().unwrap().consistency,
-            Some(ReadConsistency::AppliedIndex(7))
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn attempt_deadline_retries_with_the_exact_serialized_body() {
-        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-        let first_bodies = Arc::clone(&bodies);
-        let first_app = Router::new().route(
-            WRITE_PATH,
-            post(move |body: String| {
-                let first_bodies = Arc::clone(&first_bodies);
-                async move {
-                    first_bodies.lock().unwrap().push(body);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    Json(serde_json::json!({
-                        "applied_index": 2,
-                        "hash": vec![0_u8; 32],
-                    }))
-                }
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let second_bodies = Arc::clone(&bodies);
-        let second_app = Router::new().route(
-            WRITE_PATH,
-            post(move |body: String| {
-                let second_bodies = Arc::clone(&second_bodies);
-                async move {
-                    second_bodies.lock().unwrap().push(body);
-                    Json(serde_json::json!({
-                        "applied_index": 1,
-                        "hash": vec![0_u8; 32],
-                    }))
-                }
-            }),
-        );
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-
-        let request = WriteRequest {
-            request_id: "same-request-id".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        };
-        let response: WriteResponse = client_json_request_with_policy(
-            &[
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            "client-secret",
-            WRITE_PATH,
-            &request,
-            false,
-            ClientPolicy {
-                connect_timeout: Duration::from_millis(20),
-                attempt_timeout: Duration::from_millis(40),
-                operation_timeout: Duration::from_millis(300),
-                hedge_delay: Duration::from_millis(10),
-            },
-        )
-        .await
-        .unwrap();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(response.applied_index, 1);
-        assert_eq!(
-            *bodies.lock().unwrap(),
-            vec![
-                serde_json::to_string(&request).unwrap(),
-                serde_json::to_string(&request).unwrap(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn operation_deadline_bounds_all_attempts() {
-        let app = Router::new().route(
-            WRITE_PATH,
-            post(|| async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Json(serde_json::json!({
-                    "applied_index": 1,
-                    "hash": vec![0_u8; 32],
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let request = WriteRequest {
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        };
-
-        let error = client_json_request_with_policy::<_, WriteResponse>(
-            &[format!("http://{address}")],
-            "client-secret",
-            WRITE_PATH,
-            &request,
-            false,
-            ClientPolicy {
-                connect_timeout: Duration::from_millis(20),
-                attempt_timeout: Duration::from_secs(1),
-                operation_timeout: Duration::from_millis(40),
-                hedge_delay: Duration::from_millis(10),
-            },
-        )
-        .await
-        .unwrap_err();
-
-        server.abort();
-        assert_eq!(error, "request failed: operation deadline exceeded");
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn operation_deadline_preserves_the_last_structured_server_error() {
-        let first_app = Router::new().route(
-            WRITE_PATH,
-            post(|| async {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "code": "leader_unavailable",
-                        "retryable": true,
-                        "message": "preferred proposer unavailable",
-                    })),
-                )
-            }),
-        );
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        let first_server =
-            tokio::spawn(async move { axum::serve(first_listener, first_app).await });
-
-        let second_app = Router::new().route(
-            WRITE_PATH,
-            post(|| async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Json(serde_json::json!({
-                    "applied_index": 1,
-                    "hash": vec![0_u8; 32],
-                }))
-            }),
-        );
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        let second_server =
-            tokio::spawn(async move { axum::serve(second_listener, second_app).await });
-        let request = WriteRequest {
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        };
-
-        let error = client_json_request_with_policy::<_, WriteResponse>(
-            &[
-                format!("http://{first_address}"),
-                format!("http://{second_address}"),
-            ],
-            "client-secret",
-            WRITE_PATH,
-            &request,
-            false,
-            ClientPolicy {
-                connect_timeout: Duration::from_millis(20),
-                attempt_timeout: Duration::from_secs(1),
-                operation_timeout: Duration::from_millis(50),
-                hedge_delay: Duration::from_millis(10),
-            },
-        )
-        .await
-        .unwrap_err();
-
-        first_server.abort();
-        second_server.abort();
-        assert_eq!(
-            error,
-            "HTTP 503 Service Unavailable code=leader_unavailable message=preferred proposer unavailable"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn sql_execute_decodes_statement_and_returning_results() {
-        let app = Router::new().route(
-            SQL_EXECUTE_PATH,
-            post(|| async {
-                Json(serde_json::json!({
-                    "version": 2,
-                    "applied_index": 7,
-                    "hash": vec![0_u8; 32],
-                    "results": [{
-                        "statement_index": 0,
-                        "rows_affected": 1,
-                        "returning": {
-                            "columns": ["id"],
-                            "rows": [[{"type": "integer", "value": 42}]]
-                        }
-                    }]
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let response = request_sql_execute(&SqlExecuteArgs {
-            urls: vec![format!("http://{address}")],
-            token: "client-secret".into(),
-            request_id: "returning-1".into(),
-            statement: SqlStatement {
-                sql: "INSERT INTO items(id) VALUES (42) RETURNING id".into(),
-                parameters: vec![],
-            },
-        })
-        .await
-        .unwrap();
-
-        server.abort();
-        assert_eq!(response.applied_index, 7);
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].rows_affected, 1);
-        assert_eq!(
-            response.results[0].returning.as_ref().unwrap().rows,
-            [vec![SqlValue::Integer(42)]]
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn request_errors_do_not_expose_client_token() {
-        let app = Router::new().route(WRITE_PATH, post(|| async { StatusCode::UNAUTHORIZED }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let token = "client-secret-that-must-stay-private";
-
-        let error = request_write(&WriteArgs {
-            urls: vec![format!("http://{address}")],
-            token: token.into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap_err();
-
-        server.abort();
-        assert!(!error.contains(token));
-    }
-
     #[tokio::test]
     async fn admin_transport_errors_do_not_expose_url_credentials() {
         let address = unused_local_address();
@@ -9725,41 +8761,5 @@ mod tests {
         server.abort();
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(error.starts_with("admin request failed:"));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sql")]
-    async fn request_surfaces_structured_json_server_errors() {
-        let app = Router::new().route(
-            WRITE_PATH,
-            post(|| async {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "invalid_request",
-                        "message": "request id is empty",
-                    })),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let error = request_write(&WriteArgs {
-            urls: vec![format!("http://{address}")],
-            token: "client-secret".into(),
-            request_id: "request-1".into(),
-            key: "alpha".into(),
-            value: "one".into(),
-        })
-        .await
-        .unwrap_err();
-
-        server.abort();
-        assert_eq!(
-            error,
-            "HTTP 400 Bad Request code=invalid_request message=request id is empty"
-        );
     }
 }

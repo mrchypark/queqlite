@@ -7,13 +7,14 @@ repository.workspace = true
 
 [features]
 default = ["sql", "graph", "kv"]
-sql = ["dep:rhiza-sql", "rhiza-node/sql"]
-graph = ["rhiza-node/graph"]
-kv = ["rhiza-node/kv"]
+sql = ["dep:rhiza-sql", "rhiza-client/sql", "rhiza-node/sql"]
+graph = ["rhiza-client/graph", "rhiza-node/graph"]
+kv = ["rhiza-client/kv", "rhiza-node/kv"]
 recorder-postcard-rpc = ["rhiza-node/recorder-postcard-rpc"]
 
 [dependencies]
 axum.workspace = true
+rhiza-client = { path = "../rhiza-client", default-features = false }
 rhiza-archive = { path = "../rhiza-archive" }
 rhiza-core = { path = "../rhiza-core" }
 rhiza-log = { path = "../rhiza-log" }

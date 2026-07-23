@@ -13,13 +13,13 @@ use std::{
 #[cfg(feature = "kv")]
 use rhiza_node::run_read_operation;
 use rhiza_node::{confirm_write_durability, ConfigError, NodeConfig, NodeRuntime, NodeService};
-use rhiza_quepaxa::{Error as ConsensusError, ThreeNodeConsensus};
+use rhiza_quepaxa::{Error as ConsensusError, Membership, RecorderFileStore, ThreeNodeConsensus};
 use tokio::{
     sync::{watch, OwnedRwLockReadGuard, RwLock},
     task::{JoinError, JoinHandle},
 };
 
-pub use rhiza_core::ExecutionProfile;
+pub use rhiza_core::{ErrorCategory, ErrorClassification, ExecutionProfile};
 #[cfg(feature = "graph")]
 pub use rhiza_graph::{
     CanonicalF64, GraphColumn, GraphCommandResultV1, GraphCommandV1, GraphInternalId,
@@ -42,6 +42,7 @@ pub use rhiza_sql::{SqlCommand, SqlQueryResult, SqlStatement, SqlValue};
 
 const MATERIALIZER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(25);
+const LOCAL_RECORDER_IDS: [&str; 3] = ["recorder-1", "recorder-2", "recorder-3"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddedIdentity {
@@ -78,6 +79,47 @@ pub struct EmbeddedConfig {
 }
 
 impl EmbeddedConfig {
+    /// Creates a fixed three-recorder configuration for one local process.
+    ///
+    /// This writes durable state below `root` and is not highly available: the node and all
+    /// recorders share one process and failure domain. Use [`Self::new`] when transports or
+    /// recorder membership must be supplied explicitly.
+    pub fn local_file_backed(
+        logical_cluster_id: impl Into<String>,
+        root: impl Into<PathBuf>,
+        execution_profile: ExecutionProfile,
+    ) -> Result<Self, Error> {
+        let logical_cluster_id = logical_cluster_id.into();
+        let cluster_id = effective_cluster_id(execution_profile, &logical_cluster_id)?;
+        let root = root.into();
+        let membership = Membership::new(LOCAL_RECORDER_IDS)?;
+        let recorders = membership
+            .members()
+            .iter()
+            .map(|id| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.join("recorders").join(id),
+                    id.clone(),
+                    &cluster_id,
+                    1,
+                    1,
+                    membership.clone(),
+                )?;
+                Ok((id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>))
+            })
+            .collect::<Result<Vec<_>, ConsensusError>>()?;
+
+        Ok(Self::new(
+            EmbeddedIdentity::new(logical_cluster_id, LOCAL_RECORDER_IDS[0], 1, 1),
+            root.join("node"),
+            execution_profile,
+            membership.members().to_vec(),
+            recorders,
+            vec![],
+            None,
+        ))
+    }
+
     pub fn new(
         identity: EmbeddedIdentity,
         data_dir: impl Into<PathBuf>,
@@ -151,6 +193,36 @@ impl std::error::Error for Error {
     }
 }
 
+impl Error {
+    /// Returns a stable machine-readable code, category, and retry guidance.
+    pub fn classification(&self) -> ErrorClassification {
+        match self {
+            Self::Node(error) => error.classification(),
+            Self::Closed => ErrorClassification::new("closed", ErrorCategory::Unavailable, true),
+            Self::ExecutionProfileMismatch { .. } => ErrorClassification::new(
+                "execution_profile_mismatch",
+                ErrorCategory::Internal,
+                false,
+            ),
+            Self::Config(_) => {
+                ErrorClassification::new("config_error", ErrorCategory::Internal, false)
+            }
+            Self::Consensus(_) => {
+                ErrorClassification::new("consensus_error", ErrorCategory::Unavailable, true)
+            }
+            Self::Durability(_) => {
+                ErrorClassification::new("durability_error", ErrorCategory::Unavailable, true)
+            }
+            Self::PendingConsensusRpcs => {
+                ErrorClassification::new("pending_consensus_rpcs", ErrorCategory::Unavailable, true)
+            }
+            Self::Worker(_) => {
+                ErrorClassification::new("worker_error", ErrorCategory::Internal, false)
+            }
+        }
+    }
+}
+
 /// An outer failure from an embedded typed batch write.
 ///
 /// `NotAttempted` means the complete vector failed validation or admission before any command was
@@ -214,6 +286,11 @@ struct Inner {
     shutdown: watch::Sender<bool>,
 }
 
+/// Owns the embedded node runtime and its background workers.
+///
+/// Keep this owner alive for the lifetime of the application server. During planned shutdown,
+/// first drain the server, then call [`Self::shutdown`]. Dropping the owner only signals its
+/// workers and cannot report drain or durability errors.
 pub struct Rhiza {
     inner: Option<Arc<Inner>>,
     workers: Vec<JoinHandle<Result<(), Error>>>,
@@ -294,6 +371,7 @@ impl Rhiza {
         }
     }
 
+    /// Drains embedded work and returns any durability or worker failure.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         let inner = self.inner.take().expect("open owner has inner state");
         inner.closed.store(true, Ordering::Release);

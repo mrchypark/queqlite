@@ -555,7 +555,11 @@ fn shutdown_consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
 async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
     let root = tempfile::tempdir().unwrap();
     let mut config = config(root.path());
-    config.members = vec!["node-1".into(), "node-2".into(), "node-4".into()];
+    config.members = vec![
+        "recorder-1".into(),
+        "recorder-2".into(),
+        "recorder-4".into(),
+    ];
 
     assert!(matches!(
         Rhiza::open(config).await,
@@ -574,34 +578,24 @@ fn config_for_profile(
     root: &std::path::Path,
     execution_profile: ExecutionProfile,
 ) -> EmbeddedConfig {
-    let identity = EmbeddedIdentity::new("cluster-a", "node-1", 1, 1);
-    let recorder_cluster_id = effective_cluster_id(execution_profile, "cluster-a").unwrap();
-    let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
-    let recorders = membership
-        .members()
-        .iter()
-        .map(|id| {
-            let recorder = RecorderFileStore::new_with_membership(
-                root.join("recorders").join(id),
-                id.clone(),
-                &recorder_cluster_id,
-                1,
-                1,
-                membership.clone(),
-            )
-            .unwrap();
-            (id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>)
-        })
-        .collect();
-    EmbeddedConfig::new(
-        identity,
-        root.join("node"),
-        execution_profile,
-        membership.members().to_vec(),
-        recorders,
-        vec![],
-        None,
-    )
+    EmbeddedConfig::local_file_backed("cluster-a", root, execution_profile).unwrap()
+}
+
+#[test]
+fn local_file_backed_rejects_wrong_canonical_cluster_id_before_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+
+    assert!(matches!(
+        EmbeddedConfig::local_file_backed(
+            "rhiza:graph:cluster-a",
+            root.path(),
+            ExecutionProfile::Sqlite,
+        ),
+        Err(Error::Config(
+            rhiza_node::ConfigError::ClusterIdProfileMismatch { .. }
+        ))
+    ));
+    assert!(root.path().read_dir().unwrap().next().is_none());
 }
 
 fn config_with_blocked_minority(

@@ -2,6 +2,7 @@
 members = [
     "crates/rhiza",
     "crates/rhiza-archive",
+    "crates/rhiza-client",
     "crates/rhiza-cli",
     "crates/rhiza-core",
     "crates/rhiza-graph",

@@ -8,6 +8,85 @@ pub type ConfigId = u64;
 pub type NodeId = String;
 pub type ClusterId = String;
 
+/// A transport-neutral category for a public error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorCategory {
+    InvalidRequest,
+    Authentication,
+    Conflict,
+    Unavailable,
+    ResourceExhausted,
+    Internal,
+    Unknown,
+}
+
+/// Public retry guidance and a stable machine-readable code for an error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorClassification {
+    code: String,
+    category: ErrorCategory,
+    retryable: bool,
+}
+
+impl ErrorClassification {
+    pub fn new(code: impl Into<String>, category: ErrorCategory, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            category,
+            retryable,
+        }
+    }
+
+    pub fn from_server_code(code: impl Into<String>, retryable: bool) -> Self {
+        let code = code.into();
+        let category = match code.as_str() {
+            "invalid_request" | "invalid_json" | "invalid_content_type" => {
+                ErrorCategory::InvalidRequest
+            }
+            "unauthorized" => ErrorCategory::Authentication,
+            "request_conflict" | "precondition_failed" => ErrorCategory::Conflict,
+            "unavailable"
+            | "durability_unavailable"
+            | "write_timeout"
+            | "writes_unavailable"
+            | "configuration_transition"
+            | "contention"
+            | "winner_limit_exceeded"
+            | "leader_unavailable"
+            | "snapshot_required" => ErrorCategory::Unavailable,
+            "resource_exhausted" | "overloaded" | "payload_too_large" => {
+                ErrorCategory::ResourceExhausted
+            }
+            "data_root_locked"
+            | "unsupported_ack_mode"
+            | "execution_profile_mismatch"
+            | "storage_error"
+            | "reconciliation_error"
+            | "invariant_violation"
+            | "fatal"
+            | "task_failed" => ErrorCategory::Internal,
+            _ => ErrorCategory::Unknown,
+        };
+        Self {
+            code,
+            category,
+            retryable,
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub const fn category(&self) -> ErrorCategory {
+        self.category
+    }
+
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
 pub const RECOVERY_ANCHOR_FORMAT_VERSION: u32 = 2;
 pub const RECOVERY_ANCHOR_V1_FORMAT_VERSION: u32 = 1;
 
@@ -1560,8 +1639,50 @@ mod tests {
     use super::{
         read_config_hash, read_config_hash_at, read_config_string, read_config_u16,
         read_config_u64, read_config_u64_at, CommandEnvelopeError, ConfigChangeDecodeError,
-        ExecutionProfile, ExecutionProfileParseError, ReplicatedCommandEnvelope,
+        ErrorCategory, ErrorClassification, ExecutionProfile, ExecutionProfileParseError,
+        ReplicatedCommandEnvelope,
     };
+
+    #[test]
+    fn server_error_codes_map_to_categories_and_preserve_unknown_values() {
+        let cases = [
+            ("invalid_request", ErrorCategory::InvalidRequest, false),
+            ("invalid_json", ErrorCategory::InvalidRequest, false),
+            ("invalid_content_type", ErrorCategory::InvalidRequest, false),
+            ("unauthorized", ErrorCategory::Authentication, false),
+            ("request_conflict", ErrorCategory::Conflict, false),
+            ("precondition_failed", ErrorCategory::Conflict, false),
+            ("unavailable", ErrorCategory::Unavailable, true),
+            ("durability_unavailable", ErrorCategory::Unavailable, true),
+            ("write_timeout", ErrorCategory::Unavailable, true),
+            ("writes_unavailable", ErrorCategory::Unavailable, true),
+            ("configuration_transition", ErrorCategory::Unavailable, true),
+            ("contention", ErrorCategory::Unavailable, true),
+            ("winner_limit_exceeded", ErrorCategory::Unavailable, true),
+            ("leader_unavailable", ErrorCategory::Unavailable, true),
+            ("snapshot_required", ErrorCategory::Unavailable, false),
+            ("resource_exhausted", ErrorCategory::ResourceExhausted, true),
+            ("overloaded", ErrorCategory::ResourceExhausted, true),
+            ("payload_too_large", ErrorCategory::ResourceExhausted, false),
+            ("data_root_locked", ErrorCategory::Internal, false),
+            ("unsupported_ack_mode", ErrorCategory::Internal, false),
+            ("execution_profile_mismatch", ErrorCategory::Internal, false),
+            ("storage_error", ErrorCategory::Internal, false),
+            ("reconciliation_error", ErrorCategory::Internal, false),
+            ("invariant_violation", ErrorCategory::Internal, false),
+            ("fatal", ErrorCategory::Internal, false),
+            ("task_failed", ErrorCategory::Internal, false),
+            ("future_code", ErrorCategory::Unknown, true),
+        ];
+
+        for (code, category, retryable) in cases {
+            let classification = ErrorClassification::from_server_code(code, retryable);
+
+            assert_eq!(classification.code(), code);
+            assert_eq!(classification.category(), category);
+            assert_eq!(classification.retryable(), retryable);
+        }
+    }
 
     #[test]
     fn execution_profile_has_stable_text_and_wire_ids() {
