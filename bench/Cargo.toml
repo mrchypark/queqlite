@@ -20,7 +20,7 @@ prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
-rhiza = { path = "../crates/rhiza", features = ["graph", "kv"] }
+rhizadb = { path = "../crates/rhiza", features = ["graph", "kv"] }
 rhiza-core = { path = "../crates/rhiza-core" }
 rhiza-graph = { path = "../crates/rhiza-graph" }
 rhiza-kv = { path = "../crates/rhiza-kv" }

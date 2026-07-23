@@ -4,11 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Archive import and export support for rhiza"
 
 [dependencies]
-rhiza-core = { path = "../rhiza-core" }
-rhiza-log = { path = "../rhiza-log" }
-rhiza-obj-store = { path = "../rhiza-obj-store" }
+rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
+rhiza-log = { version = "0.1.0", path = "../rhiza-log" }
+rhiza-obj-store = { version = "0.1.0", path = "../rhiza-obj-store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }

@@ -5,20 +5,20 @@ use std::{
     time::Duration,
 };
 
+use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
+use rhiza_obj_store::{ObjStore, ObjStoreConfig};
+use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 #[cfg(feature = "kv")]
-use rhiza::KvCommandResultV1;
-use rhiza::{
+use rhizadb::KvCommandResultV1;
+use rhizadb::{
     effective_cluster_id, BatchWriteError, CheckpointCoordinator, DurabilityHealth, DurabilityMode,
     EmbeddedConfig, EmbeddedIdentity, Error, ExecutionProfile, NodeError, ReadConsistency,
     RecorderRpc, Rhiza, SqlCommand, SqlStatement, SqlValue,
 };
 #[cfg(feature = "graph")]
-use rhiza::{
+use rhizadb::{
     GraphCommandResultV1, GraphCommandV1, GraphParameterValue, GraphResultValue, GraphValueV1,
 };
-use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
-use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn executes_and_queries_sql_with_in_process_recorders() {

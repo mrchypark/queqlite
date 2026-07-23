@@ -1983,22 +1983,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rhiza"
-version = "0.1.0"
-dependencies = [
- "rhiza-archive",
- "rhiza-core",
- "rhiza-graph",
- "rhiza-kv",
- "rhiza-node",
- "rhiza-obj-store",
- "rhiza-quepaxa",
- "rhiza-sql",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "rhiza-archive"
 version = "0.1.0"
 dependencies = [
@@ -2016,7 +2000,7 @@ name = "rhiza-basic-app-server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "rhiza",
+ "rhizadb",
  "serde",
  "serde_json",
  "tempfile",
@@ -2169,6 +2153,22 @@ name = "rhiza-testkit"
 version = "0.1.0"
 dependencies = [
  "rhiza-core",
+]
+
+[[package]]
+name = "rhizadb"
+version = "0.1.0"
+dependencies = [
+ "rhiza-archive",
+ "rhiza-core",
+ "rhiza-graph",
+ "rhiza-kv",
+ "rhiza-node",
+ "rhiza-obj-store",
+ "rhiza-quepaxa",
+ "rhiza-sql",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

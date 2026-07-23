@@ -24,7 +24,7 @@ materialization engines.
 
 The Rust workspace is Kubernetes-independent. Its primary crates are:
 
-- `rhiza`: primary embedded Rust facade and lifecycle owner.
+- `rhizadb`: primary embedded Rust facade and lifecycle owner.
 - `rhiza-core`: log, configuration, command, and snapshot domain types.
 - `rhiza-quepaxa`: recorder RPC, durable recorder state, and consensus.
 - `rhiza-log`: local binary qlog and compaction anchors.
@@ -70,6 +70,7 @@ requirement.
 
 CI builds and validates all four variants without registry credentials. Image
 publication and registry tags remain a separate release operation.
+For the crates.io release procedure, see [RELEASING.md](RELEASING.md).
 
 One parameterized Dockerfile builds all four artifacts:
 
@@ -87,7 +88,7 @@ for example, use `RHIZA_IMAGE=rhiza-sql:dev` together with
 
 ## Embedded Rust API
 
-The `rhiza` crate exposes the SQL, graph, and KV profiles through one embedded
+The `rhizadb` crate exposes the SQL, graph, and KV profiles through one embedded
 owner. Its default feature set is SQL-only; graph and KV are explicit opt-ins:
 
 | Cargo features | Embedded profiles |
@@ -106,7 +107,7 @@ Dropping the owner only signals shutdown and cannot report those errors.
 ### 5-minute consumer app
 
 `examples/basic-app-server` is a separate Cargo package that depends only on
-the public `rhiza` API. Start its local HTTP server with an explicit loopback
+the public `rhizadb` API. Start its local HTTP server with an explicit loopback
 address and data directory:
 
 ```bash
@@ -143,9 +144,9 @@ configuration below one root directory. All recorders share the process and
 failure domain, so this configuration is not highly available:
 
 ```rust,no_run
-use rhiza::{EmbeddedConfig, ExecutionProfile, Rhiza, ReadConsistency};
+use rhizadb::{EmbeddedConfig, ExecutionProfile, Rhiza, ReadConsistency};
 
-async fn example() -> Result<(), rhiza::Error> {
+async fn example() -> Result<(), rhizadb::Error> {
 let config = EmbeddedConfig::local_file_backed(
     "cluster-a",
     "./data",
@@ -165,7 +166,7 @@ Ok(())
 
 `EmbeddedConfig::new` is an advanced extension point for custom or remote
 recorder and log transports. It accepts `RecorderRpc` and `LogPeer` trait
-objects, which `rhiza` re-exports as the narrow extension boundary. Implementing
+objects, which `rhizadb` re-exports as the narrow extension boundary. Implementing
 those traits or using the broader transport vocabulary still requires direct
 dependencies on `rhiza-quepaxa` and `rhiza-node`. Normal local consumers should
 use `local_file_backed`.

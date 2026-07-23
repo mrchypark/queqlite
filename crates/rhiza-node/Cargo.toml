@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Network node runtime for rhiza"
 
 [features]
 default = ["sql"]
@@ -13,14 +14,14 @@ kv = ["dep:rhiza-kv"]
 recorder-postcard-rpc = ["dep:postcard-rpc", "dep:tracing"]
 
 [dependencies]
-rhiza-archive = { path = "../rhiza-archive" }
-rhiza-core = { path = "../rhiza-core" }
-rhiza-graph = { path = "../rhiza-graph", optional = true }
-rhiza-kv = { path = "../rhiza-kv", optional = true }
-rhiza-log = { path = "../rhiza-log" }
-rhiza-obj-store = { path = "../rhiza-obj-store" }
-rhiza-quepaxa = { path = "../rhiza-quepaxa" }
-rhiza-sql = { path = "../rhiza-sql", optional = true }
+rhiza-archive = { version = "0.1.0", path = "../rhiza-archive" }
+rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
+rhiza-graph = { version = "0.1.0", path = "../rhiza-graph", optional = true }
+rhiza-kv = { version = "0.1.0", path = "../rhiza-kv", optional = true }
+rhiza-log = { version = "0.1.0", path = "../rhiza-log" }
+rhiza-obj-store = { version = "0.1.0", path = "../rhiza-obj-store" }
+rhiza-quepaxa = { version = "0.1.0", path = "../rhiza-quepaxa" }
+rhiza-sql = { version = "0.1.0", path = "../rhiza-sql", optional = true }
 axum.workspace = true
 postcard.workspace = true
 postcard-rpc = { workspace = true, optional = true }

@@ -24,7 +24,7 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use rhiza::{
+use rhizadb::{
     EmbeddedConfig, Error, ErrorCategory, ExecutionProfile, ReadConsistency, Rhiza, RhizaHandle,
 };
 use serde::{Deserialize, Serialize};
@@ -183,7 +183,7 @@ fn rhiza_error(error: Error) -> Response {
 }
 
 fn should_log_rhiza_error(error: &Error) -> bool {
-    !matches!(error, Error::Node(rhiza::NodeError::Fatal(_)))
+    !matches!(error, Error::Node(rhizadb::NodeError::Fatal(_)))
 }
 
 fn escaped_error_detail(error: &dyn std::fmt::Display) -> String {
@@ -314,7 +314,7 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use rhiza::{Error, NodeError};
+    use rhizadb::{Error, NodeError};
 
     use super::{
         build_router, escaped_error_detail, open_rhiza, parse_bind_addr, parse_data_dir,
