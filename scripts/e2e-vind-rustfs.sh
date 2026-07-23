@@ -29,8 +29,8 @@ marker=/var/lib/rhiza/emptydir-marker
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
 case "$profile" in
-  sql|graph|kv) ;;
-  *) echo "RHIZA_EXECUTION_PROFILE must be sql|graph|kv" >&2; exit 65 ;;
+  sql) ;;
+  *) echo "RHIZA_EXECUTION_PROFILE must be sql" >&2; exit 65 ;;
 esac
 for tool in docker kubectl jq yq openssl; do require "$tool"; done
 [ "$direct_cluster" = 1 ] || require vcluster
@@ -316,25 +316,9 @@ matrix_service_http() {
 }
 matrix_prepare_write_request() {
   key="$1" value="$2" request_id="$3"
-  case "$profile" in
-    sql)
-      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$key" --arg value "$value" \
-        '{request_id:$request_id,key:$key,value:$value}')"
-      matrix_path=/v1/write
-      ;;
-    graph)
-      matrix_body="$(jq -cn --arg request_id "$request_id" --arg id "$key" --arg value "$value" \
-        '{request_id:$request_id,id:$id,value:{type:"string",value:$value}}')"
-      matrix_path=/v1/graph/documents/put
-      ;;
-    kv)
-      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
-      encoded_value="$(printf '%s' "$value" | openssl base64 -A)"
-      matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$encoded_key" \
-        --arg value "$encoded_value" '{request_id:$request_id,key:$key,value:$value}')"
-      matrix_path=/v1/kv/put
-      ;;
-  esac
+  matrix_body="$(jq -cn --arg request_id "$request_id" --arg key "$key" --arg value "$value" \
+    '{request_id:$request_id,key:$key,value:$value}')"
+  matrix_path=/v1/write
 }
 matrix_service_write_response() {
   matrix_prepare_write_request "$1" "$2" "$3"
@@ -345,33 +329,12 @@ matrix_service_write() {
 }
 matrix_prepare_read_request() {
   key="$1" expected="$2" consistency="$3"
-  case "$profile" in
-    sql)
-      matrix_body="$(jq -cn --arg key "$key" --arg consistency "$consistency" \
-        '{key:$key,consistency:$consistency}')"
-      matrix_path=/v1/read
-      # shellcheck disable=SC2016
-      matrix_read_filter='.value == $expected'
-      matrix_encoded_expected="$expected"
-      ;;
-    graph)
-      matrix_body="$(jq -cn --arg id "$key" --arg consistency "$consistency" \
-        '{id:$id,consistency:$consistency}')"
-      matrix_path=/v1/graph/documents/get
-      # shellcheck disable=SC2016
-      matrix_read_filter='.value == {type:"string",value:$expected}'
-      matrix_encoded_expected="$expected"
-      ;;
-    kv)
-      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
-      matrix_encoded_expected="$(printf '%s' "$expected" | openssl base64 -A)"
-      matrix_body="$(jq -cn --arg key "$encoded_key" --arg consistency "$consistency" \
-        '{key:$key,consistency:$consistency}')"
-      matrix_path=/v1/kv/get
-      # shellcheck disable=SC2016
-      matrix_read_filter='.value == $expected'
-      ;;
-  esac
+  matrix_body="$(jq -cn --arg key "$key" --arg consistency "$consistency" \
+    '{key:$key,consistency:$consistency}')"
+  matrix_path=/v1/read
+  # shellcheck disable=SC2016
+  matrix_read_filter='.value == $expected'
+  matrix_encoded_expected="$expected"
 }
 matrix_service_read() {
   matrix_prepare_read_request "$1" "$2" "$3"
@@ -471,41 +434,11 @@ matrix_expect_read_zero_endpoint_failure() {
 }
 write_value() {
   pod="$1" key="$2" value="$3" request_id="$4"
-  case "$profile" in
-    sql) client "$pod" write --request-id "$request_id" --key "$key" --value "$value" ;;
-    graph)
-      body="$(jq -cn --arg request_id "$request_id" --arg id "$key" --arg value "$value" \
-        '{request_id:$request_id,id:$id,value:{type:"string",value:$value}}')"
-      client_http "$pod" /v1/graph/documents/put "$body" >/dev/null
-      ;;
-    kv)
-      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
-      encoded_value="$(printf '%s' "$value" | openssl base64 -A)"
-      body="$(jq -cn --arg request_id "$request_id" --arg key "$encoded_key" \
-        --arg value "$encoded_value" '{request_id:$request_id,key:$key,value:$value}')"
-      client_http "$pod" /v1/kv/put "$body" >/dev/null
-      ;;
-  esac
+  client "$pod" write --request-id "$request_id" --key "$key" --value "$value"
 }
 read_value_consistency() {
   pod="$1" key="$2" expected="$3" consistency="$4"
-  case "$profile" in
-    sql) client "$pod" read --key "$key" --consistency "$consistency" --expect "$expected" ;;
-    graph)
-      body="$(jq -cn --arg id "$key" --arg consistency "$consistency" \
-        '{id:$id,consistency:$consistency}')"
-      client_http "$pod" /v1/graph/documents/get "$body" |
-        jq -e --arg expected "$expected" '.value == {type:"string",value:$expected}' >/dev/null
-      ;;
-    kv)
-      encoded_key="$(printf '%s' "$key" | openssl base64 -A)"
-      encoded_expected="$(printf '%s' "$expected" | openssl base64 -A)"
-      body="$(jq -cn --arg key "$encoded_key" --arg consistency "$consistency" \
-        '{key:$key,consistency:$consistency}')"
-      client_http "$pod" /v1/kv/get "$body" |
-        jq -e --arg expected "$encoded_expected" '.value == $expected' >/dev/null
-      ;;
-  esac
+  client "$pod" read --key "$key" --consistency "$consistency" --expect "$expected"
 }
 read_value() {
   read_value_consistency "$1" "$2" "$3" read_barrier

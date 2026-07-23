@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG RHIZA_PROFILE=all
+ARG RHIZA_PROFILE=sql
 
 FROM rust:1.95-trixie AS builder
 ARG RHIZA_PROFILE
@@ -20,15 +20,8 @@ COPY . .
 RUN --mount=type=cache,id=rhiza-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rhiza-cargo-target,target=/src/target,sharing=locked \
     case "$RHIZA_PROFILE" in \
-      sql|graph|kv) \
-        cargo build --release --locked -p rhiza-cli --bin rhiza \
-          --no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc" \
-        ;; \
-      all) \
-        cargo build --release --locked -p rhiza-cli --bin rhiza --all-features \
-        ;; \
-      *) \
-        echo "RHIZA_PROFILE must be sql|graph|kv|all" >&2; \
+      sql) cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc ;; \
+      *) echo "RHIZA_PROFILE must be sql" >&2; \
         exit 64 \
         ;; \
     esac \

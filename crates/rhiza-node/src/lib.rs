@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(any(feature = "sql", feature = "graph", feature = "kv")),
-    allow(dead_code, unreachable_code, unused_imports, unused_variables)
-)]
-
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
@@ -14,15 +9,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(feature = "sql", feature = "kv"))]
+#[cfg(feature = "sql")]
 use std::collections::VecDeque;
 
-#[cfg(not(any(feature = "sql", feature = "graph", feature = "kv")))]
-compile_error!("rhiza-node requires at least one execution profile feature: sql, graph, or kv");
+#[cfg(not(feature = "sql"))]
+compile_error!("rhiza-node requires the sql execution profile feature");
 
 #[cfg(feature = "graph")]
 use std::collections::BTreeMap;
-#[cfg(any(feature = "sql", feature = "kv", test))]
+#[cfg(any(feature = "sql", test))]
 use std::sync::atomic::AtomicUsize;
 
 use axum::{
@@ -5915,8 +5910,6 @@ pub struct NodeRuntime {
     fatal_reason: Mutex<Option<String>>,
     #[cfg(test)]
     materialized_tip_checks: AtomicUsize,
-    #[cfg(test)]
-    read_barrier_before_snapshot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(test, feature = "sql"))]
     sql_group_commit_before_execute_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(test, feature = "kv"))]
@@ -6177,8 +6170,6 @@ impl NodeRuntime {
             fatal_reason: Mutex::new(None),
             #[cfg(test)]
             materialized_tip_checks: AtomicUsize::new(0),
-            #[cfg(test)]
-            read_barrier_before_snapshot_hook: None,
             #[cfg(all(test, feature = "sql"))]
             sql_group_commit_before_execute_hook: None,
             #[cfg(all(test, feature = "kv"))]
@@ -8785,10 +8776,6 @@ impl NodeRuntime {
             self.ensure_ready()?;
             self.ensure_writes_active()?;
             self.validate_read_barrier_qlog_descendant_locked(anchor)?;
-        }
-        #[cfg(test)]
-        if let Some(hook) = &self.read_barrier_before_snapshot_hook {
-            hook();
         }
         Ok(())
     }

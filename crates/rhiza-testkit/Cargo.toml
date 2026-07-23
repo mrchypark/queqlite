@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Testing helpers for rhiza"
+publish = false
 
 [dependencies]
 rhiza-core = { version = "0.1.0", path = "../rhiza-core" }

@@ -1,8 +1,11 @@
 # Releasing rhiza
 
-This runbook is for the first crates.io release, `v0.1.0`. It covers the 13
-publishable Rust crates only. The `basic-app-server` example has `publish =
-false` and is not released.
+This runbook is for the initial SQL-only crates.io release, `v0.1.0`. It
+covers exactly eight Rust crates: `rhiza-core`, `rhiza-obj-store`, `rhiza-log`,
+`rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb`.
+`rhiza-graph`, `rhiza-kv`, `rhiza-client`, and `rhiza-cli` are workspace
+components excluded from this release. `rhiza-testkit` and the
+`basic-app-server` example have `publish = false` and are not released.
 
 The facade is published and imported as `rhizadb`; this runbook uses
 `rhizadb` in Cargo and registry commands.
@@ -27,15 +30,17 @@ cargo test --workspace --all-features --locked
 ./scripts/check-workspace-packages.sh
 ```
 
-Confirm that `v0.1.0` does not already exist, then create the annotated tag at
-the verified `main` commit. The local tag is the source freeze. **Do not push
-it yet.**
+After a follow-up release-preparation merge, replace a stale local `v0.1.0`
+tag with an annotated tag at the verified `main` commit. The local tag is the
+source freeze. **Do not push it yet.** A remote tag is immutable release
+history: this procedure refuses to replace one.
 
 ```bash
-git rev-parse -q --verify refs/tags/v0.1.0 && {
-  echo "v0.1.0 already exists; stop and investigate" >&2
+git ls-remote --exit-code --tags origin refs/tags/v0.1.0 >/dev/null 2>&1 && {
+  echo "origin already has v0.1.0; do not replace a remote release tag" >&2
   exit 1
 }
+git rev-parse -q --verify refs/tags/v0.1.0 >/dev/null && git tag -d v0.1.0
 git tag -a v0.1.0 -m "rhiza v0.1.0"
 git show --no-patch v0.1.0
 ```
@@ -55,26 +60,34 @@ repository file, release notes, or issue.
 
 ## Publish by dependency tier
 
-For each tier, first dry-run every listed package, then publish every listed
-package. Wait until `cargo info <crate>@0.1.0` succeeds for **every** crate in
-the tier before moving to the next one. This is necessary because crates.io
-index and package visibility can lag an accepted upload.
+For each tier, first check whether each listed version is already visible on
+crates.io. Skip visible versions; dry-run and publish only versions that are
+not yet visible. At the end of the tier, verify registry visibility for
+**every** crate before moving on. This is necessary because crates.io index
+and package visibility can lag an accepted upload.
 
 Run the following helper once in the same shell:
 
 ```bash
 publish_tier() {
+  local crate
+
   for crate in "$@"; do
-    cargo publish --dry-run --locked -p "$crate"
+    if cargo info --registry crates-io "$crate@0.1.0" >/dev/null 2>&1; then
+      echo "Skipping $crate@0.1.0: already visible on crates.io."
+      continue
+    fi
+
+    cargo publish --dry-run --locked -p "$crate" || return 1
+    cargo publish --locked -p "$crate" || return 1
   done
+
   for crate in "$@"; do
-    cargo publish --locked -p "$crate"
-  done
-  for crate in "$@"; do
-    until cargo info "$crate@0.1.0"; do
+    until cargo info --registry crates-io "$crate@0.1.0" >/dev/null 2>&1; do
       echo "Waiting for $crate@0.1.0 to become visible on crates.io..." >&2
       sleep 10
     done
+    echo "Verified $crate@0.1.0 on crates.io."
   done
 }
 ```
@@ -83,25 +96,19 @@ Publish tiers in this exact order:
 
 ```bash
 # Tier 1: foundational crates
-publish_tier rhiza-core rhiza-obj-store
+publish_tier rhiza-core rhiza-obj-store || exit 1
 
 # Tier 2: direct consumers of rhiza-core
-publish_tier rhiza-log rhiza-graph rhiza-quepaxa rhiza-testkit
+publish_tier rhiza-log rhiza-quepaxa || exit 1
 
 # Tier 3: depend on tiers 1 and 2
-publish_tier rhiza-archive rhiza-kv rhiza-sql
+publish_tier rhiza-archive rhiza-sql || exit 1
 
 # Tier 4
-publish_tier rhiza-node
+publish_tier rhiza-node || exit 1
 
-# Tier 5
-publish_tier rhiza-client
-
-# Tier 6: facade crate
-publish_tier rhizadb
-
-# Tier 7
-publish_tier rhiza-cli
+# Tier 5: facade crate
+publish_tier rhizadb || exit 1
 ```
 
 ## If a publish attempt fails
@@ -110,7 +117,8 @@ Treat a failure as potentially ambiguous: crates.io may have accepted an
 upload even if the local command lost its response. Never issue `cargo publish`
 again for a version that might exist.
 
-1. For each crate in the failing tier, run `cargo info <crate>@0.1.0`.
+1. For each crate in the failing tier, run
+   `cargo info --registry crates-io <crate>@0.1.0`.
 2. If the version is visible, consider that crate published and do not rerun
    either its dry-run or publish command.
 3. For a crate that is still absent, correct the reported issue, dry-run and
@@ -124,8 +132,8 @@ versions are immutable.
 
 ## Publish the tag and GitHub release
 
-Only after all 13 crate versions are visible with `cargo info` may the source
-freeze become public:
+Only after all eight initial SQL crate versions are visible with
+`cargo info --registry crates-io` may the source freeze become public:
 
 ```bash
 git push origin v0.1.0

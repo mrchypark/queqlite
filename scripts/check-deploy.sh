@@ -51,7 +51,7 @@ assert_statefulset_env_values_are_quoted_strings() {
     return 1
   }
 }
-for profile in sql graph kv; do
+profile=sql
 for replicas in 3 7; do
   id="$replicas"
   jq -n --arg profile "$profile" --argjson id "$id" --argjson replicas "$replicas" '
@@ -99,7 +99,12 @@ for replicas in 3 7; do
     exit 1
   fi
 done
-done
+
+if RHIZA_EXECUTION_PROFILE=graph \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" "$tmp/graph-profile.yaml" successor; then
+  echo "render accepted an unsupported graph execution profile" >&2
+  exit 1
+fi
 
 RHIZA_EXECUTION_PROFILE=sql RHIZA_IMAGE=registry.example/rhiza-sql:v1 \
   scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
@@ -240,11 +245,18 @@ for recorder_tls in off on; do
     "$tmp/config-sql-3-postcard-rpc-${recorder_tls}.yaml")" = rhiza-sql:dev ]
 done
 
-# The renderer's default scoped images must compile every runtime transport it can select.
-# shellcheck disable=SC2016 # Literal Docker/CI feature mapping assertions.
-grep -Fq -- '--features "$RHIZA_PROFILE,recorder-postcard-rpc"' Dockerfile
-# shellcheck disable=SC2016 # Literal Docker/CI feature mapping assertions.
-grep -Fq -- '--features "$RHIZA_PROFILE,recorder-postcard-rpc"' .github/workflows/ci.yml
+# The SQL renderer must select the fixed SQL image and the Docker build must not
+# restore the retired graph, KV, or combined profile matrix.
+grep -Fq -- 'ARG RHIZA_PROFILE=sql' Dockerfile
+grep -Fq -- 'sql) cargo build --release --locked -p rhiza-cli --bin rhiza --features recorder-postcard-rpc ;;' Dockerfile
+grep -Fq -- 'RHIZA_PROFILE must be sql' Dockerfile
+# shellcheck disable=SC2016 # The static check must match Cargo's literal profile variable.
+if grep -Eq -- 'RHIZA_PROFILE=(graph|kv|all)|sql\|(graph|kv|all)|--features "\$RHIZA_PROFILE' Dockerfile; then
+  echo "Dockerfile restored a retired execution profile" >&2
+  exit 1
+fi
+grep -Fq -- 'build-args: RHIZA_PROFILE=sql' .github/workflows/ci.yml
+grep -Fq -- '--features recorder-postcard-rpc' .github/workflows/ci.yml
 
 RHIZA_CPU_REQUEST=100m RHIZA_MEMORY_REQUEST=256Mi \
 RHIZA_CPU_LIMIT=1 RHIZA_MEMORY_LIMIT=1Gi RHIZA_DATA_SIZE_LIMIT=8Gi \

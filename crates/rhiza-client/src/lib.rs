@@ -5,8 +5,7 @@
 //! order. Mutations and local/applied-index reads hedge after 100 milliseconds;
 //! read-barrier and unspecified-consistency reads retry sequentially.
 //!
-//! The default `sql` feature provides write, read, and SQL methods. The `graph`
-//! and `kv` features add their corresponding route methods. Wire DTOs are
+//! The default `sql` feature provides write, read, and SQL methods. Wire DTOs are
 //! re-exported from this crate for convenience, but are currently defined by
 //! `rhiza-node`; the client and node are logically separate, not DTO-independent.
 

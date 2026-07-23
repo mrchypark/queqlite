@@ -6,97 +6,61 @@ is not.
 
 ## Product Status
 
-- `rhiza sql` uses SQLite as its materialized state machine.
-- `rhiza graph` uses LadybugDB and replicates bounded semantic document
-  put/delete commands.
-- `rhiza kv` uses redb and replicates bounded byte-key put/delete commands.
+The workspace retains SQL, graph, and KV materialization crates. The released
+runtime and product documentation cover SQL only; graph and KV are not wired
+into the SQL release surface.
 
-All three profiles use the same QuePaxa ordering, qlog recovery, authenticated
-HTTP service, remote checkpoint, and deployment lifecycle. The database files
-are rebuildable materializations of the authoritative snapshot and qlog.
+The initial crates.io product, `rhizadb` v0.1.0, is SQL-only and uses SQLite.
+Its registry dependency closure is `rhiza-core`, `rhiza-obj-store`,
+`rhiza-log`, `rhiza-quepaxa`, `rhiza-archive`, `rhiza-sql`, `rhiza-node`, and
+`rhizadb`. Graph and KV are workspace components, not `rhizadb` v0.1.0
+features or part of the initial SQL-only supported release.
 
-Each cluster uses exactly one execution profile: SQL, graph, or KV. Nodes in
-one cluster do not mix materialization engines. QuePaxa is the consensus
-technology brand; SQLite, LadybugDB, and redb are the respective local
-materialization engines.
+## Workspace Components
 
-## Architecture
+The Kubernetes-independent Rust workspace currently contains:
 
-The Rust workspace is Kubernetes-independent. Its primary crates are:
-
-- `rhizadb`: primary embedded Rust facade and lifecycle owner.
+- `rhizadb`: primary embedded SQL Rust facade and lifecycle owner; part of the
+  initial registry product.
 - `rhiza-core`: log, configuration, command, and snapshot domain types.
 - `rhiza-quepaxa`: recorder RPC, durable recorder state, and consensus.
 - `rhiza-log`: local binary qlog and compaction anchors.
 - `rhiza-obj-store`: `object_store` adapters for S3, GCS, Azure, and tests.
 - `rhiza-sql`: the `rhiza sql` SQLite materialized-state boundary.
-- `rhiza-graph`: the `rhiza graph` LadybugDB state boundary.
-- `rhiza-kv`: the `rhiza kv` redb state boundary.
+- `rhiza-graph`: retained LadybugDB state boundary, excluded from the initial
+  SQL-only supported release.
+- `rhiza-kv`: retained redb state boundary, excluded from the initial SQL-only
+  supported release.
 - `rhiza-archive`: checkpoint V2, object metadata, and GC plans.
 - `rhiza-node`: runtime, HTTP RPC, recovery, and authenticated live admin HTTP.
-- `rhiza-client`: typed remote client for public SQL, graph, and KV routes.
-- `rhiza-cli`: thin remote-client and object-store administration commands.
-- `rhiza-testkit`: shared integration-test support.
+- `rhiza-client`: workspace remote-client component.
+- `rhiza-cli`: workspace administration commands.
+- `rhiza-testkit`: internal, non-publishable integration-test support.
 
-## Execution Profiles
+Only `rhiza-core`, `rhiza-obj-store`, `rhiza-log`, `rhiza-quepaxa`,
+`rhiza-archive`, `rhiza-sql`, `rhiza-node`, and `rhizadb` are in the initial
+crates.io release. `rhiza-graph`, `rhiza-kv`, `rhiza-client`, `rhiza-cli`,
+`rhiza-testkit`, and `examples/basic-app-server` are excluded from it.
 
-Serving, checkpoint, recovery, GC, and offline membership commands require one
-explicit profile:
+## SQL Runtime and Deployment
+
+The published runtime serves SQL only. Use a SQL image and set a logical
+cluster ID before serving, checkpointing, recovery, GC, or membership work:
 
 ```bash
-export RHIZA_EXECUTION_PROFILE=sql # sql, graph, or kv
+export RHIZA_EXECUTION_PROFILE=sql
 export RHIZA_CLUSTER_ID=cluster-a
-```
-
-One cluster runs exactly one profile. `RHIZA_CLUSTER_ID` is the logical name;
-the runtime binds consensus and checkpoint identity to the selected profile so
-SQL, graph, and KV nodes cannot accidentally join one another.
-
-The supported container image variants are built from the same `rhiza` binary
-with different Cargo feature sets:
-
-| Artifact | Docker build argument | Cargo feature selection |
-| --- | --- | --- |
-| `rhiza-sql` | `RHIZA_PROFILE=sql` | `--no-default-features --features sql` |
-| `rhiza-graph` | `RHIZA_PROFILE=graph` | `--no-default-features --features graph` |
-| `rhiza-kv` | `RHIZA_PROFILE=kv` | `--no-default-features --features kv` |
-| `rhiza-all` | `RHIZA_PROFILE=all` | `--all-features` |
-
-`rhiza-sql`, `rhiza-graph`, and `rhiza-kv` are the default release and
-deployment matrix. `rhiza-all` is a convenience artifact for environments
-that deliberately need one combined image; it does not change the one-profile
-per-cluster contract or remove the explicit `RHIZA_EXECUTION_PROFILE`
-requirement.
-
-CI builds and validates all four variants without registry credentials. Image
-publication and registry tags remain a separate release operation.
-For the crates.io release procedure, see [RELEASING.md](RELEASING.md).
-
-One parameterized Dockerfile builds all four artifacts:
-
-```bash
 docker build --build-arg RHIZA_PROFILE=sql -t rhiza-sql:dev .
-docker build --build-arg RHIZA_PROFILE=graph -t rhiza-graph:dev .
-docker build --build-arg RHIZA_PROFILE=kv -t rhiza-kv:dev .
-docker build --build-arg RHIZA_PROFILE=all -t rhiza-all:dev .
 ```
 
-Plain `docker build -t rhiza-all:dev .` defaults to the combined `all` build.
-For normal deployment, select the scoped image matching the required profile;
-for example, use `RHIZA_IMAGE=rhiza-sql:dev` together with
-`RHIZA_EXECUTION_PROFILE=sql`.
+Image publication and registry tags are separate from the crates.io release;
+see [RELEASING.md](RELEASING.md) for the registry procedure.
 
 ## Embedded Rust API
 
-The `rhizadb` crate exposes the SQL, graph, and KV profiles through one embedded
-owner. Its default feature set is SQL-only; graph and KV are explicit opt-ins:
-
-| Cargo features | Embedded profiles |
-| --- | --- |
-| default or `--no-default-features` | SQL |
-| `--features graph` | SQL and graph |
-| `--features kv` | SQL and KV |
-| `--all-features` | SQL, graph, and KV |
+The published `rhizadb` v0.1.0 crate exposes an SQL-only embedded owner. It
+does not offer graph or KV Cargo features, re-exports, or embedded methods;
+those remain outside the initial registry product.
 
 `Rhiza` owns the node runtime and background workers; cloneable `RhizaHandle`
 values are weak handles that stop working after owner shutdown. Keep the owner
@@ -171,62 +135,17 @@ those traits or using the broader transport vocabulary still requires direct
 dependencies on `rhiza-quepaxa` and `rhiza-node`. Normal local consumers should
 use `local_file_backed`.
 
-For the SQL profile, `execute_sql` and `query` expose typed SQL, `RETURNING`,
-consistency, and persistent idempotency. With the corresponding crate features,
-graph profiles expose `mutate_graph` and `query_graph`; KV profiles expose
-`put_kv`, `delete_kv`, `get_kv`, `scan_kv_range`, and `scan_kv_prefix`. Every
-method checks the configured `ExecutionProfile`. HTTP routes and the CLI are
-secondary adapters over the same node service contracts.
+`execute_sql` and `query` expose typed SQL, `RETURNING`, consistency, and
+persistent idempotency. HTTP routes and workspace tooling are secondary
+adapters over the same SQL node service contracts.
 
-## Remote Rust Client
-
-The `rhiza-client` crate is the typed remote counterpart to the embedded API.
-Its default `sql` feature provides write, read, and SQL methods; opt into
-`graph`, `kv`, or both for the other execution profiles. The wire DTOs are
-re-exported for convenience but currently come from `rhiza-node`, so the
-client is logically separate from the server while still coupled to its DTOs.
-
-```rust,no_run
-use rhiza_client::{
-    wire::{ReadConsistency, ReadRequest, WriteRequest},
-    RhizaClient,
-};
-
-async fn remote_example() -> Result<(), rhiza_client::ClientError> {
-    let client = RhizaClient::new(
-        vec!["https://rhiza.example.com".to_owned()],
-        "client-token",
-    )?;
-    client
-        .write(WriteRequest {
-            request_id: "request-1".to_owned(),
-            key: "key".to_owned(),
-            value: "value".to_owned(),
-        })
-        .await?;
-    let value = client
-        .read(ReadRequest {
-            key: "key".to_owned(),
-            consistency: Some(ReadConsistency::Local),
-        })
-        .await?;
-    assert_eq!(value.value.as_deref(), Some("value"));
-    Ok(())
-}
-```
-
-Transport policy is intentionally fixed: 2-second connect, 5-second attempt,
-and 15-second operation deadlines; retryable failures advance through the
-endpoint list. Mutations and local/applied-index reads hedge after 100
-milliseconds, while read-barrier and unspecified-consistency reads retry
-sequentially. There are no public framework hooks or policy knobs.
+## Kubernetes Deployment
 
 Kubernetes provides stable process identity, DNS, secrets, and orchestration;
 the runtime does not call Kubernetes APIs and receives no service-account
 token.
-Each configuration has its own profile-scoped headless Service and StatefulSet
-named `rhiza-<profile>-c<config_id>`. Stable ordinals map to `node-1` through
-`node-N`.
+Each configuration has its own SQL headless Service and StatefulSet named
+`rhiza-sql-c<config_id>`. Stable ordinals map to `node-1` through `node-N`.
 Membership accepts 3 through 7 members through a version-1 JSON bundle:
 
 ```json
@@ -435,181 +354,11 @@ The measured 3-peer `emptyDir` / no-PVC failure matrix and operator recovery
 steps are documented in
 [`docs/three-peer-emptydir-recovery-2026-07-19.md`](docs/three-peer-emptydir-recovery-2026-07-19.md).
 
-## rhiza graph and rhiza kv HTTP APIs
-
-The selected profile controls the client routes exposed by `rhiza serve`.
-Graph clusters expose:
-
-- `POST /v1/graph/documents/put`
-- `POST /v1/graph/documents/delete`
-- `POST /v1/graph/documents/get`
-- `POST /v1/graph/query`
-
-KV clusters expose:
-
-- `POST /v1/kv/put`
-- `POST /v1/kv/delete`
-- `POST /v1/kv/get`
-- `POST /v1/kv/scan`
-
-Every request uses `x-rhiza-version: 1` and the client bearer token. Mutations
-require a stable `request_id`. Reads accept `local`, `read_barrier`, or
-`{"applied_index": N}` consistency. A read response returns the value,
-`applied_index`, and qlog `hash` from one materializer boundary.
-
-`/v1/graph/query` accepts one labeled read-only Cypher statement supported by
-the bundled LadybugDB engine. This includes labeled joins, aliases,
-expressions, scalar functions, aggregates, bounded collections, whole nodes,
-relationships, `DISTINCT`, `UNWIND`, `ORDER BY`, `SKIP`, and literal or
-parameterized `LIMIT` where the referenced schema supports them. Supplied typed parameters must exactly match
-the referenced parameters and may contain bounded scalar, list, or struct
-values. Mutations, DDL, transaction control, standalone administrative calls,
-external I/O, multiple statements, and the reserved `__Rhiza*` namespace are
-rejected. Every node pattern must name a static, non-reserved label: LadybugDB
-0.18.1 has no per-connection table ACL that could otherwise keep unlabeled
-patterns from scanning rhiza's internal nodes. LadybugDB's prepared-statement
-read-only classification is the final admission check.
-
-Because LadybugDB 0.18.1 exposes no per-query memory or nested-value
-cardinality cap, container-producing expressions are admitted only when rhiza
-can prove their cumulative expansion size before execution. List/map literals,
-bounded parameters, statically sized `repeat()`, and `range()` with integer
-literal or integer parameter bounds are supported. Repeated parameter
-references count separately, and projected expansions are multiplied by the
-bounded result-row count against the same 1 MiB budget. Unbounded or
-oversized `range()`, `collect()`, list comprehensions, and functions that
-produce lists/maps from runtime data are rejected before LadybugDB execution.
-Padding functions must have a statically bounded length; multiplicative
-replacement functions are rejected. Direct node and relationship results
-remain supported.
-
-Every top-level `UNION` branch must contain exactly one explicit bounded
-`LIMIT`, and the sum of branch limits must not exceed `max_rows`. A non-`UNION`
-query is bounded by the server even when it omits `LIMIT`. Queries default to
-`max_rows: 1000` and accept at most 10,000 rows; query text is limited to 64
-KiB, serialized result data to 1 MiB, the encoded response to 4 MiB, and
-execution to the 5-second server timeout. LadybugDB uses a shared 512 MiB
-buffer pool with at most two query execution threads. The buffer pool bounds
-engine-managed pages across the database; it is not a 1 MiB per-query or total
-process RSS limit. There is no separate projection-count or result-cell limit.
-
-Graph queries support the same consistency modes and return typed columns and
-rows with the applied qlog tip from one materializer boundary. Result values
-preserve Ladybug logical types, including nested collections and graph
-node/relationship values. Graph writes remain bounded semantic document
-commands. Admission, row, or byte limit violations return the normal
-non-retryable `400 invalid_request` JSON error without changing readiness;
-malformed request JSON continues to use `invalid_json`. Internal Ladybug,
-storage, connection, or state-corruption errors return `500` and latch the node
-out of readiness. Ladybug query timeout/interruption and buffer-pool exhaustion
-return retryable `503 resource_exhausted` without changing readiness.
-
-Graph values are typed as `null`, `bool`, `i64`, `u64`, `f64`, `string`, or
-`bytes`; graph byte values use padded base64. For example:
-
-```bash
-curl -sS http://127.0.0.1:8080/v1/graph/documents/put \
-  -H 'x-rhiza-version: 1' \
-  -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"request_id":"graph-1","id":"doc-1","value":{"type":"string","value":"hello"}}'
-
-curl -sS http://127.0.0.1:8080/v1/graph/documents/get \
-  -H 'x-rhiza-version: 1' \
-  -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"id":"doc-1","consistency":"read_barrier"}'
-
-curl -sS http://127.0.0.1:8080/v1/graph/query \
-  -H 'x-rhiza-version: 1' \
-  -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"statement":{"cypher":"MATCH (v:RhizaDocument) WHERE v.id IN $ids RETURN v.id AS id, upper(v.string_value) AS value ORDER BY v.id LIMIT 10","parameters":{"ids":{"type":"list","value":[{"type":"string","value":"doc-1"}]}}},"consistency":"read_barrier","max_rows":100}'
-
-rhiza graph query --url http://127.0.0.1:8080 \
-  --cypher 'MATCH (v:RhizaDocument) RETURN v.id AS id ORDER BY v.id LIMIT 10' \
-  --consistency read_barrier --max-rows 100
-```
-
-Graph parameters and results use tagged typed values. Bytes use canonical
-padded base64.
-
-KV keys and values are bytes encoded as canonical padded base64 in both
-requests and responses. `a2V5` and `dmFsdWU=` below decode to `key` and
-`value`:
-
-```bash
-curl -sS http://127.0.0.1:8080/v1/kv/put \
-  -H 'x-rhiza-version: 1' \
-  -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"request_id":"kv-1","key":"a2V5","value":"dmFsdWU="}'
-
-curl -sS http://127.0.0.1:8080/v1/kv/get \
-  -H 'x-rhiza-version: 1' \
-  -H "Authorization: Bearer $RHIZA_CLIENT_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"key":"a2V5","consistency":{"applied_index":1}}'
-
-rhiza kv scan --url http://127.0.0.1:8080 \
-  --prefix-base64 a2V5 --limit 100 --consistency read_barrier
-```
-
-KV scan accepts either a prefix or a half-open range (`start` with optional
-`end`) and returns ordered entries plus an opaque `next_cursor`. The default
-page size is 100 and the maximum is 1,024 entries. A page is also capped at 1
-MiB of combined raw key/value bytes and 2 MiB after JSON encoding. Entries and
-the applied qlog tip are observed from one materializer boundary; continue a
-scan by sending the returned cursor with the same prefix or range.
-
-## Write batching and the Recorder fast path
-
-Graph public typed batches remain capped at 64 members. KV public typed batches
-are capped at 256 members. For KV, direct
-`NodeRuntime::mutate_kv`/`mutate_kv_batch` calls and the corresponding embedded
-`RhizaHandle` methods enter a bounded FIFO group-commit queue. It retains at
-most 64 public calls and 32 MiB of canonical member bytes. The default 500
-microsecond quiet period restarts when another call arrives, but a hard deadline
-of four quiet periods bounds collection latency. The queue drains at most 1,024
-members into one active group.
-The internal replicated KV batch uses wire command version 3. The redb
-materializer fingerprint is domain v3: one `Immediate` redb transaction stores
-the full qlog entry, request receipts, data changes, and applied tip. The file
-qlog is a buffered serving/catch-up mirror and is rehydrated from redb after a
-crash, so strict KV writes do not pay a second local qlog sync.
-Verified checkpoint compaction removes the embedded prefix only after the file
-qlog has durably installed the same compaction anchor.
-
-One encoded qlog command remains capped at 512 KiB. If a flattened group is too
-large, Rhiza proposes the largest ordered prefix that fits and continues from
-the next exact qlog base; it does not remove the byte ceiling. Every committed
-prefix is applied atomically while retaining an independent request ID and retry
-receipt for each member.
-
-HTTP writes already pass through the asynchronous HTTP writer queue, which
-coalesces up to eight requests or 500 microseconds by default. Its KV dispatch
-uses the direct writer batch path and does not enqueue a second time in the
-internal KV group queue. Graph continues to use only this HTTP writer batching
-path and is outside the KV group-commit result below.
-
-KV wire-batch v3 and materializer-domain v3 are a clean-install breaking
-boundary. Older KV materializer fingerprints and snapshots fail closed; there
-is no in-place migration or rolling dual decoder.
-
-On the ordinary QuePaxa fast path, the preferred proposal can be decided after
-the phase-zero Recorder quorum; the command is piggybacked on the typed Record
-request and persisted before a Recorder acknowledges it. Combining that path
-with Graph/KV batching structurally reduces consensus proposals, qlog appends,
-and materializer synchronization boundaries per request under concurrency. It
-does not remove network, storage, checkpoint, or durability work, and the
-batching window can add latency at light load; no fixed throughput or latency
-claim follows from the structure alone.
-
 ## Storage Model
 
-The profile-scoped StatefulSet deliberately has no `volumeClaimTemplates`.
-Every SQL, graph, or KV pod uses `emptyDir` for `/var/lib/rhiza`. StatefulSet
-identity is still useful:
+The SQL StatefulSet deliberately has no `volumeClaimTemplates`.
+Every SQL pod uses `emptyDir` for `/var/lib/rhiza`. StatefulSet identity is
+still useful:
 it gives each ephemeral process a stable ordinal and DNS name while making a
 replacement prove that recovery does not depend on an old local disk. A fresh
 pod restores an official snapshot and then replays the exact qlog suffix.
@@ -629,8 +378,8 @@ Remote checkpoint V2 stores the selected engine snapshot as opaque bytes plus
 its identity, applied index/hash, configuration state, and materializer
 fingerprint. Restore validates that envelope, rebinds the materializer to the
 target node for cross-node recovery, installs it in a fresh data directory,
-and replays the exact committed suffix after the snapshot. SQL, LadybugDB, and
-redb files are never treated as an independent recovery authority.
+and replays the exact committed suffix after the snapshot. SQLite files are
+never treated as an independent recovery authority.
 
 An application write does **not** perform an S3 CAS. Writes first commit through
 QuePaxa and append locally. Checkpoint publication batches state into immutable
@@ -661,15 +410,13 @@ kubectl -n rhiza create secret generic rhiza-sql-c1-bundle \
 kubectl -n rhiza create -f target/rhiza-sql-c1.yaml
 ```
 
-The renderer derives the local image default from the required profile (for
-example, `RHIZA_EXECUTION_PROFILE=sql` defaults to `rhiza-sql:dev`). Set
-`RHIZA_IMAGE` to override it with a registry-qualified artifact and tag. Also
-set `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`,
-`RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`, and Secret-name overrides as
-needed. `RHIZA_EXECUTION_PROFILE` is required and must be `sql`, `graph`, or
-`kv`. The renderer scopes resource names, labels, data/config paths, and bundle
-DNS to that profile. The rendered resource uses `OnDelete`; do not mutate a
-live config's pod template to reconfigure membership.
+The renderer derives the local image default from SQL
+(`RHIZA_EXECUTION_PROFILE=sql` defaults to `rhiza-sql:dev`). Set `RHIZA_IMAGE`
+to override it with a registry-qualified artifact and tag. Also set
+`RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`, `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`,
+and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be `sql`.
+The rendered resource uses `OnDelete`; do not mutate a live config's pod
+template to reconfigure membership.
 
 ## Stop And Replace
 
@@ -717,7 +464,7 @@ checkpoint inspection and GC use a short-lived `rhiza` CLI Job with generic
 object-store credentials. Examples:
 
 ```bash
-export RHIZA_EXECUTION_PROFILE=graph
+export RHIZA_EXECUTION_PROFILE=sql
 scripts/k8s-object-job.sh 2 config-c2.json checkpoint inspect
 
 plan_json="$(scripts/gc-k8s.sh plan config-c2.json)"

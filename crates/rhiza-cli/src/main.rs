@@ -18,7 +18,7 @@ use rhiza_core::{
 };
 use rhiza_log::LogStore;
 use rhiza_node::{
-    effective_cluster_id, execution_profile_compiled, install_successor_recorder, node_router,
+    effective_cluster_id, install_successor_recorder, node_router,
     node_router_with_admin_and_tasks, node_router_with_checkpoint,
     node_router_with_checkpoint_and_admin_tasks, recorder_router_for_generation,
     recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
@@ -1637,16 +1637,9 @@ fn required_env(
 fn execution_profile(
     lookup: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<ExecutionProfile, String> {
-    let profile = required_env(lookup, "RHIZA_EXECUTION_PROFILE")?
-        .parse()
-        .map_err(|_| "RHIZA_EXECUTION_PROFILE must be sql|graph|kv".to_string())?;
-    if execution_profile_compiled(profile) {
-        Ok(profile)
-    } else {
-        Err(format!(
-            "RHIZA_EXECUTION_PROFILE={} is not compiled into this binary",
-            profile.as_str()
-        ))
+    match required_env(lookup, "RHIZA_EXECUTION_PROFILE")?.as_str() {
+        "sql" => Ok(ExecutionProfile::Sqlite),
+        _ => Err("RHIZA_EXECUTION_PROFILE must be sql".to_string()),
     }
 }
 
@@ -4865,7 +4858,7 @@ fn parse_optional_bool(
     }
 }
 
-const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza graph query --url <preferred> [--url <fallback> ...] [--token <token>] --cypher <cypher> [--params-json <typed-json-object>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza kv get --url <preferred> [--token <token>] --key-base64 <base64> [--consistency local|read_barrier|applied_index:N]\n  rhiza kv scan --url <preferred> [--token <token>] (--start-base64 <base64> [--end-base64 <base64>]|--prefix-base64 <base64>) [--cursor-base64 <base64>] [--limit N] [--consistency local|read_barrier|applied_index:N]\n  rhiza kv put --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64> --value-base64 <base64>\n  rhiza kv delete --url <preferred> [--token <token>] --request-id <id> --key-base64 <base64>\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql|graph|kv and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+const USAGE: &str = "usage:\n  rhiza status --url <url>\n  rhiza e2e [options]\n  rhiza serve\n  rhiza validate-config-bundle [--stdin]\n  rhiza init-checkpoint\n  rhiza roll-checkpoint [--from-generation N --to-generation N+1]\n  rhiza checkpoint inspect\n  rhiza checkpoint compact\n  rhiza gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  rhiza gc inspect|evidence --plan-hash <sha256>\n  rhiza gc apply --plan-hash <sha256> --confirm\n  rhiza membership status|stop|install-successor|activate [--offline]\n  rhiza write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  rhiza read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier|applied_index:N] [--expect <value>]\n  rhiza sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  rhiza sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier|applied_index:N] [--max-rows N]\n  rhiza health --url <url> [--ready]\n\nServe, checkpoint, recovery, GC, and offline membership commands require RHIZA_EXECUTION_PROFILE=sql and RHIZA_CONFIG_BUNDLE or RHIZA_CONFIG_BUNDLE_FILE. Repeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
 
 fn usage() {
     eprintln!("{USAGE}");
@@ -4939,6 +4932,9 @@ mod tests {
         );
         assert!(USAGE.contains("rhiza e2e [options]"));
         assert!(!USAGE.contains("verify-restore"));
+        assert!(!USAGE.contains("rhiza graph"));
+        assert!(!USAGE.contains("rhiza kv"));
+        assert!(USAGE.contains("RHIZA_EXECUTION_PROFILE=sql"));
     }
 
     #[test]
@@ -6116,14 +6112,7 @@ mod tests {
     }
 
     fn compiled_profile_fixture() -> (&'static str, ExecutionProfile, &'static str) {
-        [
-            ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a"),
-            ("graph", ExecutionProfile::Graph, "rhiza:graph:cluster-a"),
-            ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
-        ]
-        .into_iter()
-        .find(|(_, profile, _)| execution_profile_compiled(*profile))
-        .expect("test builds enable at least one execution profile")
+        ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a")
     }
 
     fn base_bundle_json() -> &'static str {
@@ -6147,30 +6136,22 @@ mod tests {
             "RHIZA_EXECUTION_PROFILE is required"
         );
 
-        for (value, profile, expected_cluster_id) in [
-            ("sql", ExecutionProfile::Sqlite, "rhiza:sql:cluster-a"),
-            ("graph", ExecutionProfile::Graph, "rhiza:graph:cluster-a"),
-            ("kv", ExecutionProfile::Kv, "rhiza:kv:cluster-a"),
-        ] {
-            values.insert("RHIZA_EXECUTION_PROFILE", value);
-            if execution_profile_compiled(profile) {
-                let config = parse_serve_env(&values).unwrap();
-                assert_eq!(config.execution_profile, profile);
-                assert_eq!(config.cluster_id, expected_cluster_id);
-                assert_eq!(config.node_config().unwrap().execution_profile(), profile);
-            } else {
-                assert_eq!(
-                    parse_serve_env(&values).unwrap_err(),
-                    format!("RHIZA_EXECUTION_PROFILE={value} is not compiled into this binary")
-                );
-            }
-        }
-
-        values.insert("RHIZA_EXECUTION_PROFILE", "sqlite");
+        values.insert("RHIZA_EXECUTION_PROFILE", "sql");
+        let config = parse_serve_env(&values).unwrap();
+        assert_eq!(config.execution_profile, ExecutionProfile::Sqlite);
+        assert_eq!(config.cluster_id, "rhiza:sql:cluster-a");
         assert_eq!(
-            parse_serve_env(&values).unwrap_err(),
-            "RHIZA_EXECUTION_PROFILE must be sql|graph|kv"
+            config.node_config().unwrap().execution_profile(),
+            ExecutionProfile::Sqlite
         );
+
+        for unsupported in ["graph", "kv", "sqlite"] {
+            values.insert("RHIZA_EXECUTION_PROFILE", unsupported);
+            assert_eq!(
+                parse_serve_env(&values).unwrap_err(),
+                "RHIZA_EXECUTION_PROFILE must be sql"
+            );
+        }
 
         let (profile_name, profile, canonical_cluster_id) = compiled_profile_fixture();
         values.insert("RHIZA_EXECUTION_PROFILE", profile_name);
@@ -6182,12 +6163,7 @@ mod tests {
             canonical.node_config().unwrap().execution_profile(),
             profile
         );
-        let foreign_cluster_id = match profile {
-            ExecutionProfile::Sqlite => "rhiza:graph:cluster-a",
-            ExecutionProfile::Graph => "rhiza:kv:cluster-a",
-            ExecutionProfile::Kv => "rhiza:sql:cluster-a",
-        };
-        values.insert("RHIZA_CLUSTER_ID", foreign_cluster_id);
+        values.insert("RHIZA_CLUSTER_ID", "rhiza:graph:cluster-a");
         assert!(parse_serve_env(&values)
             .unwrap_err()
             .contains(&format!("not {profile_name}")));

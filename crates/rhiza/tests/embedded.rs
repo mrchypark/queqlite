@@ -1,5 +1,3 @@
-#[cfg(feature = "graph")]
-use std::collections::BTreeMap;
 use std::{
     sync::{mpsc, Arc, Condvar, Mutex},
     time::Duration,
@@ -8,16 +6,10 @@ use std::{
 use rhiza_archive::{CheckpointIdentity, ObjectArchiveStore};
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{DecisionProof, Membership, RecordRequest, RecordSummary, RecorderFileStore};
-#[cfg(feature = "kv")]
-use rhizadb::KvCommandResultV1;
 use rhizadb::{
     effective_cluster_id, BatchWriteError, CheckpointCoordinator, DurabilityHealth, DurabilityMode,
     EmbeddedConfig, EmbeddedIdentity, Error, ExecutionProfile, NodeError, ReadConsistency,
     RecorderRpc, Rhiza, SqlCommand, SqlStatement, SqlValue,
-};
-#[cfg(feature = "graph")]
-use rhizadb::{
-    GraphCommandResultV1, GraphCommandV1, GraphParameterValue, GraphResultValue, GraphValueV1,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -149,213 +141,6 @@ async fn embedded_sql_batch_preflight_failure_is_not_attempted() {
         })
         .await
         .unwrap();
-    rhiza.shutdown().await.unwrap();
-}
-
-#[cfg(feature = "graph")]
-#[tokio::test(flavor = "multi_thread")]
-async fn graph_profile_executes_semantic_writes_and_read_only_queries_in_process() {
-    let root = tempfile::tempdir().unwrap();
-    let rhiza = Rhiza::open(config_for_profile(root.path(), ExecutionProfile::Graph))
-        .await
-        .unwrap();
-    let handle = rhiza.handle();
-
-    let write = handle
-        .mutate_graph(
-            GraphCommandV1::put_document(
-                "graph-put",
-                "document-1",
-                GraphValueV1::String("Ada".into()),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        write.result(),
-        &GraphCommandResultV1::PutDocument { created: true }
-    );
-
-    let result = handle
-        .query_graph(
-            "MATCH (d:RhizaDocument) WHERE d.id = $id RETURN d.string_value AS value",
-            BTreeMap::from([(
-                "id".into(),
-                GraphParameterValue::String("document-1".into()),
-            )]),
-            ReadConsistency::Local,
-            10,
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.rows, [vec![GraphResultValue::String("Ada".into())]]);
-
-    assert!(matches!(
-        handle
-            .execute_sql(SqlCommand {
-                request_id: "wrong-profile".into(),
-                statements: vec![SqlStatement {
-                    sql: "CREATE TABLE forbidden(id INTEGER)".into(),
-                    parameters: vec![],
-                }],
-            })
-            .await,
-        Err(Error::ExecutionProfileMismatch {
-            expected: ExecutionProfile::Sqlite,
-            actual: ExecutionProfile::Graph,
-        })
-    ));
-
-    assert!(matches!(
-        handle
-            .execute_sql_batch(vec![SqlCommand {
-                request_id: "wrong-profile-batch".into(),
-                statements: vec![SqlStatement {
-                    sql: "CREATE TABLE forbidden_batch(id INTEGER)".into(),
-                    parameters: vec![],
-                }],
-            }])
-            .await,
-        Err(BatchWriteError::NotAttempted(
-            Error::ExecutionProfileMismatch {
-                expected: ExecutionProfile::Sqlite,
-                actual: ExecutionProfile::Graph,
-            }
-        ))
-    ));
-
-    rhiza.shutdown().await.unwrap();
-}
-
-#[cfg(feature = "kv")]
-#[tokio::test(flavor = "multi_thread")]
-async fn kv_profile_puts_gets_scans_and_deletes_in_process() {
-    let root = tempfile::tempdir().unwrap();
-    let rhiza = Rhiza::open(config_for_profile(root.path(), ExecutionProfile::Kv))
-        .await
-        .unwrap();
-    let handle = rhiza.handle();
-
-    let first = handle
-        .put_kv("kv-put-a", b"a".to_vec(), b"one".to_vec())
-        .await
-        .unwrap();
-    assert_eq!(first.result(), &KvCommandResultV1::Put { replaced: false });
-    handle
-        .put_kv("kv-put-aa", b"aa".to_vec(), b"two".to_vec())
-        .await
-        .unwrap();
-
-    let get = handle.get_kv(b"a", ReadConsistency::Local).await.unwrap();
-    assert_eq!(get.value, Some(b"one".to_vec()));
-
-    let scan = handle
-        .scan_kv_prefix(b"a", 10, None, ReadConsistency::Local)
-        .await
-        .unwrap();
-    assert_eq!(
-        scan.rows()
-            .iter()
-            .map(|row| (row.key(), row.value()))
-            .collect::<Vec<_>>(),
-        vec![
-            (b"a".as_slice(), b"one".as_slice()),
-            (b"aa".as_slice(), b"two".as_slice()),
-        ]
-    );
-
-    let deleted = handle.delete_kv("kv-delete", b"a".to_vec()).await.unwrap();
-    assert_eq!(
-        deleted.result(),
-        &KvCommandResultV1::Delete { existed: true }
-    );
-    assert_eq!(
-        handle
-            .get_kv(b"a", ReadConsistency::Local)
-            .await
-            .unwrap()
-            .value,
-        None
-    );
-
-    rhiza.shutdown().await.unwrap();
-}
-
-#[cfg(feature = "graph")]
-#[tokio::test(flavor = "multi_thread")]
-async fn graph_sync_write_waits_for_transient_archive_recovery() {
-    sync_embedded_profile_write_waits_for_transient_archive_recovery(ExecutionProfile::Graph).await;
-}
-
-#[cfg(feature = "kv")]
-#[tokio::test(flavor = "multi_thread")]
-async fn kv_sync_write_waits_for_transient_archive_recovery() {
-    sync_embedded_profile_write_waits_for_transient_archive_recovery(ExecutionProfile::Kv).await;
-}
-
-#[cfg(any(feature = "graph", feature = "kv"))]
-async fn sync_embedded_profile_write_waits_for_transient_archive_recovery(
-    profile: ExecutionProfile,
-) {
-    let root = tempfile::tempdir().unwrap();
-    let archive_root = root.path().join("archive");
-    let archive_backup = root.path().join("archive-backup");
-    let archive = initialized_profile_checkpoint(&archive_root, profile).await;
-    let coordinator = Arc::new(
-        CheckpointCoordinator::open(archive, DurabilityMode::Sync)
-            .await
-            .unwrap(),
-    );
-    let config = config_for_profile(root.path(), profile).with_coordinator(coordinator.clone());
-    let rhiza = Rhiza::open(config).await.unwrap();
-    let handle = rhiza.handle();
-
-    std::fs::rename(&archive_root, &archive_backup).unwrap();
-    std::fs::write(&archive_root, b"archive unavailable").unwrap();
-    let write = tokio::spawn(async move {
-        match profile {
-            #[cfg(feature = "graph")]
-            ExecutionProfile::Graph => handle
-                .mutate_graph(
-                    GraphCommandV1::put_document(
-                        "transient-archive",
-                        "document-1",
-                        GraphValueV1::String("value".into()),
-                    )
-                    .unwrap(),
-                )
-                .await
-                .map(|_| ()),
-            #[cfg(feature = "kv")]
-            ExecutionProfile::Kv => handle
-                .put_kv("transient-archive", b"key".to_vec(), b"value".to_vec())
-                .await
-                .map(|_| ()),
-            _ => unreachable!("helper is only called for an enabled embedded profile"),
-        }
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while coordinator.checkpoint_publication_attempts() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("sync durability must attempt archive publication");
-    assert!(
-        !write.is_finished(),
-        "a transient archive failure must not finish an acknowledged sync write"
-    );
-
-    std::fs::remove_file(&archive_root).unwrap();
-    std::fs::rename(&archive_backup, &archive_root).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), write)
-        .await
-        .expect("sync write must resume after archive recovery")
-        .unwrap()
-        .unwrap();
-    assert_eq!(coordinator.health(), DurabilityHealth::Available);
     rhiza.shutdown().await.unwrap();
 }
 
@@ -577,6 +362,22 @@ fn local_file_backed_rejects_wrong_canonical_cluster_id_before_creating_state() 
     assert!(root.path().read_dir().unwrap().next().is_none());
 }
 
+#[test]
+fn local_file_backed_rejects_non_sql_profiles_before_creating_state() {
+    for execution_profile in [ExecutionProfile::Graph, ExecutionProfile::Kv] {
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            EmbeddedConfig::local_file_backed("cluster-a", root.path(), execution_profile),
+            Err(Error::ExecutionProfileMismatch {
+                expected: ExecutionProfile::Sqlite,
+                actual,
+            }) if actual == execution_profile
+        ));
+        assert!(root.path().read_dir().unwrap().next().is_none());
+    }
+}
+
 fn config_with_blocked_minority(
     root: &std::path::Path,
 ) -> (EmbeddedConfig, mpsc::Receiver<()>, BlockingRelease) {
@@ -718,23 +519,6 @@ async fn initialized_checkpoint(root: &std::path::Path) -> ObjectArchiveStore {
     let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
         store,
         CheckpointIdentity::new("cluster-a", 1, 1, 1),
-    );
-    archive.initialize_checkpoint().await.unwrap();
-    archive
-}
-
-#[cfg(any(feature = "graph", feature = "kv"))]
-async fn initialized_profile_checkpoint(
-    root: &std::path::Path,
-    profile: ExecutionProfile,
-) -> ObjectArchiveStore {
-    let store = ObjStore::new(ObjStoreConfig::Local {
-        root: root.to_path_buf(),
-    })
-    .unwrap();
-    let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
-        store,
-        CheckpointIdentity::new(effective_cluster_id(profile, "cluster-a").unwrap(), 1, 1, 1),
     );
     archive.initialize_checkpoint().await.unwrap();
     archive

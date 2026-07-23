@@ -10,21 +10,14 @@ description = "Embeddable facade for rhiza replicated state machines"
 [lib]
 name = "rhizadb"
 
-[features]
-default = []
-graph = ["dep:rhiza-graph", "rhiza-node/graph"]
-kv = ["dep:rhiza-kv", "rhiza-node/kv"]
-
 [dependencies]
 rhiza-core = { version = "0.1.0", path = "../rhiza-core" }
-rhiza-graph = { version = "0.1.0", path = "../rhiza-graph", optional = true }
-rhiza-kv = { version = "0.1.0", path = "../rhiza-kv", optional = true }
-rhiza-node = { version = "0.1.0", path = "../rhiza-node", default-features = false, features = ["sql"] }
+rhiza-node = { version = "0.1.0", path = "../rhiza-node" }
 rhiza-quepaxa = { version = "0.1.0", path = "../rhiza-quepaxa" }
 rhiza-sql = { version = "0.1.0", path = "../rhiza-sql" }
 tokio.workspace = true
 
 [dev-dependencies]
-rhiza-archive = { path = "../rhiza-archive" }
-rhiza-obj-store = { path = "../rhiza-obj-store" }
+rhiza-archive = { version = "0.1.0", path = "../rhiza-archive" }
+rhiza-obj-store = { version = "0.1.0", path = "../rhiza-obj-store" }
 tempfile.workspace = true

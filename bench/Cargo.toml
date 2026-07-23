@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 default-run = "rhiza-bench"
+autobins = false
 
 # This package is intentionally standalone so adding the harness does not change
 # the main workspace manifest or its dependency graph.
@@ -20,11 +21,9 @@ prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
-rhizadb = { path = "../crates/rhiza", features = ["graph", "kv"] }
+rhizadb = { path = "../crates/rhiza" }
 rhiza-core = { path = "../crates/rhiza-core" }
-rhiza-graph = { path = "../crates/rhiza-graph" }
-rhiza-kv = { path = "../crates/rhiza-kv" }
-rhiza-node = { path = "../crates/rhiza-node", features = ["graph", "kv", "recorder-postcard-rpc"] }
+rhiza-node = { path = "../crates/rhiza-node", features = ["recorder-postcard-rpc"] }
 rhiza-quepaxa = { path = "../crates/rhiza-quepaxa" }
 rhiza-sql = { path = "../crates/rhiza-sql" }
 rustls = "0.23"
@@ -35,3 +34,19 @@ tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "rhiza-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "rhiza-cost"
+path = "src/bin/rhiza-cost.rs"
+
+[[bin]]
+name = "rhiza-recorder-transport"
+path = "src/bin/rhiza-recorder-transport.rs"
+
+[[bin]]
+name = "rhiza-transport"
+path = "src/bin/rhiza-transport.rs"
