@@ -837,13 +837,22 @@ jq -e '(.members | length) == 3 and ([.members[].token] | unique | length) == 3'
   "$tmp/config.json" >/dev/null
 
 export RHIZA_IMAGE=rhiza:fixture RHIZA_CLUSTER_ID=rhiza-vind
-export RHIZA_RECOVERY_GENERATION=1 RHIZA_STARTUP_MODE=bootstrap
+export RHIZA_RECOVERY_GENERATION=1
 export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials
 export RHIZA_S3_ALLOW_HTTP=true
 RHIZA_OBJECT_JOB_RENDER_ONLY="$tmp/object-job.yaml" \
   scripts/k8s-object-job.sh 1 "$tmp/config.json" init-checkpoint
 RHIZA_RECORDER_TRANSPORT=http \
   scripts/render-k8s-config.sh 1 3 "$tmp/config.json" "$tmp/cluster.yaml"
+yq eval -e 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[] | select(.name == "rhiza") | .env[] |
+  select(.name == "RHIZA_STARTUP_MODE") | .value == "rejoin"' \
+  "$tmp/cluster.yaml" >/dev/null
+if grep -Eq 'RHIZA_STARTUP_MODE=bootstrap|set env statefulset/rhiza-sql-c1 RHIZA_STARTUP_MODE=rejoin' \
+  scripts/bench-vind.sh; then
+  echo "benchmark mutates startup mode instead of rendering rejoin from the start" >&2
+  exit 1
+fi
 
 jq '.members |= (to_entries | map(.value + {
   recorder_tcp_addr:("rhiza-sql-c1-" + (.key | tostring) + ".rhiza-sql-c1:8082")

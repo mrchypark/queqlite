@@ -1214,7 +1214,7 @@ export RHIZA_S3_ALLOW_HTTP=true
 export RHIZA_RECORDER_TRANSPORT="$recorder_transport"
 export RHIZA_RECORDER_TLS="$recorder_tls"
 scripts/k8s-object-job.sh 1 "$bundle" init-checkpoint >/dev/null
-RHIZA_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
+scripts/render-k8s-config.sh 1 3 "$bundle" "$rendered_cluster"
 export RHIZA_CPU_REQUEST="$rhiza_cpu_request" RHIZA_CPU_LIMIT="$rhiza_cpu_limit"
 export RHIZA_MEMORY_REQUEST="$rhiza_memory_request" RHIZA_MEMORY_LIMIT="$rhiza_memory_limit"
 yq eval -i '(select(.kind == "StatefulSet" and .metadata.name == "rhiza-sql-c1") | .spec.template.spec.containers[] | select(.name == "rhiza") | .resources) = {"requests": {"cpu": strenv(RHIZA_CPU_REQUEST), "memory": strenv(RHIZA_MEMORY_REQUEST)}, "limits": {"cpu": strenv(RHIZA_CPU_LIMIT), "memory": strenv(RHIZA_MEMORY_LIMIT)}}' "$rendered_cluster"
@@ -1229,9 +1229,6 @@ if [ "$recorder_transport" != http ]; then
   done
 fi
 [ -z "$(k get persistentvolumeclaims -o name)" ] || die "benchmark deployment created a PVC"
-# Bootstrap is a one-time genesis operation. OnDelete keeps the current pods
-# running while making every future emptyDir replacement restore and rejoin.
-k set env statefulset/rhiza-sql-c1 RHIZA_STARTUP_MODE=rejoin >/dev/null
 
 local_port="${RHIZA_BENCH_PORT:-18080}"
 admin_endpoint_urls=()

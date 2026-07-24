@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 profile="${RHIZA_EXECUTION_PROFILE-}"
+logical_cluster_id=rhiza-vind
+canonical_cluster_id="rhiza:${profile}:${logical_cluster_id}"
 run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 cluster="${RHIZA_VIND_CLUSTER:-rhiza-vind-${run_id}}"
 namespace="${RHIZA_K8S_NAMESPACE:-rhiza-e2e}"
@@ -20,11 +22,15 @@ recovery_fail_csv="${RHIZA_RECOVERY_FAIL_PEERS:-1,2,3}"
 recovery_timeout="${RHIZA_STATEFULSET_READY_TIMEOUT:-420}"
 recovery_auto_timeout="${RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS:-30}"
 recovery_f1_probe_interval="${RHIZA_RECOVERY_F1_PROBE_INTERVAL_SECONDS:-10}"
+# A freshly Ready StatefulSet can still be converging its peer/Recorder transports.
+# Keep this finite so the post-restore probe cannot hide a persistent regression.
+write_retry_deadline_seconds=60
 target="${RHIZA_E2E_TARGET_DIR:-target/rhiza-e2e}/${profile:-missing}/$run_id"
 context=""
 previous_context=""
 created_cluster=false
 marker=/var/lib/rhiza/emptydir-marker
+diagnostic_secrets=()
 
 die() { echo "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 127; }; }
@@ -57,6 +63,36 @@ for failed in "${recovery_failures[@]}"; do
 done
 
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
+redact_diagnostic_stream() {
+  local line secret
+  while IFS= read -r line || [ -n "$line" ]; do
+    for secret in "${diagnostic_secrets[@]}"; do
+      [ -z "$secret" ] || line="${line//"$secret"/[REDACTED]}"
+    done
+    printf '%s\n' "$line"
+  done
+}
+capture_failure_diagnostics() {
+  local diagnostics="$target/failure-diagnostics" pod pod_name
+  mkdir -p "$diagnostics"
+  chmod 700 "$diagnostics"
+  k get pods -o wide 2>&1 |
+    redact_diagnostic_stream > "$diagnostics/pods.txt" || true
+  k get pods -l app.kubernetes.io/name=rhiza -o json 2>&1 |
+    redact_diagnostic_stream > "$diagnostics/rhiza-pods.json" || true
+  k get events --sort-by=.metadata.creationTimestamp 2>&1 |
+    redact_diagnostic_stream > "$diagnostics/events.txt" || true
+  while IFS= read -r pod; do
+    [ -n "$pod" ] || continue
+    pod_name="${pod#pod/}"
+    k describe "$pod" 2>&1 |
+      redact_diagnostic_stream > "$diagnostics/${pod_name}.describe.txt" || true
+    k logs "$pod" --all-containers=true 2>&1 |
+      redact_diagnostic_stream > "$diagnostics/${pod_name}.current.log" || true
+    k logs "$pod" --all-containers=true --previous 2>&1 |
+      redact_diagnostic_stream > "$diagnostics/${pod_name}.previous.log" || true
+  done < <(k get pods -l app.kubernetes.io/name=rhiza -o name 2>/dev/null || true)
+}
 capture_ready_context() {
   [ -n "$context" ] || context="$(kubectl config current-context 2>/dev/null || true)"
   [ -n "$context" ] || die "no Kubernetes context selected"
@@ -71,6 +107,7 @@ capture_ready_context() {
 cleanup_run() {
   status="$1"
   if [ "$status" -ne 0 ] && [ -n "$context" ]; then
+    capture_failure_diagnostics || true
     k get pods,deployments,statefulsets,jobs,services,persistentvolumeclaims -o wide >&2 || true
     k get events --sort-by=.metadata.creationTimestamp >&2 || true
   fi
@@ -144,6 +181,10 @@ peer_tokens="$(jq -cn \
   --arg third "$(openssl rand -hex 24)" \
   '[$first, $second, $third]')"
 [ "$(jq 'unique | length' <<< "$peer_tokens")" = 3 ] || die "peer tokens must be unique"
+diagnostic_secrets=("$client_token" "$admin_token")
+while IFS= read -r peer_token; do
+  diagnostic_secrets+=("$peer_token")
+done < <(jq -r '.[]' <<< "$peer_tokens")
 k create secret generic rhiza-auth \
   --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" >/dev/null
@@ -182,7 +223,7 @@ k create secret generic "${name_c1}-bundle" --from-file=config.json="$target/con
   --dry-run=client -o yaml | yq eval '.immutable = true' - | k create -f - >/dev/null
 
 export RHIZA_IMAGE="$image" RHIZA_KUBE_CONTEXT="$context" RHIZA_K8S_NAMESPACE="$namespace"
-export RHIZA_CLUSTER_ID=rhiza-vind RHIZA_RECOVERY_GENERATION=1
+export RHIZA_CLUSTER_ID="$logical_cluster_id" RHIZA_RECOVERY_GENERATION=1
 export RHIZA_CHECKPOINT_LEASE_MS=5000
 export RHIZA_S3_ENDPOINT=http://rustfs:9000 RHIZA_OBJECT_SECRET=rustfs-credentials
 export RHIZA_S3_ALLOW_HTTP=true
@@ -432,9 +473,37 @@ matrix_expect_read_zero_endpoint_failure() {
   matrix_prepare_read_request "$1" "$2" "$3"
   matrix_expect_zero_endpoint_transport_failure "$matrix_path" "$matrix_body"
 }
+retryable_write_failure() {
+  local attempt_log="$1"
+  grep -Eq \
+    '^write failed: HTTP 503 Service Unavailable code=(write_timeout|unavailable)( |$)' \
+    "$attempt_log"
+}
 write_value() {
-  pod="$1" key="$2" value="$3" request_id="$4"
-  client "$pod" write --request-id "$request_id" --key "$key" --value "$value"
+  local pod="$1" key="$2" value="$3" request_id="$4"
+  local attempt deadline attempt_log write_attempt_dir
+  deadline=$((SECONDS + write_retry_deadline_seconds))
+  write_attempt_dir="$target/write-attempts"
+  mkdir -p "$write_attempt_dir"
+  chmod 700 "$write_attempt_dir"
+
+  for ((attempt=1; attempt<=60; attempt++)); do
+    attempt_log="$(mktemp "$write_attempt_dir/write.XXXXXX")"
+    if client "$pod" write --request-id "$request_id" --key "$key" --value "$value" 2> "$attempt_log"; then
+      return 0
+    fi
+    if ! retryable_write_failure "$attempt_log"; then
+      cat "$attempt_log" >&2
+      return 1
+    fi
+    if [ "$attempt" -eq 60 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      echo "write did not converge after retryable failures (request_id=$request_id, attempts=$attempt)" >&2
+      cat "$attempt_log" >&2
+      return 1
+    fi
+    echo "retrying write after retryable failure (request_id=$request_id, attempt=$attempt, stderr=$attempt_log)" >&2
+    sleep 1
+  done
 }
 read_value_consistency() {
   pod="$1" key="$2" expected="$3" consistency="$4"
@@ -450,6 +519,91 @@ retry_read_value() {
       return 0
     fi
     [ "$attempt" -lt 60 ] || return 1
+    sleep 1
+  done
+}
+verify_same_membership_pod_recreation() {
+  local target_pod survivor_a survivor_b
+  local old_target_uid old_survivor_a_uid old_survivor_b_uid new_target_uid
+  local old_generation old_replicas expected_digest statuses ordinal status_file
+  local sample_complete
+  target_pod="${name_c2}-1"
+  survivor_a="${name_c2}-0"
+  survivor_b="${name_c2}-2"
+
+  for ordinal in 0 1 2; do
+    # shellcheck disable=SC2016
+    k exec "${name_c2}-$ordinal" -- /bin/sh -ec \
+      'printf marker > "$1"' sh "$marker"
+  done
+  old_target_uid="$(k get pod "$target_pod" -o jsonpath='{.metadata.uid}')"
+  old_survivor_a_uid="$(k get pod "$survivor_a" -o jsonpath='{.metadata.uid}')"
+  old_survivor_b_uid="$(k get pod "$survivor_b" -o jsonpath='{.metadata.uid}')"
+  old_generation="$(k get statefulset "$name_c2" -o jsonpath='{.metadata.generation}')"
+  old_replicas="$(k get statefulset "$name_c2" -o jsonpath='{.spec.replicas}')"
+  scripts/k8s-admin-job.sh "$name_c2" "$target_pod" GET \
+    /v1/admin/membership/status > "$target/pre-pod-recreation-status.json"
+  expected_digest="$(jq -c '.node.active_membership_digest' \
+    "$target/pre-pod-recreation-status.json")"
+
+  # BEGIN same-membership automatic Pod recreation: no scale, config, or recovery command.
+  k delete pod "$target_pod" --wait=true >/dev/null
+  "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
+  # END same-membership automatic Pod recreation.
+
+  new_target_uid="$(k get pod "$target_pod" -o jsonpath='{.metadata.uid}')"
+  [ -n "$new_target_uid" ] && [ "$new_target_uid" != "$old_target_uid" ] \
+    || die "StatefulSet did not recreate the deleted ordinal with a new Pod UID"
+  [ "$(k get pod "$survivor_a" -o jsonpath='{.metadata.uid}')" = "$old_survivor_a_uid" ] \
+    || die "first survivor Pod was replaced during one-Pod recovery"
+  [ "$(k get pod "$survivor_b" -o jsonpath='{.metadata.uid}')" = "$old_survivor_b_uid" ] \
+    || die "second survivor Pod was replaced during one-Pod recovery"
+  k exec "$target_pod" -- test ! -e "$marker" \
+    || die "replacement Pod retained deleted emptyDir data"
+  k exec "$survivor_a" -- test -e "$marker" \
+    || die "first survivor lost its emptyDir data"
+  k exec "$survivor_b" -- test -e "$marker" \
+    || die "second survivor lost its emptyDir data"
+  [ "$(k get statefulset "$name_c2" -o jsonpath='{.metadata.generation}')" = "$old_generation" ] \
+    || die "StatefulSet configuration changed during automatic Pod recovery"
+  [ "$(k get statefulset "$name_c2" -o jsonpath='{.spec.replicas}')" = "$old_replicas" ] \
+    || die "StatefulSet replica count changed during automatic Pod recovery"
+
+  retry_read_value "$target_pod" generation two
+  for ((attempt=1; attempt<=60; attempt++)); do
+    sample_complete=true
+    for ordinal in 0 1 2; do
+      status_file="$target/pod-recreation-status-${ordinal}.json"
+      if ! scripts/k8s-admin-job.sh "$name_c2" "${name_c2}-$ordinal" GET \
+        /v1/admin/membership/status > "$status_file"; then
+        sample_complete=false
+        break
+      fi
+    done
+    if "$sample_complete" &&
+      statuses="$(jq -s '.' \
+        "$target/pod-recreation-status-0.json" \
+        "$target/pod-recreation-status-1.json" \
+        "$target/pod-recreation-status-2.json")" &&
+      jq -e --arg cluster "$canonical_cluster_id" --argjson digest "$expected_digest" '
+      length == 3 and all(.[];
+        .cluster_id == $cluster and
+        .execution_profile == "sql" and
+        .epoch == 1 and
+        .recovery_generation == 2 and
+        .members == ["node-1", "node-2", "node-3"] and
+        .node.ready == true and
+        .node.configuration_status == "active" and
+        .node.active_config_id == 2 and
+        .node.configuration_state.phase == "active" and
+        .node.configuration_state.config_id == 2 and
+        .node.active_membership_digest == $digest and
+        .node.configuration_state.digest == $digest) and
+      ([.[].qlog_root] | unique | length == 1)
+    ' <<< "$statuses" >/dev/null; then
+      return 0
+    fi
+    [ "$attempt" -lt 60 ] || die "same-membership replacement did not converge"
     sleep 1
   done
 }
@@ -1032,9 +1186,7 @@ k set env "statefulset/$name_c2" RHIZA_RECOVERY_GENERATION=2 >/dev/null
 k scale statefulset "$name_c2" --replicas=3 >/dev/null
 "$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
 write_value "${name_c2}-0" generation two "generation-2-${run_id}"
-k delete pod "${name_c2}-1" --wait=true >/dev/null
-"$BASH" scripts/wait-k8s-statefulset-ready.sh "$name_c2" 3 2
-retry_read_value "${name_c2}-1" generation two
+verify_same_membership_pod_recreation
 if [ "$profile" = sql ]; then
   client "${name_c2}-1" sql query --sql 'SELECT count(*) AS users FROM users' \
     --consistency read_barrier > "$target/sql-generation-2.json"

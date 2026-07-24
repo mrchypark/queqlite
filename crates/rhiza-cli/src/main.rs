@@ -14,7 +14,7 @@ use rhiza_archive::{
 };
 use rhiza_client::RhizaClient;
 use rhiza_core::{
-    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, StoredCommand,
+    ConfigChange, ConfigurationState, ExecutionProfile, LogAnchor, LogEntry, LogHash, StoredCommand,
 };
 use rhiza_log::LogStore;
 use rhiza_node::{
@@ -54,7 +54,7 @@ use rhiza_node::{
 use rhiza_obj_store::{ObjStore, ObjStoreConfig};
 use rhiza_quepaxa::{
     DecisionProof, Membership, ReadFenceObservation, ReadFenceRequest, RecordRequest,
-    RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
+    RecordSummary, RecorderFileStore, RecorderPreflight, RecorderRpc, ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
 use rhiza_sql::{SqlStatement, SqlValue};
@@ -433,8 +433,11 @@ const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity-v1.json";
+const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = rhiza_node::durability::LOCAL_CHECKPOINT_IDENTITY_FILE;
 const MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES: u64 = 4 * 1024;
+const SUCCESSOR_RESTORE_INTENT_FILE: &str = ".successor-restore.intent";
+const SUCCESSOR_RESTORE_COMPLETE_FILE: &str = ".successor-restore.complete";
+const MAX_SUCCESSOR_RESTORE_CONTROL_BYTES: u64 = 16 * 1024;
 
 impl fmt::Debug for AdminClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -646,10 +649,35 @@ struct RemoteCheckpointConfig {
 struct LocalCheckpointIdentityMarker {
     format_version: u32,
     cluster_id: String,
+    node_id: String,
     execution_profile: ExecutionProfile,
     epoch: u64,
     config_id: u64,
     recovery_generation: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessorRestoreReceipt {
+    version: u32,
+    cluster_id: String,
+    epoch: u64,
+    target_config_id: u64,
+    recovery_generation: u64,
+    node_id: String,
+    membership_digest: String,
+    predecessor_config_id: u64,
+    stop_index: u64,
+    stop_hash: String,
+    checkpoint_index: u64,
+    checkpoint_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuccessorRestoreControlState {
+    Fresh,
+    Intent,
+    Complete,
 }
 
 impl RemoteCheckpointConfig {
@@ -2412,7 +2440,7 @@ where
 {
     tokio::pin!(shutdown);
     let node_config = config.node_config()?;
-    let recorder = open_recorder(&config)?;
+    let recorder = open_recorder_from_current_state(&config)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let recorder_server_startup =
         spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone());
@@ -2572,40 +2600,95 @@ where
         result = async {
             if config.bundle.predecessor.is_some() {
                 require_successor_startup_mode(remote.startup)?;
+                let exact_marker_exists = match fs::symlink_metadata(
+                    config.data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE),
+                ) {
+                    Ok(_) => read_and_validate_local_checkpoint_identity_marker(
+                        &config.data_dir,
+                        config.execution_profile,
+                        &authoritative_identity,
+                        &config.node_id,
+                    )
+                    .map(|_| true)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect local checkpoint identity marker: {error}"
+                        ))
+                    }
+                };
+                let expected_receipt =
+                    expected_successor_restore_receipt(&archive, &config).await?;
+                let successor_control = validate_successor_restore_controls(
+                    &config.data_dir,
+                    &expected_receipt,
+                )?;
+                if !exact_marker_exists
+                    && successor_control == SuccessorRestoreControlState::Fresh
+                    && !local_data_is_fresh(&config.data_dir)?
+                {
+                    return Err(
+                        "successor rejoin requires a local checkpoint identity marker or validated restore receipt"
+                            .into(),
+                    );
+                }
+                let recorder_state = if successor_control == SuccessorRestoreControlState::Intent {
+                    LocalRecorderState::Missing
+                } else {
+                    preflight_local_recorder(
+                        &config.data_dir,
+                        &authoritative_identity,
+                        &config.bundle.membership,
+                    )?
+                };
+                let recorder_state = recover_local_recorder_before_view_recovery(
+                    recorder_state,
+                    &config.data_dir,
+                    &config.node_id,
+                    &authoritative_identity,
+                    &config.bundle.membership,
+                )?;
                 let restored =
                     restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
                         .await
                         .map_err(|error| error.to_string())?;
-                if restored.requires_recorder_install() {
+                if restored.requires_recorder_install()
+                    || recorder_state == LocalRecorderState::Missing
+                {
                     install_successor_recorder_for_startup(&config)?;
+                }
+                if restored.requires_recorder_install() {
                     restored.complete().map_err(|error| error.to_string())?;
                 }
                 write_local_checkpoint_identity_marker(
                     &config.data_dir,
                     config.execution_profile,
                     &authoritative_identity,
+                    &config.node_id,
                 )?;
-                Ok::<_, String>(StartupPreparation::RecorderFirst)
+                Ok::<_, String>(StartupPreparation::RecorderFirst {
+                    recorder_open: RecorderOpenPolicy::MustExist,
+                })
             } else {
-                prepare_remote_startup(
+                prepare_remote_startup_with_membership(
                     remote.startup,
                     &archive,
                     &config.data_dir,
                     &config.node_id,
                     config.execution_profile,
+                    &config.bundle.membership,
                 )
                 .await
             }
         } => result?,
     };
-    let recorder = open_recorder(&config)?;
+    let recorder = open_recorder_for_preparation(&config, preparation.recorder_open_policy())?;
     let startup_recorder = match &preparation {
-        StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } => {
-            Some(StartupRecorderGate::new(recorder.clone(), *checkpoint_root))
-        }
-        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
-            None
-        }
+        StartupPreparation::RuntimeFirstWithPeerCatchup {
+            checkpoint_root, ..
+        } => Some(StartupRecorderGate::new(recorder.clone(), *checkpoint_root)),
+        StartupPreparation::RecorderFirst { .. }
+        | StartupPreparation::VerifyLocalCheckpoint { .. } => None,
     };
     let mut recorder_server = match &startup_recorder {
         Some(startup_recorder) => tokio::select! {
@@ -2635,19 +2718,17 @@ where
 
     let local_recorder = remote_startup_uses_direct_recorder(&preparation).then_some(&recorder);
     let recovered_checkpoint = match &preparation {
-        StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } => {
-            Some(*checkpoint_root)
-        }
-        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
-            None
-        }
+        StartupPreparation::RuntimeFirstWithPeerCatchup {
+            checkpoint_root, ..
+        } => Some(*checkpoint_root),
+        StartupPreparation::RecorderFirst { .. }
+        | StartupPreparation::VerifyLocalCheckpoint { .. } => None,
     };
     let consensus = build_consensus_at_checkpoint(&config, local_recorder, recovered_checkpoint)?;
     let peer_candidates = match &preparation {
         StartupPreparation::RuntimeFirstWithPeerCatchup { .. } => build_log_peers(&config)?,
-        StartupPreparation::RecorderFirst | StartupPreparation::VerifyLocalCheckpoint { .. } => {
-            Vec::new()
-        }
+        StartupPreparation::RecorderFirst { .. }
+        | StartupPreparation::VerifyLocalCheckpoint { .. } => Vec::new(),
     };
     let runtime_startup = open_runtime_with_retry(node_config, consensus, peer_candidates);
     tokio::pin!(runtime_startup);
@@ -2663,7 +2744,10 @@ where
     if let StartupPreparation::VerifyLocalCheckpoint { identity, root } = &preparation {
         verify_local_rejoin_checkpoint(&runtime, identity, *root)?;
     }
-    if let StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root } = &preparation {
+    if let StartupPreparation::RuntimeFirstWithPeerCatchup {
+        checkpoint_root, ..
+    } = &preparation
+    {
         verify_local_rejoin_checkpoint(&runtime, &authoritative_identity, *checkpoint_root)?;
         let rehydration = rehydrate_recorder_with_retry(
             runtime.clone(),
@@ -2863,7 +2947,7 @@ async fn finish_remote_shutdown(
 
 fn install_successor_recorder_for_startup(config: &ServeConfig) -> Result<(), String> {
     let predecessor = config.bundle.require_predecessor()?;
-    let recorder = RecorderFileStore::new_with_membership(
+    let recorder = open_recorder_after_preflight(
         config.data_dir.join("recorder"),
         config.node_id.clone(),
         config.cluster_id.clone(),
@@ -2914,8 +2998,8 @@ fn redact_object_store_error(config: &ObjStoreConfig, mut message: String) -> St
     message
 }
 
-fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
-    RecorderFileStore::new_with_membership(
+fn open_recorder_from_current_state(config: &ServeConfig) -> Result<RecorderFileStore, String> {
+    open_recorder_after_preflight(
         config.data_dir.join("recorder"),
         config.node_id.clone(),
         config.cluster_id.clone(),
@@ -2923,7 +3007,166 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
         config.bundle.config_id,
         config.bundle.membership.clone(),
     )
-    .map_err(|error| error.to_string())
+}
+
+fn open_recorder_for_preparation(
+    config: &ServeConfig,
+    policy: RecorderOpenPolicy,
+) -> Result<RecorderFileStore, String> {
+    open_recorder_at_policy(
+        config.data_dir.join("recorder"),
+        config.node_id.clone(),
+        config.cluster_id.clone(),
+        config.epoch,
+        config.bundle.config_id,
+        config.bundle.membership.clone(),
+        policy,
+    )
+}
+
+fn open_recorder_at_policy(
+    root: PathBuf,
+    recorder_id: String,
+    cluster_id: String,
+    epoch: u64,
+    config_id: u64,
+    membership: Membership,
+    policy: RecorderOpenPolicy,
+) -> Result<RecorderFileStore, String> {
+    match policy {
+        RecorderOpenPolicy::MustExist => RecorderFileStore::open_existing_with_membership(
+            root,
+            recorder_id,
+            cluster_id,
+            epoch,
+            config_id,
+            membership,
+        )
+        .map_err(|error| {
+            format!("required local recorder disappeared after startup preparation: {error}")
+        }),
+        RecorderOpenPolicy::CreateAfterRehydration => {
+            match RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                &cluster_id,
+                epoch,
+                config_id,
+                &membership,
+            )
+            .map_err(|error| format!("local recorder is not trustworthy: {error}"))?
+            {
+                RecorderPreflight::Missing => RecorderFileStore::new_with_membership(
+                    root,
+                    recorder_id,
+                    cluster_id,
+                    epoch,
+                    config_id,
+                    membership,
+                )
+                .map_err(|error| error.to_string()),
+                RecorderPreflight::Valid | RecorderPreflight::Recoverable => Err(
+                    "local recorder appeared after startup preparation; refusing to replace it"
+                        .into(),
+                ),
+            }
+        }
+    }
+}
+
+fn open_recorder_after_preflight(
+    root: PathBuf,
+    recorder_id: impl Into<String>,
+    cluster_id: impl Into<String>,
+    epoch: u64,
+    config_id: u64,
+    membership: Membership,
+) -> Result<RecorderFileStore, String> {
+    let recorder_id = recorder_id.into();
+    let cluster_id = cluster_id.into();
+    let outcome = RecorderFileStore::preflight_existing_with_membership_outcome(
+        &root,
+        &cluster_id,
+        epoch,
+        config_id,
+        &membership,
+    )
+    .map_err(|error| format!("local recorder is not trustworthy: {error}"))?;
+    let opened = match outcome {
+        RecorderPreflight::Missing => RecorderFileStore::new_with_membership(
+            root,
+            recorder_id,
+            cluster_id,
+            epoch,
+            config_id,
+            membership,
+        ),
+        RecorderPreflight::Valid | RecorderPreflight::Recoverable => {
+            RecorderFileStore::open_existing_with_membership(
+                root,
+                recorder_id,
+                cluster_id,
+                epoch,
+                config_id,
+                membership,
+            )
+        }
+    };
+    opened.map_err(|error| error.to_string())
+}
+
+fn preflight_local_recorder(
+    data_dir: &Path,
+    identity: &CheckpointIdentity,
+    membership: &Membership,
+) -> Result<LocalRecorderState, String> {
+    RecorderFileStore::preflight_existing_with_membership_outcome(
+        data_dir.join("recorder"),
+        identity.cluster_id(),
+        identity.epoch(),
+        identity.config_id(),
+        membership,
+    )
+    .map(|outcome| match outcome {
+        RecorderPreflight::Missing => LocalRecorderState::Missing,
+        RecorderPreflight::Valid => LocalRecorderState::Valid,
+        RecorderPreflight::Recoverable => LocalRecorderState::Recoverable,
+    })
+    .map_err(|error| format!("local recorder is not trustworthy: {error}"))
+}
+
+fn recover_local_recorder_before_view_recovery(
+    state: LocalRecorderState,
+    data_dir: &Path,
+    node_id: &str,
+    identity: &CheckpointIdentity,
+    membership: &Membership,
+) -> Result<LocalRecorderState, String> {
+    if state != LocalRecorderState::Recoverable {
+        return Ok(state);
+    }
+
+    eprintln!(
+        "local recorder has normal crash artifacts; completing locked recorder recovery before rebuilding local views"
+    );
+    // This must-exist locked open revalidates the same durable files before it can finish crash
+    // recovery. A replacement or deletion after preflight therefore fails rather than creating a
+    // new empty recorder.
+    RecorderFileStore::open_existing_with_membership(
+        data_dir.join("recorder"),
+        node_id,
+        identity.cluster_id(),
+        identity.epoch(),
+        identity.config_id(),
+        membership.clone(),
+    )
+    .map_err(|error| format!("local recorder crash recovery failed: {error}"))?;
+
+    match preflight_local_recorder(data_dir, identity, membership)? {
+        LocalRecorderState::Valid => Ok(LocalRecorderState::Valid),
+        state => Err(format!(
+            "local recorder crash recovery did not produce a valid recorder: {state:?}"
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -4137,14 +4380,51 @@ async fn roll_checkpoint(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StartupPreparation {
-    RecorderFirst,
+    RecorderFirst {
+        recorder_open: RecorderOpenPolicy,
+    },
     VerifyLocalCheckpoint {
         identity: CheckpointIdentity,
         root: LogAnchor,
     },
     RuntimeFirstWithPeerCatchup {
         checkpoint_root: LogAnchor,
+        recorder_open: RecorderOpenPolicy,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderOpenPolicy {
+    MustExist,
+    CreateAfterRehydration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalRecorderState {
+    Missing,
+    Valid,
+    /// Normal crash artifacts are present. This state must be opened under the recorder lock and
+    /// reclassified before any rebuildable local view is changed.
+    Recoverable,
+}
+
+impl StartupPreparation {
+    fn recorder_open_policy(&self) -> RecorderOpenPolicy {
+        match self {
+            Self::RecorderFirst { recorder_open }
+            | Self::RuntimeFirstWithPeerCatchup { recorder_open, .. } => *recorder_open,
+            Self::VerifyLocalCheckpoint { .. } => RecorderOpenPolicy::MustExist,
+        }
+    }
+}
+
+fn recorder_open_policy_for_state(state: LocalRecorderState) -> RecorderOpenPolicy {
+    match state {
+        LocalRecorderState::Missing => RecorderOpenPolicy::CreateAfterRehydration,
+        LocalRecorderState::Valid | LocalRecorderState::Recoverable => {
+            RecorderOpenPolicy::MustExist
+        }
+    }
 }
 
 fn remote_startup_uses_direct_recorder(preparation: &StartupPreparation) -> bool {
@@ -4154,12 +4434,13 @@ fn remote_startup_uses_direct_recorder(preparation: &StartupPreparation) -> bool
     )
 }
 
-async fn prepare_remote_startup(
+async fn prepare_remote_startup_with_membership(
     mode: StartupMode,
     archive: &ObjectArchiveStore,
     data_dir: &Path,
     node_id: &str,
     execution_profile: ExecutionProfile,
+    membership: &Membership,
 ) -> Result<StartupPreparation, String> {
     match mode {
         StartupMode::Bootstrap => {
@@ -4178,14 +4459,18 @@ async fn prepare_remote_startup(
                 data_dir,
                 execution_profile,
                 loaded.manifest().identity(),
+                node_id,
             )?;
-            Ok(StartupPreparation::RecorderFirst)
+            Ok(StartupPreparation::RecorderFirst {
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
+            })
         }
         StartupMode::Rejoin if local_data_is_fresh(data_dir)? => {
             let identity = archive
                 .checkpoint_identity()
                 .map_err(|error| error.to_string())?;
-            let marker = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
+            let marker =
+                encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
             let tip =
                 rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
                     archive.clone(),
@@ -4193,6 +4478,7 @@ async fn prepare_remote_startup(
                     node_id,
                     LOCAL_CHECKPOINT_IDENTITY_FILE,
                     &marker,
+                    false,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -4200,9 +4486,11 @@ async fn prepare_remote_startup(
                 data_dir,
                 execution_profile,
                 identity,
+                node_id,
             )?;
             Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
                 checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
             })
         }
         StartupMode::Rejoin => {
@@ -4211,12 +4499,60 @@ async fn prepare_remote_startup(
                 .await
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "rejoin requires an initialized checkpoint".to_string())?;
-            if rhiza_node::durability::checkpoint_restore_in_progress(data_dir)
-                .map_err(|error| error.to_string())?
+            let checkpoint_root = LogAnchor::new(
+                loaded.manifest().tip().index(),
+                loaded.manifest().tip().hash(),
+            );
+            let exact_marker_exists =
+                match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
+                    Ok(_) => {
+                        read_and_validate_local_checkpoint_identity_marker(
+                            data_dir,
+                            execution_profile,
+                            loaded.manifest().identity(),
+                            node_id,
+                        )?;
+                        true
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect local checkpoint identity marker: {error}"
+                        ))
+                    }
+                };
+            let restore_state = rhiza_node::durability::checkpoint_restore_in_progress(
+                data_dir,
+                loaded.manifest().identity(),
+                node_id,
+                execution_profile,
+                checkpoint_root,
+                exact_marker_exists,
+            )
+            .map_err(|error| error.to_string())?;
+            // A normal nonfresh rejoin is fenced by the exact node-bound marker. The only
+            // exception is an identity-bound restore intent which has already been validated
+            // against this node and checkpoint above. Do not open a recoverable recorder before
+            // one of those read-only fences succeeds.
+            if !exact_marker_exists
+                && restore_state == rhiza_node::durability::CheckpointRestoreState::None
             {
+                return Err("rejoin requires a local checkpoint identity marker".into());
+            }
+            let recorder_state =
+                preflight_local_recorder(data_dir, loaded.manifest().identity(), membership)?;
+            let recorder_state = recover_local_recorder_before_view_recovery(
+                recorder_state,
+                data_dir,
+                node_id,
+                loaded.manifest().identity(),
+                membership,
+            )?;
+            if restore_state != rhiza_node::durability::CheckpointRestoreState::None {
                 let marker = encode_local_checkpoint_identity_marker(
                     execution_profile,
                     loaded.manifest().identity(),
+                    node_id,
                 )?;
                 let tip = if execution_profile == ExecutionProfile::Graph {
                     rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
@@ -4225,6 +4561,8 @@ async fn prepare_remote_startup(
                         node_id,
                         LOCAL_CHECKPOINT_IDENTITY_FILE,
                         &marker,
+                        restore_state
+                            == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
                     )
                     .await
                 } else {
@@ -4235,6 +4573,8 @@ async fn prepare_remote_startup(
                         execution_profile,
                         LOCAL_CHECKPOINT_IDENTITY_FILE,
                         &marker,
+                        restore_state
+                            == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
                     )
                     .await
                 }
@@ -4243,15 +4583,18 @@ async fn prepare_remote_startup(
                     data_dir,
                     execution_profile,
                     loaded.manifest().identity(),
+                    node_id,
                 )?;
                 return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
                     checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+                    recorder_open: recorder_open_policy_for_state(recorder_state),
                 });
             }
             read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
                 loaded.manifest().identity(),
+                node_id,
             )?;
             let checkpoint_root = LogAnchor::new(
                 loaded.manifest().tip().index(),
@@ -4270,6 +4613,7 @@ async fn prepare_remote_startup(
                 let marker = encode_local_checkpoint_identity_marker(
                     execution_profile,
                     loaded.manifest().identity(),
+                    node_id,
                 )?;
                 let tip = rhiza_node::durability::restore_checkpoint_for_rejoin_preserving_recorder(
                     archive.clone(),
@@ -4278,6 +4622,7 @@ async fn prepare_remote_startup(
                     execution_profile,
                     LOCAL_CHECKPOINT_IDENTITY_FILE,
                     &marker,
+                    false,
                 )
                 .await
                 .map_err(|restore_error| {
@@ -4289,9 +4634,17 @@ async fn prepare_remote_startup(
                     data_dir,
                     execution_profile,
                     loaded.manifest().identity(),
+                    node_id,
                 )?;
                 return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
                     checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+                    recorder_open: recorder_open_policy_for_state(recorder_state),
+                });
+            }
+            if recorder_state == LocalRecorderState::Missing {
+                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                    checkpoint_root,
+                    recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
                 });
             }
             Ok(StartupPreparation::VerifyLocalCheckpoint {
@@ -4303,22 +4656,59 @@ async fn prepare_remote_startup(
             })
         }
         StartupMode::Disaster => {
-            let restore_in_progress =
-                rhiza_node::durability::checkpoint_restore_in_progress(data_dir)
-                    .map_err(|error| error.to_string())?;
-            if !restore_in_progress && !local_data_is_fresh(data_dir)? {
-                return Err("disaster startup requires a fresh local data directory".into());
-            }
             let identity = archive
                 .checkpoint_identity()
                 .map_err(|error| error.to_string())?;
-            let marker = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
+            let checkpoint = archive
+                .load_checkpoint()
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "disaster startup requires an initialized checkpoint".to_string())?;
+            let checkpoint_root = LogAnchor::new(
+                checkpoint.manifest().tip().index(),
+                checkpoint.manifest().tip().hash(),
+            );
+            let exact_marker_exists =
+                match fs::symlink_metadata(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)) {
+                    Ok(_) => {
+                        read_and_validate_local_checkpoint_identity_marker(
+                            data_dir,
+                            execution_profile,
+                            identity,
+                            node_id,
+                        )?;
+                        true
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect local checkpoint identity marker: {error}"
+                        ))
+                    }
+                };
+            let restore_state = rhiza_node::durability::checkpoint_restore_in_progress(
+                data_dir,
+                identity,
+                node_id,
+                execution_profile,
+                checkpoint_root,
+                exact_marker_exists,
+            )
+            .map_err(|error| error.to_string())?;
+            if restore_state == rhiza_node::durability::CheckpointRestoreState::None
+                && !local_data_is_fresh(data_dir)?
+            {
+                return Err("disaster startup requires a fresh local data directory".into());
+            }
+            let marker =
+                encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
             rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
                 archive.clone(),
                 data_dir,
                 node_id,
                 LOCAL_CHECKPOINT_IDENTITY_FILE,
                 &marker,
+                restore_state == rhiza_node::durability::CheckpointRestoreState::LegacyV1,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4326,19 +4716,45 @@ async fn prepare_remote_startup(
                 data_dir,
                 execution_profile,
                 identity,
+                node_id,
             )?;
-            Ok(StartupPreparation::RecorderFirst)
+            Ok(StartupPreparation::RecorderFirst {
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
+            })
         }
     }
+}
+
+#[cfg(test)]
+async fn prepare_remote_startup(
+    mode: StartupMode,
+    archive: &ObjectArchiveStore,
+    data_dir: &Path,
+    node_id: &str,
+    execution_profile: ExecutionProfile,
+) -> Result<StartupPreparation, String> {
+    let membership =
+        Membership::new(["node-1", "node-2", "node-3"]).map_err(|error| error.to_string())?;
+    prepare_remote_startup_with_membership(
+        mode,
+        archive,
+        data_dir,
+        node_id,
+        execution_profile,
+        &membership,
+    )
+    .await
 }
 
 fn marker_from_identity(
     execution_profile: ExecutionProfile,
     identity: &CheckpointIdentity,
+    node_id: &str,
 ) -> LocalCheckpointIdentityMarker {
     LocalCheckpointIdentityMarker {
-        format_version: 1,
+        format_version: 2,
         cluster_id: identity.cluster_id().to_owned(),
+        node_id: node_id.to_owned(),
         execution_profile,
         epoch: identity.epoch(),
         config_id: identity.config_id(),
@@ -4349,8 +4765,9 @@ fn marker_from_identity(
 fn encode_local_checkpoint_identity_marker(
     execution_profile: ExecutionProfile,
     identity: &CheckpointIdentity,
+    node_id: &str,
 ) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&marker_from_identity(execution_profile, identity))
+    serde_json::to_vec(&marker_from_identity(execution_profile, identity, node_id))
         .map_err(|error| format!("cannot encode local checkpoint identity marker: {error}"))
 }
 
@@ -4358,9 +4775,11 @@ fn validate_local_checkpoint_identity_marker(
     marker: &LocalCheckpointIdentityMarker,
     execution_profile: ExecutionProfile,
     identity: &CheckpointIdentity,
+    node_id: &str,
 ) -> Result<(), String> {
-    if marker.format_version != 1
+    if marker.format_version != 2
         || marker.cluster_id != identity.cluster_id()
+        || marker.node_id != node_id
         || marker.execution_profile != execution_profile
         || marker.epoch != identity.epoch()
         || marker.config_id != identity.config_id()
@@ -4378,46 +4797,213 @@ fn read_and_validate_local_checkpoint_identity_marker(
     data_dir: &Path,
     execution_profile: ExecutionProfile,
     identity: &CheckpointIdentity,
+    node_id: &str,
 ) -> Result<(), String> {
     let marker_path = data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE);
-    let metadata = fs::symlink_metadata(&marker_path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            "nonfresh rejoin requires a local checkpoint identity marker".to_string()
-        } else {
-            format!("cannot inspect local checkpoint identity marker: {error}")
-        }
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("local checkpoint identity marker must be a regular file".into());
-    }
-    if metadata.len() == 0 || metadata.len() > MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES {
-        return Err("local checkpoint identity marker has an invalid size".into());
-    }
-    let file = fs::File::open(&marker_path)
-        .map_err(|error| format!("cannot open local checkpoint identity marker: {error}"))?;
-    if !file
-        .metadata()
-        .map_err(|error| format!("cannot inspect open checkpoint identity marker: {error}"))?
-        .is_file()
-    {
-        return Err("local checkpoint identity marker must remain a regular file".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read local checkpoint identity marker: {error}"))?;
-    if bytes.len() as u64 > MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES {
-        return Err("local checkpoint identity marker has an invalid size".into());
-    }
+    let bytes = read_bounded_regular_file_no_follow(
+        &marker_path,
+        MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES,
+        "local checkpoint identity marker",
+    )?;
     let marker: LocalCheckpointIdentityMarker = serde_json::from_slice(&bytes)
         .map_err(|_| "local checkpoint identity marker is invalid".to_string())?;
-    validate_local_checkpoint_identity_marker(&marker, execution_profile, identity)
+    validate_local_checkpoint_identity_marker(&marker, execution_profile, identity, node_id)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+fn open_read_no_follow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    options.open(path)
+}
+
+fn read_bounded_regular_file_no_follow(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    read_optional_bounded_regular_file_no_follow(path, max_bytes, label)?
+        .ok_or_else(|| format!("nonfresh rejoin requires a {label}"))
+}
+
+fn read_optional_bounded_regular_file_no_follow(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match open_read_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            let is_symlink =
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+            return Err(
+                if is_symlink || (cfg!(unix) && error.raw_os_error() == Some(40)) {
+                    format!("{label} must be a regular file")
+                } else {
+                    format!("cannot open {label}: {error}")
+                },
+            );
+        }
+    };
+    let before = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect open {label}: {error}"))?;
+    if !before.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    if before.len() == 0 || before.len() > max_bytes {
+        return Err(format!("{label} has an invalid size"));
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {label}: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect open {label}: {error}"))?;
+    if !after.is_file()
+        || after.len() != before.len()
+        || bytes.len() as u64 != before.len()
+        || bytes.len() as u64 > max_bytes
+    {
+        return Err(format!("{label} changed during bounded read"));
+    }
+    Ok(Some(bytes))
+}
+
+async fn expected_successor_restore_receipt(
+    archive: &ObjectArchiveStore,
+    config: &ServeConfig,
+) -> Result<Vec<u8>, String> {
+    let loaded = archive
+        .load_checkpoint()
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "successor startup requires an initialized checkpoint".to_string())?;
+    let identity = loaded.manifest().identity();
+    let transition = loaded
+        .manifest()
+        .successor_transition()
+        .ok_or_else(|| "successor startup requires transition provenance".to_string())?;
+    let predecessor = config.bundle.require_predecessor()?;
+    if identity.cluster_id() != config.cluster_id
+        || identity.epoch() != config.epoch
+        || identity.config_id() != config.bundle.config_id
+        || identity.recovery_generation() != config.recovery_generation
+        || transition.predecessor().config_id() != predecessor.stop.entry.config_id
+        || transition.stop_entry() != &predecessor.stop.entry
+    {
+        return Err("successor checkpoint does not match target node configuration".into());
+    }
+    serde_json::to_vec(&SuccessorRestoreReceipt {
+        version: 1,
+        cluster_id: config.cluster_id.clone(),
+        epoch: config.epoch,
+        target_config_id: identity.config_id(),
+        recovery_generation: config.recovery_generation,
+        node_id: config.node_id.clone(),
+        membership_digest: config.bundle.membership.digest().to_hex(),
+        predecessor_config_id: transition.predecessor().config_id(),
+        stop_index: transition.stop_entry().index,
+        stop_hash: transition.stop_entry().hash.to_hex(),
+        checkpoint_index: loaded.manifest().tip().index(),
+        checkpoint_hash: loaded.manifest().tip().hash().to_hex(),
+    })
+    .map_err(|error| format!("cannot encode successor restore receipt: {error}"))
+}
+
+fn validate_successor_restore_controls(
+    data_dir: &Path,
+    expected: &[u8],
+) -> Result<SuccessorRestoreControlState, String> {
+    let intent = read_optional_bounded_regular_file_no_follow(
+        &data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE),
+        MAX_SUCCESSOR_RESTORE_CONTROL_BYTES,
+        "successor restore intent",
+    )?;
+    let complete = read_optional_bounded_regular_file_no_follow(
+        &data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE),
+        MAX_SUCCESSOR_RESTORE_CONTROL_BYTES,
+        "successor restore completion",
+    )?;
+    match (intent, complete) {
+        (None, None) => Ok(SuccessorRestoreControlState::Fresh),
+        (Some(actual), None) if actual == expected => Ok(SuccessorRestoreControlState::Intent),
+        (None, Some(actual)) if completed_successor_receipt_matches(&actual, expected) => {
+            Ok(SuccessorRestoreControlState::Complete)
+        }
+        _ => {
+            Err("successor restore receipt does not exactly match this node and checkpoint".into())
+        }
+    }
+}
+
+fn completed_successor_receipt_matches(actual: &[u8], expected: &[u8]) -> bool {
+    let (Ok(mut actual), Ok(mut expected)) = (
+        serde_json::from_slice::<serde_json::Value>(actual),
+        serde_json::from_slice::<serde_json::Value>(expected),
+    ) else {
+        return false;
+    };
+    let (Some(actual_index), Some(expected_index), Some(actual_hash), Some(expected_hash)) = (
+        actual["checkpoint_index"].as_u64(),
+        expected["checkpoint_index"].as_u64(),
+        actual["checkpoint_hash"].as_str(),
+        expected["checkpoint_hash"].as_str(),
+    ) else {
+        return false;
+    };
+    if LogHash::from_hex(actual_hash).is_none()
+        || LogHash::from_hex(expected_hash).is_none()
+        || actual_index > expected_index
+        || (actual_index == expected_index && actual_hash != expected_hash)
+    {
+        return false;
+    }
+    for receipt in [&mut actual, &mut expected] {
+        let Some(receipt) = receipt.as_object_mut() else {
+            return false;
+        };
+        receipt.remove("checkpoint_index");
+        receipt.remove("checkpoint_hash");
+    }
+    actual == expected
 }
 
 fn write_local_checkpoint_identity_marker(
     data_dir: &Path,
     execution_profile: ExecutionProfile,
     identity: &CheckpointIdentity,
+    node_id: &str,
 ) -> Result<(), String> {
     fs::create_dir_all(data_dir)
         .map_err(|error| format!("cannot create local data directory: {error}"))?;
@@ -4428,14 +5014,23 @@ fn write_local_checkpoint_identity_marker(
     }
 
     let marker_path = data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE);
-    if fs::symlink_metadata(&marker_path).is_ok() {
-        return read_and_validate_local_checkpoint_identity_marker(
-            data_dir,
-            execution_profile,
-            identity,
-        );
+    match fs::symlink_metadata(&marker_path) {
+        Ok(_) => {
+            return read_and_validate_local_checkpoint_identity_marker(
+                data_dir,
+                execution_profile,
+                identity,
+                node_id,
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect local checkpoint identity marker: {error}"
+            ))
+        }
     }
-    let bytes = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
+    let bytes = encode_local_checkpoint_identity_marker(execution_profile, identity, node_id)?;
     let nonce = LOCAL_MARKER_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temporary = data_dir.join(format!(
         ".rhiza-checkpoint-identity.tmp-{}-{nonce}",
@@ -4471,7 +5066,12 @@ fn write_local_checkpoint_identity_marker(
         let _ = fs::remove_file(&temporary);
     }
     result?;
-    read_and_validate_local_checkpoint_identity_marker(data_dir, execution_profile, identity)
+    read_and_validate_local_checkpoint_identity_marker(
+        data_dir,
+        execution_profile,
+        identity,
+        node_id,
+    )
 }
 
 static LOCAL_MARKER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -7373,7 +7973,9 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RecorderFirst
+            StartupPreparation::RecorderFirst {
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
+            }
         );
         let empty_rejoin_dir = root.path().join("empty-rejoin");
         assert_eq!(
@@ -7387,19 +7989,21 @@ mod tests {
             .await
             .unwrap(),
             StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(0, LogHash::ZERO)
+                checkpoint_root: LogAnchor::new(0, LogHash::ZERO),
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
             }
         );
-        let valid_nonfresh_dir = root.path().join("valid-nonfresh");
+        let genesis_without_qlog_dir = root.path().join("genesis-without-qlog");
         write_local_checkpoint_identity_marker(
-            &valid_nonfresh_dir,
+            &genesis_without_qlog_dir,
             ExecutionProfile::Sqlite,
             archive.checkpoint_identity().unwrap(),
+            "node-1",
         )
         .unwrap();
         drop(
             SqliteStateMachine::open(
-                valid_nonfresh_dir.join("sqlite/db.sqlite"),
+                genesis_without_qlog_dir.join("sqlite/db.sqlite"),
                 "rhiza:sql:cluster-a",
                 "node-1",
                 1,
@@ -7407,21 +8011,25 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(
+        let genesis_without_qlog_before = directory_file_bytes(&genesis_without_qlog_dir);
+        assert!(matches!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
                 &archive,
-                &valid_nonfresh_dir,
+                &genesis_without_qlog_dir,
                 "node-1",
                 ExecutionProfile::Sqlite,
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(0, LogHash::ZERO)
-            }
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
+                if checkpoint_root == LogAnchor::new(0, LogHash::ZERO)
+        ));
+        assert_eq!(
+            directory_file_bytes(&genesis_without_qlog_dir),
+            genesis_without_qlog_before
         );
-        let committed = entries(3);
+        let committed = entries(5);
         archive.publish_committed(&committed[..2]).await.unwrap();
         let snapshot_dir = root.path().join("snapshot-source");
         let snapshot_state = SqliteStateMachine::open(
@@ -7442,6 +8050,13 @@ mod tests {
             .unwrap();
         let interrupted_rejoin_dir = root.path().join("interrupted-rejoin");
         std::fs::create_dir_all(interrupted_rejoin_dir.join("sqlite")).unwrap();
+        write_local_checkpoint_identity_marker(
+            &interrupted_rejoin_dir,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+            "node-1",
+        )
+        .unwrap();
         std::fs::write(
             interrupted_rejoin_dir.join(".rhiza-restore-v1"),
             b"rhiza restore in progress\n",
@@ -7457,13 +8072,16 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
                 if checkpoint_root == LogAnchor::new(2, committed[1].hash)
         ));
         assert!(interrupted_rejoin_dir
             .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
             .is_file());
         assert!(!interrupted_rejoin_dir.join(".rhiza-restore-v1").exists());
+        assert!(!interrupted_rejoin_dir
+            .join(".rhiza-restore-v2.json")
+            .exists());
         let fresh_bootstrap_dir = root.path().join("fresh-bootstrap-nonempty");
         assert!(prepare_remote_startup(
             StartupMode::Bootstrap,
@@ -7488,7 +8106,8 @@ mod tests {
             .await
             .unwrap(),
             StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, committed[1].hash)
+                checkpoint_root: LogAnchor::new(2, committed[1].hash),
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
             }
         );
         assert!(fresh_rejoin_dir.join("consensus/log").exists());
@@ -7505,9 +8124,25 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { root, .. }
-                if root == LogAnchor::new(2, committed[1].hash)
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
         ));
+
+        std::fs::remove_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
+        ));
+        assert!(fresh_rejoin_dir.join("sqlite/db.sqlite").is_file());
 
         let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
         let recorder = RecorderFileStore::new_with_membership(
@@ -7562,6 +8197,19 @@ mod tests {
         assert!(recorder_before
             .get(Path::new("recorder.wal"))
             .is_some_and(|bytes| bytes.starts_with(b"QWAL")));
+        let quarantine_count = || {
+            std::fs::read_dir(&fresh_rejoin_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".rebuildable-quarantine-")
+                })
+                .count()
+        };
+        let quarantine_count_before = quarantine_count();
         std::fs::remove_dir_all(fresh_rejoin_dir.join("consensus")).unwrap();
         assert!(matches!(
             prepare_remote_startup(
@@ -7573,13 +8221,17 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
                 if checkpoint_root == LogAnchor::new(2, committed[1].hash)
         ));
         assert_eq!(
             directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
             recorder_before
         );
+        // A valid local-view validation cleans up an exact-identity, owned quarantine from an
+        // earlier completed repair. The next repair replaces that one owned artifact rather than
+        // retaining an unbounded history of rebuildable views.
+        assert_eq!(quarantine_count(), quarantine_count_before);
 
         let materializer =
             SqliteStateMachine::open_existing(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap();
@@ -7592,6 +8244,10 @@ mod tests {
         )
         .unwrap();
         qlog.append(&committed[2]).unwrap();
+        drop(materializer);
+        drop(qlog);
+        let sqlite_before = directory_file_bytes(&fresh_rejoin_dir.join("sqlite"));
+        let consensus_before = directory_file_bytes(&fresh_rejoin_dir.join("consensus"));
         assert!(matches!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
@@ -7602,25 +8258,31 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
-                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
+            StartupPreparation::VerifyLocalCheckpoint { root, .. }
+                if root == LogAnchor::new(2, committed[1].hash)
         ));
-        rhiza_node::durability::validate_local_recovery_view(
-            &fresh_rejoin_dir,
-            archive.checkpoint_identity().unwrap(),
-            "node-1",
-            ExecutionProfile::Sqlite,
-            LogAnchor::new(2, committed[1].hash),
-        )
-        .unwrap();
+        assert_eq!(
+            directory_file_bytes(&fresh_rejoin_dir.join("sqlite")),
+            sqlite_before
+        );
+        assert_eq!(
+            directory_file_bytes(&fresh_rejoin_dir.join("consensus")),
+            consensus_before
+        );
+        // Verification may remove only the exact-identity, owned recovery quarantine left by
+        // the preceding completed repair. It must leave the active view intact.
+        assert_eq!(quarantine_count(), 0);
         assert_eq!(
             directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
             recorder_before
         );
 
-        std::fs::create_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
-        std::fs::write(fresh_rejoin_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
-        assert_eq!(
+        let materializer =
+            SqliteStateMachine::open_existing(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap();
+        materializer.apply_entry(&committed[3]).unwrap();
+        drop(materializer);
+        let local_view_before = directory_file_bytes(&fresh_rejoin_dir);
+        assert!(matches!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
                 &archive,
@@ -7630,9 +8292,55 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, committed[1].hash)
-            }
+            StartupPreparation::VerifyLocalCheckpoint { root, .. }
+                if root == LogAnchor::new(2, committed[1].hash)
+        ));
+        assert_eq!(directory_file_bytes(&fresh_rejoin_dir), local_view_before);
+
+        let qlog = FileLogStore::open(
+            fresh_rejoin_dir.join("consensus/log"),
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+        )
+        .unwrap();
+        qlog.append_batch(&committed[3..]).unwrap();
+        drop(qlog);
+        let local_view_before = directory_file_bytes(&fresh_rejoin_dir);
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::VerifyLocalCheckpoint { root, .. }
+                if root == LogAnchor::new(2, committed[1].hash)
+        ));
+        assert_eq!(directory_file_bytes(&fresh_rejoin_dir), local_view_before);
+
+        std::fs::create_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
+        std::fs::write(fresh_rejoin_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
+        let quarantine_count_before = quarantine_count();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root, .. }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
+        ));
+        assert_ne!(
+            std::fs::read(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap(),
+            b"corrupt"
         );
         assert!(fresh_rejoin_dir.join("consensus/log").exists());
         assert_eq!(
@@ -7652,13 +8360,7 @@ mod tests {
             recorder.fetch_command(recorder_command.hash()).unwrap(),
             Some(recorder_command)
         );
-        assert!(std::fs::read_dir(&fresh_rejoin_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".rebuildable-quarantine-")));
+        assert_eq!(quarantine_count(), quarantine_count_before + 1);
 
         let disaster_dir = root.path().join("disaster");
         std::fs::create_dir_all(disaster_dir.join("sqlite")).unwrap();
@@ -7685,7 +8387,9 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RecorderFirst
+            StartupPreparation::RecorderFirst {
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
+            }
         );
         assert!(fresh_disaster_dir.join("consensus/log").exists());
     }
@@ -7711,13 +8415,86 @@ mod tests {
         .unwrap_err()
         .contains("requires a local checkpoint identity marker"));
 
+        let wrong_intent = root.path().join("wrong-intent");
+        write_local_checkpoint_identity_marker(
+            &wrong_intent,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+            "node-1",
+        )
+        .unwrap();
+        std::fs::write(wrong_intent.join("sentinel"), b"preserve").unwrap();
+        let committed = entries(1);
+        std::fs::write(
+            wrong_intent.join(".rhiza-restore-v2.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "cluster_id": "rhiza:sql:cluster-a",
+                "node_id": "node-2",
+                "execution_profile": "sql",
+                "epoch": 1,
+                "config_id": 1,
+                "recovery_generation": 1,
+                "checkpoint_index": 1,
+                "checkpoint_hash": committed[0].hash.to_hex(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let wrong_intent_before = directory_file_bytes(&wrong_intent);
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &wrong_intent,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("does not exactly match this node and checkpoint"));
+        assert_eq!(directory_file_bytes(&wrong_intent), wrong_intent_before);
+
+        let ambiguous_intent = root.path().join("ambiguous-intent");
+        std::fs::create_dir_all(&ambiguous_intent).unwrap();
+        write_local_checkpoint_identity_marker(
+            &ambiguous_intent,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+            "node-1",
+        )
+        .unwrap();
+        std::fs::write(
+            ambiguous_intent.join(".rhiza-restore-v2.json"),
+            std::fs::read(wrong_intent.join(".rhiza-restore-v2.json")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            ambiguous_intent.join(".rhiza-restore-v1"),
+            b"rhiza restore in progress\n",
+        )
+        .unwrap();
+        let ambiguous_before = directory_file_bytes(&ambiguous_intent);
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &ambiguous_intent,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("both legacy and identity-bound"));
+        assert_eq!(directory_file_bytes(&ambiguous_intent), ambiguous_before);
+
         let mismatch = root.path().join("mismatch");
         write_local_checkpoint_identity_marker(
             &mismatch,
             ExecutionProfile::Sqlite,
             &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 2),
+            "node-1",
         )
         .unwrap();
+        let mismatch_before = directory_file_bytes(&mismatch);
         assert!(prepare_remote_startup(
             StartupMode::Rejoin,
             &archive,
@@ -7728,6 +8505,65 @@ mod tests {
         .await
         .unwrap_err()
         .contains("does not exactly match"));
+        assert_eq!(directory_file_bytes(&mismatch), mismatch_before);
+
+        let wrong_node = root.path().join("wrong-node");
+        write_local_checkpoint_identity_marker(
+            &wrong_node,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+            "node-2",
+        )
+        .unwrap();
+        let wrong_node_before = directory_file_bytes(&wrong_node);
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &wrong_node,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("does not exactly match"));
+        assert_eq!(directory_file_bytes(&wrong_node), wrong_node_before);
+
+        let corrupt_recorder = root.path().join("corrupt-recorder");
+        write_local_checkpoint_identity_marker(
+            &corrupt_recorder,
+            ExecutionProfile::Sqlite,
+            archive.checkpoint_identity().unwrap(),
+            "node-1",
+        )
+        .unwrap();
+        std::fs::create_dir_all(corrupt_recorder.join("recorder")).unwrap();
+        std::fs::write(
+            corrupt_recorder.join("recorder/recorded-head.rec"),
+            b"corrupt",
+        )
+        .unwrap();
+        let corrupt_recorder_before = directory_file_bytes(&corrupt_recorder);
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &corrupt_recorder,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("local recorder is not trustworthy"));
+        assert_eq!(
+            directory_file_bytes(&corrupt_recorder),
+            corrupt_recorder_before
+        );
+        assert!(!std::fs::read_dir(&corrupt_recorder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rebuildable-quarantine-")));
 
         let torn = root.path().join("torn");
         std::fs::create_dir_all(&torn).unwrap();
@@ -7748,6 +8584,315 @@ mod tests {
         .contains("marker is invalid"));
     }
 
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn nonfresh_rejoin_keeps_recoverable_recorder_unchanged_when_identity_marker_is_missing()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        archive.publish_committed(&entries(1)).await.unwrap();
+        let data_dir = root.path().join("node");
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            data_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"missing-marker".to_vec());
+        recorder
+            .record(RecordRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 2,
+                step: 4,
+                proposal: Proposal::new(
+                    ProposalPriority::MAX,
+                    "node-1",
+                    1,
+                    AcceptedValue::from_command(
+                        "rhiza:sql:cluster-a",
+                        2,
+                        1,
+                        1,
+                        LogHash::ZERO,
+                        &command,
+                    ),
+                ),
+                command: Some(command),
+            })
+            .unwrap();
+        drop(recorder);
+        let wal = data_dir.join("recorder/recorder.wal");
+        let wal_len = std::fs::metadata(&wal).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(wal_len - 7)
+            .unwrap();
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                data_dir.join("recorder"),
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+        let before = directory_file_bytes(&data_dir);
+
+        assert!(prepare_remote_startup(
+            StartupMode::Rejoin,
+            &archive,
+            &data_dir,
+            "node-1",
+            ExecutionProfile::Sqlite,
+        )
+        .await
+        .unwrap_err()
+        .contains("requires a local checkpoint identity marker"));
+
+        assert_eq!(directory_file_bytes(&data_dir), before);
+        assert!(!std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rebuildable-quarantine-")));
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn successor_control_rejects_corrupt_complete_before_recoverable_recorder_is_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("node");
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            data_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            2,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"forged-complete".to_vec());
+        recorder
+            .record(RecordRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 2,
+                config_digest: membership.digest(),
+                slot: 1,
+                step: 4,
+                proposal: Proposal::new(
+                    ProposalPriority::MAX,
+                    "node-1",
+                    1,
+                    AcceptedValue::from_command(
+                        "rhiza:sql:cluster-a",
+                        1,
+                        1,
+                        2,
+                        LogHash::ZERO,
+                        &command,
+                    ),
+                ),
+                command: Some(command),
+            })
+            .unwrap();
+        drop(recorder);
+        let wal = data_dir.join("recorder/recorder.wal");
+        let wal_len = std::fs::metadata(&wal).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(wal_len - 7)
+            .unwrap();
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                data_dir.join("recorder"),
+                "rhiza:sql:cluster-a",
+                1,
+                2,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+        assert!(!data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE).exists());
+        std::fs::write(
+            data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE),
+            br#"{"forged":true}"#,
+        )
+        .unwrap();
+        let before = directory_file_bytes(&data_dir);
+        let expected = serde_json::to_vec(&SuccessorRestoreReceipt {
+            version: 1,
+            cluster_id: "rhiza:sql:cluster-a".into(),
+            epoch: 1,
+            target_config_id: 2,
+            recovery_generation: 1,
+            node_id: "node-1".into(),
+            membership_digest: membership.digest().to_hex(),
+            predecessor_config_id: 1,
+            stop_index: 9,
+            stop_hash: LogHash::ZERO.to_hex(),
+            checkpoint_index: 9,
+            checkpoint_hash: LogHash::ZERO.to_hex(),
+        })
+        .unwrap();
+
+        assert!(validate_successor_restore_controls(&data_dir, &expected)
+            .unwrap_err()
+            .contains("does not exactly match"));
+        assert_eq!(directory_file_bytes(&data_dir), before);
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn rejoin_repairs_recoverable_recorder_before_rebuilding_a_corrupt_local_view() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let committed = entries(2);
+        archive.publish_committed(&committed).await.unwrap();
+        let snapshot_state = SqliteStateMachine::open(
+            root.path().join("snapshot/db.sqlite"),
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap();
+        for entry in &committed {
+            snapshot_state.apply_entry(entry).unwrap();
+        }
+        let snapshot = snapshot_state.create_recovery_snapshot(1).unwrap();
+        archive
+            .publish_checkpoint_snapshot(snapshot.anchor().clone(), snapshot.db_bytes())
+            .await
+            .unwrap();
+        let data_dir = root.path().join("node");
+
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &data_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
+        ));
+
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            data_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"recover-before-view".to_vec());
+        recorder
+            .record(RecordRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 3,
+                step: 4,
+                proposal: Proposal::new(
+                    ProposalPriority::MAX,
+                    "node-1",
+                    1,
+                    AcceptedValue::from_command(
+                        "rhiza:sql:cluster-a",
+                        3,
+                        1,
+                        1,
+                        LogHash::from_bytes([2; 32]),
+                        &command,
+                    ),
+                ),
+                command: Some(command),
+            })
+            .unwrap();
+        drop(recorder);
+        let wal = data_dir.join("recorder/recorder.wal");
+        let wal_len = std::fs::metadata(&wal).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(wal_len - 7)
+            .unwrap();
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                data_dir.join("recorder"),
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+
+        std::fs::write(data_dir.join("sqlite/db.sqlite"), b"corrupt").unwrap();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &data_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { .. }
+        ));
+
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                data_dir.join("recorder"),
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Valid,
+        );
+        assert_ne!(
+            std::fs::read(data_dir.join("sqlite/db.sqlite")).unwrap(),
+            b"corrupt"
+        );
+        assert!(std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rebuildable-quarantine-")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn checkpoint_identity_marker_rejects_symlink_files_and_data_directories() {
@@ -7760,13 +8905,30 @@ mod tests {
         let target = root.path().join("target.json");
         std::fs::write(&target, b"{}").unwrap();
         symlink(&target, data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)).unwrap();
+        let target_before = std::fs::read(&target).unwrap();
         assert!(read_and_validate_local_checkpoint_identity_marker(
             &data_dir,
             ExecutionProfile::Sqlite,
             &identity,
+            "node-1",
         )
         .unwrap_err()
         .contains("regular file"));
+        assert_eq!(std::fs::read(&target).unwrap(), target_before);
+
+        std::fs::remove_file(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE)).unwrap();
+        let oversized = vec![b'x'; (MAX_LOCAL_CHECKPOINT_IDENTITY_BYTES + 1) as usize];
+        std::fs::write(data_dir.join(LOCAL_CHECKPOINT_IDENTITY_FILE), &oversized).unwrap();
+        let before = directory_file_bytes(&data_dir);
+        assert!(read_and_validate_local_checkpoint_identity_marker(
+            &data_dir,
+            ExecutionProfile::Sqlite,
+            &identity,
+            "node-1",
+        )
+        .unwrap_err()
+        .contains("invalid size"));
+        assert_eq!(directory_file_bytes(&data_dir), before);
 
         let real_dir = root.path().join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
@@ -7776,6 +8938,7 @@ mod tests {
             &linked_dir,
             ExecutionProfile::Sqlite,
             &identity,
+            "node-1",
         )
         .unwrap_err()
         .contains("real directory"));
@@ -7802,12 +8965,14 @@ mod tests {
             &root.path().join("node"),
             ExecutionProfile::Sqlite,
             &identity,
+            "node-1",
         )
         .unwrap();
         read_and_validate_local_checkpoint_identity_marker(
             &root.path().join("node"),
             ExecutionProfile::Sqlite,
             &identity,
+            "node-1",
         )
         .unwrap();
 
@@ -7838,7 +9003,9 @@ mod tests {
         let root = LogAnchor::new(1, LogHash::from_bytes([1; 32]));
 
         assert!(remote_startup_uses_direct_recorder(
-            &StartupPreparation::RecorderFirst
+            &StartupPreparation::RecorderFirst {
+                recorder_open: RecorderOpenPolicy::MustExist,
+            }
         ));
         assert!(remote_startup_uses_direct_recorder(
             &StartupPreparation::VerifyLocalCheckpoint { identity, root }
@@ -7846,8 +9013,54 @@ mod tests {
         assert!(!remote_startup_uses_direct_recorder(
             &StartupPreparation::RuntimeFirstWithPeerCatchup {
                 checkpoint_root: root,
+                recorder_open: RecorderOpenPolicy::CreateAfterRehydration,
             }
         ));
+    }
+
+    #[test]
+    fn must_exist_recorder_policy_does_not_recreate_a_recorder_deleted_after_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder_root = root.path().join("recorder");
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        drop(
+            RecorderFileStore::new_with_membership(
+                &recorder_root,
+                "node-1",
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &recorder_root,
+                "rhiza:sql:cluster-a",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Valid,
+        );
+        std::fs::remove_dir_all(&recorder_root).unwrap();
+
+        assert!(open_recorder_at_policy(
+            recorder_root.clone(),
+            "node-1".into(),
+            "rhiza:sql:cluster-a".into(),
+            1,
+            1,
+            membership,
+            RecorderOpenPolicy::MustExist,
+        )
+        .unwrap_err()
+        .contains("disappeared after startup preparation"));
+        assert!(!recorder_root.exists());
+        assert!(!root.path().join("sqlite").exists());
+        assert!(!root.path().join("consensus").exists());
     }
 
     #[test]

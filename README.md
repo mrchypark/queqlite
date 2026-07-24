@@ -398,16 +398,26 @@ scripts/check-deploy.sh
 ```
 
 Render a config-scoped StatefulSet without writing the bundle token to a YAML
-artifact:
+artifact. Initialize the authoritative object-store checkpoint before creating
+the StatefulSet; all rendered pods start in `rejoin` mode and restore from that
+checkpoint:
 
 ```bash
-RHIZA_EXECUTION_PROFILE=sql \
-  scripts/render-k8s-config.sh 1 3 config-c1.json target/rhiza-sql-c1.yaml
-kubectl -n rhiza create secret generic rhiza-sql-c1-bundle \
+export RHIZA_EXECUTION_PROFILE=sql
+export RHIZA_K8S_NAMESPACE=rhiza
+export RHIZA_IMAGE=rhiza-sql:dev
+export RHIZA_CLUSTER_ID=cluster-a
+# Point these at the object store and existing credential Secret for this namespace.
+export RHIZA_S3_ENDPOINT=https://s3.example.internal
+export RHIZA_OBJECT_SECRET=rhiza-object-store
+
+kubectl -n "$RHIZA_K8S_NAMESPACE" create secret generic rhiza-sql-c1-bundle \
   --from-file=config.json=config-c1.json --dry-run=client -o yaml \
   | yq eval '.immutable = true' - \
-  | kubectl -n rhiza create -f -
-kubectl -n rhiza create -f target/rhiza-sql-c1.yaml
+  | kubectl -n "$RHIZA_K8S_NAMESPACE" create -f -
+scripts/k8s-object-job.sh 1 config-c1.json init-checkpoint
+scripts/render-k8s-config.sh 1 3 config-c1.json target/rhiza-sql-c1.yaml
+kubectl -n "$RHIZA_K8S_NAMESPACE" create -f target/rhiza-sql-c1.yaml
 ```
 
 The renderer derives the local image default from SQL
@@ -415,8 +425,51 @@ The renderer derives the local image default from SQL
 to override it with a registry-qualified artifact and tag. Also set
 `RHIZA_CLUSTER_ID`, `RHIZA_EPOCH`, `RHIZA_RECOVERY_GENERATION`, `RHIZA_S3_*`,
 and Secret-name overrides as needed. `RHIZA_EXECUTION_PROFILE` must be `sql`.
-The rendered resource uses `OnDelete`; do not mutate a live config's pod
-template to reconfigure membership.
+The example assumes `rhiza-auth` and `rhiza-object-store` Secrets already
+exist in the same `rhiza` namespace; replace the image, endpoint, and Secret
+name with deployment-specific values.
+The renderer accepts only an unset or explicit `rejoin`
+`RHIZA_STARTUP_MODE`; bootstrap and disaster-recovery startup modes are not
+valid for the reference StatefulSet.
+
+The rendered StatefulSet uses `Parallel`, `OnDelete`, stable ordinals, and
+per-Pod `emptyDir` data. If one Pod is deleted or lost, Kubernetes recreates
+the same ordinal automatically; a container-only crash restarts in the
+existing Pod. A replacement Pod starts with the same node and membership
+identity, restores the initialized official checkpoint plus its committed
+suffix, and rejoins while the other replicas retain their local state. No
+scale, configuration, or recovery command is part of this same-membership
+repair.
+
+The matching PodDisruptionBudget sets `maxUnavailable: 1` to limit cooperating
+voluntary disruptions. A PDB does not prevent direct Pod deletion, process or
+node failure, involuntary eviction, or simultaneous failures, and it does not
+repair quorum by itself.
+
+This automatic repair is not a membership change and is not a general binary
+upgrade guarantee. Changing member identities still uses the stop-and-replace
+flow below. `OnDelete` also means an image/template change does not roll pods
+automatically; only deploy mutually compatible binaries and verify them one
+ordinal at a time under a separate upgrade procedure.
+
+The node-bound local identity marker is
+`.rhiza-checkpoint-identity-v2.json`; its format version is `2` and includes
+the exact node identity as well as the cluster, profile, epoch, configuration,
+and recovery generation.
+
+Interrupted checkpoint replacement uses `.rhiza-restore-v2.json`, bound to the
+same identity plus the exact checkpoint index and hash. The older
+`.rhiza-restore-v1` literal is resumed only when an exact, valid v2 node marker
+already authorizes that local directory; absent or conflicting markers and
+dual restore intents fail without replacing local state.
+
+On steady-state `rejoin`, a missing local Recorder is rebuilt behind the
+startup gate from the verified qlog and quorum-certified peer tail before the
+Pod becomes Ready. A partial, corrupt, or foreign Recorder fails closed.
+Successor configurations may additionally reconstruct a missing Recorder from
+their completed node-bound receipt and predecessor Stop proof. Rebuildable
+SQLite and qlog state may be quarantined and restored independently; Recorder
+state is never included in that quarantine.
 
 ## Stop And Replace
 

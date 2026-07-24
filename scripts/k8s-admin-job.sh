@@ -63,14 +63,37 @@ sed \
   deploy/k8s/rhiza-admin-job.yaml > "$manifest"
 # These variables expand inside the Job container.
 # shellcheck disable=SC2016
-export RHIZA_ADMIN_JOB_COMMAND='exec curl --fail-with-body --silent --show-error \
-  --connect-timeout 5 --max-time 90 \
-  -X "$RHIZA_ADMIN_METHOD" \
-  -H "Authorization: Bearer ${RHIZA_ADMIN_TOKEN}" \
-  -H "x-rhiza-version: 1" \
-  -H "Content-Type: application/json" \
-  --data "$RHIZA_ADMIN_BODY" \
-  "http://${RHIZA_ADMIN_POD}.${RHIZA_ADMIN_SERVICE}:8080${RHIZA_ADMIN_PATH}"'
+export RHIZA_ADMIN_JOB_COMMAND='attempt=1
+while :; do
+  if curl --fail-with-body --silent --show-error \
+    --connect-timeout 5 --max-time 90 \
+    -X "$RHIZA_ADMIN_METHOD" \
+    -H "Authorization: Bearer ${RHIZA_ADMIN_TOKEN}" \
+    -H "x-rhiza-version: 1" \
+    -H "Content-Type: application/json" \
+    --data "$RHIZA_ADMIN_BODY" \
+    "http://${RHIZA_ADMIN_POD}.${RHIZA_ADMIN_SERVICE}:8080${RHIZA_ADMIN_PATH}" \
+    2>/tmp/rhiza-admin-curl-error; then
+    rm -f /tmp/rhiza-admin-curl-error
+    exit 0
+  else
+    curl_status=$?
+  fi
+  case "$curl_status" in
+    6|7)
+      if [ "$attempt" -ge 10 ]; then
+        cat /tmp/rhiza-admin-curl-error >&2
+        exit "$curl_status"
+      fi
+      attempt=$((attempt + 1))
+      sleep 1
+      ;;
+    *)
+      cat /tmp/rhiza-admin-curl-error >&2
+      exit "$curl_status"
+      ;;
+  esac
+done'
 export RHIZA_ADMIN_JOB_IMAGE="$curl_image"
 export RHIZA_ADMIN_JOB_AUTH_SECRET="$auth_secret"
 export RHIZA_ADMIN_METHOD="$method"

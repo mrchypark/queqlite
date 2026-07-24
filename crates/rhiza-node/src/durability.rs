@@ -1,8 +1,10 @@
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     error::Error,
     fmt, fs,
     future::Future,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process,
     sync::{
@@ -34,19 +36,58 @@ use rhiza_kv::{
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
 #[cfg(feature = "sql")]
 use rhiza_sql::{restore_recovery_snapshot_file, sql_executor_fingerprint};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Materializer, NodeConfig, NodeRuntime};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
-const RESTORE_INTENT_FILE: &str = ".rhiza-restore-v1";
-const RESTORE_INTENT_CONTENTS: &[u8] = b"rhiza restore in progress\n";
+const RESTORE_INTENT_FILE: &str = ".rhiza-restore-v2.json";
+const LEGACY_RESTORE_INTENT_FILE: &str = ".rhiza-restore-v1";
 const RESTORE_STAGING_PREFIX: &str = ".restore-stage-";
 const RESTORE_MARKER_TMP_PREFIX: &str = ".restore-marker-tmp-";
 const SUCCESSOR_RESTORE_LOCK_FILE: &str = ".successor-restore.lock";
 const SUCCESSOR_RESTORE_INTENT_FILE: &str = ".successor-restore.intent";
 const SUCCESSOR_RESTORE_COMPLETE_FILE: &str = ".successor-restore.complete";
+const REPAIR_ARTIFACT_OWNER_FILE: &str = ".rhiza-recovery-owner.json";
+pub const LOCAL_CHECKPOINT_IDENTITY_FILE: &str = ".rhiza-checkpoint-identity-v2.json";
 static RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreIntentIdentity {
+    version: u32,
+    cluster_id: String,
+    node_id: String,
+    execution_profile: ExecutionProfile,
+    epoch: u64,
+    config_id: u64,
+    recovery_generation: u64,
+    checkpoint_index: LogIndex,
+    checkpoint_hash: String,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
+enum RecoveryArtifactIdentity {
+    Successor(SuccessorRestoreReceipt),
+    Restore(RestoreIntentIdentity),
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RepairArtifactRole {
+    Staging,
+    Quarantine,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepairArtifactOwnership {
+    format_version: u32,
+    role: RepairArtifactRole,
+    name: String,
+    identity: RecoveryArtifactIdentity,
+}
 
 #[derive(Serialize)]
 struct SuccessorRestoreIdentity<'a> {
@@ -56,6 +97,23 @@ struct SuccessorRestoreIdentity<'a> {
     target_config_id: u64,
     recovery_generation: u64,
     node_id: &'a str,
+    membership_digest: String,
+    predecessor_config_id: u64,
+    stop_index: LogIndex,
+    stop_hash: String,
+    checkpoint_index: LogIndex,
+    checkpoint_hash: String,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessorRestoreReceipt {
+    version: u32,
+    cluster_id: String,
+    epoch: u64,
+    target_config_id: u64,
+    recovery_generation: u64,
+    node_id: String,
     membership_digest: String,
     predecessor_config_id: u64,
     stop_index: LogIndex,
@@ -86,12 +144,28 @@ impl SuccessorRestorePreparation {
             return Ok(self.tip);
         }
         let intent = self.data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE);
-        if fs::read(&intent)? != self.identity {
+        let actual = read_regular_successor_control_file(&intent)?.ok_or_else(|| {
+            DurabilityError::SnapshotVerification("successor restore intent is missing".into())
+        })?;
+        if parse_successor_restore_receipt(&actual).is_none()
+            || parse_successor_restore_receipt(&self.identity).is_none()
+            || actual != self.identity
+        {
             return Err(DurabilityError::SnapshotVerification(
                 "successor restore intent changed before completion".into(),
             ));
         }
-        fs::rename(intent, self.data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE))?;
+        let complete = self.data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
+        match fs::symlink_metadata(&complete) {
+            Ok(_) => {
+                return Err(DurabilityError::SnapshotVerification(
+                    "successor restore completion target already exists".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::rename(intent, complete)?;
         sync_directory(&self.data_dir)?;
         self.requires_recorder_install = false;
         Ok(self.tip)
@@ -109,6 +183,13 @@ pub enum DurabilityMode {
 pub enum DurabilityHealth {
     Available,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointRestoreState {
+    None,
+    IdentityBoundV2,
+    LegacyV1,
 }
 
 impl DurabilityMode {
@@ -831,7 +912,8 @@ pub async fn restore_checkpoint_to_fresh_data_dir(
     store: ObjectArchiveStore,
     data_dir: impl AsRef<Path>,
 ) -> Result<CheckpointTip, DurabilityError> {
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None).await
+    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None, false)
+        .await
 }
 
 pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
@@ -849,6 +931,7 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
         data_dir.as_ref(),
         Some(target_node_id),
         None,
+        false,
     )
     .await
 }
@@ -859,6 +942,7 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
     target_node_id: &str,
     marker_name: &str,
     marker_contents: &[u8],
+    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -871,26 +955,128 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
         data_dir.as_ref(),
         Some(target_node_id),
         Some((marker_name, marker_contents)),
+        resume_legacy_v1_intent,
     )
     .await
 }
 
-pub fn checkpoint_restore_in_progress(data_dir: impl AsRef<Path>) -> Result<bool, DurabilityError> {
-    let intent = data_dir.as_ref().join(RESTORE_INTENT_FILE);
-    let metadata = match fs::symlink_metadata(&intent) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+fn restore_intent_identity(
+    identity: &CheckpointIdentity,
+    node_id: &str,
+    execution_profile: ExecutionProfile,
+    checkpoint_root: LogAnchor,
+) -> RestoreIntentIdentity {
+    RestoreIntentIdentity {
+        version: 2,
+        cluster_id: identity.cluster_id().to_owned(),
+        node_id: node_id.to_owned(),
+        execution_profile,
+        epoch: identity.epoch(),
+        config_id: identity.config_id(),
+        recovery_generation: identity.recovery_generation(),
+        checkpoint_index: checkpoint_root.index(),
+        checkpoint_hash: checkpoint_root.hash().to_hex(),
+    }
+}
+
+fn encode_restore_intent(
+    identity: &CheckpointIdentity,
+    node_id: &str,
+    execution_profile: ExecutionProfile,
+    checkpoint_root: LogAnchor,
+) -> Result<Vec<u8>, DurabilityError> {
+    serde_json::to_vec(&restore_intent_identity(
+        identity,
+        node_id,
+        execution_profile,
+        checkpoint_root,
+    ))
+    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))
+}
+
+fn parse_restore_intent_identity(bytes: &[u8]) -> Option<RestoreIntentIdentity> {
+    let intent = serde_json::from_slice::<RestoreIntentIdentity>(bytes).ok()?;
+    (intent.version == 2
+        && !intent.cluster_id.is_empty()
+        && !intent.node_id.is_empty()
+        && LogHash::from_hex(&intent.checkpoint_hash).is_some())
+    .then_some(intent)
+}
+
+pub fn checkpoint_restore_in_progress(
+    data_dir: impl AsRef<Path>,
+    identity: &CheckpointIdentity,
+    node_id: &str,
+    execution_profile: ExecutionProfile,
+    checkpoint_root: LogAnchor,
+    legacy_v1_authorized_by_exact_marker: bool,
+) -> Result<CheckpointRestoreState, DurabilityError> {
+    let data_dir = data_dir.as_ref();
+    let legacy = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
+    let intent = data_dir.join(RESTORE_INTENT_FILE);
+    let legacy_metadata = match fs::symlink_metadata(&legacy) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || fs::read(intent)? != RESTORE_INTENT_CONTENTS
-    {
+    let metadata = match fs::symlink_metadata(&intent) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if legacy_metadata.is_some() && metadata.is_some() {
+        return Err(DurabilityError::SnapshotVerification(
+            "both legacy and identity-bound checkpoint restore intents exist".into(),
+        ));
+    }
+    if let Some(metadata) = legacy_metadata {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || read_bounded_regular_file(&legacy, 4096)?.as_deref()
+                != Some(b"rhiza restore in progress\n")
+        {
+            return Err(DurabilityError::SnapshotVerification(
+                "legacy local checkpoint restore intent is invalid".into(),
+            ));
+        }
+        if !legacy_v1_authorized_by_exact_marker {
+            return Err(DurabilityError::SnapshotVerification(
+                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
+            ));
+        }
+        return Ok(CheckpointRestoreState::LegacyV1);
+    }
+    let Some(metadata) = metadata else {
+        return Ok(CheckpointRestoreState::None);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
         return Err(DurabilityError::SnapshotVerification(
             "local checkpoint restore intent is invalid".into(),
         ));
     }
-    Ok(true)
+    let bytes = read_bounded_regular_file(&intent, 4096)?.ok_or_else(|| {
+        DurabilityError::SnapshotVerification("local checkpoint restore intent disappeared".into())
+    })?;
+    let actual: RestoreIntentIdentity = serde_json::from_slice(&bytes).map_err(|_| {
+        DurabilityError::SnapshotVerification("local checkpoint restore intent is invalid".into())
+    })?;
+    let expected = restore_intent_identity(identity, node_id, execution_profile, checkpoint_root);
+    if actual.version != expected.version
+        || actual.cluster_id != expected.cluster_id
+        || actual.node_id != expected.node_id
+        || actual.execution_profile != expected.execution_profile
+        || actual.epoch != expected.epoch
+        || actual.config_id != expected.config_id
+        || actual.recovery_generation != expected.recovery_generation
+        || actual.checkpoint_index != expected.checkpoint_index
+        || actual.checkpoint_hash != expected.checkpoint_hash
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "local checkpoint restore intent does not exactly match this node and checkpoint"
+                .into(),
+        ));
+    }
+    Ok(CheckpointRestoreState::IdentityBoundV2)
 }
 
 pub fn validate_local_recovery_view(
@@ -901,7 +1087,15 @@ pub fn validate_local_recovery_view(
     checkpoint_root: LogAnchor,
 ) -> Result<(), DurabilityError> {
     let data_dir = data_dir.as_ref();
-    if checkpoint_restore_in_progress(data_dir)? {
+    if checkpoint_restore_in_progress(
+        data_dir,
+        identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+        false,
+    )? != CheckpointRestoreState::None
+    {
         return Err(DurabilityError::SnapshotVerification(
             "local recovery view has an incomplete checkpoint restore intent".into(),
         ));
@@ -913,27 +1107,52 @@ pub fn validate_local_recovery_view(
             "local recovery view profile does not match checkpoint identity".into(),
         ));
     }
-    let validate_qlog = match execution_profile {
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+    ));
+    cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    let validate_qlog = validate_local_materializer_identity(
+        data_dir,
+        identity,
+        target_node_id,
+        execution_profile,
+    )?;
+
+    if validate_qlog {
+        // NodeRuntime reconciles valid materializer/qlog crash skew. This preflight only opens the
+        // expected local identity and fences startup to an exactly included authoritative root.
+        validate_local_qlog(data_dir, identity, checkpoint_root)?;
+    }
+    Ok(())
+}
+
+fn validate_local_materializer_identity(
+    data_dir: &Path,
+    identity: &CheckpointIdentity,
+    target_node_id: &str,
+    execution_profile: ExecutionProfile,
+) -> Result<bool, DurabilityError> {
+    Ok(match execution_profile {
         ExecutionProfile::Sqlite => {
             #[cfg(feature = "sql")]
             {
-                let state =
-                    rhiza_sql::SqliteStateMachine::open_existing(data_dir.join("sqlite/db.sqlite"))
-                        .map_err(|error| {
-                            DurabilityError::SnapshotVerification(error.to_string())
-                        })?;
-                validate_materializer_tip(
-                    "SQL",
-                    LogAnchor::new(
-                        state.applied_index_value().map_err(|error| {
-                            DurabilityError::SnapshotVerification(error.to_string())
-                        })?,
-                        state.applied_hash_value().map_err(|error| {
-                            DurabilityError::SnapshotVerification(error.to_string())
-                        })?,
-                    ),
-                    checkpoint_root,
-                )?;
+                let path = data_dir.join("sqlite/db.sqlite");
+                if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(DurabilityError::SnapshotVerification(
+                        "SQL materializer is missing or is not a regular file".into(),
+                    ));
+                }
+                let _state = rhiza_sql::SqliteStateMachine::open(
+                    path,
+                    identity.cluster_id(),
+                    target_node_id,
+                    identity.epoch(),
+                    identity.config_id(),
+                )
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
                 true
             }
             #[cfg(not(feature = "sql"))]
@@ -950,7 +1169,7 @@ pub fn validate_local_recovery_view(
                         "KV materializer is missing or is not a regular file".into(),
                     ));
                 }
-                let state = RedbStateMachine::open(
+                let _state = RedbStateMachine::open(
                     &path,
                     identity.cluster_id(),
                     target_node_id,
@@ -958,13 +1177,6 @@ pub fn validate_local_recovery_view(
                     identity.config_id(),
                 )
                 .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
-                validate_materializer_tip(
-                    "KV",
-                    state.applied_tip().map_err(|error| {
-                        DurabilityError::SnapshotVerification(error.to_string())
-                    })?,
-                    checkpoint_root,
-                )?;
                 true
             }
             #[cfg(not(feature = "kv"))]
@@ -973,13 +1185,7 @@ pub fn validate_local_recovery_view(
             ));
         }
         ExecutionProfile::Graph => false,
-    };
-
-    if validate_qlog {
-        validate_local_qlog(data_dir, identity, checkpoint_root)
-    } else {
-        Ok(())
-    }
+    })
 }
 
 pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
@@ -989,6 +1195,7 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
     execution_profile: ExecutionProfile,
     marker_name: &str,
     marker_contents: &[u8],
+    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     if target_node_id.is_empty() {
         return Err(DurabilityError::SnapshotVerification(
@@ -1006,7 +1213,25 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
         ));
     }
     let restored = store.restore_checkpoint_v2().await?;
-    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, RESTORE_INTENT_CONTENTS)?;
+    let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
+    let intent = encode_restore_intent(
+        &identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+    )?;
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        &identity,
+        target_node_id,
+        execution_profile,
+        checkpoint_root,
+    ));
+    cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    if resume_legacy_v1_intent {
+        fs::remove_file(data_dir.join(LEGACY_RESTORE_INTENT_FILE))?;
+        sync_directory(data_dir)?;
+    }
+    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
         &restored,
@@ -1014,6 +1239,7 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
         Some(target_node_id),
         true,
         true,
+        Some(&recovery_identity),
         Some((marker_name, marker_contents)),
     )
 }
@@ -1023,22 +1249,39 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
     data_dir: &Path,
     target_node_id: Option<&str>,
     completion_marker: Option<(&str, &[u8])>,
+    resume_legacy_v1_intent: bool,
 ) -> Result<CheckpointTip, DurabilityError> {
     let identity = store.checkpoint_identity()?.clone();
     store
         .load_checkpoint()
         .await?
         .ok_or(DurabilityError::MissingCheckpoint)?;
-    prepare_fresh_restore_data_dir(data_dir, completion_marker.map(|(name, _)| name))?;
     let restored = store.restore_checkpoint_v2().await?;
-    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, RESTORE_INTENT_CONTENTS)?;
+    let target_node_id = target_node_id.unwrap_or("<unbound-restore>");
+    let profile = snapshot_profile(identity.cluster_id())?;
+    let checkpoint_root = LogAnchor::new(restored.tip().index(), restored.tip().hash());
+    let intent = encode_restore_intent(&identity, target_node_id, profile, checkpoint_root)?;
+    let recovery_identity = RecoveryArtifactIdentity::Restore(restore_intent_identity(
+        &identity,
+        target_node_id,
+        profile,
+        checkpoint_root,
+    ));
+    prepare_fresh_restore_data_dir(
+        data_dir,
+        completion_marker.map(|(name, _)| name),
+        &intent,
+        resume_legacy_v1_intent,
+    )?;
+    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, &intent)?;
     install_restored_checkpoint(
         &identity,
         &restored,
         data_dir,
-        target_node_id,
+        Some(target_node_id),
         true,
         false,
+        Some(&recovery_identity),
         completion_marker,
     )
 }
@@ -1050,12 +1293,13 @@ fn install_restored_checkpoint(
     target_node_id: Option<&str>,
     remove_generic_intent: bool,
     replace_rebuildable: bool,
+    recovery_identity: Option<&RecoveryArtifactIdentity>,
     completion_marker: Option<(&str, &[u8])>,
 ) -> Result<CheckpointTip, DurabilityError> {
     let tip = *restored.tip();
     let profile = snapshot_profile(identity.cluster_id())?;
     validate_restored_suffix(profile, restored.suffix())?;
-    let staging = create_restore_staging_dir(data_dir)?;
+    let staging = create_restore_staging_dir(data_dir, recovery_identity)?;
     let result = (|| -> Result<(), DurabilityError> {
         if let Some(snapshot) = restored.snapshot() {
             install_profile_snapshot(identity, snapshot, &staging, target_node_id)?;
@@ -1092,7 +1336,7 @@ fn install_restored_checkpoint(
             }
         }
         if replace_rebuildable {
-            quarantine_rebuildable_view(data_dir, profile)?;
+            quarantine_rebuildable_view(data_dir, profile, recovery_identity)?;
         }
         publish_restore_staging(&staging, data_dir, remove_generic_intent, completion_marker)
     })();
@@ -1114,31 +1358,16 @@ fn validate_restored_suffix(
     Ok(())
 }
 
-#[cfg(any(feature = "sql", feature = "kv", test))]
-fn validate_materializer_tip(
-    label: &str,
-    actual: LogAnchor,
-    checkpoint_root: LogAnchor,
-) -> Result<(), DurabilityError> {
-    if actual != checkpoint_root {
-        return Err(DurabilityError::SnapshotVerification(format!(
-            "{label} materializer tip {}/{} does not exactly match checkpoint root {}/{}",
-            actual.index(),
-            actual.hash().to_hex(),
-            checkpoint_root.index(),
-            checkpoint_root.hash().to_hex(),
-        )));
-    }
-    Ok(())
-}
-
 fn validate_local_qlog(
     data_dir: &Path,
     identity: &CheckpointIdentity,
     checkpoint_root: LogAnchor,
-) -> Result<(), DurabilityError> {
+) -> Result<LogAnchor, DurabilityError> {
     let path = data_dir.join("consensus/log");
     if !path_has_state(&path)? {
+        if checkpoint_root == LogAnchor::new(0, LogHash::ZERO) {
+            return Ok(checkpoint_root);
+        }
         return Err(DurabilityError::SnapshotVerification(
             "local qlog is missing or empty".into(),
         ));
@@ -1153,9 +1382,9 @@ fn validate_local_qlog(
     let tip = state
         .tip
         .ok_or_else(|| DurabilityError::SnapshotVerification("local qlog has no tip".into()))?;
-    if tip != checkpoint_root {
+    if tip.index() < checkpoint_root.index() {
         return Err(DurabilityError::SnapshotVerification(format!(
-            "local qlog tip {}/{} does not exactly match checkpoint root {}/{}",
+            "local qlog tip {}/{} is behind checkpoint root {}/{}",
             tip.index(),
             tip.hash().to_hex(),
             checkpoint_root.index(),
@@ -1168,7 +1397,7 @@ fn validate_local_qlog(
                 "checkpoint genesis hash is not zero".into(),
             ));
         }
-        return Ok(());
+        return Ok(tip);
     }
     let included_hash = match state.anchor.as_ref() {
         Some(anchor) if anchor.compacted().index() == checkpoint_root.index() => {
@@ -1187,7 +1416,7 @@ fn validate_local_qlog(
             checkpoint_root.index(),
         )));
     }
-    Ok(())
+    Ok(tip)
 }
 
 fn install_profile_snapshot(
@@ -1377,8 +1606,49 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
         checkpoint_hash: loaded.manifest().tip().hash().to_hex(),
     })
     .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
-    let (lock, state) = prepare_successor_restore_root(config.data_dir(), &receipt)?;
+    let intent_identity =
+        RecoveryArtifactIdentity::Successor(parse_successor_restore_receipt(&receipt).ok_or_else(
+            || DurabilityError::SnapshotVerification("successor restore receipt is invalid".into()),
+        )?);
+    let (lock, state, complete_marker) =
+        prepare_successor_restore_root(config.data_dir(), &receipt)?;
     if state == SuccessorRestoreRootState::Complete {
+        let checkpoint_root = LogAnchor::new(
+            loaded.manifest().tip().index(),
+            loaded.manifest().tip().hash(),
+        );
+        if let Err(error) = validate_local_recovery_view(
+            config.data_dir(),
+            identity,
+            config.node_id(),
+            config.execution_profile(),
+            checkpoint_root,
+        ) {
+            if config.execution_profile() == ExecutionProfile::Graph {
+                return Err(error);
+            }
+            let restored = store.restore_checkpoint_v2().await?;
+            if restored.tip() != loaded.manifest().tip() {
+                return Err(DurabilityError::SnapshotVerification(
+                    "successor checkpoint changed during repair".into(),
+                ));
+            }
+            install_restored_checkpoint(
+                identity,
+                &restored,
+                config.data_dir(),
+                Some(config.node_id()),
+                false,
+                true,
+                Some(&RecoveryArtifactIdentity::Successor(
+                    complete_marker
+                        .as_ref()
+                        .expect("Complete state has a validated identity")
+                        .clone(),
+                )),
+                None,
+            )?;
+        }
         return Ok(SuccessorRestorePreparation {
             tip: *loaded.manifest().tip(),
             data_dir: config.data_dir().clone(),
@@ -1404,6 +1674,7 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
         Some(config.node_id()),
         false,
         false,
+        Some(&intent_identity),
         None,
     )?;
     Ok(SuccessorRestorePreparation {
@@ -1415,7 +1686,41 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
     })
 }
 
-fn create_restore_staging_dir(data_dir: &Path) -> Result<PathBuf, DurabilityError> {
+fn write_repair_artifact_ownership(
+    artifact: &Path,
+    role: RepairArtifactRole,
+    identity: &RecoveryArtifactIdentity,
+) -> Result<(), DurabilityError> {
+    let name = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DurabilityError::SnapshotVerification(
+                "repair artifact path must have a UTF-8 final component".into(),
+            )
+        })?
+        .to_owned();
+    let contents = serde_json::to_vec(&RepairArtifactOwnership {
+        format_version: 1,
+        role,
+        name,
+        identity: identity.clone(),
+    })
+    .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+    let owner = artifact.join(REPAIR_ARTIFACT_OWNER_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(owner)?;
+    file.write_all(&contents)?;
+    file.sync_all()?;
+    sync_directory(artifact)
+}
+
+fn create_restore_staging_dir(
+    data_dir: &Path,
+    recovery_identity: Option<&RecoveryArtifactIdentity>,
+) -> Result<PathBuf, DurabilityError> {
     fs::create_dir_all(data_dir)?;
     for _ in 0..128 {
         let sequence = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1424,7 +1729,19 @@ fn create_restore_staging_dir(data_dir: &Path) -> Result<PathBuf, DurabilityErro
             process::id()
         ));
         match fs::create_dir(&staging) {
-            Ok(()) => return Ok(staging),
+            Ok(()) => {
+                if let Some(identity) = recovery_identity {
+                    if let Err(error) = write_repair_artifact_ownership(
+                        &staging,
+                        RepairArtifactRole::Staging,
+                        identity,
+                    ) {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Err(error);
+                    }
+                }
+                return Ok(staging);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
@@ -1449,7 +1766,10 @@ fn publish_restore_staging(
             fs::rename(&source, data_dir.join(name))?;
         }
     }
-    fs::remove_dir(staging)?;
+    // A recovery-owned staging directory carries its ownership record inside the staging root.
+    // Remove that sidecar together with the now-empty staging root; it must never be promoted
+    // into the live data directory.
+    fs::remove_dir_all(staging)?;
     sync_directory(data_dir)?;
     if let Some((marker_name, marker_contents)) = completion_marker {
         publish_restore_marker(data_dir, marker_name, marker_contents)?;
@@ -1463,6 +1783,7 @@ fn publish_restore_staging(
 fn quarantine_rebuildable_view(
     data_dir: &Path,
     profile: ExecutionProfile,
+    recovery_identity: Option<&RecoveryArtifactIdentity>,
 ) -> Result<Option<PathBuf>, DurabilityError> {
     let materializer = match profile {
         ExecutionProfile::Sqlite => "sqlite",
@@ -1474,10 +1795,20 @@ fn quarantine_rebuildable_view(
         }
     };
     let names = [materializer, "consensus"];
-    if !names
-        .iter()
-        .any(|name| fs::symlink_metadata(data_dir.join(name)).is_ok())
-    {
+    let mut has_rebuildable_view = false;
+    for name in names {
+        match fs::symlink_metadata(data_dir.join(name)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(DurabilityError::SnapshotVerification(
+                    "rebuildable recovery view is not a regular directory".into(),
+                ));
+            }
+            Ok(_) => has_rebuildable_view = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !has_rebuildable_view {
         return Ok(None);
     }
     for _ in 0..128 {
@@ -1488,10 +1819,22 @@ fn quarantine_rebuildable_view(
         ));
         match fs::create_dir(&quarantine) {
             Ok(()) => {
+                if let Some(identity) = recovery_identity {
+                    if let Err(error) = write_repair_artifact_ownership(
+                        &quarantine,
+                        RepairArtifactRole::Quarantine,
+                        identity,
+                    ) {
+                        let _ = fs::remove_dir_all(&quarantine);
+                        return Err(error);
+                    }
+                }
                 for name in names {
                     let source = data_dir.join(name);
-                    if fs::symlink_metadata(&source).is_ok() {
-                        fs::rename(source, quarantine.join(name))?;
+                    match fs::symlink_metadata(&source) {
+                        Ok(_) => fs::rename(source, quarantine.join(name))?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
                     }
                 }
                 sync_directory(&quarantine)?;
@@ -1550,10 +1893,211 @@ enum SuccessorRestoreRootState {
     Complete,
 }
 
+fn is_owned_generated_recovery_name(name: &str, prefix: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    let (Some(process_id), Some(sequence), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    process_id.parse::<u32>().is_ok_and(|id| id > 0) && sequence.parse::<u64>().is_ok()
+}
+
+fn is_safe_restore_marker_tmp(path: &Path, name: &str) -> Result<bool, DurabilityError> {
+    if !is_owned_generated_recovery_name(name, RESTORE_MARKER_TMP_PREFIX) {
+        return Ok(false);
+    }
+    Ok(read_bounded_regular_file(path, 16384)?.is_some())
+}
+
+fn is_owned_recovery_directory(
+    path: &Path,
+    allowed_children: &[&str],
+    expected_role: RepairArtifactRole,
+    expected_identity: &RecoveryArtifactIdentity,
+) -> Result<bool, DurabilityError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+    let owner = path.join(REPAIR_ARTIFACT_OWNER_FILE);
+    let Some(owner_bytes) = read_bounded_regular_file(&owner, 16384)? else {
+        return Ok(false);
+    };
+    let Ok(ownership) = serde_json::from_slice::<RepairArtifactOwnership>(&owner_bytes) else {
+        return Ok(false);
+    };
+    if ownership.format_version != 1
+        || ownership.role != expected_role
+        || ownership.identity != *expected_identity
+        || path.file_name().and_then(|name| name.to_str()) != Some(ownership.name.as_str())
+    {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == REPAIR_ARTIFACT_OWNER_FILE {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !allowed_children.contains(&name.as_ref())
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cleanup_owned_recovery_artifacts(
+    data_dir: &Path,
+    identity: &RecoveryArtifactIdentity,
+) -> Result<(), DurabilityError> {
+    let mut cleanup = Vec::new();
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let has_staging_prefix = name.starts_with(RESTORE_STAGING_PREFIX);
+        let has_quarantine_prefix = name.starts_with(".rebuildable-quarantine-");
+        if (has_staging_prefix && !is_owned_generated_recovery_name(&name, RESTORE_STAGING_PREFIX))
+            || (has_quarantine_prefix
+                && !is_owned_generated_recovery_name(&name, ".rebuildable-quarantine-"))
+        {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let artifact = if has_staging_prefix {
+            Some((
+                ["sqlite", "ladybug", "kv", "consensus"].as_slice(),
+                RepairArtifactRole::Staging,
+            ))
+        } else if has_quarantine_prefix {
+            Some((
+                ["sqlite", "ladybug", "kv", "consensus"].as_slice(),
+                RepairArtifactRole::Quarantine,
+            ))
+        } else {
+            None
+        };
+        let Some((allowed_children, role)) = artifact else {
+            continue;
+        };
+        if !is_owned_recovery_directory(&entry.path(), allowed_children, role, identity)? {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        cleanup.push(entry.path());
+    }
+    for path in cleanup.iter() {
+        fs::remove_dir_all(path)?;
+    }
+    if !cleanup.is_empty() {
+        sync_directory(data_dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+fn open_recovery_file_no_follow(path: &Path) -> Result<fs::File, DurabilityError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    options.custom_flags(O_NOFOLLOW_FLAG);
+    Ok(options.open(path)?)
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, DurabilityError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(DurabilityError::SnapshotVerification(
+            "recovery file is not a bounded regular file".into(),
+        ));
+    }
+    let mut file = open_recovery_file_no_follow(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() > max_bytes {
+        return Err(DurabilityError::SnapshotVerification(
+            "recovery file changed to an invalid form before read".into(),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || metadata.len() != opened.len()
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "recovery file changed before no-follow open".into(),
+        ));
+    }
+    let mut contents = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > max_bytes || contents.len() as u64 != opened.len() {
+        return Err(DurabilityError::SnapshotVerification(
+            "recovery file changed during bounded read".into(),
+        ));
+    }
+    Ok(Some(contents))
+}
+
+fn read_regular_successor_control_file(path: &Path) -> Result<Option<Vec<u8>>, DurabilityError> {
+    read_bounded_regular_file(path, 16384)
+}
+
+fn parse_successor_restore_receipt(bytes: &[u8]) -> Option<SuccessorRestoreReceipt> {
+    let receipt = serde_json::from_slice::<SuccessorRestoreReceipt>(bytes).ok()?;
+    (receipt.version == 1
+        && !receipt.cluster_id.is_empty()
+        && !receipt.node_id.is_empty()
+        && LogHash::from_hex(&receipt.membership_digest).is_some()
+        && LogHash::from_hex(&receipt.stop_hash).is_some()
+        && LogHash::from_hex(&receipt.checkpoint_hash).is_some())
+    .then_some(receipt)
+}
+
 fn prepare_successor_restore_root(
     data_dir: &Path,
     expected_identity: &[u8],
-) -> Result<(fs::File, SuccessorRestoreRootState), DurabilityError> {
+) -> Result<
+    (
+        fs::File,
+        SuccessorRestoreRootState,
+        Option<SuccessorRestoreReceipt>,
+    ),
+    DurabilityError,
+> {
     fs::create_dir_all(data_dir)?;
     let lock = fs::OpenOptions::new()
         .read(true)
@@ -1565,49 +2109,70 @@ fn prepare_successor_restore_root(
 
     let intent = data_dir.join(SUCCESSOR_RESTORE_INTENT_FILE);
     let complete = data_dir.join(SUCCESSOR_RESTORE_COMPLETE_FILE);
-    let state = match (fs::read(&intent), fs::read(&complete)) {
-        (Ok(actual), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            if actual != expected_identity {
+    let intent_contents = read_regular_successor_control_file(&intent)
+        .map_err(|_| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
+    let complete_contents = read_regular_successor_control_file(&complete)
+        .map_err(|_| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
+    let (state, complete_marker) = match (intent_contents, complete_contents) {
+        (Some(actual), None) => {
+            if actual != expected_identity || parse_successor_restore_receipt(&actual).is_none() {
                 return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
             }
-            SuccessorRestoreRootState::Intent
+            (SuccessorRestoreRootState::Intent, None)
         }
-        (Err(error), Ok(actual)) if error.kind() == std::io::ErrorKind::NotFound => {
+        (None, Some(actual)) => {
             if !completed_successor_identity_matches(&actual, expected_identity) {
                 return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
             }
-            SuccessorRestoreRootState::Complete
+            let receipt = parse_successor_restore_receipt(&actual)
+                .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?;
+            (SuccessorRestoreRootState::Complete, Some(receipt))
         }
-        (Err(intent_error), Err(complete_error))
-            if intent_error.kind() == std::io::ErrorKind::NotFound
-                && complete_error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            SuccessorRestoreRootState::Fresh
-        }
+        (None, None) => (SuccessorRestoreRootState::Fresh, None),
         _ => return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf())),
     };
+
+    if state == SuccessorRestoreRootState::Complete {
+        let recovery_identity = RecoveryArtifactIdentity::Successor(
+            complete_marker
+                .as_ref()
+                .expect("Complete state has a validated identity")
+                .clone(),
+        );
+        cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    } else if state == SuccessorRestoreRootState::Intent {
+        let recovery_identity = RecoveryArtifactIdentity::Successor(
+            parse_successor_restore_receipt(expected_identity)
+                .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?,
+        );
+        cleanup_owned_recovery_artifacts(data_dir, &recovery_identity)?;
+    }
 
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let common =
-            name == SUCCESSOR_RESTORE_LOCK_FILE || name.starts_with(RESTORE_MARKER_TMP_PREFIX);
+        let marker_tmp = is_safe_restore_marker_tmp(&entry.path(), &name)?;
+        if name.starts_with(RESTORE_MARKER_TMP_PREFIX) && !marker_tmp {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let common = name == SUCCESSOR_RESTORE_LOCK_FILE || marker_tmp;
         let allowed = match state {
             SuccessorRestoreRootState::Fresh => common,
             SuccessorRestoreRootState::Intent => {
                 common
                     || name == SUCCESSOR_RESTORE_INTENT_FILE
+                    || name == LOCAL_CHECKPOINT_IDENTITY_FILE
                     || name == "sqlite"
                     || name == "ladybug"
                     || name == "kv"
                     || name == "consensus"
                     || name == "recorder"
-                    || name.starts_with(RESTORE_STAGING_PREFIX)
             }
             SuccessorRestoreRootState::Complete => {
                 common
                     || name == SUCCESSOR_RESTORE_COMPLETE_FILE
+                    || name == LOCAL_CHECKPOINT_IDENTITY_FILE
                     || name == ".node.lock"
                     || name == "sqlite"
                     || name == "ladybug"
@@ -1623,11 +2188,9 @@ fn prepare_successor_restore_root(
 
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(RESTORE_MARKER_TMP_PREFIX)
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_safe_restore_marker_tmp(&entry.path(), &name)? {
             fs::remove_file(entry.path())?;
         }
     }
@@ -1650,7 +2213,7 @@ fn prepare_successor_restore_root(
         }
         sync_directory(data_dir)?;
     }
-    Ok((lock, state))
+    Ok((lock, state, complete_marker))
 }
 
 fn completed_successor_identity_matches(actual: &[u8], expected: &[u8]) -> bool {
@@ -1736,19 +2299,62 @@ fn validate_local_batch(
 fn prepare_fresh_restore_data_dir(
     data_dir: &Path,
     completion_marker_name: Option<&str>,
+    expected_intent: &[u8],
+    resume_legacy_v1_intent: bool,
 ) -> Result<(), DurabilityError> {
     if !path_has_state(data_dir)? {
         return Ok(());
     }
 
+    let legacy_intent = data_dir.join(LEGACY_RESTORE_INTENT_FILE);
     let intent = data_dir.join(RESTORE_INTENT_FILE);
-    if !intent.exists() {
+    let legacy_metadata = match fs::symlink_metadata(&legacy_intent) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let intent_metadata = match fs::symlink_metadata(&intent) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if legacy_metadata.is_some() && intent_metadata.is_some() {
+        return Err(DurabilityError::SnapshotVerification(
+            "both legacy and identity-bound checkpoint restore intents exist".into(),
+        ));
+    }
+    let (active_intent, recovery_identity) = if let Some(metadata) = legacy_metadata {
+        if !resume_legacy_v1_intent
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || read_bounded_regular_file(&legacy_intent, 4096)?.as_deref()
+                != Some(b"rhiza restore in progress\n")
+        {
+            return Err(DurabilityError::SnapshotVerification(
+                "legacy local checkpoint restore intent requires an exact node-bound v2 identity marker".into(),
+            ));
+        }
+        (&legacy_intent, None)
+    } else if let Some(metadata) = intent_metadata {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || read_bounded_regular_file(&intent, 4096)?.as_deref() != Some(expected_intent)
+        {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        (
+            &intent,
+            Some(RecoveryArtifactIdentity::Restore(
+                parse_restore_intent_identity(expected_intent)
+                    .ok_or_else(|| DurabilityError::DataDirNotFresh(data_dir.to_path_buf()))?,
+            )),
+        )
+    } else {
         let entries = fs::read_dir(data_dir)?.collect::<Result<Vec<_>, _>>()?;
         if entries.iter().all(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(RESTORE_MARKER_TMP_PREFIX)
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            is_safe_restore_marker_tmp(&entry.path(), &name).unwrap_or(false)
         }) {
             for entry in entries {
                 fs::remove_file(entry.path())?;
@@ -1756,23 +2362,40 @@ fn prepare_fresh_restore_data_dir(
             sync_directory(data_dir)?;
             return Ok(());
         }
-    }
-    if !matches!(fs::read(&intent), Ok(contents) if contents == RESTORE_INTENT_CONTENTS) {
         return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
-    }
+    };
 
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let owned = name == RESTORE_INTENT_FILE
+        let marker_tmp = is_safe_restore_marker_tmp(&entry.path(), &name)?;
+        if name.starts_with(RESTORE_MARKER_TMP_PREFIX) && !marker_tmp {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let is_staging = name.starts_with(RESTORE_STAGING_PREFIX);
+        if is_staging
+            && (!is_owned_generated_recovery_name(&name, RESTORE_STAGING_PREFIX)
+                || !recovery_identity.as_ref().is_some_and(|identity| {
+                    is_owned_recovery_directory(
+                        &entry.path(),
+                        &["sqlite", "ladybug", "kv", "consensus"],
+                        RepairArtifactRole::Staging,
+                        identity,
+                    )
+                    .unwrap_or(false)
+                }))
+        {
+            return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
+        }
+        let owned = entry.path() == active_intent.as_path()
             || completion_marker_name.is_some_and(|marker| name == marker)
             || name == "sqlite"
             || name == "ladybug"
             || name == "kv"
             || name == "consensus"
-            || name.starts_with(RESTORE_MARKER_TMP_PREFIX)
-            || name.starts_with(RESTORE_STAGING_PREFIX);
+            || marker_tmp
+            || is_staging;
         if !owned {
             return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
         }
@@ -1790,11 +2413,11 @@ fn prepare_fresh_restore_data_dir(
         let name = name.to_string_lossy();
         if name.starts_with(RESTORE_STAGING_PREFIX) {
             fs::remove_dir_all(entry.path())?;
-        } else if name.starts_with(RESTORE_MARKER_TMP_PREFIX) {
+        } else if is_safe_restore_marker_tmp(&entry.path(), &name)? {
             fs::remove_file(entry.path())?;
         }
     }
-    fs::remove_file(intent)?;
+    fs::remove_file(active_intent)?;
     sync_directory(data_dir)?;
     Ok(())
 }
@@ -1818,9 +2441,13 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::{
         completed_successor_identity_matches, mark_durable_state, observe_durable_tip,
-        snapshot_profile, validate_local_qlog, validate_materializer_tip, validate_restored_suffix,
+        parse_successor_restore_receipt, prepare_successor_restore_root, snapshot_profile,
+        validate_local_qlog, validate_restored_suffix, write_repair_artifact_ownership,
         CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth, ExecutionProfile,
-        LogHash, PendingLag, RESTORE_INTENT_CONTENTS, RESTORE_INTENT_FILE,
+        LogAnchor, LogHash, PendingLag, RecoveryArtifactIdentity, RepairArtifactRole,
+        SuccessorRestorePreparation, SuccessorRestoreRootState, RESTORE_INTENT_FILE,
+        SUCCESSOR_RESTORE_COMPLETE_FILE, SUCCESSOR_RESTORE_INTENT_FILE,
+        SUCCESSOR_RESTORE_LOCK_FILE,
     };
     #[cfg(feature = "kv")]
     use crate::{KvCommandV1, NodeConfig, NodeRuntime};
@@ -1857,6 +2484,302 @@ mod tests {
     }
 
     #[test]
+    fn completed_successor_prepare_discards_owned_interrupted_repair_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+
+        let staging = root.path().join(".restore-stage-4242-0");
+        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
+        let quarantine = root.path().join(".rebuildable-quarantine-4242-1");
+        std::fs::create_dir_all(quarantine.join("sqlite")).unwrap();
+        std::fs::create_dir_all(quarantine.join("consensus")).unwrap();
+        let complete_marker = parse_successor_restore_receipt(receipt).unwrap();
+        let complete_identity = RecoveryArtifactIdentity::Successor(complete_marker);
+        write_repair_artifact_ownership(&staging, RepairArtifactRole::Staging, &complete_identity)
+            .unwrap();
+        write_repair_artifact_ownership(
+            &quarantine,
+            RepairArtifactRole::Quarantine,
+            &complete_identity,
+        )
+        .unwrap();
+
+        let (lock, state, _) = prepare_successor_restore_root(root.path(), receipt).unwrap();
+        assert!(state == SuccessorRestoreRootState::Complete);
+        drop(lock);
+        assert!(!staging.exists());
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn completed_successor_prepare_keeps_unowned_repair_artifact_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"membership","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+        let unowned = root.path().join(".rebuildable-quarantine-not-owned");
+        std::fs::create_dir_all(&unowned).unwrap();
+        std::fs::write(unowned.join("keep"), b"do not remove").unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert_eq!(
+            std::fs::read(unowned.join("keep")).unwrap(),
+            b"do not remove"
+        );
+    }
+
+    #[test]
+    fn completed_successor_prepare_keeps_exact_shaped_lookalike_without_ownership_record() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"membership","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+        let lookalike = root.path().join(".rebuildable-quarantine-4242-1");
+        std::fs::create_dir_all(lookalike.join("sqlite")).unwrap();
+        std::fs::create_dir_all(lookalike.join("consensus")).unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(lookalike.join("sqlite").is_dir());
+        assert!(lookalike.join("consensus").is_dir());
+    }
+
+    #[test]
+    fn intent_successor_prepare_keeps_ownerless_staging_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_INTENT_FILE), receipt).unwrap();
+        let staging = root.path().join(".restore-stage-4242-1");
+        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(staging.join("sqlite").is_dir());
+    }
+
+    #[test]
+    fn intent_successor_prepare_discards_exactly_owned_staging_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_INTENT_FILE), receipt).unwrap();
+        let staging = root.path().join(".restore-stage-4242-1");
+        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(
+            &staging,
+            RepairArtifactRole::Staging,
+            &RecoveryArtifactIdentity::Successor(parse_successor_restore_receipt(receipt).unwrap()),
+        )
+        .unwrap();
+
+        let (lock, state, _) = prepare_successor_restore_root(root.path(), receipt).unwrap();
+        assert!(state == SuccessorRestoreRootState::Intent);
+        drop(lock);
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn generic_restore_prepare_keeps_prefix_spoofed_staging_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let intent = super::encode_restore_intent(
+            &identity,
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(0, LogHash::ZERO),
+        )
+        .unwrap();
+        std::fs::write(root.path().join(RESTORE_INTENT_FILE), &intent).unwrap();
+        let staging = root.path().join(".restore-stage-4242-1");
+        std::fs::create_dir_all(staging.join("sqlite")).unwrap();
+
+        assert!(matches!(
+            super::prepare_fresh_restore_data_dir(root.path(), None, &intent, false),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(staging.join("sqlite").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successor_intent_symlink_fails_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let target = root.path().join("target");
+        std::fs::write(&target, receipt).unwrap();
+        let intent = root.path().join(SUCCESSOR_RESTORE_INTENT_FILE);
+        symlink(&target, &intent).unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), receipt);
+        assert!(std::fs::symlink_metadata(&intent)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn successor_prepare_keeps_spoofed_restore_marker_tmp_directory_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+        let spoof = root.path().join(".restore-marker-tmp-not-generated");
+        std::fs::create_dir(&spoof).unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(spoof.is_dir());
+    }
+
+    #[test]
+    fn bounded_regular_reader_rejects_file_larger_than_its_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized");
+        std::fs::write(&path, b"12345").unwrap();
+
+        assert!(super::read_bounded_regular_file(&path, 4).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn rejoin_artifact_cleanup_removes_only_owned_stale_stage_and_quarantine() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = LogAnchor::new(0, LogHash::ZERO);
+        let identity = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            checkpoint,
+        ));
+        let stage = root.path().join(".restore-stage-4242-1");
+        std::fs::create_dir_all(stage.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(&stage, RepairArtifactRole::Staging, &identity).unwrap();
+        let quarantine = root.path().join(".rebuildable-quarantine-4242-2");
+        std::fs::create_dir_all(quarantine.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(&quarantine, RepairArtifactRole::Quarantine, &identity)
+            .unwrap();
+
+        super::cleanup_owned_recovery_artifacts(root.path(), &identity).unwrap();
+        assert!(!stage.exists());
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn rejoin_artifact_cleanup_keeps_foreign_prefix_artifact_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let spoof = root.path().join(".restore-stage-foreign");
+        std::fs::create_dir(&spoof).unwrap();
+        let identity = RecoveryArtifactIdentity::Restore(super::restore_intent_identity(
+            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(0, LogHash::ZERO),
+        ));
+
+        assert!(matches!(
+            super::cleanup_owned_recovery_artifacts(root.path(), &identity),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(spoof.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successor_completion_keeps_existing_complete_symlink_and_intent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let intent = root.path().join(SUCCESSOR_RESTORE_INTENT_FILE);
+        std::fs::write(&intent, receipt).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"do not replace").unwrap();
+        let complete = root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE);
+        symlink(&target, &complete).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(root.path().join(SUCCESSOR_RESTORE_LOCK_FILE))
+            .unwrap();
+        let preparation = SuccessorRestorePreparation {
+            tip: CheckpointTip::new(0, LogHash::ZERO),
+            data_dir: root.path().to_path_buf(),
+            identity: receipt.to_vec(),
+            requires_recorder_install: true,
+            _lock: lock,
+        };
+
+        assert!(preparation.complete().is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not replace");
+        assert_eq!(std::fs::read(&intent).unwrap(), receipt);
+        assert!(std::fs::symlink_metadata(&complete)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn completed_successor_prepare_keeps_artifact_bound_to_a_different_complete_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let foreign_receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"other-node","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+        let artifact = root.path().join(".rebuildable-quarantine-4242-1");
+        std::fs::create_dir_all(artifact.join("sqlite")).unwrap();
+        write_repair_artifact_ownership(
+            &artifact,
+            RepairArtifactRole::Quarantine,
+            &RecoveryArtifactIdentity::Successor(
+                parse_successor_restore_receipt(foreign_receipt).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(artifact.join("sqlite").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_successor_prepare_keeps_symlinked_repair_lookalike_and_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = br#"{"version":1,"cluster_id":"rhiza:sql:cluster-a","epoch":1,"target_config_id":2,"recovery_generation":1,"node_id":"node-1","membership_digest":"0000000000000000000000000000000000000000000000000000000000000000","predecessor_config_id":1,"stop_index":0,"stop_hash":"0000000000000000000000000000000000000000000000000000000000000000","checkpoint_index":0,"checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        std::fs::write(root.path().join(SUCCESSOR_RESTORE_COMPLETE_FILE), receipt).unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let lookalike = root.path().join(".rebuildable-quarantine-4242-1");
+        symlink(&target, &lookalike).unwrap();
+
+        assert!(matches!(
+            prepare_successor_restore_root(root.path(), receipt),
+            Err(DurabilityError::DataDirNotFresh(_))
+        ));
+        assert!(target.is_dir());
+        assert!(std::fs::symlink_metadata(&lookalike)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
     fn sqlite_restore_suffix_rejects_legacy_commands_during_preflight() {
         let payload = b"put\tlegacy\tkey\tvalue".to_vec();
         let entry = LogEntry {
@@ -1885,20 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn materializer_tip_requires_exact_checkpoint_root() {
-        let checkpoint = rhiza_core::LogAnchor::new(4, LogHash::digest(&[b"checkpoint"]));
-        let ahead = rhiza_core::LogAnchor::new(5, LogHash::digest(&[b"ahead"]));
-        let behind = rhiza_core::LogAnchor::new(3, LogHash::digest(&[b"behind"]));
-        let conflicting = rhiza_core::LogAnchor::new(4, LogHash::digest(&[b"conflicting"]));
-
-        assert!(validate_materializer_tip("test", ahead, checkpoint).is_err());
-        assert!(validate_materializer_tip("test", behind, checkpoint).is_err());
-        assert!(validate_materializer_tip("test", conflicting, checkpoint).is_err());
-        assert!(validate_materializer_tip("test", checkpoint, checkpoint).is_ok());
-    }
-
-    #[test]
-    fn local_qlog_rejects_ahead_tip_even_when_checkpoint_entry_is_retained() {
+    fn local_qlog_accepts_ahead_tip_when_checkpoint_entry_is_retained() {
         let root = tempfile::tempdir().unwrap();
         let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
         let log = FileLogStore::open(
@@ -1931,14 +2841,17 @@ mod tests {
         };
         let first = entry(1, LogHash::ZERO);
         let second = entry(2, first.hash);
-        log.append_batch(&[first.clone(), second]).unwrap();
+        log.append_batch(&[first.clone(), second.clone()]).unwrap();
 
-        assert!(validate_local_qlog(
-            root.path(),
-            &identity,
-            rhiza_core::LogAnchor::new(first.index, first.hash),
-        )
-        .is_err());
+        assert_eq!(
+            validate_local_qlog(
+                root.path(),
+                &identity,
+                rhiza_core::LogAnchor::new(first.index, first.hash),
+            )
+            .unwrap(),
+            rhiza_core::LogAnchor::new(2, second.hash)
+        );
         assert!(validate_local_qlog(
             root.path(),
             &identity,
@@ -1954,38 +2867,63 @@ mod tests {
     }
 
     #[test]
+    fn local_qlog_treats_absent_log_as_genesis_only() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let genesis = rhiza_core::LogAnchor::new(0, LogHash::ZERO);
+
+        assert_eq!(
+            validate_local_qlog(root.path(), &identity, genesis).unwrap(),
+            genesis
+        );
+        assert!(validate_local_qlog(
+            root.path(),
+            &identity,
+            rhiza_core::LogAnchor::new(1, LogHash::digest(&[b"checkpoint"])),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn restore_intent_remains_until_completion_marker_is_durable_and_retryable() {
         let root = tempfile::tempdir().unwrap();
         let data_dir = root.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        std::fs::write(data_dir.join(RESTORE_INTENT_FILE), RESTORE_INTENT_CONTENTS).unwrap();
+        let intent = super::encode_restore_intent(
+            &CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            rhiza_core::LogAnchor::new(0, LogHash::ZERO),
+        )
+        .unwrap();
+        std::fs::write(data_dir.join(RESTORE_INTENT_FILE), &intent).unwrap();
         std::fs::create_dir(data_dir.join("identity.json")).unwrap();
-        let staging = super::create_restore_staging_dir(&data_dir).unwrap();
+        let staging = super::create_restore_staging_dir(&data_dir, None).unwrap();
 
         assert!(super::publish_restore_staging(
             &staging,
             &data_dir,
             true,
-            Some(("identity.json", b"identity-v1")),
+            Some(("identity.json", b"identity-fixture")),
         )
         .is_err());
         assert_eq!(
             std::fs::read(data_dir.join(RESTORE_INTENT_FILE)).unwrap(),
-            RESTORE_INTENT_CONTENTS
+            intent
         );
 
         std::fs::remove_dir(data_dir.join("identity.json")).unwrap();
-        let retry_staging = super::create_restore_staging_dir(&data_dir).unwrap();
+        let retry_staging = super::create_restore_staging_dir(&data_dir, None).unwrap();
         super::publish_restore_staging(
             &retry_staging,
             &data_dir,
             true,
-            Some(("identity.json", b"identity-v1")),
+            Some(("identity.json", b"identity-fixture")),
         )
         .unwrap();
         assert_eq!(
             std::fs::read(data_dir.join("identity.json")).unwrap(),
-            b"identity-v1"
+            b"identity-fixture"
         );
         assert!(!data_dir.join(RESTORE_INTENT_FILE).exists());
     }
@@ -2077,7 +3015,8 @@ mod tests {
             "node-1",
             ExecutionProfile::Kv,
             "identity.json",
-            b"identity-v1",
+            b"identity-fixture",
+            false,
         )
         .await
         .unwrap();
@@ -2097,7 +3036,8 @@ mod tests {
             "node-1",
             ExecutionProfile::Kv,
             "identity.json",
-            b"identity-v1",
+            b"identity-fixture",
+            false,
         )
         .await
         .unwrap();

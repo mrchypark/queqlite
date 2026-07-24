@@ -95,7 +95,7 @@ image="${RHIZA_IMAGE:-rhiza-${profile}:dev}"
 cluster_id="${RHIZA_CLUSTER_ID:-rhiza-vind}"
 epoch="${RHIZA_EPOCH:-1}"
 generation="${RHIZA_RECOVERY_GENERATION:-1}"
-startup="${RHIZA_STARTUP_MODE:-rejoin}"
+startup="${RHIZA_STARTUP_MODE-rejoin}"
 durability="${RHIZA_DURABILITY_MODE-sync}"
 durability_max_lag="${RHIZA_DURABILITY_MAX_LAG-}"
 durability_interval="${RHIZA_DURABILITY_INTERVAL-}"
@@ -138,6 +138,10 @@ validate_positive_u64() {
 }
 validate_positive_u64 RHIZA_EPOCH "$epoch"
 validate_positive_u64 RHIZA_RECOVERY_GENERATION "$generation"
+case "$startup" in
+  rejoin) ;;
+  *) die "RHIZA_STARTUP_MODE must be rejoin when set" ;;
+esac
 case "$s3_http" in
   true|false|1|0) ;;
   *) die "RHIZA_S3_ALLOW_HTTP must be true|false|1|0" ;;

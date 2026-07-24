@@ -48,7 +48,8 @@ jq -e '.version == 1 and (.predecessor | not)' "$successor_draft" >/dev/null
 umask 077
 old_preflight_yaml="$(mktemp)"
 successor_preflight_yaml="$(mktemp)"
-trap 'rm -f "$old_preflight_yaml" "$successor_preflight_yaml"' EXIT
+transition_secret_compare="$(mktemp)"
+trap 'rm -f "$old_preflight_yaml" "$successor_preflight_yaml" "$transition_secret_compare"' EXIT
 scripts/render-k8s-config.sh \
   "$old_id" "$old_replicas" "$old_bundle" "$old_preflight_yaml"
 scripts/render-k8s-config.sh \
@@ -87,6 +88,21 @@ validate_runtime_bundle() {
     echo "runtime rejected the $label configuration bundle" >&2
     exit 65
   }
+}
+
+transition_secret_matches_artifacts() {
+  local secret_json="$1" bundle="$2" stop="$3"
+  jq -e --slurpfile bundle "$bundle" --slurpfile stop "$stop" '
+    (.data["config.json"] |
+      if type == "string" then (try (@base64d | fromjson) catch null)
+      else null end) as $actual_bundle |
+    (.data["stop.json"] |
+      if type == "string" then (try (@base64d | fromjson) catch null)
+      else null end) as $actual_stop |
+    ($bundle | length == 1) and ($stop | length == 1) and
+    $actual_bundle != null and $actual_stop != null and
+    $actual_bundle == $bundle[0] and $actual_stop == $stop[0]
+  ' "$secret_json" >/dev/null
 }
 
 durable_resume=false
@@ -321,13 +337,10 @@ jq -e --argjson id "$old_id" \
   "$source_inspect_json" >/dev/null
 fi
 
-expected_bundle_b64="$(openssl base64 -A -in "$successor_bundle")"
-expected_stop_b64="$(openssl base64 -A -in "$stop_json")"
-if "${k[@]}" get secret "${new_name}-bundle" >/dev/null 2>&1; then
-  actual_bundle_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.config\.json}')"
-  actual_stop_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.stop\.json}')"
-  if [ "$actual_bundle_b64" != "$expected_bundle_b64" ] ||
-    [ "$actual_stop_b64" != "$expected_stop_b64" ]; then
+if "${k[@]}" get secret "${new_name}-bundle" -o json \
+  > "$transition_secret_compare" 2>/dev/null; then
+  if ! transition_secret_matches_artifacts \
+    "$transition_secret_compare" "$successor_bundle" "$stop_json"; then
     echo "existing successor transition Secret differs from the resume artifacts" >&2
     exit 65
   fi

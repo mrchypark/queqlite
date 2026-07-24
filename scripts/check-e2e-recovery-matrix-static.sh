@@ -55,6 +55,19 @@ require_literal 'tip_hashes_equal'
 require_literal 'recovery_deadline_exceeded'
 require_literal 'matrix_expect_write_no_quorum'
 require_literal '(.code == "write_timeout" or .code == "unavailable")'
+require_literal 'write_retry_deadline_seconds=60'
+# The post-restore probe may encounter a short-lived quorum convergence window.
+# It must retry only known retryable HTTP errors, with the original request ID.
+require_literal 'retryable_write_failure'
+require_literal 'HTTP 503 Service Unavailable code=(write_timeout|unavailable)'
+# shellcheck disable=SC2016
+require_literal 'for ((attempt=1; attempt<=60; attempt++)); do'
+# shellcheck disable=SC2016
+require_literal 'client "$pod" write --request-id "$request_id" --key "$key" --value "$value" 2> "$attempt_log"'
+# shellcheck disable=SC2016
+require_literal 'retryable_write_failure "$attempt_log"'
+# shellcheck disable=SC2016
+require_literal 'cat "$attempt_log" >&2'
 require_literal 'matrix_expect_read_barrier_unavailable'
 require_literal 'matrix_expect_f2_read_barrier_timeout'
 require_literal 'failure_read_barrier_actual_detail'

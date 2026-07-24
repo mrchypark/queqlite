@@ -70,6 +70,7 @@ for replicas in 3 7; do
   yq eval '.' "$tmp/config-${profile}-${id}.yaml" >/dev/null
   [ "$(yq eval 'select(.kind == "StatefulSet") | .metadata.name' "$tmp/config-${profile}-${id}.yaml")" = "rhiza-${profile}-c${id}" ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.replicas' "$tmp/config-${profile}-${id}.yaml")" = "$replicas" ]
+  [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.podManagementPolicy' "$tmp/config-${profile}-${id}.yaml")" = Parallel ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.updateStrategy.type' "$tmp/config-${profile}-${id}.yaml")" = OnDelete ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec.volumes[] | select(.name == "data") | has("emptyDir")' "$tmp/config-${profile}-${id}.yaml")" = true ]
   [ "$(yq eval 'select(.kind == "StatefulSet") | .spec.template.spec | has("initContainers")' "$tmp/config-${profile}-${id}.yaml")" = false ]
@@ -92,10 +93,36 @@ for replicas in 3 7; do
     .spec.template.spec.containers[0].env[] |
     select(.name == "RHIZA_STARTUP_MODE") | .value' \
     "$tmp/config-${profile}-${id}.yaml")" = rejoin ]
+  [ "$(yq eval-all '[select(.kind == "PodDisruptionBudget")] | length' \
+    "$tmp/config-${profile}-${id}.yaml")" = 1 ]
+  [ "$(yq eval 'select(.kind == "PodDisruptionBudget") | .spec.maxUnavailable' \
+    "$tmp/config-${profile}-${id}.yaml")" = 1 ]
+  [ "$(yq eval -o=json -I=0 \
+      'select(.kind == "StatefulSet") | .spec.selector.matchLabels' \
+      "$tmp/config-${profile}-${id}.yaml")" = \
+    "$(yq eval -o=json -I=0 \
+      'select(.kind == "PodDisruptionBudget") | .spec.selector.matchLabels' \
+      "$tmp/config-${profile}-${id}.yaml")" ]
   if yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[].name' "$tmp/config-${profile}-${id}.yaml" |
     grep -Eq '^RHIZA_S3_(ENDPOINT|ACCESS_KEY|SECRET_KEY)$'; then
     echo "provider-chain render retained optional S3 endpoint or credentials" >&2
+    exit 1
+  fi
+done
+
+RHIZA_EXECUTION_PROFILE=sql RHIZA_STARTUP_MODE=rejoin \
+  scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+    "$tmp/explicit-rejoin.yaml"
+[ "$(yq eval -r 'select(.kind == "StatefulSet") |
+  .spec.template.spec.containers[0].env[] |
+  select(.name == "RHIZA_STARTUP_MODE") | .value' \
+  "$tmp/explicit-rejoin.yaml")" = rejoin ]
+for invalid_startup_mode in '' bootstrap disaster recover; do
+  if RHIZA_EXECUTION_PROFILE=sql RHIZA_STARTUP_MODE="$invalid_startup_mode" \
+    scripts/render-k8s-config.sh 3 3 "$tmp/config-sql-3.json" \
+      "$tmp/invalid-startup.yaml"; then
+    echo "render accepted unsupported RHIZA_STARTUP_MODE: ${invalid_startup_mode:-<empty>}" >&2
     exit 1
   fi
 done
@@ -843,6 +870,83 @@ jq -e '.stop.entry.config_id == 3 and .successor.config_id == 4' \
   "$post_scale_stop" >/dev/null
 jq -e '.config_id == 4 and .predecessor.stop_entry.config_id == 3' \
   "$post_scale_bundle" >/dev/null
+
+transition_secret_matches_artifacts_fixture() {
+  local secret_json="$1" bundle="$2" stop="$3"
+  jq -e --slurpfile bundle "$bundle" --slurpfile stop "$stop" '
+    (.data["config.json"] |
+      if type == "string" then (try (@base64d | fromjson) catch null)
+      else null end) as $actual_bundle |
+    (.data["stop.json"] |
+      if type == "string" then (try (@base64d | fromjson) catch null)
+      else null end) as $actual_stop |
+    ($bundle | length == 1) and ($stop | length == 1) and
+    $actual_bundle != null and $actual_stop != null and
+    $actual_bundle == $bundle[0] and $actual_stop == $stop[0]
+  ' "$secret_json" >/dev/null
+}
+semantic_transition_secret="$tmp/semantic-transition-secret.json"
+jq -cS . "$post_scale_bundle" > "$tmp/semantic-config.json"
+jq -cS . "$post_scale_stop" > "$tmp/semantic-stop.json"
+jq -n \
+  --arg bundle "$(openssl base64 -A -in "$tmp/semantic-config.json")" \
+  --arg stop "$(openssl base64 -A -in "$tmp/semantic-stop.json")" \
+  '{data:{"config.json":$bundle,"stop.json":$stop}}' \
+  > "$semantic_transition_secret"
+transition_secret_matches_artifacts_fixture \
+  "$semantic_transition_secret" "$post_scale_bundle" "$post_scale_stop"
+
+live_shape_bundle=scripts/test-fixtures/config-4-predecessor.json
+live_shape_stop="$tmp/live-shape-stop.json"
+jq -n --slurpfile bundle "$live_shape_bundle" '{
+  operation_id:"stop-live-shape",
+  stop:{
+    version:2,
+    entry:$bundle[0].predecessor.stop_entry,
+    proof:$bundle[0].predecessor.stop_proof
+  },
+  successor:{
+    config_id:$bundle[0].config_id,
+    members:$bundle[0].members | map(.node_id),
+    digest:$bundle[0].predecessor.stop_entry.hash
+  }
+}' > "$live_shape_stop"
+jq -n \
+  --arg bundle "$(jq -cS . "$live_shape_bundle" | openssl base64 -A)" \
+  --arg stop "$(jq -cS . "$live_shape_stop" | openssl base64 -A)" \
+  '{data:{"config.json":$bundle,"stop.json":$stop}}' \
+  > "$tmp/live-shape-transition-secret.json"
+transition_secret_matches_artifacts_fixture \
+  "$tmp/live-shape-transition-secret.json" "$live_shape_bundle" "$live_shape_stop"
+
+jq '.config_id += 1' "$post_scale_bundle" > "$tmp/changed-semantic-config.json"
+jq --arg changed "$(openssl base64 -A -in "$tmp/changed-semantic-config.json")" \
+  '.data["config.json"] = $changed' "$semantic_transition_secret" \
+  > "$tmp/changed-semantic-transition-secret.json"
+if transition_secret_matches_artifacts_fixture \
+  "$tmp/changed-semantic-transition-secret.json" \
+  "$post_scale_bundle" "$post_scale_stop"; then
+  echo "transition Secret comparison accepted changed semantic JSON" >&2
+  exit 1
+fi
+jq '.data["config.json"] = "not-base64"' "$semantic_transition_secret" \
+  > "$tmp/invalid-base64-transition-secret.json"
+if transition_secret_matches_artifacts_fixture \
+  "$tmp/invalid-base64-transition-secret.json" \
+  "$post_scale_bundle" "$post_scale_stop"; then
+  echo "transition Secret comparison accepted invalid base64" >&2
+  exit 1
+fi
+jq --arg invalid "$(printf 'not-json' | openssl base64 -A)" \
+  '.data["config.json"] = $invalid' "$semantic_transition_secret" \
+  > "$tmp/invalid-json-transition-secret.json"
+if transition_secret_matches_artifacts_fixture \
+  "$tmp/invalid-json-transition-secret.json" \
+  "$post_scale_bundle" "$post_scale_stop"; then
+  echo "transition Secret comparison accepted invalid JSON" >&2
+  exit 1
+fi
+
 jq -e 'del(.data["stop.json"])' "$durable_transition_secret" \
   > "$tmp/incomplete-transition-secret.json"
 set +e
@@ -945,6 +1049,12 @@ grep -Fq 'incomplete successor bundle artifact will be rebuilt' \
   scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh write-bundle' scripts/replace-k8s-config.sh
 grep -Fq 'k8s-stop-state.sh hydrate' scripts/replace-k8s-config.sh
+grep -Fq 'transition_secret_matches_artifacts' scripts/replace-k8s-config.sh
+if grep -Eq 'actual_(bundle|stop)_b64|expected_(bundle|stop)_b64' \
+  scripts/replace-k8s-config.sh; then
+  echo "transition Secret resume still compares raw base64 bytes" >&2
+  exit 1
+fi
 # shellcheck disable=SC2016
 grep -Fq 'rhiza.dev/execution-profile=${profile},rhiza.dev/config-id=${old_id}' \
   scripts/replace-k8s-config.sh
@@ -970,6 +1080,11 @@ grep -Fq 'RHIZA_STARTUP_MODE=rejoin scripts/render-k8s-config.sh' \
 # shellcheck disable=SC2016
 grep -Fq 'profile="${RHIZA_EXECUTION_PROFILE-}"' scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016
+grep -Fq 'canonical_cluster_id="rhiza:${profile}:${logical_cluster_id}"' \
+  scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'export RHIZA_CLUSTER_ID="$logical_cluster_id"' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
 grep -Fq 'name="rhiza-${profile}-c${id}"' scripts/e2e-vind-rustfs.sh
 if grep -Eq 'rhiza-c[0-9]' scripts/e2e-vind-rustfs.sh; then
   echo "vind E2E retained an unscoped rhiza-cN resource name" >&2
@@ -978,6 +1093,48 @@ fi
 grep -Fq "kill -TERM 1" scripts/e2e-vind-rustfs.sh
 grep -Fq "containerStatuses[0].restartCount" scripts/e2e-vind-rustfs.sh
 grep -Fq "current_uid\" = \"\$restart_uid" scripts/e2e-vind-rustfs.sh
+grep -Fq 'capture_failure_diagnostics || true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'failure-diagnostics' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'k logs "$pod" --all-containers=true --previous' \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq 'k get pods -l app.kubernetes.io/name=rhiza -o json' \
+  scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'k describe "$pod"' scripts/e2e-vind-rustfs.sh
+grep -Fq 'k get events --sort-by=.metadata.creationTimestamp' \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq 'redact_diagnostic_stream' scripts/e2e-vind-rustfs.sh
+self_heal_e2e="$(sed -n \
+  '/^verify_same_membership_pod_recreation() {$/,/^}$/p' \
+  scripts/e2e-vind-rustfs.sh)"
+# shellcheck disable=SC2016
+for required_recovery_proof in \
+  'k delete pod "$target_pod" --wait=true' \
+  'new_target_uid" != "$old_target_uid' \
+  'old_survivor_a_uid' \
+  'old_survivor_b_uid' \
+  'replacement Pod retained deleted emptyDir data' \
+  'survivor lost its emptyDir data' \
+  'retry_read_value "$target_pod"' \
+  '--arg cluster "$canonical_cluster_id"' \
+  '.cluster_id == $cluster' \
+  '.node.configuration_status == "active"' \
+  '.node.active_membership_digest == $digest' \
+  'if ! scripts/k8s-admin-job.sh' \
+  'sample_complete=false' \
+  '([.[].qlog_root] | unique | length == 1)'; do
+  grep -Fq "$required_recovery_proof" <<< "$self_heal_e2e"
+done
+if grep -Fq '.cluster_id == "rhiza-vind"' <<< "$self_heal_e2e"; then
+  echo "same-membership Pod recreation E2E compares a logical rather than canonical cluster ID" >&2
+  exit 1
+fi
+if grep -Eq 'scale statefulset|set env|render-k8s-config|k8s-object-job|membership/(stop|activate)' \
+  <<< "$self_heal_e2e"; then
+  echo "same-membership Pod recreation E2E contains an operator recovery command" >&2
+  exit 1
+fi
 # shellcheck disable=SC2016
 grep -Fq 'token:$tokens[$n]' \
   scripts/e2e-vind-rustfs.sh
@@ -1095,6 +1252,21 @@ RHIZA_AUTH_SECRET=rendered-auth RHIZA_ADMIN_JOB_RENDER_ONLY="$tmp/admin-job.yaml
 yq eval '.' "$tmp/admin-job.yaml" >/dev/null
 [ "$(yq eval -r '.metadata.labels["rhiza.dev/execution-profile"]' "$tmp/admin-job.yaml")" = sql ]
 [ "$(yq eval -r '.spec.template.spec.containers[0].env[] | select(.name == "RHIZA_EXECUTION_PROFILE") | .value' "$tmp/admin-job.yaml")" = sql ]
+admin_job_command="$(yq eval -r '.spec.template.spec.containers[0].args[0]' \
+  "$tmp/admin-job.yaml")"
+sh -n -c "$admin_job_command"
+# shellcheck disable=SC2016
+grep -Fq 'case "$curl_status" in' <<< "$admin_job_command"
+grep -Fq '6|7)' <<< "$admin_job_command"
+# shellcheck disable=SC2016
+grep -Fq '[ "$attempt" -ge 10 ]' <<< "$admin_job_command"
+# shellcheck disable=SC2016
+grep -Fq 'cat /tmp/rhiza-admin-curl-error >&2' <<< "$admin_job_command"
+grep -Fq '2>/tmp/rhiza-admin-curl-error' <<< "$admin_job_command"
+if grep -Eq -- '--retry([^[:alnum:]]|$)' <<< "$admin_job_command"; then
+  echo "admin Job must not retry HTTP or application failures through curl --retry" >&2
+  exit 1
+fi
 for invalid_target in \
   'rhiza-graph-c3 rhiza-graph-c3-0' \
   'rhiza-sql-c3 rhiza-sql-c4-0' \

@@ -38,6 +38,22 @@ spec:
       port: 8080
       targetPort: client
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: __CONFIG_NAME__
+  labels:
+    app.kubernetes.io/name: rhiza
+    rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
+    rhiza.dev/config-id: "__CONFIG_ID__"
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhiza
+      rhiza.dev/execution-profile: "__EXECUTION_PROFILE__"
+      rhiza.dev/config-id: "__CONFIG_ID__"
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

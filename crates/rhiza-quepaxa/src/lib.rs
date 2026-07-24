@@ -1,10 +1,23 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     cmp::Ordering as CmpOrdering,
     collections::{hash_map, BTreeMap, BTreeSet, HashMap},
     fmt, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -28,10 +41,44 @@ pub type Phase = u8;
 pub type Step = u64;
 pub type Priority = u128;
 
+/// Read-only classification of a recorder root before startup recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecorderPreflight {
+    Missing,
+    Valid,
+    Recoverable,
+}
+
 const RECORDER_STATE_VERSION: u16 = 4;
 const CONFIGURATION_STATE_VERSION: u16 = 3;
 const RECORD_WORKER_QUEUE_CAPACITY: usize = 1;
 const CONTROL_WORKER_QUEUE_CAPACITY: usize = 1;
+
+// The largest replicated command supported by the bounded WAL rotation policy below. The
+// remaining limits follow directly from the on-disk envelopes: seven membership entries,
+// two durable slot snapshots, and at most one oversized WAL frame past the soft limit.
+const MAX_REPLICATED_COMMAND_BYTES: usize = 512 * 1024;
+const MAX_COMMAND_CACHE_BYTES: usize = 4 + 2 + 1 + 8 + MAX_REPLICATED_COMMAND_BYTES + 32;
+const MAX_CONFIGURATION_BYTES: usize = 512 * 1024;
+const MAX_RECORDER_STATE_BYTES: usize = 1024 * 1024;
+const MAX_RECORDED_HEAD_BYTES: usize = 2 * MAX_RECORDER_STATE_BYTES + MAX_CONFIGURATION_BYTES;
+const MAX_TRANSITION_INTENT_BYTES: usize =
+    MAX_RECORDER_STATE_BYTES + MAX_CONFIGURATION_BYTES + 4 + 2 + 8 + 2 + 2;
+const MAX_CONFIGURATION_HEAD_INTENT_BYTES: usize =
+    MAX_CONFIGURATION_BYTES + MAX_RECORDED_HEAD_BYTES + 4 + 2 + 8 + 8;
+const MAX_RECORDER_WAL_BYTES: usize = 64 * 1024 * 1024 + 2 * 1024 * 1024;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -1329,6 +1376,117 @@ pub trait RecorderRpc: Send + Sync {
 }
 
 impl RecorderFileStore {
+    /// Classifies an existing recorder root without creating, recovering, truncating, or
+    /// rewriting local state. `Recoverable` is limited to durable normal-crash artifacts that a
+    /// subsequent locked open knows how to finish.
+    #[doc(hidden)]
+    pub fn preflight_existing_with_membership_outcome(
+        root: impl AsRef<Path>,
+        cluster_id: &str,
+        epoch: Epoch,
+        config_id: ConfigId,
+        membership: &Membership,
+    ) -> Result<RecorderPreflight> {
+        let root = root.as_ref();
+        let metadata = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RecorderPreflight::Missing)
+            }
+            Err(error) => return Err(Error::Io(error.to_string())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::Decode(
+                "recorder root must be a real directory".into(),
+            ));
+        }
+        let entries = fs::read_dir(root)
+            .map_err(|error| Error::Io(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Io(error.to_string()))?;
+        if entries.is_empty()
+            || entries
+                .iter()
+                .all(|entry| entry.file_name() == ".recorder.lock")
+        {
+            return Ok(RecorderPreflight::Missing);
+        }
+        let transition_intent =
+            read_preflight_intent(root, "configuration.intent", MAX_TRANSITION_INTENT_BYTES)?;
+        let configuration_head_intent = read_preflight_intent(
+            root,
+            "configuration-head.intent",
+            MAX_CONFIGURATION_HEAD_INTENT_BYTES,
+        )?;
+        match (transition_intent, configuration_head_intent) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Decode(
+                    "recorder has conflicting recovery intents".into(),
+                ))
+            }
+            (Some(bytes), None) => {
+                validate_recoverable_transition_intent(
+                    root, &bytes, cluster_id, epoch, config_id, membership,
+                )?;
+                validate_empty_recovery_wal(root)?;
+                return Ok(RecorderPreflight::Recoverable);
+            }
+            (None, Some(bytes)) => {
+                validate_recoverable_configuration_head_intent(
+                    root, &bytes, cluster_id, epoch, config_id, membership,
+                )?;
+                validate_empty_recovery_wal(root)?;
+                return Ok(RecorderPreflight::Recoverable);
+            }
+            (None, None) => {}
+        }
+        for name in [".recorder.lock"] {
+            let path = root.join(name);
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|_| Error::Decode(format!("recorder is missing {name}")))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(Error::Decode(format!(
+                    "recorder {name} must be a regular file"
+                )));
+            }
+        }
+        let configuration = decode_configuration_state(&read_regular_file_bounded(
+            &root.join("configuration.rec"),
+            MAX_CONFIGURATION_BYTES,
+            "configuration.rec",
+        )?)?;
+        validate_preflight_configuration(&configuration, config_id, membership)?;
+        let (head, recent_slots, checkpoint) = decode_recorded_head(
+            &read_regular_file_bounded(
+                &root.join("recorded-head.rec"),
+                MAX_RECORDED_HEAD_BYTES,
+                "recorded-head.rec",
+            )?,
+            cluster_id,
+            epoch,
+            &configuration,
+        )?;
+        validate_existing_snapshots(root, &recent_slots, cluster_id, epoch, &configuration)?;
+        let torn_wal = validate_existing_wal(
+            root,
+            &read_regular_file_bounded(
+                &root.join("recorder.wal"),
+                MAX_RECORDER_WAL_BYTES,
+                "recorder.wal",
+            )?,
+            cluster_id,
+            epoch,
+            &configuration,
+            &head,
+            checkpoint,
+        )?;
+        Ok(if torn_wal {
+            RecorderPreflight::Recoverable
+        } else {
+            RecorderPreflight::Valid
+        })
+    }
+
     pub fn new(
         root: impl Into<PathBuf>,
         cluster_id: impl Into<ClusterId>,
@@ -1426,6 +1584,78 @@ impl RecorderFileStore {
         ))
     }
 
+    fn open_existing_root(
+        root: PathBuf,
+        recorder_id: NodeId,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+    ) -> Result<(Self, bool)> {
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::Decode("recorder root does not exist".into()))
+            }
+            Err(error) => return Err(Error::Io(error.to_string())),
+        };
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(Error::Decode(
+                "recorder root must be an existing real directory".into(),
+            ));
+        }
+        if recorder_id.is_empty() {
+            return Err(Error::EmptyRecorderIdentity);
+        }
+        let root_lock_path = root.join(".recorder.lock");
+        let root_lock = open_existing_root_lock(&root_lock_path)?;
+        match root_lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Error::RecorderRootLocked(root));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(Error::Io(error.to_string())),
+        }
+        let head_exists = fs::symlink_metadata(root.join("recorded-head.rec"))
+            .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+            .unwrap_or(false);
+        let legacy_files_exist = if !head_exists {
+            fs::read_dir(&root)
+                .map_err(|error| Error::Io(error.to_string()))?
+                .filter_map(std::result::Result::ok)
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name == "configuration.rec"
+                        || name.starts_with("slot-")
+                        || name.starts_with("command-")
+                })
+        } else {
+            false
+        };
+        Ok((
+            Self {
+                root,
+                recorder_id,
+                cluster_id,
+                epoch,
+                config_id,
+                config_digest: LogHash::ZERO,
+                configuration: Arc::new(Mutex::new(ConfigurationState::initial(
+                    config_id,
+                    LogHash::ZERO,
+                    None,
+                ))),
+                recorded_head: Arc::new(Mutex::new(RecordedHeadProvenance::Empty)),
+                recent_slots: Arc::new(Mutex::new(Vec::new())),
+                wal: Arc::new(Mutex::new(RecorderWal::default())),
+                seal_fault: Arc::new(Mutex::new(None)),
+                _root_lock: Arc::new(root_lock),
+                sync: Arc::new(Mutex::new(())),
+            },
+            head_exists || legacy_files_exist,
+        ))
+    }
+
     pub fn new_with_membership(
         root: impl Into<PathBuf>,
         recorder_id: impl Into<NodeId>,
@@ -1434,26 +1664,98 @@ impl RecorderFileStore {
         config_id: ConfigId,
         membership: Membership,
     ) -> Result<Self> {
-        let recorder_id = recorder_id.into();
-        let (mut store, existing_format) =
-            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?;
-        store.recover_configuration_head_intent()?;
-        let configured = if store.configuration_path().exists() {
-            decode_configuration_state(
-                &fs::read(store.configuration_path()).map_err(|err| Error::Io(err.to_string()))?,
-            )?
+        Self::open_with_membership(
+            root.into(),
+            recorder_id.into(),
+            cluster_id.into(),
+            epoch,
+            config_id,
+            membership,
+            false,
+        )
+    }
+
+    /// Opens a recorder that must already exist. Unlike `new_with_membership`, this path never
+    /// creates a directory, lock file, or fresh recorder state.
+    #[doc(hidden)]
+    pub fn open_existing_with_membership(
+        root: impl Into<PathBuf>,
+        recorder_id: impl Into<NodeId>,
+        cluster_id: impl Into<ClusterId>,
+        epoch: Epoch,
+        config_id: ConfigId,
+        membership: Membership,
+    ) -> Result<Self> {
+        Self::open_with_membership(
+            root.into(),
+            recorder_id.into(),
+            cluster_id.into(),
+            epoch,
+            config_id,
+            membership,
+            true,
+        )
+    }
+
+    fn open_with_membership(
+        root: PathBuf,
+        recorder_id: NodeId,
+        cluster_id: ClusterId,
+        epoch: Epoch,
+        config_id: ConfigId,
+        membership: Membership,
+        existing_only: bool,
+    ) -> Result<Self> {
+        let (mut store, existing_format) = if existing_only {
+            Self::open_existing_root(root, recorder_id, cluster_id, epoch, config_id)?
         } else {
-            if existing_format {
-                return Err(Error::MigrationRequired {
-                    format: "recorder durable head",
-                    version: 2,
-                });
+            Self::open_root(root, recorder_id, cluster_id, epoch, config_id)?
+        };
+        // Preflight is advisory until this process owns the recorder lock. Re-run the same
+        // bounded, no-follow validation under that lock before an intent can rewrite authority
+        // files, so a path replacement after startup classification cannot authorize mutation.
+        match Self::preflight_existing_with_membership_outcome(
+            &store.root,
+            &store.cluster_id,
+            store.epoch,
+            config_id,
+            &membership,
+        ) {
+            Ok(RecorderPreflight::Missing) if existing_only => {
+                return Err(Error::Decode(
+                    "recorder root is missing durable state".into(),
+                ))
             }
-            let configured =
-                ConfigurationState::initial(config_id, membership.digest(), Some(membership));
-            store
-                .commit_configuration_head_unlocked(&configured, &RecordedHeadProvenance::Empty)?;
-            configured
+            Ok(_) => {}
+            // A pre-manifest recorder is legacy state. Preserve the established migration error
+            // below; it cannot reach intent recovery because it has no complete authority set.
+            Err(Error::Decode(message))
+                if existing_format && message.starts_with("recorder is missing ") => {}
+            Err(error) => return Err(error),
+        }
+        store.recover_configuration_head_intent()?;
+        let configured = match read_regular_file_bounded(
+            &store.configuration_path(),
+            MAX_CONFIGURATION_BYTES,
+            "configuration.rec",
+        ) {
+            Ok(bytes) => decode_configuration_state(&bytes)?,
+            Err(Error::Decode(message)) if message == "recorder is missing configuration.rec" => {
+                if existing_format {
+                    return Err(Error::MigrationRequired {
+                        format: "recorder durable head",
+                        version: 2,
+                    });
+                }
+                let configured =
+                    ConfigurationState::initial(config_id, membership.digest(), Some(membership));
+                store.commit_configuration_head_unlocked(
+                    &configured,
+                    &RecordedHeadProvenance::Empty,
+                )?;
+                configured
+            }
+            Err(error) => return Err(error),
         };
         if configured
             .membership
@@ -2032,17 +2334,20 @@ impl RecorderFileStore {
         }
         drop(wal);
         let path = self.path(slot);
-        if !path.exists() {
-            return Ok(RecorderSlotState::new_with_digest(
-                slot,
-                self.cluster_id.clone(),
-                self.epoch,
-                self.current_config_id(),
-                config_digest,
-            ));
-        }
-        let state =
-            decode_recorder_state(&fs::read(path).map_err(|err| Error::Io(err.to_string()))?)?;
+        let bytes = match read_regular_file_bounded(&path, MAX_RECORDER_STATE_BYTES, "slot cache") {
+            Ok(bytes) => bytes,
+            Err(Error::Decode(message)) if message == "recorder is missing slot cache" => {
+                return Ok(RecorderSlotState::new_with_digest(
+                    slot,
+                    self.cluster_id.clone(),
+                    self.epoch,
+                    self.current_config_id(),
+                    config_digest,
+                ))
+            }
+            Err(error) => return Err(error),
+        };
+        let state = decode_recorder_state(&bytes)?;
         if state.slot != slot
             || state.cluster_id != self.cluster_id
             || state.epoch != self.epoch
@@ -2056,34 +2361,37 @@ impl RecorderFileStore {
 
     fn open_or_initialize_recorded_head(&self, existing_format: bool) -> Result<()> {
         let configuration = self.configuration_state()?;
-        let (head, recent_slots, wal_checkpoint) = if self.recorded_head_path().exists() {
-            decode_recorded_head(
-                &fs::read(self.recorded_head_path()).map_err(|err| Error::Io(err.to_string()))?,
-                &self.cluster_id,
-                self.epoch,
-                &configuration,
-            )?
-        } else {
-            if existing_format {
-                return Err(Error::MigrationRequired {
-                    format: "recorder durable head",
-                    version: 2,
-                });
+        let (head, recent_slots, wal_checkpoint) = match read_regular_file_bounded(
+            &self.recorded_head_path(),
+            MAX_RECORDED_HEAD_BYTES,
+            "recorded-head.rec",
+        ) {
+            Ok(bytes) => {
+                decode_recorded_head(&bytes, &self.cluster_id, self.epoch, &configuration)?
             }
-            let head = RecordedHeadProvenance::Empty;
-            let wal_checkpoint = WalCheckpoint::default();
-            atomic_write(
-                &self.recorded_head_path(),
-                &encode_recorded_head(
-                    &self.cluster_id,
-                    self.epoch,
-                    &configuration,
-                    &head,
-                    &[],
-                    wal_checkpoint,
-                )?,
-            )?;
-            (head, Vec::new(), wal_checkpoint)
+            Err(Error::Decode(message)) if message == "recorder is missing recorded-head.rec" => {
+                if existing_format {
+                    return Err(Error::MigrationRequired {
+                        format: "recorder durable head",
+                        version: 2,
+                    });
+                }
+                let head = RecordedHeadProvenance::Empty;
+                let wal_checkpoint = WalCheckpoint::default();
+                atomic_write(
+                    &self.recorded_head_path(),
+                    &encode_recorded_head(
+                        &self.cluster_id,
+                        self.epoch,
+                        &configuration,
+                        &head,
+                        &[],
+                        wal_checkpoint,
+                    )?,
+                )?;
+                (head, Vec::new(), wal_checkpoint)
+            }
+            Err(error) => return Err(error),
         };
         self.install_recorded_head(&configuration, head, recent_slots, wal_checkpoint)
     }
@@ -2102,7 +2410,7 @@ impl RecorderFileStore {
         if created {
             self.sync_root()?;
         }
-        let bytes = fs::read(&path).map_err(|error| Error::Io(error.to_string()))?;
+        let bytes = read_regular_file_bounded(&path, MAX_RECORDER_WAL_BYTES, "recorder.wal")?;
         let checkpoint = self.wal_checkpoint()?;
         let mut replayed = RecorderWal {
             checkpoint,
@@ -2256,7 +2564,11 @@ impl RecorderFileStore {
                 self.validate_value_unlocked(snapshot.slot, value)?;
             }
             let path = self.path(snapshot.slot);
-            if fs::read(&path).ok().as_deref() != Some(snapshot.bytes.as_slice()) {
+            if read_regular_file_bounded(&path, MAX_RECORDER_STATE_BYTES, "slot cache")
+                .ok()
+                .as_deref()
+                != Some(snapshot.bytes.as_slice())
+            {
                 atomic_replace(&path, &snapshot.bytes)?;
                 recovered_cache = true;
             }
@@ -2339,18 +2651,12 @@ impl RecorderFileStore {
     }
 
     fn fetch_command_cache_unlocked(&self, command_hash: LogHash) -> Result<Option<StoredCommand>> {
-        let path = self.command_path(command_hash);
-        if !path.exists() {
-            return Ok(None);
-        }
         #[cfg(test)]
         COMMAND_FILE_READS.with(|reads| reads.set(reads.get() + 1));
-        let command =
-            decode_stored_command(&fs::read(path).map_err(|err| Error::Io(err.to_string()))?)?;
-        if command.hash() != command_hash {
-            return Err(Error::CommandHashMismatch);
+        match read_existing_command_cache(&self.root, command_hash) {
+            Err(Error::CommandUnavailable) => Ok(None),
+            result => result.map(Some),
         }
-        Ok(Some(command))
     }
 
     fn validate_value_unlocked(&self, slot: Slot, value: &AcceptedValue) -> Result<()> {
@@ -2616,11 +2922,15 @@ impl RecorderFileStore {
     fn recover_intent(&self) -> Result<()> {
         self.recover_configuration_head_intent()?;
         let path = self.intent_path();
-        if !path.exists() {
+        let Some(intent_bytes) = read_preflight_intent(
+            &self.root,
+            "configuration.intent",
+            MAX_TRANSITION_INTENT_BYTES,
+        )?
+        else {
             return Ok(());
-        }
-        let (slot, slot_bytes, configuration_bytes) =
-            decode_transition_intent(&fs::read(&path).map_err(|err| Error::Io(err.to_string()))?)?;
+        };
+        let (slot, slot_bytes, configuration_bytes) = decode_transition_intent(&intent_bytes)?;
         let configuration = decode_configuration_state(&configuration_bytes)?;
         let slot_state = decode_recorder_state(&slot_bytes)?;
         let head = self.head_after_slot_state(&configuration, &slot_state)?;
@@ -2658,10 +2968,14 @@ impl RecorderFileStore {
 
     fn recover_configuration_head_intent(&self) -> Result<()> {
         let path = self.configuration_head_intent_path();
-        if !path.exists() {
+        let Some(intent_bytes) = read_preflight_intent(
+            &self.root,
+            "configuration-head.intent",
+            MAX_CONFIGURATION_HEAD_INTENT_BYTES,
+        )?
+        else {
             return Ok(());
-        }
-        let intent_bytes = fs::read(&path).map_err(|err| Error::Io(err.to_string()))?;
+        };
         let (configuration_bytes, head_bytes) = decode_configuration_head_intent(&intent_bytes)?;
         atomic_write(&self.configuration_path(), configuration_bytes)?;
         atomic_write(&self.recorded_head_path(), head_bytes)?;
@@ -6067,6 +6381,398 @@ fn decode_wal_frame(bytes: &[u8], offset: usize) -> Result<Option<(WalFrame, usi
     )))
 }
 
+fn read_regular_file_bounded(path: &Path, maximum: usize, name: &str) -> Result<Vec<u8>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::Decode(format!("recorder is missing {name}")))
+        }
+        Err(error) => return Err(Error::Io(error.to_string())),
+    };
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum as u64 {
+        return Err(Error::Decode(format!(
+            "recorder {name} must be a bounded regular file"
+        )));
+    }
+    let mut file = open_regular_file_no_follow(path)?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    if !opened.is_file()
+        || !same_opened_file(&before, &opened)
+        || opened.len() != before.len()
+        || opened.len() > maximum as u64
+    {
+        return Err(Error::Decode(format!(
+            "recorder {name} changed before no-follow open"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let after_opened = file
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let after_path = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+    if after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || !after_opened.is_file()
+        || !same_opened_file(&opened, &after_opened)
+        || !same_opened_file(&opened, &after_path)
+        || after_opened.len() != opened.len()
+        || after_path.len() != opened.len()
+    {
+        return Err(Error::Decode(format!(
+            "recorder {name} changed during bounded read"
+        )));
+    }
+    if bytes.len() > maximum || bytes.len() as u64 != opened.len() {
+        return Err(Error::Decode(format!(
+            "recorder {name} exceeds its size limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn open_regular_file_no_follow(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    options.custom_flags(O_NOFOLLOW_FLAG);
+    options
+        .open(path)
+        .map_err(|error| Error::Io(error.to_string()))
+}
+
+fn open_existing_root_lock(path: &Path) -> Result<fs::File> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::Decode("recorder root lock does not exist".into()))
+        }
+        Err(error) => return Err(Error::Io(error.to_string())),
+    };
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(Error::Decode(
+            "recorder root lock must be an existing regular file".into(),
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    options.custom_flags(O_NOFOLLOW_FLAG);
+    let file = options
+        .open(path)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let after = fs::symlink_metadata(path).map_err(|error| Error::Io(error.to_string()))?;
+    if after.file_type().is_symlink()
+        || !after.is_file()
+        || !opened.is_file()
+        || !same_opened_file(&before, &opened)
+        || !same_opened_file(&opened, &after)
+        || before.len() != opened.len()
+        || opened.len() != after.len()
+    {
+        return Err(Error::Decode(
+            "recorder root lock changed before open".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn same_opened_file(opened: &fs::Metadata, linked: &fs::Metadata) -> bool {
+    opened.dev() == linked.dev() && opened.ino() == linked.ino()
+}
+
+#[cfg(not(unix))]
+fn same_opened_file(opened: &fs::Metadata, linked: &fs::Metadata) -> bool {
+    opened.file_type() == linked.file_type()
+        && opened.len() == linked.len()
+        && opened.modified().ok() == linked.modified().ok()
+}
+
+fn read_preflight_intent(root: &Path, name: &str, maximum: usize) -> Result<Option<Vec<u8>>> {
+    let path = root.join(name);
+    match read_regular_file_bounded(&path, maximum, name) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Error::Decode(message)) if message == format!("recorder is missing {name}") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_preflight_configuration(
+    configuration: &ConfigurationState,
+    config_id: ConfigId,
+    membership: &Membership,
+) -> Result<()> {
+    if configuration.config_id != config_id
+        || configuration.config_digest != membership.digest()
+        || configuration.membership.as_ref() != Some(membership)
+    {
+        return Err(Error::Decode(
+            "recorder configuration does not exactly match expected membership".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_existing_snapshots(
+    root: &Path,
+    snapshots: &[DurableSlotSnapshot],
+    cluster_id: &str,
+    epoch: Epoch,
+    configuration: &ConfigurationState,
+) -> Result<()> {
+    let no_inline_commands = HashMap::new();
+    for snapshot in snapshots {
+        let state = decode_recorder_state(&snapshot.bytes)?;
+        if state.slot() != snapshot.slot
+            || state.cluster_id != cluster_id
+            || state.epoch != epoch
+            || state.config_id != configuration.config_id
+            || state.config_digest != configuration.config_digest
+        {
+            return Err(Error::Decode(
+                "durable recorder snapshot identity mismatch".into(),
+            ));
+        }
+        for value in recorder_state_values(&state) {
+            validate_existing_value(
+                root,
+                cluster_id,
+                snapshot.slot,
+                epoch,
+                configuration.config_id,
+                value,
+                &no_inline_commands,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_recoverable_transition_intent(
+    root: &Path,
+    bytes: &[u8],
+    cluster_id: &str,
+    epoch: Epoch,
+    config_id: ConfigId,
+    membership: &Membership,
+) -> Result<()> {
+    let (slot, slot_bytes, configuration_bytes) = decode_transition_intent(bytes)?;
+    let configuration = decode_configuration_state(&configuration_bytes)?;
+    validate_preflight_configuration(&configuration, config_id, membership)?;
+    let state = decode_recorder_state(&slot_bytes)?;
+    if state.slot() != slot
+        || state.cluster_id != cluster_id
+        || state.epoch != epoch
+        || state.config_id != configuration.config_id
+        || state.config_digest != configuration.config_digest
+    {
+        return Err(Error::Decode(
+            "recorder transition intent state identity mismatch".into(),
+        ));
+    }
+    let no_inline_commands = HashMap::new();
+    for value in recorder_state_values(&state) {
+        validate_existing_value(
+            root,
+            cluster_id,
+            slot,
+            epoch,
+            configuration.config_id,
+            value,
+            &no_inline_commands,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_recoverable_configuration_head_intent(
+    root: &Path,
+    bytes: &[u8],
+    cluster_id: &str,
+    epoch: Epoch,
+    config_id: ConfigId,
+    membership: &Membership,
+) -> Result<()> {
+    let (configuration_bytes, head_bytes) = decode_configuration_head_intent(bytes)?;
+    let configuration = decode_configuration_state(configuration_bytes)?;
+    validate_preflight_configuration(&configuration, config_id, membership)?;
+    let (_, snapshots, _) = decode_recorded_head(head_bytes, cluster_id, epoch, &configuration)?;
+    validate_existing_snapshots(root, &snapshots, cluster_id, epoch, &configuration)
+}
+
+fn validate_empty_recovery_wal(root: &Path) -> Result<()> {
+    let path = root.join("recorder.wal");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::Decode(
+            "recorder WAL must be a regular file during recovery".into(),
+        ));
+    }
+    if metadata.len() != 0 {
+        return Err(Error::Decode(
+            "recorder recovery intent requires an empty WAL".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_existing_wal(
+    root: &Path,
+    bytes: &[u8],
+    cluster_id: &str,
+    epoch: Epoch,
+    initial_configuration: &ConfigurationState,
+    initial_head: &RecordedHeadProvenance,
+    checkpoint: WalCheckpoint,
+) -> Result<bool> {
+    let mut commands = HashMap::new();
+    let mut next_sequence = checkpoint
+        .through_sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::Decode("recorder WAL sequence exhausted".into()))?;
+    let mut last_digest = LogHash::ZERO;
+    let mut configuration = initial_configuration.clone();
+    let mut head = initial_head.clone();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let Some((frame, end)) = decode_wal_frame(bytes, offset)? else {
+            return Ok(true);
+        };
+        if frame.generation < checkpoint.generation {
+            offset = end;
+            continue;
+        }
+        if frame.generation != checkpoint.generation
+            || frame.sequence != next_sequence
+            || frame.prev_digest != last_digest
+        {
+            return Err(Error::Decode(
+                "recorder WAL sequence or digest chain mismatch".into(),
+            ));
+        }
+        let state = decode_recorder_state(&frame.slot_bytes)?;
+        let next_configuration = decode_configuration_state(&frame.configuration_bytes)?;
+        if state.slot() != frame.slot
+            || state.cluster_id != cluster_id
+            || state.epoch != epoch
+            || state.config_id != next_configuration.config_id
+            || state.config_digest != next_configuration.config_digest
+            || configuration_structure_changed(&configuration, &next_configuration)
+        {
+            return Err(Error::Decode("recorder WAL state identity mismatch".into()));
+        }
+        if let Some((hash, command)) = &frame.command {
+            if command.hash() != *hash {
+                return Err(Error::Decode(
+                    "recorder WAL inline command hash mismatch".into(),
+                ));
+            }
+            upsert_wal_command(&mut commands, *hash, command)?;
+        }
+        for value in recorder_state_values(&state) {
+            validate_existing_value(
+                root,
+                cluster_id,
+                frame.slot,
+                epoch,
+                next_configuration.config_id,
+                value,
+                &commands,
+            )?;
+        }
+        let expected_head = if next_configuration.max_accepted_or_decided_slot == Some(frame.slot)
+            && recorder_state_values(&state).next().is_some()
+        {
+            RecordedHeadProvenance::SlotBacked { slot: frame.slot }
+        } else {
+            head.clone()
+        };
+        if frame.head != expected_head {
+            return Err(Error::Decode("recorder WAL head mismatch".into()));
+        }
+        next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Decode("recorder WAL sequence exhausted".into()))?;
+        last_digest = frame.digest;
+        configuration = next_configuration;
+        head = frame.head;
+        offset = end;
+    }
+    Ok(false)
+}
+
+fn validate_existing_value(
+    root: &Path,
+    cluster_id: &str,
+    slot: Slot,
+    epoch: Epoch,
+    config_id: ConfigId,
+    value: &AcceptedValue,
+    inline_commands: &HashMap<LogHash, StoredCommand>,
+) -> Result<()> {
+    let cached_command;
+    let command = match inline_commands.get(&value.command_hash) {
+        Some(command) => command,
+        None => {
+            cached_command = read_existing_command_cache(root, value.command_hash)?;
+            &cached_command
+        }
+    };
+    if AcceptedValue::from_command(cluster_id, slot, epoch, config_id, value.prev_hash, command)
+        != *value
+    {
+        return Err(Error::Decode("recorder WAL value mismatch".into()));
+    }
+    Ok(())
+}
+
+fn read_existing_command_cache(root: &Path, command_hash: LogHash) -> Result<StoredCommand> {
+    let path = root.join(format!("command-{}.cmd", command_hash.to_hex()));
+    let bytes =
+        match read_regular_file_bounded(&path, MAX_COMMAND_CACHE_BYTES, "command cache entry") {
+            Err(Error::Decode(message)) if message == "recorder is missing command cache entry" => {
+                return Err(Error::CommandUnavailable)
+            }
+            result => result?,
+        };
+    let command = decode_stored_command(&bytes)?;
+    if command.hash() != command_hash {
+        return Err(Error::CommandHashMismatch);
+    }
+    Ok(command)
+}
+
 fn encode_head_provenance(out: &mut Vec<u8>, head: &RecordedHeadProvenance) {
     match head {
         RecordedHeadProvenance::Empty => out.push(0),
@@ -6495,20 +7201,22 @@ impl Consensus for SingleNodeConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_file_reads, decode_wal_frame, encode_stored_command, encode_wal_frame,
-        last_file_sync_kind, reset_command_file_reads, reset_sync_counts, sync_counts,
-        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue,
-        CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus, ControlDispatch,
-        ControlJob, DecisionInspection, DecisionProof, DriveOutcome, Error, FileSyncKind,
-        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
+        command_file_reads, decode_configuration_state, decode_recorder_state, decode_wal_frame,
+        encode_stored_command, encode_wal_frame, last_file_sync_kind, reset_command_file_reads,
+        reset_sync_counts, sync_counts, sync_wal_append, sync_wal_metadata, upsert_wal_command,
+        AcceptedValue, CertifiedDecisionInspection, ConfigChange, ConfigurationState, Consensus,
+        ControlDispatch, ControlJob, DecisionInspection, DecisionProof, DriveOutcome, Error,
+        FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
         ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderFileStore, RecorderRequest, RecorderRpc, RecorderSlotState,
-        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        RecordedHeadProvenance, RecorderFileStore, RecorderPreflight, RecorderRequest, RecorderRpc,
+        RecorderSlotState, RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus,
+        ThreeNodeConsensus,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
-        collections::{BTreeSet, HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+        path::{Path, PathBuf},
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Condvar, Mutex,
@@ -6516,6 +7224,55 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    fn directory_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(base: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            if !current.exists() {
+                return;
+            }
+            for entry in std::fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(base, &entry.path(), files);
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(base).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    fn cache_backed_recorder_for_preflight(
+        root: &Path,
+        membership: Membership,
+    ) -> (LogHash, StoredCommand) {
+        let store =
+            RecorderFileStore::new_with_membership(root, "n1", "cluster", 1, 1, membership.clone())
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"preflight-cache".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: None,
+            })
+            .unwrap();
+        (command.hash(), command)
+    }
 
     fn record_requests(consensus: &ThreeNodeConsensus, slot: u64) -> Vec<RecordRequest> {
         let proposal = Proposal::new(
@@ -7704,6 +8461,701 @@ mod tests {
         assert_eq!(reopened.load(8).unwrap().isr.step(), 4);
         assert_eq!(reopened.fetch_command(second.hash()).unwrap(), None);
         assert_eq!(reopened.load(9).unwrap().isr.step(), 0);
+    }
+
+    #[test]
+    fn recorder_preflight_distinguishes_absent_from_valid_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("absent");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &absent,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Missing
+        );
+        assert!(!absent.exists());
+
+        let valid = root.path().join("valid");
+        drop(
+            RecorderFileStore::new_with_membership(
+                &valid,
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        let before = directory_files(&valid);
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &valid,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Valid
+        );
+        assert_eq!(directory_files(&valid), before);
+    }
+
+    #[test]
+    fn recorder_preflight_rejects_partial_or_foreign_state_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let partial = root.path().join("partial");
+        std::fs::create_dir(&partial).unwrap();
+        std::fs::write(partial.join("recorded-head.rec"), b"partial").unwrap();
+        let partial_before = directory_files(&partial);
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &partial,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert_eq!(directory_files(&partial), partial_before);
+
+        let valid = root.path().join("foreign");
+        drop(
+            RecorderFileStore::new_with_membership(
+                &valid,
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        let before = directory_files(&valid);
+        let other_membership = Membership::new(["n1", "n2", "n4"]).unwrap();
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &valid,
+                "cluster",
+                1,
+                2,
+                &membership,
+            )
+            .is_err()
+        );
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &valid,
+                "cluster",
+                1,
+                1,
+                &other_membership,
+            )
+            .is_err()
+        );
+        assert_eq!(directory_files(&valid), before);
+    }
+
+    #[test]
+    fn recorder_preflight_validates_command_cache_backed_values_without_mutation() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        for case in ["valid", "missing", "corrupt", "foreign"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(case);
+            let (command_hash, command) =
+                cache_backed_recorder_for_preflight(&root, membership.clone());
+            let command_path = root.join(format!("command-{}.cmd", command_hash.to_hex()));
+            match case {
+                "valid" => {}
+                "missing" => std::fs::remove_file(&command_path).unwrap(),
+                "corrupt" => std::fs::write(&command_path, b"corrupt command cache").unwrap(),
+                "foreign" => std::fs::write(
+                    &command_path,
+                    encode_stored_command(&StoredCommand::new(
+                        EntryType::Command,
+                        b"different command".to_vec(),
+                    )),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let before = directory_files(&root);
+            let result = RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            );
+            if case == "valid" {
+                assert_eq!(result.unwrap(), RecorderPreflight::Valid, "{case}");
+                assert_eq!(
+                    std::fs::read(&command_path).unwrap(),
+                    encode_stored_command(&command),
+                    "{case}"
+                );
+            } else {
+                assert!(result.is_err(), "{case}");
+            }
+            assert_eq!(directory_files(&root), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn recorder_preflight_rejects_nonregular_command_cache_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let (command_hash, _) = cache_backed_recorder_for_preflight(&root, membership.clone());
+        let command_path = root.join(format!("command-{}.cmd", command_hash.to_hex()));
+        std::fs::remove_file(&command_path).unwrap();
+        std::fs::create_dir(&command_path).unwrap();
+        let before = directory_files(&root);
+
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert_eq!(directory_files(&root), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_preflight_rejects_symlinked_command_cache_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let (command_hash, command) =
+            cache_backed_recorder_for_preflight(&root, membership.clone());
+        let command_path = root.join(format!("command-{}.cmd", command_hash.to_hex()));
+        let outside = temp.path().join("outside-command.cmd");
+        std::fs::write(&outside, encode_stored_command(&command)).unwrap();
+        std::fs::remove_file(&command_path).unwrap();
+        symlink(&outside, &command_path).unwrap();
+
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert!(std::fs::symlink_metadata(&command_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            encode_stored_command(&command)
+        );
+    }
+
+    #[test]
+    fn recorder_preflight_rejects_command_cache_backed_value_mismatch_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        cache_backed_recorder_for_preflight(&root, membership.clone());
+        let wal_path = root.join("recorder.wal");
+        let original = std::fs::read(&wal_path).unwrap();
+        let (frame, end) = decode_wal_frame(&original, 0).unwrap().unwrap();
+        assert_eq!(end, original.len());
+        let mut state = decode_recorder_state(&frame.slot_bytes).unwrap();
+        state
+            .isr
+            .first_current
+            .as_mut()
+            .unwrap()
+            .value
+            .as_mut()
+            .unwrap()
+            .entry_hash = LogHash::ZERO;
+        let configuration = decode_configuration_state(&frame.configuration_bytes).unwrap();
+        let (tampered, _, _) = encode_wal_frame(
+            frame.generation,
+            frame.sequence,
+            frame.prev_digest,
+            &state,
+            &configuration,
+            &frame.head,
+            None,
+        )
+        .unwrap();
+        std::fs::write(&wal_path, tampered).unwrap();
+        let before = directory_files(&root);
+
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert_eq!(directory_files(&root), before);
+    }
+
+    #[test]
+    fn recorder_preflight_allows_normal_configuration_intent_recovery_before_open() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let configuration = store.configuration_state().unwrap();
+        let state = RecorderSlotState::new_with_digest(8, "cluster", 1, 1, membership.digest());
+        store
+            .set_seal_fault(Some(SealFaultPoint::AfterIntent))
+            .unwrap();
+        assert!(store
+            .commit_transition_unlocked(&state, &configuration)
+            .is_err());
+        drop(store);
+        let before = directory_files(root.path());
+
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                root.path(),
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+        assert_eq!(directory_files(root.path()), before);
+        RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+            .unwrap();
+        assert!(!root.path().join("configuration.intent").exists());
+    }
+
+    #[test]
+    fn recorder_preflight_allows_torn_final_wal_recovery_before_open() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"torn-preflight".to_vec());
+        {
+            let store = RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap();
+            let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+            store
+                .record_proposal(RecordRequest {
+                    cluster_id: "cluster".into(),
+                    epoch: 1,
+                    config_id: 1,
+                    config_digest: membership.digest(),
+                    slot: 8,
+                    step: 4,
+                    proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                    command: Some(command.clone()),
+                })
+                .unwrap();
+        }
+        let wal = root.path().join("recorder.wal");
+        let len = std::fs::metadata(&wal).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(len - 7)
+            .unwrap();
+        let before = directory_files(root.path());
+
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                root.path(),
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+        assert_eq!(directory_files(root.path()), before);
+        let reopened =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(reopened.load(8).unwrap().isr.step(), 0);
+    }
+
+    #[test]
+    fn recorder_preflight_keeps_interior_wal_corruption_invalid_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"interior-preflight".to_vec());
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal: Proposal::new(ProposalPriority::MAX, "writer", 1, value),
+                command: Some(command),
+            })
+            .unwrap();
+        drop(store);
+        let wal = root.path().join("recorder.wal");
+        let mut bytes = std::fs::read(&wal).unwrap();
+        bytes[100] ^= 0x80;
+        std::fs::write(&wal, bytes).unwrap();
+        let before = directory_files(root.path());
+
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                root.path(),
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert_eq!(directory_files(root.path()), before);
+    }
+
+    #[test]
+    fn recorder_preflight_rejects_oversized_wal_cache_and_intent_without_mutation() {
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        for (name, limit) in [
+            ("recorder.wal", super::MAX_RECORDER_WAL_BYTES),
+            ("configuration.intent", super::MAX_TRANSITION_INTENT_BYTES),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            drop(
+                RecorderFileStore::new_with_membership(
+                    root.path(),
+                    "n1",
+                    "cluster",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap(),
+            );
+            let path = root.path().join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(limit as u64 + 1)
+                .unwrap();
+            let before_len = std::fs::symlink_metadata(&path).unwrap().len();
+            assert!(
+                RecorderFileStore::preflight_existing_with_membership_outcome(
+                    root.path(),
+                    "cluster",
+                    1,
+                    1,
+                    &membership,
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::symlink_metadata(&path).unwrap().len(), before_len);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (command_hash, _) =
+            cache_backed_recorder_for_preflight(root.path(), membership.clone());
+        let path = root
+            .path()
+            .join(format!("command-{}.cmd", command_hash.to_hex()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(super::MAX_COMMAND_CACHE_BYTES as u64 + 1)
+            .unwrap();
+        let before_len = std::fs::symlink_metadata(&path).unwrap().len();
+        assert!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                root.path(),
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().len(), before_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_preflight_rejects_symlinked_authority_files_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        for name in [
+            "configuration.rec",
+            "recorded-head.rec",
+            "recorder.wal",
+            "configuration.intent",
+            "configuration-head.intent",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            drop(
+                RecorderFileStore::new_with_membership(
+                    root.path(),
+                    "n1",
+                    "cluster",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap(),
+            );
+            let path = root.path().join(name);
+            let outside = root.path().join(format!("outside-{name}"));
+            if path.exists() {
+                std::fs::rename(&path, &outside).unwrap();
+            } else {
+                std::fs::write(&outside, b"intent").unwrap();
+            }
+            symlink(&outside, &path).unwrap();
+
+            assert!(
+                RecorderFileStore::preflight_existing_with_membership_outcome(
+                    root.path(),
+                    "cluster",
+                    1,
+                    1,
+                    &membership,
+                )
+                .is_err(),
+                "{name}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn recorder_open_revalidates_after_preflight_before_recovery_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        drop(
+            RecorderFileStore::new_with_membership(
+                root.path(),
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                root.path(),
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Valid,
+        );
+        let configuration = root.path().join("configuration.rec");
+        std::fs::write(&configuration, b"replaced after preflight").unwrap();
+        let before = directory_files(root.path());
+
+        assert!(RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership,
+        )
+        .is_err());
+        assert_eq!(directory_files(root.path()), before);
+    }
+
+    #[test]
+    fn existing_open_never_recreates_a_deleted_or_replaced_valid_recorder_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        drop(
+            RecorderFileStore::new_with_membership(
+                &root,
+                "n1",
+                "cluster",
+                1,
+                1,
+                membership.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Valid,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let parent_before = directory_files(parent.path());
+        assert!(RecorderFileStore::open_existing_with_membership(
+            &root,
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .is_err());
+        assert!(!root.exists());
+        assert_eq!(directory_files(parent.path()), parent_before);
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement"), b"foreign").unwrap();
+        let parent_before = directory_files(parent.path());
+        assert!(RecorderFileStore::open_existing_with_membership(
+            &root, "n1", "cluster", 1, 1, membership,
+        )
+        .is_err());
+        assert!(!root.join(".recorder.lock").exists());
+        assert_eq!(directory_files(parent.path()), parent_before);
+    }
+
+    #[test]
+    fn existing_open_never_recreates_a_deleted_or_replaced_recoverable_recorder_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            &root,
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let configuration = store.configuration_state().unwrap();
+        let state = RecorderSlotState::new_with_digest(8, "cluster", 1, 1, membership.digest());
+        store
+            .set_seal_fault(Some(SealFaultPoint::AfterIntent))
+            .unwrap();
+        assert!(store
+            .commit_transition_unlocked(&state, &configuration)
+            .is_err());
+        drop(store);
+        assert_eq!(
+            RecorderFileStore::preflight_existing_with_membership_outcome(
+                &root,
+                "cluster",
+                1,
+                1,
+                &membership,
+            )
+            .unwrap(),
+            RecorderPreflight::Recoverable,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let parent_before = directory_files(parent.path());
+        assert!(RecorderFileStore::open_existing_with_membership(
+            &root,
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .is_err());
+        assert!(!root.exists());
+        assert_eq!(directory_files(parent.path()), parent_before);
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement"), b"foreign").unwrap();
+        let parent_before = directory_files(parent.path());
+        assert!(RecorderFileStore::open_existing_with_membership(
+            &root, "n1", "cluster", 1, 1, membership,
+        )
+        .is_err());
+        assert!(!root.join(".recorder.lock").exists());
+        assert_eq!(directory_files(parent.path()), parent_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_open_rejects_a_recorder_root_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let root = parent.path().join("recorder");
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        std::fs::write(target.path().join("sentinel"), b"untouched").unwrap();
+        let before = directory_files(target.path());
+        symlink(target.path(), &root).unwrap();
+
+        assert!(RecorderFileStore::open_existing_with_membership(
+            &root, "n1", "cluster", 1, 1, membership,
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(directory_files(target.path()), before);
     }
 
     #[test]

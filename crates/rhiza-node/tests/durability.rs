@@ -682,7 +682,7 @@ async fn restore_preserves_an_existing_empty_data_directory() {
 }
 
 #[tokio::test]
-async fn restore_rolls_back_an_owned_interrupted_install() {
+async fn unbound_legacy_restore_intent_fails_without_mutation() {
     let root = tempfile::tempdir().unwrap();
     let archive = initialized_checkpoint(&root.path().join("archive")).await;
     let data_dir = root.path().join("mounted-data");
@@ -694,13 +694,16 @@ async fn restore_rolls_back_an_owned_interrupted_install() {
     )
     .unwrap();
 
-    restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
+    let before = std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap();
+    assert!(restore_checkpoint_to_fresh_data_dir(archive, &data_dir)
         .await
-        .unwrap();
-
-    assert!(!data_dir.join("consensus").exists());
-    assert!(!data_dir.join(".restore-stage-old").exists());
-    assert!(!data_dir.join(".rhiza-restore-v1").exists());
+        .is_err());
+    assert_eq!(
+        std::fs::read(data_dir.join(".rhiza-restore-v1")).unwrap(),
+        before
+    );
+    assert!(data_dir.join("consensus/partial").is_dir());
+    assert!(data_dir.join(".restore-stage-old").is_dir());
 }
 
 #[tokio::test]
@@ -1062,6 +1065,11 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
     );
     drop(runtime);
 
+    std::fs::write(
+        data_dir.join(".rhiza-checkpoint-identity-v2.json"),
+        b"matching-cli-identity-marker",
+    )
+    .unwrap();
     let completed = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
         .await
         .unwrap();
@@ -1102,6 +1110,66 @@ async fn successor_restore_requires_bound_target_config_and_opens_awaiting_activ
         RuntimeConfigurationStatus::Active
     );
     drop(rejoined);
+
+    std::fs::remove_dir_all(data_dir.join("sqlite")).unwrap();
+    let repaired = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
+        .await
+        .unwrap();
+    assert!(!repaired.requires_recorder_install());
+    assert!(data_dir.join("sqlite/db.sqlite").is_file());
+    assert!(std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rebuildable-quarantine-")));
+    drop(repaired);
+
+    // A repaired Complete successor must remain restartable. The first repair keeps the
+    // replaced recovery view in a quarantine directory, but that implementation detail must
+    // not turn the next prepare/open into a non-fresh data-directory failure.
+    let restarted = restore_successor_checkpoint_to_fresh_data_dir(target_archive.clone(), &config)
+        .await
+        .unwrap();
+    assert!(!restarted.requires_recorder_install());
+    drop(restarted);
+    let restarted_recorders: Vec<(String, Box<dyn RecorderRpc>)> = ["node-1", "node-2", "node-3"]
+        .into_iter()
+        .map(|node_id| {
+            (
+                node_id.to_string(),
+                Box::new(
+                    RecorderFileStore::new_with_membership(
+                        recorder_root.join(node_id),
+                        node_id,
+                        "rhiza:sql:cluster-a",
+                        1,
+                        2,
+                        successor.clone(),
+                    )
+                    .unwrap(),
+                ) as Box<dyn RecorderRpc>,
+            )
+        })
+        .collect();
+    let restarted_consensus = Arc::new(
+        ThreeNodeConsensus::from_recorders_with_ids(
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            2,
+            restarted_recorders,
+        )
+        .unwrap(),
+    );
+    let reopened_after_repair =
+        NodeRuntime::open(config.clone(), restarted_consensus, &[]).unwrap();
+    assert_eq!(
+        reopened_after_repair.status().unwrap().configuration_status,
+        RuntimeConfigurationStatus::Active
+    );
+    drop(reopened_after_repair);
 
     let wrong = NodeConfig::new_with_configuration(
         "rhiza:sql:cluster-a",
